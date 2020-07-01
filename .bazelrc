@@ -1,0 +1,1 @@
+run --show_loading_progress=false --show_progress=false --ui_event_filters='ERROR'

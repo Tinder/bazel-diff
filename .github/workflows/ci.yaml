@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v1.4.2
+        with:
+          java-version: 1.8
+        id: java
+      - name: Setup Go environment
+        uses: actions/setup-go@v2.1.2
+        with:
+          go-version: ^1.14
+        id: go
+      - name: Setup Bazelisk
+        run: go get github.com/bazelbuild/bazelisk
+      - uses: actions/checkout@v2
+      - name: Run bazel-diff tests
+        run: ~/go/bin/bazelisk test //test/...

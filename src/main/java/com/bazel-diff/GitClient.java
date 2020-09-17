@@ -12,7 +12,7 @@ interface GitClient {
     Set<Path> getModifiedFilepaths(String startRevision, String endRevision) throws IOException, InterruptedException;
     void checkoutRevision(String revision) throws IOException, InterruptedException;
     String getHeadSha() throws GitClientException, IOException, InterruptedException;
-    void ensureAllChangesAreCommited() throws IOException, InterruptedException, GitClientException;
+    void ensureAllChangesAreCommitted() throws IOException, InterruptedException, GitClientException;
 }
 
 class GitClientException extends Exception
@@ -60,7 +60,7 @@ class GitClientImpl implements GitClient {
     }
 
     @Override
-    public void ensureAllChangesAreCommited() throws IOException, InterruptedException, GitClientException {
+    public void ensureAllChangesAreCommitted() throws IOException, InterruptedException, GitClientException {
         List<String> gitOutput = performGitCommand("git", "status", "--porcelain");
         if (gitOutput.size() > 0) {
             throw new GitClientException("There are working changes in the directory, please commit them and try again");

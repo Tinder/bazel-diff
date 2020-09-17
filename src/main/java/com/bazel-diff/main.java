@@ -41,7 +41,7 @@ class FetchModifiedFilepaths implements Callable<Integer> {
     public Integer call() {
         GitClient gitClient = new GitClientImpl(parent.workspacePath);
         try {
-            gitClient.ensureAllChangesAreCommited();
+            gitClient.ensureAllChangesAreCommitted();
         } catch (IOException | InterruptedException e) {
             e.printStackTrace();
             return ExitCode.SOFTWARE;
@@ -89,7 +89,7 @@ class GenerateHashes implements Callable<Integer> {
         BazelClient bazelClient = new BazelClientImpl(parent.workspacePath, parent.bazelPath);
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient);
         try {
-            gitClient.ensureAllChangesAreCommited();
+            gitClient.ensureAllChangesAreCommitted();
             Set<Path> modifiedFilepathsSet = new HashSet<>();
             if (modifiedFilepaths != null) {
                 FileReader fileReader = new FileReader(modifiedFilepaths);
@@ -200,7 +200,7 @@ class BazelDiff implements Callable<Integer> {
         BazelClient bazelClient = new BazelClientImpl(workspacePath, bazelPath);
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient);
         try {
-            gitClient.ensureAllChangesAreCommited();
+            gitClient.ensureAllChangesAreCommitted();
         } catch (IOException | InterruptedException e) {
             e.printStackTrace();
             return ExitCode.SOFTWARE;

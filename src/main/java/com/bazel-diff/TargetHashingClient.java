@@ -94,9 +94,9 @@ class TargetHashingClientImpl implements TargetHashingClient {
             Map<String, MessageDigest> ruleHashes,
             Set<BazelSourceFileTarget> bazelSourcefileTargets
     ) throws NoSuchAlgorithmException {
-        MessageDigest exisitingMessage = ruleHashes.get(rule.getName());
-        if (exisitingMessage != null) {
-            return exisitingMessage;
+        MessageDigest existingMessage = ruleHashes.get(rule.getName());
+        if (existingMessage != null) {
+            return existingMessage;
         }
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         digest.update(rule.getDigest());

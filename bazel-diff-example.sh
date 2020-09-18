@@ -4,7 +4,7 @@
 workspace_path=$1
 # Path to your Bazel executable
 bazel_path=$2
-# Starting Rvision SHA
+# Starting Revision SHA
 previous_revision=$3
 # Final Revision SHA
 final_revision=$4

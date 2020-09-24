@@ -1,5 +1,7 @@
 # bazel-diff
 
+Test CLA
+
 `bazel-diff` is a command line tool for Bazel projects that allows users to determine the exact affected set of impacted targets between two Git revisions. Using this set, users can test or build the exact modified set of targets.
 
 `bazel-diff` offers several key advantages over rolling your own target diffing solution

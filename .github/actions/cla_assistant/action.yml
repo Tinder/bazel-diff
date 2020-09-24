@@ -35,4 +35,4 @@ inputs:
     description: "pull request comment when everyone has signed, defaults to **CLA Assistant Lite** All Contributors have signed the CLA."
 runs:
   using: "node12"
-  main: "lib/main.js"
+  main: "./.github/actions/cla_assistant/lib/main.js"

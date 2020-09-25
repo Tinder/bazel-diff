@@ -52,7 +52,7 @@ class BazelClientImpl implements BazelClient {
     @Override
     public Set<BazelSourceFileTarget> convertFilepathsToSourceTargets(Set<Path> filepaths) throws IOException, NoSuchAlgorithmException {
         Set<BazelSourceFileTarget> sourceTargets = new HashSet<>();
-        for (List<Path> partition : Iterables.partition(filepaths, 100)) {
+        for (List<Path> partition : Iterables.partition(filepaths, 1)) {
             String targetQuery = partition
                     .stream()
                     .map(path -> path.toString())

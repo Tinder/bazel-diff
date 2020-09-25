@@ -1,10 +1,12 @@
-name: CI
+name: Integration
 
 on:
   push:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  schedule:
+    - cron: "0 */2 * * *"
 
 jobs:
   build:
@@ -24,5 +26,5 @@ jobs:
       - name: Setup Bazelisk
         run: go get github.com/bazelbuild/bazelisk
       - uses: actions/checkout@v2
-      - name: Run bazel-diff tests
-        run: USE_BAZEL_VERSION=last_rc ~/go/bin/bazelisk test //test/...
+      - name: Run integration test
+        run: ./integration/integration_test.sh -e

@@ -1,3 +1,5 @@
+package com.bazel_diff;
+
 import picocli.CommandLine;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;

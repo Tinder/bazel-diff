@@ -21,7 +21,7 @@ java_library(
         "@bazel_diff_maven//:com_google_code_gson_gson",
         "@bazel_diff_maven//:com_google_guava_guava"
     ],
-    visibility = ["//test/java/com/bazel-diff:__pkg__"]
+    visibility = ["//src/test/java/com/bazel_diff:__pkg__"]
 )
 
 java_proto_library(

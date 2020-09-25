@@ -1,3 +1,5 @@
+package com.bazel_diff;
+
 import picocli.CommandLine.IVersionProvider;
 
 class VersionProvider implements IVersionProvider {

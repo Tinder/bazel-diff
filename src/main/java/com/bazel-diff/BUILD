@@ -1,13 +1,10 @@
 load("@rules_java//java:defs.bzl", "java_binary", "java_library", "java_proto_library")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 
-BAZEL_DIFF_VERSION = "1.0.1" # Update this when updating version!
-
 java_binary(
     name = "bazel-diff",
     main_class = "BazelDiff",
     runtime_deps = [":java-bazel-diff-lib"],
-    jvm_flags = ["-DBAZEL_DIFF_VERSION=%s" % BAZEL_DIFF_VERSION],
     visibility = ["//visibility:public"]
 )
 

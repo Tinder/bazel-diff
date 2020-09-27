@@ -175,9 +175,6 @@ Add the following to your `WORKSPACE` file to add the external repositories, rep
         sha256 = "UPDATE_ME",
     )
 
-    load("@bazel_diff//:repositories.bzl", "bazel_diff_dependencies")
-    load("@bazel_diff//:constants.bzl", "bazel_diff_dependencies")
-
     http_archive(
         name = "bazel_skylib",
         urls = [
@@ -193,12 +190,12 @@ Add the following to your `WORKSPACE` file to add the external repositories, rep
     load("@bazel_skylib//lib:versions.bzl", "versions")
 
     load("@bazel_diff//:repositories.bzl", "bazel_diff_dependencies")
+    load("@bazel_diff//:constants.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
 
     # Allows bazel-diff to run based on your projects' version of Bazel
     bazel_diff_dependencies(versions.get())
 
     load("@rules_jvm_external//:defs.bzl", "maven_install")
-    load("@bazel_diff//:constants.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
 
     maven_install(
         name = "bazel_diff_maven",

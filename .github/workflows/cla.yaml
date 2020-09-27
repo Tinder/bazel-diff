@@ -14,7 +14,6 @@ jobs:
         uses: ./.github/actions/cla_assistant
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PERSONAL_ACCESS_TOKEN : ${{ secrets.PERSONAL_ACCESS_TOKEN }}
         with:
           path-to-signatures: 'signatures/version1/cla.json'
           path-to-cla-document: 'https://github.com/Tinder/bazel-diff/blob/master/CLA.txt'

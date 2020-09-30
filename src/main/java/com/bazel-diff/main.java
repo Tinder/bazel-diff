@@ -53,7 +53,7 @@ class FetchModifiedFilepaths implements Callable<Integer> {
             Set<String> modifiedFilepaths = gitClient
                     .getModifiedFilepaths(startingGitRevision, endingGitRevision)
                     .stream()
-                    .map( path -> path.toString())
+                    .map(Path::toString)
                     .collect(Collectors.toSet());
             FileWriter myWriter = new FileWriter(outputPath);
             myWriter.write(String.join(System.lineSeparator(), modifiedFilepaths));
@@ -116,57 +116,9 @@ class GenerateHashes implements Callable<Integer> {
 }
 
 @Command(
-        name = "impacted-tests",
-        description = "Write to a file the impacted test targets for the list of Bazel targets in the provided file",
-        mixinStandardHelpOptions = true,
-        versionProvider = VersionProvider.class
-)
-class ImpactedTests implements Callable<Integer> {
-
-    @ParentCommand
-    private BazelDiff parent;
-
-    @Parameters(index = "0", description = "The filepath to a newline separated list of Bazel targets")
-    File impactedBazelTargetsPath;
-
-    @Parameters(index = "1", description = "The filepath to write the impacted test targets to")
-    File outputPath;
-
-    @Override
-    public Integer call() {
-        FileReader fileReader = null;
-        try {
-            fileReader = new FileReader(impactedBazelTargetsPath);
-        } catch (FileNotFoundException e) {
-            System.out.println("Unable to read impactedBazelTargetsPath! Exiting");
-            return ExitCode.USAGE;
-        }
-        BufferedReader bufferedReader = new BufferedReader(fileReader);
-        BazelClient bazelClient = new BazelClientImpl(parent.workspacePath, parent.bazelPath);
-        Set<String> impactedTargets = bufferedReader.lines().collect(Collectors.toSet());
-        Set<String> testTargets = null;
-        try {
-            testTargets = bazelClient.queryForImpactedTestTargets(impactedTargets);
-        } catch (IOException e) {
-            System.out.println("Unable to query rdeps tests of impacted targets");
-            return ExitCode.SOFTWARE;
-        }
-        try {
-            FileWriter myWriter = new FileWriter(outputPath);
-            myWriter.write(testTargets.stream().collect(Collectors.joining(System.lineSeparator())));
-            myWriter.close();
-        } catch (IOException e) {
-            System.out.println("Unable to write to outputPath!");
-            return ExitCode.USAGE;
-        }
-        return ExitCode.OK;
-    }
-}
-
-@Command(
         name = "bazel-diff",
         description = "Writes to a file the impacted targets between two Bazel graph JSON files",
-        subcommands = { GenerateHashes.class, FetchModifiedFilepaths.class, ImpactedTests.class },
+        subcommands = { GenerateHashes.class, FetchModifiedFilepaths.class },
         mixinStandardHelpOptions = true,
         versionProvider = VersionProvider.class
 )
@@ -187,7 +139,10 @@ class BazelDiff implements Callable<Integer> {
     @Option(names = {"-o", "--output"}, scope = ScopeType.LOCAL, description = "Filepath to write the impacted Bazel targets to, newline separated")
     File outputPath;
 
-    public Integer call() {
+    @Option(names = {"-t", "--tests"}, scope = ScopeType.LOCAL, description = "Return only targets of kind 'test')")
+    boolean testTargets;
+
+    public Integer call() throws IOException {
         if (startingHashesJSONPath == null || !startingHashesJSONPath.canRead()) {
             System.out.println("startingHashesJSONPath does not exist! Exiting");
             return ExitCode.USAGE;
@@ -209,8 +164,8 @@ class BazelDiff implements Callable<Integer> {
             return ExitCode.USAGE;
         }
         Gson gson = new Gson();
-        FileReader startingFileReader = null;
-        FileReader finalFileReader = null;
+        FileReader startingFileReader;
+        FileReader finalFileReader;
         try {
             startingFileReader = new FileReader(startingHashesJSONPath);
         } catch (FileNotFoundException e) {
@@ -226,7 +181,12 @@ class BazelDiff implements Callable<Integer> {
         Map<String, String > gsonHash = new HashMap<>();
         Map<String, String> startingHashes = gson.fromJson(startingFileReader, gsonHash.getClass());
         Map<String, String> finalHashes = gson.fromJson(finalFileReader, gsonHash.getClass());
-        Set<String> impactedTargets = hashingClient.getImpactedTargets(startingHashes, finalHashes);
+        Set<String> impactedTargets;
+        if (testTargets) {
+            impactedTargets = hashingClient.getImpactedTestTargets(startingHashes, finalHashes);
+        } else {
+            impactedTargets = hashingClient.getImpactedTargets(startingHashes, finalHashes);
+        }
         try {
             FileWriter myWriter = new FileWriter(outputPath);
             myWriter.write(impactedTargets.stream().collect(Collectors.joining(System.lineSeparator())));

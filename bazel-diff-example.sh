@@ -11,7 +11,7 @@ final_revision=$4
 
 modified_filepaths_output="/tmp/modified_filepaths.txt"
 starting_hashes_json="/tmp/starting_hashes.json"
-final_hashes_json="/tmp/final_hashes_json.json"
+final_hashes_json="/tmp/final_hashes.json"
 impacted_targets_path="/tmp/impacted_targets.txt"
 impacted_test_targets_path="/tmp/impacted_test_targets.txt"
 
@@ -28,7 +28,7 @@ git -C $workspace_path checkout $previous_revision --quiet
 echo "Generating Hashes for Revision '$previous_revision'"
 $bazel_path run :bazel-diff -- generate-hashes -w $workspace_path -b $bazel_path $starting_hashes_json
 
-git -C $workspace_path checkout -  --quiet
+git -C $workspace_path checkout - --quiet
 
 echo "Generating Hashes for Revision '$final_revision'"
 $bazel_path run :bazel-diff -- generate-hashes -w $workspace_path -b $bazel_path -m $modified_filepaths_output $final_hashes_json
@@ -37,7 +37,7 @@ echo "Determining Impacted Targets"
 $bazel_path run :bazel-diff -- -sh $starting_hashes_json -fh $final_hashes_json -w $workspace_path -b $bazel_path -o $impacted_targets_path
 
 echo "Determining Impacted Test Targets"
-$bazel_path run :bazel-diff -- impacted-tests -w $workspace_path -b $bazel_path $impacted_targets_path $impacted_test_targets_path
+$bazel_path run :bazel-diff -- -sh $starting_hashes_json -fh $final_hashes_json -w $workspace_path -b $bazel_path -o $impacted_test_targets_path -t
 
 IFS=$'\n' read -d '' -r -a impacted_targets < $impacted_targets_path
 formatted_impacted_targets=$(IFS=$'\n'; echo "${impacted_targets[*]}")

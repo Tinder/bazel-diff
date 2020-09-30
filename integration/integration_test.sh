@@ -28,16 +28,19 @@ ruby ./integration/update_final_hashes.rb
 
 $bazel_path run :bazel-diff -- -sh $starting_hashes_json -fh $final_hashes_json -w $workspace_path -b $bazel_path -o $impacted_targets_path
 
-$bazel_path run :bazel-diff -- impacted-tests -w $workspace_path -b $bazel_path $impacted_targets_path $impacted_test_targets_path
+$bazel_path run :bazel-diff -- -sh $starting_hashes_json -fh $final_hashes_json -w $workspace_path -b $bazel_path -o $impacted_test_targets_path -t
 
 IFS=$'\n' read -d '' -r -a impacted_targets < $impacted_targets_path
-target="//src/main/java/com/integration:StringGenerator.java"
-if containsElement $target "${impacted_targets[@]}";
+target1="//test/java/com/integration:bazel-diff-integration-test-lib"
+target2="//src/main/java/com/integration:bazel-diff-integration-lib"
+target3="//test/java/com/integration:bazel-diff-integration-tests"
+if containsElement $target1 "${impacted_targets[@]}" && \
+    containsElement $target2 "${impacted_targets[@]}" && \
+    containsElement $target3 "${impacted_targets[@]}"
 then
-    echo "Correct first impacted target"
+    echo "Correct impacted targets"
 else
-    echo "Impacted Targets: ${impacted_targets[@]}"
-    echo "Incorrect first impacted target: ${target}"
+    echo "Incorrect impacted targets: ${impacted_targets[@]}"
     exit 1
 fi
 

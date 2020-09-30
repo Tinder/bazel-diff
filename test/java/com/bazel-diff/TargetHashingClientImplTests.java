@@ -112,7 +112,10 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void getImpactedTargets() {
+    public void getImpactedTargets() throws IOException {
+        when(bazelClientMock.queryForImpactedTargets(anySet())).thenReturn(
+                new HashSet<>(Arrays.asList("rule1", "rule3"))
+        );
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);
         Map<String, String> hash1 = new HashMap<>();
         hash1.put("rule1", "rule1hash");
@@ -130,7 +133,7 @@ public class TargetHashingClientImplTests {
 
     @Test
     public void getImpactedTestTargets() throws IOException {
-        when(bazelClientMock.queryForImpactedTestTargets(anySet())).thenReturn(
+        when(bazelClientMock.queryForTestTargets(anySet())).thenReturn(
                 new HashSet<>(Arrays.asList("rule1test", "rule3test", "someothertest"))
         );
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);

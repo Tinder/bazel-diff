@@ -52,15 +52,13 @@ Open `bazel-diff-example.sh` to see how this is implemented. This is purely an e
 
 * Next we checkout the initial revision, then we run `generate-hashes` with the file output of `modified-filepaths` and write that JSON to a file. Now we have our final hashmap representation for the Bazel graph.
 
-* We run `bazel-diff` on the starting and final JSON hash filepaths to get our affected set of targets. This impacted set of targets is written to a file
-
-* Finally we run `impacted-tests` with the filepath to the list of impacted targets. This returns us the impacted test targets.
+* We run `bazel-diff` on the starting and final JSON hash filepaths to get our impacted set of targets. This impacted set of targets is written to a file. You can also pass the `-t` flag to only return tests
 
 ## CLI Interface
 
 `bazel-diff` Command
 ~~~
-Usage: bazel-diff [-hV] -b=<bazelPath> [-fh=<finalHashesJSONPath>]
+Usage: bazel-diff [-htV] -b=<bazelPath> [-fh=<finalHashesJSONPath>]
                   [-o=<outputPath>] [-sh=<startingHashesJSONPath>]
                   -w=<workspacePath> [COMMAND]
 Writes to a file the impacted targets between two Bazel graph JSON files
@@ -76,26 +74,10 @@ Writes to a file the impacted targets between two Bazel graph JSON files
       -sh, --startingHashes=<startingHashesJSONPath>
                   The path to the JSON file of target hashes for the initial
                     revision. Run 'generate-hashes' to get this value.
+  -t, --tests     Return only targets of kind 'test')
   -V, --version   Print version information and exit.
   -w, --workspacePath=<workspacePath>
                   Path to Bazel workspace directory.
-~~~
-
-`impacted-tests` Command
-~~~
-Usage: bazel-diff impacted-tests [-hV] -b=<bazelPath> -w=<workspacePath>
-                                 <impactedBazelTargetsPath> <outputPath>
-Write to a file the impacted test targets for the list of Bazel targets in the
-provided file
-      <impactedBazelTargetsPath>
-                     The filepath to a newline separated list of Bazel targets
-      <outputPath>   The filepath to write the impacted test targets to
-  -b, --bazelPath=<bazelPath>
-                     Path to Bazel binary
-  -h, --help         Show this help message and exit.
-  -V, --version      Print version information and exit.
-  -w, --workspacePath=<workspacePath>
-                     Path to Bazel workspace directory.
 ~~~
 
 `modified-filepaths` Command

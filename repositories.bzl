@@ -2,17 +2,15 @@
 Methods to assist in loading dependencies for bazel-diff in WORKSPACE files
 """
 
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 load("//:constants.bzl", "DEFAULT_JVM_EXTERNAL_TAG", "RULES_JVM_EXTERNAL_SHA", "BUILD_PROTO_MESSAGE_SHA")
 
 def _maybe(repo_rule, name, **kwargs):
     if not native.existing_rule(name):
         repo_rule(name = name, **kwargs)
 
-def bazel_diff_dependencies(bazel_version,
-                            rules_jvm_external_tag=DEFAULT_JVM_EXTERNAL_TAG,
-                            rules_jvm_external_sha=RULES_JVM_EXTERNAL_SHA,
-                            build_proto_message_sha=BUILD_PROTO_MESSAGE_SHA):
+def bazel_diff_dependencies(rules_jvm_external_tag=DEFAULT_JVM_EXTERNAL_TAG,
+                            rules_jvm_external_sha=RULES_JVM_EXTERNAL_SHA):
     _maybe(
         http_archive,
         name = "bazel_skylib",
@@ -21,13 +19,6 @@ def bazel_diff_dependencies(bazel_version,
             "https://github.com/bazelbuild/bazel-skylib/releases/download/1.0.2/bazel-skylib-1.0.2.tar.gz",
         ],
         sha256 = "97e70364e9249702246c0e9444bccdc4b847bed1eb03c5a3ece4f83dfe6abc44",
-    )
-
-    _maybe(
-        http_file,
-        name = "build_proto_message",
-        urls = ["https://raw.githubusercontent.com/bazelbuild/bazel/%s/src/main/protobuf/build.proto" % bazel_version],
-        sha256 = build_proto_message_sha
     )
 
     _maybe(

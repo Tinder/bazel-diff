@@ -33,7 +33,7 @@ proto_library(
 
 genrule(
     name = "build_proto_gen",
-    srcs = ["@build_proto_message//file"],
+    srcs = ["@bazel_tools//src/main/protobuf:build.proto"],
     outs = ["build.proto"],
     cmd = "cp $< $@"
 )

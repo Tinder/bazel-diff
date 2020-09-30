@@ -20,7 +20,6 @@ This approach was inspired by the [following BazelConf talk](https://www.youtube
 
 * Git
 * Bazel 3.3.0 or higher
-* `bazel_skylib` version 1.0.2 or higher
 * Java 8 JDK or higher (Bazel requires this)
 
 ## Getting Started
@@ -165,7 +164,7 @@ java -jar bazel-bin/src/main/java/com/bazel-diff/bazel-diff_deploy.jar # This JA
 
 Add the following to your `WORKSPACE` file to add the external repositories, replacing the `RELEASE_ARCHIVE_URL` with the archive url of the bazel-diff release you wish to depend on:
 
-    load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
+    load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
     http_archive(
       name = "bazel_diff",
@@ -175,25 +174,10 @@ Add the following to your `WORKSPACE` file to add the external repositories, rep
         sha256 = "UPDATE_ME",
     )
 
-    http_archive(
-        name = "bazel_skylib",
-        urls = [
-            "ARCHIVE_URL_VERSION_ABOVE_1.0.2",
-        ],
-        sha256 = "UPDATE_ME",
-    )
-
-    load("@bazel_skylib//:workspace.bzl", "bazel_skylib_workspace")
-
-    bazel_skylib_workspace()
-
-    load("@bazel_skylib//lib:versions.bzl", "versions")
-
     load("@bazel_diff//:repositories.bzl", "bazel_diff_dependencies")
     load("@bazel_diff//:constants.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
 
-    # Allows bazel-diff to run based on your projects' version of Bazel
-    bazel_diff_dependencies(versions.get())
+    bazel_diff_dependencies()
 
     load("@rules_jvm_external//:defs.bzl", "maven_install")
 

@@ -154,6 +154,7 @@ Add the following to your `WORKSPACE` file to add the external repositories, rep
             "RELEASE_ARCHIVE_URL",
         ],
         sha256 = "UPDATE_ME",
+        strip_prefix = "UPDATE_ME"
     )
 
     load("@bazel_diff//:repositories.bzl", "bazel_diff_dependencies")

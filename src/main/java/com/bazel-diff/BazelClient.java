@@ -30,8 +30,8 @@ class BazelClientImpl implements BazelClient {
     BazelClientImpl(Path workingDirectory, Path bazelPath, String startupOptions, String commandOptions) {
         this.workingDirectory = workingDirectory.normalize();
         this.bazelPath = bazelPath;
-        this.startupOptions = Arrays.asList(startupOptions.split(" "));
-        this.commandOptions = Arrays.asList(commandOptions.split(" "));
+        this.startupOptions = startupOptions != null ? Arrays.asList(startupOptions.split(" ")): new ArrayList<String>();
+        this.commandOptions = commandOptions != null ? Arrays.asList(commandOptions.split(" ")): new ArrayList<String>();
     }
 
     @Override
@@ -102,22 +102,14 @@ class BazelClientImpl implements BazelClient {
         List<String> cmd = new ArrayList<String>();
         
         cmd.add((bazelPath.toString()));
-
-        if(this.startupOptions != null) {
-            cmd.addAll(this.startupOptions);
-        }
-
+        cmd.addAll(this.startupOptions);
         cmd.add("query");
         cmd.add("--output");
         cmd.add("streamed_proto");
         cmd.add("--order_output=no");
         cmd.add("--show_progress=false");
         cmd.add("--show_loading_progress=false");
-
-        if(this.commandOptions != null) {
-            cmd.addAll(this.commandOptions);
-        }
-
+        cmd.addAll(this.commandOptions);
         cmd.add(query);
 
         ProcessBuilder pb = new ProcessBuilder(cmd).directory(workingDirectory.toFile());

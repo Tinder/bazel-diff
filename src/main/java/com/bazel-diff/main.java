@@ -80,19 +80,13 @@ class GenerateHashes implements Callable<Integer> {
     @Option(names = {"-m", "--modifiedFilepaths"}, description = "The path to a file containing the list of modified filepaths in the workspace, you can use the 'modified-filepaths' command to get this list")
     File modifiedFilepaths;
 
-    @Option(names = {"-so", "--bazelStartupOptions"}, description = "Additional Bazel client startup options used when invoking Bazel")
-    String bazelStartupOptions;
-
-    @Option(names = {"-co", "--bazelCommandOptions"}, description = "Additional Bazel command options used when invoking Bazel")
-    String bazelCommandOptions;
-
     @Parameters(index = "0", description = "The filepath to write the resulting JSON of dictionary target => SHA-256 values")
     File outputPath;
 
     @Override
     public Integer call() {
         GitClient gitClient = new GitClientImpl(parent.workspacePath);
-        BazelClient bazelClient = new BazelClientImpl(parent.workspacePath, parent.bazelPath, bazelStartupOptions, bazelCommandOptions);
+        BazelClient bazelClient = new BazelClientImpl(parent.workspacePath, parent.bazelPath, parent.bazelStartupOptions, parent.bazelCommandOptions);
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient);
         try {
             gitClient.ensureAllChangesAreCommitted();

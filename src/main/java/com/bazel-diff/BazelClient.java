@@ -12,6 +12,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.Arrays;
 
 interface BazelClient {
     List<BazelTarget> queryAllTargets() throws IOException;
@@ -23,10 +24,14 @@ interface BazelClient {
 class BazelClientImpl implements BazelClient {
     private Path workingDirectory;
     private Path bazelPath;
+    private List<String> startupOptions;
+    private List<String> commandOptions;
 
-    BazelClientImpl(Path workingDirectory, Path bazelPath) {
+    BazelClientImpl(Path workingDirectory, Path bazelPath, String startupOptions, String commandOptions) {
         this.workingDirectory = workingDirectory.normalize();
         this.bazelPath = bazelPath;
+        this.startupOptions = startupOptions != null ? Arrays.asList(startupOptions.split(" ")): new ArrayList<String>();
+        this.commandOptions = commandOptions != null ? Arrays.asList(commandOptions.split(" ")): new ArrayList<String>();
     }
 
     @Override
@@ -94,15 +99,20 @@ class BazelClientImpl implements BazelClient {
     }
 
     private List<Build.Target> performBazelQuery(String query) throws IOException {
-        ProcessBuilder pb = new ProcessBuilder(bazelPath.toString(),
-                "query",
-                query,
-                "--output",
-                "streamed_proto",
-                "--order_output=no",
-                "--show_progress=false",
-                "--show_loading_progress=false"
-        ).directory(workingDirectory.toFile());
+        List<String> cmd = new ArrayList<String>();
+        
+        cmd.add((bazelPath.toString()));
+        cmd.addAll(this.startupOptions);
+        cmd.add("query");
+        cmd.add("--output");
+        cmd.add("streamed_proto");
+        cmd.add("--order_output=no");
+        cmd.add("--show_progress=false");
+        cmd.add("--show_loading_progress=false");
+        cmd.addAll(this.commandOptions);
+        cmd.add(query);
+
+        ProcessBuilder pb = new ProcessBuilder(cmd).directory(workingDirectory.toFile());
         Process process = pb.start();
         ArrayList<Build.Target> targets = new ArrayList<>();
         while (true) {

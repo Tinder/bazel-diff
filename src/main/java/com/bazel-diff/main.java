@@ -86,7 +86,7 @@ class GenerateHashes implements Callable<Integer> {
     @Override
     public Integer call() {
         GitClient gitClient = new GitClientImpl(parent.workspacePath);
-        BazelClient bazelClient = new BazelClientImpl(parent.workspacePath, parent.bazelPath);
+        BazelClient bazelClient = new BazelClientImpl(parent.workspacePath, parent.bazelPath, parent.bazelStartupOptions, parent.bazelCommandOptions);
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient);
         try {
             gitClient.ensureAllChangesAreCommitted();
@@ -142,6 +142,13 @@ class BazelDiff implements Callable<Integer> {
     @Option(names = {"-t", "--tests"}, scope = ScopeType.LOCAL, description = "Return only targets of kind 'test')")
     boolean testTargets;
 
+    @Option(names = {"-so", "--bazelStartupOptions"}, description = "Additional space separated Bazel client startup options used when invoking Bazel", scope = ScopeType.INHERIT)
+    String bazelStartupOptions;
+
+    @Option(names = {"-co", "--bazelCommandOptions"}, description = "Additional space separated Bazel command options used when invoking Bazel", scope = ScopeType.INHERIT)
+    String bazelCommandOptions;
+
+    @Override
     public Integer call() throws IOException {
         if (startingHashesJSONPath == null || !startingHashesJSONPath.canRead()) {
             System.out.println("startingHashesJSONPath does not exist! Exiting");
@@ -152,7 +159,7 @@ class BazelDiff implements Callable<Integer> {
             return ExitCode.USAGE;
         }
         GitClient gitClient = new GitClientImpl(workspacePath);
-        BazelClient bazelClient = new BazelClientImpl(workspacePath, bazelPath);
+        BazelClient bazelClient = new BazelClientImpl(workspacePath, bazelPath, bazelStartupOptions, bazelCommandOptions);
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient);
         try {
             gitClient.ensureAllChangesAreCommitted();

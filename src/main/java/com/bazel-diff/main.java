@@ -142,10 +142,10 @@ class BazelDiff implements Callable<Integer> {
     @Option(names = {"-t", "--tests"}, scope = ScopeType.LOCAL, description = "Return only targets of kind 'test')")
     boolean testTargets;
 
-    @Option(names = {"-so", "--bazelStartupOptions"}, description = "Additional space separated Bazel client startup options used when invoking Bazel")
+    @Option(names = {"-so", "--bazelStartupOptions"}, description = "Additional space separated Bazel client startup options used when invoking Bazel", scope = ScopeType.INHERIT)
     String bazelStartupOptions;
 
-    @Option(names = {"-co", "--bazelCommandOptions"}, description = "Additional space separated Bazel command options used when invoking Bazel")
+    @Option(names = {"-co", "--bazelCommandOptions"}, description = "Additional space separated Bazel command options used when invoking Bazel", scope = ScopeType.INHERIT)
     String bazelCommandOptions;
 
     @Override

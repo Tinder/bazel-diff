@@ -1,3 +1,5 @@
+package com.bazel_diff;
+
 import com.google.devtools.build.lib.query2.proto.proto2api.Build;
 
 interface BazelTarget {

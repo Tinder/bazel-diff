@@ -138,8 +138,8 @@ bazel run :bazel-diff -- bazel-diff -h
 ### Build your own deployable JAR
 
 ```
-bazel build //src/main/java/com/bazel-diff:bazel-diff_deploy.jar
-java -jar bazel-bin/src/main/java/com/bazel-diff/bazel-diff_deploy.jar # This JAR can be run anywhere
+bazel build //src/main/java/com/bazel_diff:bazel-diff_deploy.jar
+java -jar bazel-bin/src/main/java/com/bazel_diff/bazel-diff_deploy.jar # This JAR can be run anywhere
 ```
 
 ### Integrate directly into your Bazel Project

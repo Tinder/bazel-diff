@@ -1,3 +1,5 @@
+package com.bazel_diff;
+
 import java.io.IOException;
 import java.nio.file.Path;
 import java.security.MessageDigest;

@@ -1,3 +1,5 @@
+package com.bazel_diff;
+
 import java.security.MessageDigest;
 
 interface BazelSourceFileTarget {

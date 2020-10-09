@@ -3,7 +3,7 @@ load("@rules_proto//proto:defs.bzl", "proto_library")
 
 java_binary(
     name = "bazel-diff",
-    main_class = "BazelDiff",
+    main_class = "com.bazel_diff.BazelDiff",
     runtime_deps = [":java-bazel-diff-lib"],
     visibility = ["//visibility:public"]
 )
@@ -18,7 +18,7 @@ java_library(
         "@bazel_diff_maven//:com_google_code_gson_gson",
         "@bazel_diff_maven//:com_google_guava_guava"
     ],
-    visibility = ["//test/java/com/bazel-diff:__pkg__"]
+    visibility = ["//test/java/com/bazel_diff:__pkg__"]
 )
 
 java_proto_library(

@@ -11,7 +11,7 @@ final_hashes_json="/tmp/final_hashes_json.json"
 impacted_targets_path="/tmp/impacted_targets.txt"
 impacted_test_targets_path="/tmp/impacted_test_targets.txt"
 
-export USE_BAZEL_VERSION=last_rc
+export USE_BAZEL_VERSION=last_downstream_green
 
 containsElement () {
   local e match="$1"

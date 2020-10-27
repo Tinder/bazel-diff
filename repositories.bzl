@@ -3,7 +3,7 @@ Methods to assist in loading dependencies for bazel-diff in WORKSPACE files
 """
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-load("//:constants.bzl", "DEFAULT_JVM_EXTERNAL_TAG", "RULES_JVM_EXTERNAL_SHA", "BUILD_PROTO_MESSAGE_SHA")
+load("//:constants.bzl", "DEFAULT_JVM_EXTERNAL_TAG", "RULES_JVM_EXTERNAL_SHA")
 
 def _maybe(repo_rule, name, **kwargs):
     if not native.existing_rule(name):

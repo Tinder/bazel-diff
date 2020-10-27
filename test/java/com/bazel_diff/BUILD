@@ -13,5 +13,6 @@ java_library(
         "//src/main/java/com/bazel_diff:java-bazel-diff-lib",
         "@bazel_diff_maven//:org_mockito_mockito_core",
         "@bazel_diff_maven//:junit_junit"
-    ]
+    ],
+    testonly = True
 )

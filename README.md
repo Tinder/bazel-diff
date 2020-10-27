@@ -186,7 +186,7 @@ Add the following to your `WORKSPACE` file to add the external repositories, rep
     bazel_diff_dependencies()
 
     load("@rules_jvm_external//:defs.bzl", "maven_install")
-    load("//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
+    load("@bazel_diff//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
 
     maven_install(
         name = "bazel_diff_maven",

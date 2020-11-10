@@ -208,6 +208,7 @@ class BazelDiff implements Callable<Integer> {
     }
 
     public static void main(String[] args) {
-        new CommandLine(new BazelDiff()).execute(args);
+        int exitCode = new CommandLine(new BazelDiff()).execute(args);
+        System.exit(exitCode);
     }
 }

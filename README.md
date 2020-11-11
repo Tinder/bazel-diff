@@ -7,16 +7,18 @@
 1. `bazel-diff` is designed for very large Bazel projects. We use Java Protobuf's `parseDelimitedFrom` method alongside Bazel Query's `streamed_proto` output option. These two together allow you to parse Gigabyte or larger protobuf messages. We have tested it with projects containing tens of thousands of targets.
 2. We avoid usage of large command line query lists when interacting with Bazel, [issue here](https://github.com/bazelbuild/bazel/issues/8609). When you interact with Bazel with thousands of query parameters you can reach an upper maximum limit, seeing this error:
 
-        bash: /usr/local/bin/bazel: Argument list too long
+  ```terminal
+  bash: /usr/local/bin/bazel: Argument list too long
+  ```
 
-    `bazel-diff` is smart enough to prevent these errors
+`bazel-diff` is smart enough to prevent these errors
 3. `bazel-diff` has been tested with file renames, deletions, and modifications. Works on `bzl` files, `WORKSPACE` files, `BUILD` files and regular files
 
 Track the feature request for target diffing in Bazel [here](https://github.com/bazelbuild/bazel/issues/7962)
 
 This approach was inspired by the [following BazelConf talk](https://www.youtube.com/watch?v=9Dk7mtIm7_A) by Benjamin Peterson.
 
-### Prerequisites
+## Prerequisites
 
 * Git
 * Bazel 3.3.0 or higher
@@ -26,13 +28,16 @@ This approach was inspired by the [following BazelConf talk](https://www.youtube
 
 To start using `bazel-diff` immediately, simply clone down the repo and then run the example shell script:
 
-    git clone https://github.com/Tinder/bazel-diff.git
-    cd bazel-diff
-    ./bazel-diff-example.sh WORKSPACE_PATH BAZEL_PATH START_GIT_REVISION END_GIT_REVISION
+```terminal
+git clone https://github.com/Tinder/bazel-diff.git
+cd bazel-diff
+./bazel-diff-example.sh WORKSPACE_PATH BAZEL_PATH START_GIT_REVISION END_GIT_REVISION
+```
 
 Here is a breakdown of those arguments:
+
 * `WORKSPACE_PATH`: Path to directory containing your `WORKSPACE` file in your Bazel project.
-  *  Note: Your project must use Git for `bazel-diff` to work!
+  * Note: Your project must use Git for `bazel-diff` to work!
 * `BAZEL_PATH`: Path to your Bazel executable
 * `START_GIT_REVISION`: Starting Git Branch or SHA for your desired commit range
 * `END_GIT_REVISION`: Final Git Branch or SHA for your desired commit range
@@ -46,6 +51,7 @@ Open `bazel-diff-example.sh` to see how this is implemented. This is purely an e
 ## How it works
 
 `bazel-diff` works as follows
+
 * The `modified-filepaths` command is used to fetch the modified filepaths between two Git revisions, we write this list of modified filepaths to a file.
 
 * The previous revision is checked out, then we run `generate-hashes`. This gives us the hashmap representation for the entire Bazel graph, then we write this JSON to a file. We do not pass `modified-filepaths` here since it is the starting revision.
@@ -57,7 +63,8 @@ Open `bazel-diff-example.sh` to see how this is implemented. This is purely an e
 ## CLI Interface
 
 `bazel-diff` Command
-~~~
+
+```terminal
 Usage: bazel-diff [-htV] -b=<bazelPath> [-co=<bazelCommandOptions>]
                   [-fh=<finalHashesJSONPath>] [-o=<outputPath>]
                   [-sh=<startingHashesJSONPath>] [-so=<bazelStartupOptions>]
@@ -81,14 +88,15 @@ Writes to a file the impacted targets between two Bazel graph JSON files
       -so, --bazelStartupOptions=<bazelStartupOptions>
                   Additional space separated Bazel client startup options used
                     when invoking Bazel
-  -t, --tests     Return only targets of kind 'test')
+  -t, --tests     Return only targets of kind 'test'
   -V, --version   Print version information and exit.
   -w, --workspacePath=<workspacePath>
                   Path to Bazel workspace directory.
-~~~
+```
 
 `modified-filepaths` Command
-~~~
+
+```terminal
 Usage: bazel-diff modified-filepaths [-hV] -b=<bazelPath>
                                      [-co=<bazelCommandOptions>]
                                      [-so=<bazelStartupOptions>]
@@ -111,10 +119,11 @@ Writes to the file the modified filepaths between two revisions.
   -V, --version             Print version information and exit.
   -w, --workspacePath=<workspacePath>
                             Path to Bazel workspace directory.
-~~~
+```
 
 `generate-hashes` Command
-~~~
+
+```terminal
 Usage: bazel-diff generate-hashes [-hV] -b=<bazelPath>
                                   [-co=<bazelCommandOptions>]
                                   [-m=<modifiedFilepaths>]
@@ -140,7 +149,7 @@ workspace.
   -V, --version      Print version information and exit.
   -w, --workspacePath=<workspacePath>
                      Path to Bazel workspace directory.
-~~~
+```
 
 ## Installing
 
@@ -150,18 +159,20 @@ After cloning down the repo, you are good to go, Bazel will handle the rest
 
 To run the project
 
-```
+```terminal
 bazel run :bazel-diff -- bazel-diff -h
 ```
 
 ### Run Via JAR Release
 
-    curl -LO bazel-diff.jar GITHUB_RELEASE_JAR_URL
-    java -jar bazel-diff.jar -h
+```terminal
+curl -LO bazel-diff.jar GITHUB_RELEASE_JAR_URL
+java -jar bazel-diff.jar -h
+```
 
 ### Build your own deployable JAR
 
-```
+```terminal
 bazel build //src/main/java/com/bazel_diff:bazel-diff_deploy.jar
 java -jar bazel-bin/src/main/java/com/bazel_diff/bazel-diff_deploy.jar # This JAR can be run anywhere
 ```
@@ -170,36 +181,38 @@ java -jar bazel-bin/src/main/java/com/bazel_diff/bazel-diff_deploy.jar # This JA
 
 Add the following to your `WORKSPACE` file to add the external repositories, replacing the `RELEASE_ARCHIVE_URL` with the archive url of the bazel-diff release you wish to depend on:
 
-    load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+```bazel
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
-    http_archive(
-      name = "bazel_diff",
-      urls = [
-            "RELEASE_ARCHIVE_URL",
-        ],
-        sha256 = "UPDATE_ME",
-        strip_prefix = "UPDATE_ME"
-    )
+http_archive(
+  name = "bazel_diff",
+  urls = [
+        "RELEASE_ARCHIVE_URL",
+    ],
+    sha256 = "UPDATE_ME",
+    strip_prefix = "UPDATE_ME"
+)
 
-    load("@bazel_diff//:repositories.bzl", "bazel_diff_dependencies")
+load("@bazel_diff//:repositories.bzl", "bazel_diff_dependencies")
 
-    bazel_diff_dependencies()
+bazel_diff_dependencies()
 
-    load("@rules_jvm_external//:defs.bzl", "maven_install")
-    load("@bazel_diff//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
+load("@rules_jvm_external//:defs.bzl", "maven_install")
+load("@bazel_diff//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
 
-    maven_install(
-        name = "bazel_diff_maven",
-        artifacts = BAZEL_DIFF_MAVEN_ARTIFACTS,
-        repositories = [
-            "http://uk.maven.org/maven2",
-            "https://jcenter.bintray.com/",
-        ],
-    )
+maven_install(
+    name = "bazel_diff_maven",
+    artifacts = BAZEL_DIFF_MAVEN_ARTIFACTS,
+    repositories = [
+        "http://uk.maven.org/maven2",
+        "https://jcenter.bintray.com/",
+    ],
+)
+```
 
 Now you can simply run `bazel-diff` from your project:
 
-```
+```terminal
 bazel run @bazel_diff//:bazel-diff -- bazel-diff -h
 ```
 
@@ -207,7 +220,7 @@ bazel run @bazel_diff//:bazel-diff -- bazel-diff -h
 
 To run the tests simply run
 
-```
+```terminal
 bazel test //test/...
 ```
 
@@ -216,9 +229,11 @@ bazel test //test/...
 We use [SemVer](http://semver.org/) for versioning. For the versions available,
 see the [tags on this repository](https://github.com/Tinder/bazel-diff/tags).
 
-License
+## License
+
 ---
-~~~
+
+```text
 Copyright (c) 2020, Match Group, LLC
 All rights reserved.
 
@@ -243,3 +258,4 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
 ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```

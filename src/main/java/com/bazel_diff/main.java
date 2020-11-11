@@ -141,7 +141,7 @@ class BazelDiff implements Callable<Integer> {
     @Option(names = {"-o", "--output"}, scope = ScopeType.LOCAL, description = "Filepath to write the impacted Bazel targets to, newline separated")
     File outputPath;
 
-    @Option(names = {"-t", "--tests"}, scope = ScopeType.LOCAL, description = "Return only targets of kind 'test')")
+    @Option(names = {"-t", "--tests"}, scope = ScopeType.LOCAL, description = "Return only targets of kind 'test'")
     boolean testTargets;
 
     @Option(names = {"-so", "--bazelStartupOptions"}, description = "Additional space separated Bazel client startup options used when invoking Bazel", scope = ScopeType.INHERIT)

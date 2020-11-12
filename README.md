@@ -12,6 +12,7 @@
   ```
 
 `bazel-diff` is smart enough to prevent these errors
+
 3. `bazel-diff` has been tested with file renames, deletions, and modifications. Works on `bzl` files, `WORKSPACE` files, `BUILD` files and regular files
 
 Track the feature request for target diffing in Bazel [here](https://github.com/bazelbuild/bazel/issues/7962)

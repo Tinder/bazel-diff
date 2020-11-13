@@ -5,7 +5,7 @@ import picocli.CommandLine.IVersionProvider;
 class VersionProvider implements IVersionProvider {
     public String[] getVersion() throws Exception {
         return new String[] {
-            "1.2.0"
+            "1.2.1"
         };
     }
 }

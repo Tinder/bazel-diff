@@ -4,6 +4,8 @@ import com.google.devtools.build.lib.query2.proto.proto2api.Build;
 
 import com.google.common.collect.Iterables;
 
+import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -45,13 +47,11 @@ class BazelClientImpl implements BazelClient {
     @Override
     public Set<String> queryForImpactedTargets(Set<String> impactedTargets) throws IOException {
         Set<String> impactedTestTargets = new HashSet<>();
-        for (List<String> partition : Iterables.partition(impactedTargets, 100)) {
-            String targetQuery = partition.stream().collect(Collectors.joining(" + "));
-            List<Build.Target> targets = performBazelQuery(String.format("rdeps(//..., %s)", targetQuery));
-            for (Build.Target target : targets) {
-                if (target.hasRule()) {
-                    impactedTestTargets.add(target.getRule().getName());
-                }
+        String targetQuery = impactedTargets.stream().collect(Collectors.joining(" + "));
+        List<Build.Target> targets = performBazelQuery(String.format("rdeps(//..., %s)", targetQuery));
+        for (Build.Target target : targets) {
+            if (target.hasRule()) {
+                impactedTestTargets.add(target.getRule().getName());
             }
         }
         return impactedTestTargets;
@@ -60,13 +60,11 @@ class BazelClientImpl implements BazelClient {
     @Override
     public Set<String> queryForTestTargets(Set<String> targets) throws IOException {
         Set<String> impactedTestTargets = new HashSet<>();
-        for (List<String> partition : Iterables.partition(targets, 100)) {
-            String targetQuery = partition.stream().collect(Collectors.joining(" + "));
-            List<Build.Target> testTargets = performBazelQuery(String.format("kind(test, %s)", targetQuery));
-            for (Build.Target target : testTargets) {
-                if (target.hasRule()) {
-                    impactedTestTargets.add(target.getRule().getName());
-                }
+        String targetQuery = targets.stream().collect(Collectors.joining(" + "));
+        List<Build.Target> testTargets = performBazelQuery(String.format("kind(test, %s)", targetQuery));
+        for (Build.Target target : testTargets) {
+            if (target.hasRule()) {
+                impactedTestTargets.add(target.getRule().getName());
             }
         }
         return impactedTestTargets;
@@ -101,8 +99,10 @@ class BazelClientImpl implements BazelClient {
     }
 
     private List<Build.Target> performBazelQuery(String query) throws IOException {
+        Path tempFile = Files.createTempFile(null, ".txt");
+        Files.write(tempFile, query.getBytes(StandardCharsets.UTF_8));
+
         List<String> cmd = new ArrayList<String>();
-        
         cmd.add((bazelPath.toString()));
         cmd.addAll(this.startupOptions);
         cmd.add("query");
@@ -112,7 +112,8 @@ class BazelClientImpl implements BazelClient {
         cmd.add("--show_progress=false");
         cmd.add("--show_loading_progress=false");
         cmd.addAll(this.commandOptions);
-        cmd.add(query);
+        cmd.add("--query_file");
+        cmd.add(tempFile.toString());
 
         ProcessBuilder pb = new ProcessBuilder(cmd).directory(workingDirectory.toFile());
         Process process = pb.start();
@@ -122,6 +123,9 @@ class BazelClientImpl implements BazelClient {
             if (target == null) break;  // EOF
             targets.add(target);
         }
+
+        Files.delete(tempFile);
+
         return targets;
     }
 }

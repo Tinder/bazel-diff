@@ -115,7 +115,7 @@ public class TargetHashingClientImplTests {
 
     @Test
     public void getImpactedTargets() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet())).thenReturn(
+        when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject())).thenReturn(
                 new HashSet<>(Arrays.asList("rule1", "rule3"))
         );
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);
@@ -126,7 +126,7 @@ public class TargetHashingClientImplTests {
         hash2.put("rule1", "differentrule1hash");
         hash2.put("rule2", "rule2hash");
         hash2.put("rule3", "rule3hash");
-        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2);
+        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, null);
         Set<String> expectedSet = new HashSet<>();
         expectedSet.add("rule1");
         expectedSet.add("rule3");
@@ -134,9 +134,9 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void getImpactedTestTargets() throws IOException {
-        when(bazelClientMock.queryForTestTargets(anySet())).thenReturn(
-                new HashSet<>(Arrays.asList("rule1test", "rule3test", "someothertest"))
+    public void getImpactedTargets_withAvoidQuery() throws IOException {
+        when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"))).thenReturn(
+                new HashSet<>(Arrays.asList("rule1"))
         );
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);
         Map<String, String> hash1 = new HashMap<>();
@@ -146,12 +146,10 @@ public class TargetHashingClientImplTests {
         hash2.put("rule1", "differentrule1hash");
         hash2.put("rule2", "rule2hash");
         hash2.put("rule3", "rule3hash");
-        Set <String> impactedTestTargets = client.getImpactedTestTargets(hash1, hash2);
+        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, "some_query");
         Set<String> expectedSet = new HashSet<>();
-        expectedSet.add("rule1test");
-        expectedSet.add("someothertest");
-        expectedSet.add("rule3test");
-        assertEquals(expectedSet, impactedTestTargets);
+        expectedSet.add("rule1");
+        assertEquals(expectedSet, impactedTargets);
     }
 
     private BazelTarget createRuleTarget(String ruleName, List<String> ruleInputs, String ruleDigest) throws NoSuchAlgorithmException {

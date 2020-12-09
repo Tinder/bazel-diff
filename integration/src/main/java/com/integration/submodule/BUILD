@@ -1,10 +1,10 @@
 load("@rules_java//java:defs.bzl", "java_library")
 
 java_library(
-    name = "bazel-diff-integration-lib",
+    name = "Submodule",
     srcs = glob(["*.java"]),
-    deps = [
-        "//src/main/java/com/integration/submodule:Submodule"
+    tags = [
+        "manual"
     ],
     visibility = ["//visibility:public"]
 )

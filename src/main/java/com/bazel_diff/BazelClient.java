@@ -20,8 +20,7 @@ import java.util.Arrays;
 
 interface BazelClient {
     List<BazelTarget> queryAllTargets() throws IOException;
-    Set<String> queryForImpactedTargets(Set<String> impactedTargets) throws IOException;
-    Set<String> queryForTestTargets(Set<String> targets) throws IOException;
+    Set<String> queryForImpactedTargets(Set<String> impactedTargets, String avoidQuery) throws IOException;
     Set<BazelSourceFileTarget> convertFilepathsToSourceTargets(Set<Path> filepaths) throws IOException, NoSuchAlgorithmException;
 }
 
@@ -45,24 +44,15 @@ class BazelClientImpl implements BazelClient {
     }
 
     @Override
-    public Set<String> queryForImpactedTargets(Set<String> impactedTargets) throws IOException {
+    public Set<String> queryForImpactedTargets(Set<String> impactedTargets, String avoidQuery) throws IOException {
         Set<String> impactedTestTargets = new HashSet<>();
         String targetQuery = impactedTargets.stream().collect(Collectors.joining(" + "));
-        List<Build.Target> targets = performBazelQuery(String.format("rdeps(//..., %s)", targetQuery));
-        for (Build.Target target : targets) {
-            if (target.hasRule()) {
-                impactedTestTargets.add(target.getRule().getName());
-            }
+        String query = String.format("rdeps(//..., %s)", targetQuery);
+        if (avoidQuery != null) {
+            query = String.format("(%s) except %s", query, avoidQuery);
         }
-        return impactedTestTargets;
-    }
-
-    @Override
-    public Set<String> queryForTestTargets(Set<String> targets) throws IOException {
-        Set<String> impactedTestTargets = new HashSet<>();
-        String targetQuery = targets.stream().collect(Collectors.joining(" + "));
-        List<Build.Target> testTargets = performBazelQuery(String.format("kind(test, %s)", targetQuery));
-        for (Build.Target target : testTargets) {
+        List<Build.Target> targets = performBazelQuery(query);
+        for (Build.Target target : targets) {
             if (target.hasRule()) {
                 impactedTestTargets.add(target.getRule().getName());
             }

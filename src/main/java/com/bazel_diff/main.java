@@ -141,8 +141,8 @@ class BazelDiff implements Callable<Integer> {
     @Option(names = {"-o", "--output"}, scope = ScopeType.LOCAL, description = "Filepath to write the impacted Bazel targets to, newline separated")
     File outputPath;
 
-    @Option(names = {"-t", "--tests"}, scope = ScopeType.LOCAL, description = "Return only targets of kind 'test'")
-    boolean testTargets;
+    @Option(names = {"-aq", "--avoid-query"}, scope = ScopeType.LOCAL, description = "A Bazel query string, any targets that pass this query will be removed from the returned set of targets")
+    String avoidQuery;
 
     @Option(names = {"-so", "--bazelStartupOptions"}, description = "Additional space separated Bazel client startup options used when invoking Bazel", scope = ScopeType.INHERIT)
     String bazelStartupOptions;
@@ -190,12 +190,7 @@ class BazelDiff implements Callable<Integer> {
         Map<String, String > gsonHash = new HashMap<>();
         Map<String, String> startingHashes = gson.fromJson(startingFileReader, gsonHash.getClass());
         Map<String, String> finalHashes = gson.fromJson(finalFileReader, gsonHash.getClass());
-        Set<String> impactedTargets;
-        if (testTargets) {
-            impactedTargets = hashingClient.getImpactedTestTargets(startingHashes, finalHashes);
-        } else {
-            impactedTargets = hashingClient.getImpactedTargets(startingHashes, finalHashes);
-        }
+        Set<String> impactedTargets = hashingClient.getImpactedTargets(startingHashes, finalHashes, avoidQuery);
         try {
             FileWriter myWriter = new FileWriter(outputPath);
             myWriter.write(impactedTargets.stream().collect(Collectors.joining(System.lineSeparator())));

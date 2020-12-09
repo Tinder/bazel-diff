@@ -5,11 +5,11 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
+import java.util.stream.Collectors;
 
 interface TargetHashingClient {
     Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths) throws IOException, NoSuchAlgorithmException;
-    Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes) throws IOException;
-    Set<String> getImpactedTestTargets(Map<String, String> startHashes, Map<String, String> endHashes) throws IOException;
+    Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes, String avoidQuery) throws IOException;
 }
 
 class TargetHashingClientImpl implements TargetHashingClient {
@@ -52,7 +52,11 @@ class TargetHashingClientImpl implements TargetHashingClient {
     }
 
     @Override
-    public Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes) throws IOException {
+    public Set<String> getImpactedTargets(
+        Map<String, String> startHashes,
+        Map<String, String> endHashes,
+        String avoidQuery)
+    throws IOException {
         Set<String> impactedTargets = new HashSet<>();
         for ( Map.Entry<String,String> entry : endHashes.entrySet()) {
             String startHashValue = startHashes.get(entry.getKey());
@@ -60,13 +64,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
                 impactedTargets.add(entry.getKey());
             }
         }
-        return bazelClient.queryForImpactedTargets(impactedTargets);
-    }
-
-    @Override
-    public Set<String> getImpactedTestTargets(Map<String, String> startHashes, Map<String, String> endHashes) throws IOException {
-        Set<String> impactedTargets = getImpactedTargets(startHashes, endHashes);
-        return bazelClient.queryForTestTargets(impactedTargets);
+        return bazelClient.queryForImpactedTargets(impactedTargets, avoidQuery);
     }
 
     private MessageDigest createDigestForTarget(

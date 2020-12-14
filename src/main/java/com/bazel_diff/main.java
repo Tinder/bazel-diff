@@ -58,7 +58,10 @@ class FetchModifiedFilepaths implements Callable<Integer> {
                     .map(Path::toString)
                     .collect(Collectors.toSet());
             FileWriter myWriter = new FileWriter(outputPath);
-            myWriter.write(String.join(System.lineSeparator(), modifiedFilepaths));
+            for (String line : modifiedFilepaths) {
+                myWriter.write(line);
+                myWriter.write(System.lineSeparator());
+            }
             myWriter.close();
             return ExitCode.OK;
         } catch (IOException | InterruptedException e) {

@@ -24,7 +24,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
         Set<BazelSourceFileTarget> bazelSourcefileTargets = bazelClient.convertFilepathsToSourceTargets(modifiedFilepaths);
         List<BazelTarget> allTargets = bazelClient.queryAllTargets();
         Map<String, String> targetHashes = new HashMap<>();
-        Map<String, MessageDigest> ruleHashes = new HashMap<>();
+        Map<String, byte[]> ruleHashes = new HashMap<>();
         Map<String, BazelRule> allRulesMap = new HashMap<>();
         for (BazelTarget target : allTargets) {
             String targetName = getNameForTarget(target);
@@ -38,14 +38,14 @@ class TargetHashingClientImpl implements TargetHashingClient {
             if (targetName == null) {
                 continue;
             }
-            MessageDigest targetDigest = createDigestForTarget(
+            byte[] targetDigest = createDigestForTarget(
                     target,
                     allRulesMap,
                     bazelSourcefileTargets,
                     ruleHashes
             );
             if (targetDigest != null) {
-                targetHashes.put(targetName, digestToString(targetDigest));
+                targetHashes.put(targetName, convertByteArrayToString(targetDigest));
             }
         }
         return targetHashes;
@@ -67,11 +67,11 @@ class TargetHashingClientImpl implements TargetHashingClient {
         return bazelClient.queryForImpactedTargets(impactedTargets, avoidQuery);
     }
 
-    private MessageDigest createDigestForTarget(
+    private byte[] createDigestForTarget(
             BazelTarget target,
             Map<String, BazelRule> allRulesMap,
             Set<BazelSourceFileTarget> bazelSourcefileTargets,
-            Map<String, MessageDigest> ruleHashes
+            Map<String, byte[]> ruleHashes
     ) throws NoSuchAlgorithmException {
         BazelRule targetRule = target.getRule();
         if (target.hasSourceFile()) {
@@ -80,23 +80,23 @@ class TargetHashingClientImpl implements TargetHashingClient {
                 MessageDigest digest = MessageDigest.getInstance("SHA-256");
                 byte[] sourceTargetDigestBytes = getDigestForSourceTargetName(sourceFileName, bazelSourcefileTargets);
                 if (sourceTargetDigestBytes != null) {
-                    digest.update(getDigestForSourceTargetName(sourceFileName, bazelSourcefileTargets));
+                    digest.update(sourceTargetDigestBytes);
                 }
-                return digest;
+                return digest.digest().clone();
             }
         }
-        return createHashForRule(targetRule, allRulesMap, ruleHashes, bazelSourcefileTargets);
+        return createDigestForRule(targetRule, allRulesMap, ruleHashes, bazelSourcefileTargets);
     }
 
-    private MessageDigest createHashForRule(
+    private byte[] createDigestForRule(
             BazelRule rule,
             Map<String, BazelRule> allRulesMap,
-            Map<String, MessageDigest> ruleHashes,
+            Map<String, byte[]> ruleHashes,
             Set<BazelSourceFileTarget> bazelSourcefileTargets
     ) throws NoSuchAlgorithmException {
-        MessageDigest existingMessage = ruleHashes.get(rule.getName());
-        if (existingMessage != null) {
-            return existingMessage;
+        byte[] existingByteArray = ruleHashes.get(rule.getName());
+        if (existingByteArray != null) {
+            return existingByteArray;
         }
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         digest.update(rule.getDigest());
@@ -105,21 +105,22 @@ class TargetHashingClientImpl implements TargetHashingClient {
             BazelRule inputRule = allRulesMap.get(ruleInput);
             byte[] sourceFileDigest = getDigestForSourceTargetName(ruleInput, bazelSourcefileTargets);
             if (inputRule != null) {
-                MessageDigest ruleInputDigest = createHashForRule(
+                byte[] ruleInputHash = createDigestForRule(
                         inputRule,
                         allRulesMap,
                         ruleHashes,
                         bazelSourcefileTargets
                 );
-                if (ruleInputDigest != null) {
-                    digest.update(ruleInputDigest.digest());
+                if (ruleInputHash != null) {
+                    digest.update(ruleInputHash);
                 }
             } else if (sourceFileDigest != null) {
                 digest.update(sourceFileDigest);
             }
         }
-        ruleHashes.put(rule.getName(), digest);
-        return digest;
+        byte[] finalHashValue = digest.digest().clone();
+        ruleHashes.put(rule.getName(), finalHashValue);
+        return finalHashValue;
     }
 
     private byte[] getDigestForSourceTargetName(
@@ -134,9 +135,9 @@ class TargetHashingClientImpl implements TargetHashingClient {
         return null;
     }
 
-    private String digestToString(MessageDigest digest) {
+    private String convertByteArrayToString(byte[] bytes) {
         StringBuilder result = new StringBuilder();
-        for (byte aByte : digest.digest()) {
+        for (byte aByte : bytes) {
             result.append(String.format("%02x", aByte));
         }
         return result.toString();

@@ -1,18 +1,19 @@
 package com.bazel_diff;
 
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 interface BazelSourceFileTarget {
     String getName();
-    byte[] getDigest();
+    byte[] getDigest() throws NoSuchAlgorithmException;
 }
 
 class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
 
     private String name;
-    private MessageDigest digest;
+    private byte[] digest;
 
-    BazelSourceFileTargetImpl(String name, MessageDigest digest) {
+    BazelSourceFileTargetImpl(String name, byte[] digest) {
         this.name = name;
         this.digest = digest;
     }
@@ -23,7 +24,10 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
     }
 
     @Override
-    public byte[] getDigest() {
-        return digest.digest();
+    public byte[] getDigest() throws NoSuchAlgorithmException {
+        MessageDigest finalDigest = MessageDigest.getInstance("SHA-256");
+        finalDigest.update(digest);
+        finalDigest.update(name.getBytes());
+        return finalDigest.digest();
     }
 }

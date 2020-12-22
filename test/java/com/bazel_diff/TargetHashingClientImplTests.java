@@ -176,7 +176,7 @@ public class TargetHashingClientImplTests {
         return target;
     }
 
-    private BazelSourceFileTarget createSourceFileTarget(String name, String digest) {
+    private BazelSourceFileTarget createSourceFileTarget(String name, String digest) throws NoSuchAlgorithmException {
         BazelSourceFileTarget target = mock(BazelSourceFileTarget.class);
         when(target.getName()).thenReturn(name);
         when(target.getDigest()).thenReturn(digest.getBytes());

@@ -126,7 +126,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
     private byte[] getDigestForSourceTargetName(
             String sourceTargetName,
             Set<BazelSourceFileTarget> bazelSourcefileTargets
-    ) {
+    ) throws NoSuchAlgorithmException {
         for (BazelSourceFileTarget sourceFileTarget : bazelSourcefileTargets) {
             if (sourceFileTarget.getName().equals(sourceTargetName)) {
                 return sourceFileTarget.getDigest();

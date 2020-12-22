@@ -71,6 +71,9 @@ Usage: bazel-diff [-htV] -b=<bazelPath> [-co=<bazelCommandOptions>]
                   [-sh=<startingHashesJSONPath>] [-so=<bazelStartupOptions>]
                   -w=<workspacePath> [COMMAND]
 Writes to a file the impacted targets between two Bazel graph JSON files
+      -aq, --avoid-query=<avoidQuery>
+                  A Bazel query string, any targets that pass this query will
+                    be removed from the returned set of targets
   -b, --bazelPath=<bazelPath>
                   Path to Bazel binary
       -co, --bazelCommandOptions=<bazelCommandOptions>
@@ -89,7 +92,6 @@ Writes to a file the impacted targets between two Bazel graph JSON files
       -so, --bazelStartupOptions=<bazelStartupOptions>
                   Additional space separated Bazel client startup options used
                     when invoking Bazel
-  -t, --tests     Return only targets of kind 'test'
   -V, --version   Print version information and exit.
   -w, --workspacePath=<workspacePath>
                   Path to Bazel workspace directory.

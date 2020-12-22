@@ -64,14 +64,17 @@ public class TargetHashingClientImplTests {
         ruleInputs.add("rule1");
         BazelTarget rule3 = createRuleTarget("rule3", ruleInputs, "digest");
         defaultTargets.add(rule3);
+        BazelTarget rule4 = createRuleTarget("rule4", ruleInputs, "digest2");
+        defaultTargets.add(rule4);
         when(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets);
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);
         try {
             Map<String, String> hash = client.hashAllBazelTargets(new HashSet<>());
-            assertEquals(3, hash.size());
+            assertEquals(4, hash.size());
             assertEquals("2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775", hash.get("rule1"));
             assertEquals("bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9", hash.get("rule2"));
-            assertEquals("0f34d9fff9902c8e5915d82ded7a42f714c80bc55dfc1558f743fe01c5821923", hash.get("rule3"));
+            assertEquals("87dd050f1ca0f684f37970092ff6a02677d995718b5a05461706c0f41ffd4915", hash.get("rule3"));
+            assertEquals("a7bc5d23cd98c4942dc879c649eb9646e38eddd773f9c7996fa0d96048cf63dc", hash.get("rule4"));
         } catch (IOException | NoSuchAlgorithmException e) {
             fail(e.getMessage());
         }

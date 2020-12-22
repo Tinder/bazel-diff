@@ -5,7 +5,7 @@ bazel_path=$(which bazelisk)
 
 previous_revision="HEAD^"
 final_revision="HEAD"
-output_dir=$(mktemp -d)
+output_dir="/tmp"
 modified_filepaths_output="$PWD/integration/modified_filepaths.txt"
 starting_hashes_json="$output_dir/starting_hashes.json"
 final_hashes_json="$output_dir/final_hashes_json.json"

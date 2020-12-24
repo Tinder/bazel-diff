@@ -27,14 +27,16 @@ interface BazelClient {
 class BazelClientImpl implements BazelClient {
     private Path workingDirectory;
     private Path bazelPath;
+    private Boolean verbose;
     private List<String> startupOptions;
     private List<String> commandOptions;
 
-    BazelClientImpl(Path workingDirectory, Path bazelPath, String startupOptions, String commandOptions) {
+    BazelClientImpl(Path workingDirectory, Path bazelPath, String startupOptions, String commandOptions, Boolean verbose) {
         this.workingDirectory = workingDirectory.normalize();
         this.bazelPath = bazelPath;
         this.startupOptions = startupOptions != null ? Arrays.asList(startupOptions.split(" ")): new ArrayList<String>();
         this.commandOptions = commandOptions != null ? Arrays.asList(commandOptions.split(" ")): new ArrayList<String>();
+        this.verbose = verbose;
     }
 
     @Override
@@ -94,13 +96,15 @@ class BazelClientImpl implements BazelClient {
 
         List<String> cmd = new ArrayList<String>();
         cmd.add((bazelPath.toString()));
+        if (verbose) {
+            System.out.println(String.format("Executing Query: %s", query));
+            cmd.add("--bazelrc=/dev/null");
+        }
         cmd.addAll(this.startupOptions);
         cmd.add("query");
         cmd.add("--output");
         cmd.add("streamed_proto");
         cmd.add("--order_output=no");
-        cmd.add("--show_progress=false");
-        cmd.add("--show_loading_progress=false");
         cmd.add("--keep_going");
         cmd.addAll(this.commandOptions);
         cmd.add("--query_file");

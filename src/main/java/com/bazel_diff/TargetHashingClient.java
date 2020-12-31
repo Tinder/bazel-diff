@@ -58,7 +58,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
         String avoidQuery)
     throws IOException {
         Set<String> impactedTargets = new HashSet<>();
-        for ( Map.Entry<String,String> entry : endHashes.entrySet()) {
+        for (Map.Entry<String,String> entry : endHashes.entrySet()) {
             String startHashValue = startHashes.get(entry.getKey());
             if (startHashValue == null || !startHashValue.equals(entry.getValue())) {
                 impactedTargets.add(entry.getKey());

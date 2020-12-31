@@ -47,19 +47,19 @@ class BazelClientImpl implements BazelClient {
 
     @Override
     public Set<String> queryForImpactedTargets(Set<String> impactedTargets, String avoidQuery) throws IOException {
-        Set<String> impactedTestTargets = new HashSet<>();
+        Set<String> impactedTargetNames = new HashSet<>();
         String targetQuery = impactedTargets.stream().collect(Collectors.joining(" + "));
         String query = String.format("rdeps(//..., %s)", targetQuery);
         if (avoidQuery != null) {
-            query = String.format("(%s) except %s", query, avoidQuery);
+            query = String.format("(%s) except (%s)", query, avoidQuery);
         }
         List<Build.Target> targets = performBazelQuery(query);
         for (Build.Target target : targets) {
             if (target.hasRule()) {
-                impactedTestTargets.add(target.getRule().getName());
+                impactedTargetNames.add(target.getRule().getName());
             }
         }
-        return impactedTestTargets;
+        return impactedTargetNames;
     }
 
     @Override
@@ -70,7 +70,7 @@ class BazelClientImpl implements BazelClient {
                     .stream()
                     .map(path -> path.toString())
                     .collect(Collectors.joining(" + "));
-            List<Build.Target> targets = performBazelQuery(String.format("'%s'", targetQuery));
+            List<Build.Target> targets = performBazelQuery(targetQuery);
             for (Build.Target target : targets) {
                 Build.SourceFile sourceFile = target.getSourceFile();
                 if (sourceFile != null) {

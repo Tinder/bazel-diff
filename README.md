@@ -19,6 +19,13 @@ Track the feature request for target diffing in Bazel [here](https://github.com/
 
 This approach was inspired by the [following BazelConf talk](https://www.youtube.com/watch?v=9Dk7mtIm7_A) by Benjamin Peterson.
 
+> There are simpler and faster ways to approximate the affected set of targets.
+> However an incorrect solution can result in a system you can't trust,
+> because tests could be broken at a commit where you didn't select to run them.
+> Then you can't rely on green-to-red (or red-to-green) transitions and
+> lose much of the value from your CI system as breakages can be discovered
+> later on unrelated commits.
+
 ## Prerequisites
 
 * Git
@@ -156,15 +163,42 @@ workspace.
 
 ## Installing
 
-### Run from Source
+### Integrate into your project (recommended)
 
-After cloning down the repo, you are good to go, Bazel will handle the rest
+Add to your `WORKSPACE` file:
 
-To run the project
+```bazel
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
+
+http_jar(
+    name = "bazel_diff",
+    urls = [
+        "https://github.com/Tinder/bazel-diff/releases/download/2.0.0/bazel-diff_deploy.jar",
+    ],
+    sha256 = "c16296d2c770365a410253c8f6dc88061f412ca94cc1cbe4328705e4eed50378",
+)
+```
+
+and then in your root `BUILD.bazel` file:
+
+```bazel
+load("@rules_java//java:defs.bzl", "java_binary")
+
+java_binary(
+    name = "bazel-diff",
+    main_class = "com.bazel_diff.BazelDiff",
+    runtime_deps = ["@bazel_diff//jar"],
+)
+```
+
+now run the tool with
 
 ```terminal
-bazel run :bazel-diff -- bazel-diff -h
+bazel run //:bazel-diff
 ```
+
+
+> Note, in releases prior to 2.0.0 the value for the `main_class` attribute is just `BazelDiff`
 
 #### Debugging
 
@@ -181,6 +215,16 @@ curl -LO bazel-diff.jar GITHUB_RELEASE_JAR_URL
 java -jar bazel-diff.jar -h
 ```
 
+### Build from Source
+
+After cloning down the repo, you are good to go, Bazel will handle the rest
+
+To run the project
+
+```terminal
+bazel run :bazel-diff -- bazel-diff -h
+```
+
 ### Build your own deployable JAR
 
 ```terminal
@@ -188,7 +232,7 @@ bazel build //src/main/java/com/bazel_diff:bazel-diff_deploy.jar
 java -jar bazel-bin/src/main/java/com/bazel_diff/bazel-diff_deploy.jar # This JAR can be run anywhere
 ```
 
-### Integrate directly into your Bazel Project
+### Build from sources in your Bazel Project
 
 Add the following to your `WORKSPACE` file to add the external repositories, replacing the `RELEASE_ARCHIVE_URL` with the archive url of the bazel-diff release you wish to depend on:
 

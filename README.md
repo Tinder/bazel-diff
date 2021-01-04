@@ -73,10 +73,10 @@ Open `bazel-diff-example.sh` to see how this is implemented. This is purely an e
 `bazel-diff` Command
 
 ```terminal
-Usage: bazel-diff [-htV] -b=<bazelPath> [-co=<bazelCommandOptions>]
-                  [-fh=<finalHashesJSONPath>] [-o=<outputPath>]
-                  [-sh=<startingHashesJSONPath>] [-so=<bazelStartupOptions>]
-                  -w=<workspacePath> [COMMAND]
+Usage: bazel-diff [-hV] [-aq=<avoidQuery>] -b=<bazelPath>
+                  [-co=<bazelCommandOptions>] [-fh=<finalHashesJSONPath>]
+                  [-o=<outputPath>] [-sh=<startingHashesJSONPath>]
+                  [-so=<bazelStartupOptions>] -w=<workspacePath> [COMMAND]
 Writes to a file the impacted targets between two Bazel graph JSON files
       -aq, --avoid-query=<avoidQuery>
                   A Bazel query string, any targets that pass this query will
@@ -197,7 +197,16 @@ now run the tool with
 bazel run //:bazel-diff
 ```
 
+
 > Note, in releases prior to 2.0.0 the value for the `main_class` attribute is just `BazelDiff`
+
+#### Debugging
+
+To run `bazel-diff` with debug logging, run your commands with the `verbose` config like so:
+
+```terminal
+bazel run :bazel-diff --config=verbose -- bazel-diff -h
+```
 
 ### Run Via JAR Release
 

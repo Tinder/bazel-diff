@@ -1,11 +1,22 @@
 load("@rules_java//java:defs.bzl", "java_binary", "java_library", "java_proto_library")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 
+config_setting(
+    name = "enable_verbose",
+    values = {
+        "compilation_mode": "dbg",
+    },
+)
+
 java_binary(
     name = "bazel-diff",
     main_class = "com.bazel_diff.BazelDiff",
     runtime_deps = [":java-bazel-diff-lib"],
-    visibility = ["//visibility:public"]
+    visibility = ["//visibility:public"],
+    jvm_flags = select({
+        ":enable_verbose": ["-DVERBOSE=true"],
+        "//conditions:default": [],
+    }),
 )
 
 java_library(
@@ -18,6 +29,10 @@ java_library(
         "@bazel_diff_maven//:com_google_code_gson_gson",
         "@bazel_diff_maven//:com_google_guava_guava"
     ],
+    javacopts = select({
+        ":enable_verbose": ["-AVERBOSE=true"],
+        "//conditions:default": [],
+    }),
     visibility = ["//test/java/com/bazel_diff:__pkg__"]
 )
 

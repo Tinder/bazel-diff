@@ -68,7 +68,7 @@ class BazelClientImpl implements BazelClient {
         for (List<Path> partition : Iterables.partition(filepaths, 100)) {
             String targetQuery = partition
                     .stream()
-                    .map(path -> path.toString())
+                    .map(path -> String.format("'%s'", path.toString()))
                     .collect(Collectors.joining(" + "));
             List<Build.Target> targets = performBazelQuery(targetQuery);
             for (Build.Target target : targets) {

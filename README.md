@@ -199,13 +199,6 @@ bazel run //:bazel-diff
 
 
 > Note, in releases prior to 2.0.0 the value for the `main_class` attribute is just `BazelDiff`
-
-#### Debugging
-
-To run `bazel-diff` with debug logging, run your commands with the `verbose` config like so:
-
-```terminal
-bazel run :bazel-diff --config=verbose -- bazel-diff -h
 ```
 
 ### Run Via JAR Release
@@ -223,6 +216,14 @@ To run the project
 
 ```terminal
 bazel run :bazel-diff -- bazel-diff -h
+```
+
+#### Debugging (when running from source)
+
+To run `bazel-diff` with debug logging, run your commands with the `verbose` config like so:
+
+```terminal
+bazel run :bazel-diff --config=verbose -- bazel-diff -h
 ```
 
 ### Build your own deployable JAR

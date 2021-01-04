@@ -233,7 +233,7 @@ bazel build //src/main/java/com/bazel_diff:bazel-diff_deploy.jar
 java -jar bazel-bin/src/main/java/com/bazel_diff/bazel-diff_deploy.jar # This JAR can be run anywhere
 ```
 
-### Build from sources in your Bazel Project
+### Build from source in your Bazel Project
 
 Add the following to your `WORKSPACE` file to add the external repositories, replacing the `RELEASE_ARCHIVE_URL` with the archive url of the bazel-diff release you wish to depend on:
 

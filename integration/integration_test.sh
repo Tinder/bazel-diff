@@ -5,11 +5,12 @@ bazel_path=$(which bazelisk)
 
 previous_revision="HEAD^"
 final_revision="HEAD"
-output_dir=$(mktemp -d)
-modified_filepaths_output="$PWD/integration/modified_filepaths.txt"
+output_dir="/tmp"
+modified_filepaths_output="$workspace_path/modified_filepaths.txt"
 starting_hashes_json="$output_dir/starting_hashes.json"
 final_hashes_json="$output_dir/final_hashes_json.json"
 impacted_targets_path="$output_dir/impacted_targets.txt"
+shared_flags="--config=verbose"
 
 export USE_BAZEL_VERSION=last_downstream_green
 
@@ -20,13 +21,13 @@ containsElement () {
   return 1
 }
 
-$bazel_path run :bazel-diff -- generate-hashes -w $workspace_path -b $bazel_path $starting_hashes_json
+$bazel_path run :bazel-diff $shared_flags -- generate-hashes -w $workspace_path -b $bazel_path $starting_hashes_json
 
-$bazel_path run :bazel-diff -- generate-hashes -w $workspace_path -b $bazel_path -m $modified_filepaths_output $final_hashes_json
+$bazel_path run :bazel-diff $shared_flags -- generate-hashes -w $workspace_path -b $bazel_path -m $modified_filepaths_output $final_hashes_json
 
 ruby ./integration/update_final_hashes.rb
 
-$bazel_path run :bazel-diff -- -sh $starting_hashes_json -fh $final_hashes_json -w $workspace_path -b $bazel_path -o $impacted_targets_path -aq "attr('tags', 'manual', //...)"
+$bazel_path run :bazel-diff $shared_flags -- -sh $starting_hashes_json -fh $final_hashes_json -w $workspace_path -b $bazel_path -o $impacted_targets_path -aq "attr('tags', 'manual', //...)"
 
 IFS=$'\n' read -d '' -r -a impacted_targets < $impacted_targets_path
 target1="//test/java/com/integration:bazel-diff-integration-test-lib"

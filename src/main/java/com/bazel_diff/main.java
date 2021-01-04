@@ -91,7 +91,7 @@ class GenerateHashes implements Callable<Integer> {
     @Override
     public Integer call() {
         GitClient gitClient = new GitClientImpl(parent.workspacePath);
-        BazelClient bazelClient = new BazelClientImpl(parent.workspacePath, parent.bazelPath, parent.bazelStartupOptions, parent.bazelCommandOptions);
+        BazelClient bazelClient = new BazelClientImpl(parent.workspacePath, parent.bazelPath, parent.bazelStartupOptions, parent.bazelCommandOptions, BazelDiff.isVerbose());
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient);
         try {
             gitClient.ensureAllChangesAreCommitted();
@@ -164,7 +164,7 @@ class BazelDiff implements Callable<Integer> {
             return ExitCode.USAGE;
         }
         GitClient gitClient = new GitClientImpl(workspacePath);
-        BazelClient bazelClient = new BazelClientImpl(workspacePath, bazelPath, bazelStartupOptions, bazelCommandOptions);
+        BazelClient bazelClient = new BazelClientImpl(workspacePath, bazelPath, bazelStartupOptions, bazelCommandOptions, BazelDiff.isVerbose());
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient);
         try {
             gitClient.ensureAllChangesAreCommitted();
@@ -203,6 +203,11 @@ class BazelDiff implements Callable<Integer> {
             return ExitCode.SOFTWARE;
         }
         return ExitCode.OK;
+    }
+
+    static Boolean isVerbose() {
+        String verboseFlag = System.getProperty("VERBOSE", "false");
+        return verboseFlag.equals("true");
     }
 
     public static void main(String[] args) {

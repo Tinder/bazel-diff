@@ -199,7 +199,6 @@ bazel run //:bazel-diff
 
 
 > Note, in releases prior to 2.0.0 the value for the `main_class` attribute is just `BazelDiff`
-```
 
 ### Run Via JAR Release
 

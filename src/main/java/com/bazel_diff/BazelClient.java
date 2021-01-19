@@ -48,7 +48,9 @@ class BazelClientImpl implements BazelClient {
     @Override
     public Set<String> queryForImpactedTargets(Set<String> impactedTargets, String avoidQuery) throws IOException {
         Set<String> impactedTargetNames = new HashSet<>();
-        String targetQuery = impactedTargets.stream().collect(Collectors.joining(" + "));
+        String targetQuery = impactedTargets.stream()
+                                            .map(target -> String.format("'%s'", target))
+                                            .collect(Collectors.joining(" + "));
         String query = String.format("rdeps(//..., %s)", targetQuery);
         if (avoidQuery != null) {
             query = String.format("(%s) except (%s)", query, avoidQuery);

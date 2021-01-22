@@ -18,8 +18,8 @@ bazel_diff="/tmp/bazel_diff"
 
 shared_flags=""
 
-# Uncomment the line below to see debug information
-# shared_flags="--config=verbose"
+# Comment out this flag to suppress debug information
+shared_flags="--config=verbose"
 
 $bazel_path run :bazel-diff $shared_flags --script_path="$bazel_diff"
 
@@ -45,7 +45,7 @@ echo "Determining Impacted Targets"
 $bazel_diff -sh $starting_hashes_json -fh $final_hashes_json -w $workspace_path -b $bazel_path -o $impacted_targets_path
 
 echo "Determining Impacted Test Targets"
-$bazel_diff -sh $starting_hashes_json -fh $final_hashes_json -w $workspace_path -b $bazel_path -o $impacted_test_targets_path --avoid-query "//... except tests(//...)"
+$bazel_diff -sh $starting_hashes_json -fh $final_hashes_json -w $workspace_path -b $bazel_path -o $impacted_test_targets_path --avoid-query "(//... except tests(//...))"
 
 IFS=$'\n' read -d '' -r -a impacted_targets < $impacted_targets_path
 formatted_impacted_targets=$(IFS=$'\n'; echo "${impacted_targets[*]}")

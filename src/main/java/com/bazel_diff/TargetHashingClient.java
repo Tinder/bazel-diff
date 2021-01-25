@@ -9,6 +9,7 @@ import java.util.stream.Collectors;
 
 interface TargetHashingClient {
     Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths) throws IOException, NoSuchAlgorithmException;
+    Map<String, String> hashAllBazelTargetsAndSourcefiles() throws IOException, NoSuchAlgorithmException;
     Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes, String avoidQuery) throws IOException;
 }
 
@@ -22,33 +23,13 @@ class TargetHashingClientImpl implements TargetHashingClient {
     @Override
     public Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths) throws IOException, NoSuchAlgorithmException {
         Set<BazelSourceFileTarget> bazelSourcefileTargets = bazelClient.convertFilepathsToSourceTargets(modifiedFilepaths);
-        List<BazelTarget> allTargets = bazelClient.queryAllTargets();
-        Map<String, String> targetHashes = new HashMap<>();
-        Map<String, byte[]> ruleHashes = new HashMap<>();
-        Map<String, BazelRule> allRulesMap = new HashMap<>();
-        for (BazelTarget target : allTargets) {
-            String targetName = getNameForTarget(target);
-            if (targetName == null || !target.hasRule()) {
-                continue;
-            }
-            allRulesMap.put(targetName, target.getRule());
-        }
-        for (BazelTarget target : allTargets) {
-            String targetName = getNameForTarget(target);
-            if (targetName == null) {
-                continue;
-            }
-            byte[] targetDigest = createDigestForTarget(
-                    target,
-                    allRulesMap,
-                    bazelSourcefileTargets,
-                    ruleHashes
-            );
-            if (targetDigest != null) {
-                targetHashes.put(targetName, convertByteArrayToString(targetDigest));
-            }
-        }
-        return targetHashes;
+        return hashAllTargets(bazelSourcefileTargets);
+    }
+
+    @Override
+    public Map<String, String> hashAllBazelTargetsAndSourcefiles() throws IOException, NoSuchAlgorithmException {
+        Set<BazelSourceFileTarget> bazelSourcefileTargets = bazelClient.queryAllSourcefileTargets();
+        return hashAllTargets(bazelSourcefileTargets);
     }
 
     @Override
@@ -151,5 +132,35 @@ class TargetHashingClientImpl implements TargetHashingClient {
             return target.getSourceFileName();
         }
         return null;
+    }
+
+    private Map<String, String> hashAllTargets(Set<BazelSourceFileTarget> bazelSourcefileTargets) throws IOException, NoSuchAlgorithmException {
+        List<BazelTarget> allTargets = bazelClient.queryAllTargets();
+        Map<String, String> targetHashes = new HashMap<>();
+        Map<String, byte[]> ruleHashes = new HashMap<>();
+        Map<String, BazelRule> allRulesMap = new HashMap<>();
+        for (BazelTarget target : allTargets) {
+            String targetName = getNameForTarget(target);
+            if (targetName == null || !target.hasRule()) {
+                continue;
+            }
+            allRulesMap.put(targetName, target.getRule());
+        }
+        for (BazelTarget target : allTargets) {
+            String targetName = getNameForTarget(target);
+            if (targetName == null) {
+                continue;
+            }
+            byte[] targetDigest = createDigestForTarget(
+                    target,
+                    allRulesMap,
+                    bazelSourcefileTargets,
+                    ruleHashes
+            );
+            if (targetDigest != null) {
+                targetHashes.put(targetName, convertByteArrayToString(targetDigest));
+            }
+        }
+        return targetHashes;
     }
 }

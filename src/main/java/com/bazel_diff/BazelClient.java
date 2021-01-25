@@ -22,6 +22,7 @@ interface BazelClient {
     List<BazelTarget> queryAllTargets() throws IOException;
     Set<String> queryForImpactedTargets(Set<String> impactedTargets, String avoidQuery) throws IOException;
     Set<BazelSourceFileTarget> convertFilepathsToSourceTargets(Set<Path> filepaths) throws IOException, NoSuchAlgorithmException;
+    Set<BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException;
 }
 
 class BazelClientImpl implements BazelClient {
@@ -72,21 +73,32 @@ class BazelClientImpl implements BazelClient {
                     .stream()
                     .map(path -> String.format("'%s'", path.toString()))
                     .collect(Collectors.joining(" + "));
-            List<Build.Target> targets = performBazelQuery(targetQuery);
-            for (Build.Target target : targets) {
-                Build.SourceFile sourceFile = target.getSourceFile();
-                if (sourceFile != null) {
-                    MessageDigest digest = MessageDigest.getInstance("SHA-256");
-                    digest.update(sourceFile.getNameBytes().toByteArray());
-                    for (String subinclude : sourceFile.getSubincludeList()) {
-                        digest.update(subinclude.getBytes());
-                    }
-                    BazelSourceFileTargetImpl sourceFileTarget = new BazelSourceFileTargetImpl(
-                            sourceFile.getName(),
-                            digest.digest().clone()
-                    );
-                    sourceTargets.add(sourceFileTarget);
+            sourceTargets.addAll(processBazelSourcefileTargets(performBazelQuery(targetQuery), false));
+        }
+        return sourceTargets;
+    }
+
+    @Override
+    public Set<BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException {
+        return processBazelSourcefileTargets(performBazelQuery("kind('source file', deps(//...))"), true);
+    }
+
+    private Set<BazelSourceFileTarget> processBazelSourcefileTargets(List<Build.Target> targets, Boolean readSourcefileTargets) throws IOException, NoSuchAlgorithmException {
+        Set<BazelSourceFileTarget> sourceTargets = new HashSet<>();
+        for (Build.Target target : targets) {
+            Build.SourceFile sourceFile = target.getSourceFile();
+            if (sourceFile != null) {
+                MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                digest.update(sourceFile.getNameBytes().toByteArray());
+                for (String subinclude : sourceFile.getSubincludeList()) {
+                    digest.update(subinclude.getBytes());
                 }
+                BazelSourceFileTargetImpl sourceFileTarget = new BazelSourceFileTargetImpl(
+                        sourceFile.getName(),
+                        digest.digest().clone(),
+                        readSourcefileTargets ? workingDirectory : null
+                );
+                sourceTargets.add(sourceFileTarget);
             }
         }
         return sourceTargets;

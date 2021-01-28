@@ -18,7 +18,6 @@ import java.util.concurrent.Callable;
 import java.util.stream.Collectors;
 
 import static picocli.CommandLine.*;
-
 @Command(
         name = "modified-filepaths",
         mixinStandardHelpOptions = true,
@@ -82,8 +81,16 @@ class GenerateHashes implements Callable<Integer> {
     @ParentCommand
     private BazelDiff parent;
 
-    @Option(names = {"-m", "--modifiedFilepaths"}, description = "The path to a file containing the list of modified filepaths in the workspace, you can use the 'modified-filepaths' command to get this list")
-    File modifiedFilepaths;
+    @ArgGroup(exclusive = true)
+    Exclusive exclusive;
+
+    static class Exclusive {
+        @Option(names = {"-m", "--modifiedFilepaths"}, description = "The path to a file containing the list of modified filepaths in the workspace, you can use the 'modified-filepaths' command to get this list")
+        File modifiedFilepaths;
+
+        @Option(names = {"-a", "--all-sourcefiles"}, description = "Experimental: Hash all sourcefile targets (instead of relying on --modifiedFilepaths), Warning: Performance may degrade from reading all source files")
+        Boolean hashAllSourcefiles;
+    }
 
     @Parameters(index = "0", description = "The filepath to write the resulting JSON of dictionary target => SHA-256 values")
     File outputPath;
@@ -96,15 +103,22 @@ class GenerateHashes implements Callable<Integer> {
         try {
             gitClient.ensureAllChangesAreCommitted();
             Set<Path> modifiedFilepathsSet = new HashSet<>();
-            if (modifiedFilepaths != null) {
-                FileReader fileReader = new FileReader(modifiedFilepaths);
-                BufferedReader bufferedReader = new BufferedReader(fileReader);
-                modifiedFilepathsSet = bufferedReader
-                        .lines()
-                        .map( line -> new File(line).toPath())
-                        .collect(Collectors.toSet());
+            Map<String, String> hashes = new HashMap<>();
+            if (exclusive != null) {
+                if (exclusive.modifiedFilepaths != null) {
+                    FileReader fileReader = new FileReader(exclusive.modifiedFilepaths);
+                    BufferedReader bufferedReader = new BufferedReader(fileReader);
+                    modifiedFilepathsSet = bufferedReader
+                            .lines()
+                            .map( line -> new File(line).toPath())
+                            .collect(Collectors.toSet());
+                    hashes = hashingClient.hashAllBazelTargets(modifiedFilepathsSet);
+                } else if (exclusive.hashAllSourcefiles) {
+                    hashes = hashingClient.hashAllBazelTargetsAndSourcefiles();
+                }
+            } else {
+                hashes = hashingClient.hashAllBazelTargets(modifiedFilepathsSet);
             }
-            Map<String, String> hashes = hashingClient.hashAllBazelTargets(modifiedFilepathsSet);
             Gson gson = new GsonBuilder().setPrettyPrinting().create();
             FileWriter myWriter = new FileWriter(outputPath);
             myWriter.write(gson.toJson(hashes));

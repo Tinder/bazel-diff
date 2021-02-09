@@ -13,7 +13,7 @@ impacted_targets_path="$output_dir/impacted_targets.txt"
 shared_flags="--config=verbose"
 command_options="--incompatible_restrict_string_escapes=false"
 
-export USE_BAZEL_VERSION=3.7.0
+export USE_BAZEL_VERSION=last_downstream_green
 
 containsElement () {
   local e match="$1"

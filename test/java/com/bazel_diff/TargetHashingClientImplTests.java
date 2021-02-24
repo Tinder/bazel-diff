@@ -31,21 +31,19 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void hashAllBazelTargets_noTargets() throws IOException {
+    public void hashAllBazelTargets_noTargets() throws IOException, BazelClientException {
         when(bazelClientMock.queryAllTargets()).thenReturn(new ArrayList<>());
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);
         try {
             Map<String, String> hash = client.hashAllBazelTargets(new HashSet<>());
             assertEquals(hash.size(), 0);
-        } catch (IOException e) {
-            assertTrue(false);
-        } catch (NoSuchAlgorithmException e) {
+        } catch (IOException | BazelClientException | NoSuchAlgorithmException e) {
             assertTrue(false);
         }
     }
 
     @Test
-    public void hashAllBazelTargets_ruleTargets() throws IOException {
+    public void hashAllBazelTargets_ruleTargets() throws IOException, BazelClientException {
         when(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets);
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);
         try {
@@ -59,7 +57,7 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void hashAllBazelTargets_ruleTargets_ruleInputs() throws IOException, NoSuchAlgorithmException {
+    public void hashAllBazelTargets_ruleTargets_ruleInputs() throws IOException, BazelClientException, NoSuchAlgorithmException {
         List<String> ruleInputs = new ArrayList<>();
         ruleInputs.add("rule1");
         BazelTarget rule3 = createRuleTarget("rule3", ruleInputs, "digest");
@@ -81,7 +79,7 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void hashAllBazelTargets_sourceTargets_unmodifiedSources() throws IOException {
+    public void hashAllBazelTargets_sourceTargets_unmodifiedSources() throws IOException, BazelClientException {
         defaultTargets.add(createSourceTarget("sourceFile1"));
         when(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets);
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);
@@ -97,7 +95,7 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void hashAllBazelTargets_sourceTargets_modifiedSources() throws IOException, NoSuchAlgorithmException {
+    public void hashAllBazelTargets_sourceTargets_modifiedSources() throws IOException, BazelClientException, NoSuchAlgorithmException {
         createSourceTarget("sourceFile1");
         defaultTargets.add(createSourceTarget("sourceFile1"));
         Set<BazelSourceFileTarget> modifiedFileTargets = new HashSet<>();
@@ -117,7 +115,7 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void getImpactedTargets() throws IOException {
+    public void getImpactedTargets() throws IOException, BazelClientException {
         when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject())).thenReturn(
                 new HashSet<>(Arrays.asList("rule1", "rule3"))
         );
@@ -137,7 +135,7 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void getImpactedTargets_withAvoidQuery() throws IOException {
+    public void getImpactedTargets_withAvoidQuery() throws IOException, BazelClientException {
         when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"))).thenReturn(
                 new HashSet<>(Arrays.asList("rule1"))
         );

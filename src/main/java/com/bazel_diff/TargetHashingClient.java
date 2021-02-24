@@ -8,9 +8,9 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 interface TargetHashingClient {
-    Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths) throws IOException, NoSuchAlgorithmException;
-    Map<String, String> hashAllBazelTargetsAndSourcefiles() throws IOException, NoSuchAlgorithmException;
-    Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes, String avoidQuery) throws IOException;
+    Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths) throws IOException, BazelClientException, NoSuchAlgorithmException;
+    Map<String, String> hashAllBazelTargetsAndSourcefiles() throws IOException, BazelClientException, NoSuchAlgorithmException;
+    Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes, String avoidQuery) throws IOException, BazelClientException;
 }
 
 class TargetHashingClientImpl implements TargetHashingClient {
@@ -21,13 +21,13 @@ class TargetHashingClientImpl implements TargetHashingClient {
     }
 
     @Override
-    public Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths) throws IOException, NoSuchAlgorithmException {
+    public Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths) throws IOException, BazelClientException, NoSuchAlgorithmException {
         Set<BazelSourceFileTarget> bazelSourcefileTargets = bazelClient.convertFilepathsToSourceTargets(modifiedFilepaths);
         return hashAllTargets(bazelSourcefileTargets);
     }
 
     @Override
-    public Map<String, String> hashAllBazelTargetsAndSourcefiles() throws IOException, NoSuchAlgorithmException {
+    public Map<String, String> hashAllBazelTargetsAndSourcefiles() throws IOException, BazelClientException, NoSuchAlgorithmException {
         Set<BazelSourceFileTarget> bazelSourcefileTargets = bazelClient.queryAllSourcefileTargets();
         return hashAllTargets(bazelSourcefileTargets);
     }
@@ -37,7 +37,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
         Map<String, String> startHashes,
         Map<String, String> endHashes,
         String avoidQuery)
-    throws IOException {
+    throws IOException, BazelClientException {
         Set<String> impactedTargets = new HashSet<>();
         for (Map.Entry<String,String> entry : endHashes.entrySet()) {
             String startHashValue = startHashes.get(entry.getKey());
@@ -134,7 +134,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
         return null;
     }
 
-    private Map<String, String> hashAllTargets(Set<BazelSourceFileTarget> bazelSourcefileTargets) throws IOException, NoSuchAlgorithmException {
+    private Map<String, String> hashAllTargets(Set<BazelSourceFileTarget> bazelSourcefileTargets) throws IOException, BazelClientException, NoSuchAlgorithmException {
         List<BazelTarget> allTargets = bazelClient.queryAllTargets();
         Map<String, String> targetHashes = new HashMap<>();
         Map<String, byte[]> ruleHashes = new HashMap<>();

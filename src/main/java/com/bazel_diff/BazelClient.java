@@ -19,10 +19,18 @@ import java.util.stream.Collectors;
 import java.util.Arrays;
 
 interface BazelClient {
-    List<BazelTarget> queryAllTargets() throws IOException;
-    Set<String> queryForImpactedTargets(Set<String> impactedTargets, String avoidQuery) throws IOException;
-    Set<BazelSourceFileTarget> convertFilepathsToSourceTargets(Set<Path> filepaths) throws IOException, NoSuchAlgorithmException;
-    Set<BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException;
+    List<BazelTarget> queryAllTargets() throws IOException, BazelClientException;
+    Set<String> queryForImpactedTargets(Set<String> impactedTargets, String avoidQuery) throws IOException, BazelClientException;
+    Set<BazelSourceFileTarget> convertFilepathsToSourceTargets(Set<Path> filepaths) throws IOException, BazelClientException, NoSuchAlgorithmException;
+    Set<BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, BazelClientException, NoSuchAlgorithmException;    
+}
+
+class BazelClientException extends Exception
+{
+    BazelClientException(String message)
+    {
+        super(message);
+    }
 }
 
 class BazelClientImpl implements BazelClient {
@@ -41,13 +49,13 @@ class BazelClientImpl implements BazelClient {
     }
 
     @Override
-    public List<BazelTarget> queryAllTargets() throws IOException {
+    public List<BazelTarget> queryAllTargets() throws IOException, BazelClientException {
         List<Build.Target> targets = performBazelQuery("'//external:all-targets' + '//...:all-targets'");
         return targets.stream().map( target -> new BazelTargetImpl(target)).collect(Collectors.toList());
     }
 
     @Override
-    public Set<String> queryForImpactedTargets(Set<String> impactedTargets, String avoidQuery) throws IOException {
+    public Set<String> queryForImpactedTargets(Set<String> impactedTargets, String avoidQuery) throws IOException, BazelClientException {
         Set<String> impactedTargetNames = new HashSet<>();
         String targetQuery = impactedTargets.stream()
                                             .map(target -> String.format("'%s'", target))
@@ -66,7 +74,7 @@ class BazelClientImpl implements BazelClient {
     }
 
     @Override
-    public Set<BazelSourceFileTarget> convertFilepathsToSourceTargets(Set<Path> filepaths) throws IOException, NoSuchAlgorithmException {
+    public Set<BazelSourceFileTarget> convertFilepathsToSourceTargets(Set<Path> filepaths) throws IOException, BazelClientException, NoSuchAlgorithmException {
         Set<BazelSourceFileTarget> sourceTargets = new HashSet<>();
         for (List<Path> partition : Iterables.partition(filepaths, 100)) {
             String targetQuery = partition
@@ -79,7 +87,7 @@ class BazelClientImpl implements BazelClient {
     }
 
     @Override
-    public Set<BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException {
+    public Set<BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, BazelClientException, NoSuchAlgorithmException {
         return processBazelSourcefileTargets(performBazelQuery("kind('source file', deps(//...))"), true);
     }
 
@@ -104,7 +112,7 @@ class BazelClientImpl implements BazelClient {
         return sourceTargets;
     }
 
-    private List<Build.Target> performBazelQuery(String query) throws IOException {
+    private List<Build.Target> performBazelQuery(String query) throws IOException, BazelClientException {
         Path tempFile = Files.createTempFile(null, ".txt");
         Files.write(tempFile, query.getBytes(StandardCharsets.UTF_8));
 
@@ -134,6 +142,19 @@ class BazelClientImpl implements BazelClient {
         }
 
         Files.delete(tempFile);
+
+        try  {
+            process.waitFor();
+        } catch(InterruptedException e) {
+            throw new BazelClientException("Couldn't wait for Bazel query to complete.");
+        }
+        
+        // Check exit value and fail if query wasn't successful.
+        if (process.exitValue() != 0) {
+            BufferedReader buffer = new BufferedReader(new InputStreamReader(process.getErrorStream()));
+            String error = buffer.lines().collect(Collectors.joining("\n"));
+            throw new BazelClientException(error);
+        }
 
         return targets;
     }

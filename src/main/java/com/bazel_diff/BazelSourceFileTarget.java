@@ -24,7 +24,7 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
             String filenameSubstring = name.substring(2);
             String filenamePath = filenameSubstring.replaceFirst(":", "/");
             File sourceFile = new File(workingDirectory.toString(), filenamePath);
-            if (sourceFile.canRead()) {
+            if (sourceFile.isFile() && sourceFile.canRead()) {
                 ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
                 outputStream.write(Files.readAllBytes(sourceFile.toPath()));
                 outputStream.write(digest);

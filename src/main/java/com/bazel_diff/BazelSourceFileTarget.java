@@ -44,7 +44,9 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
     @Override
     public byte[] getDigest() throws NoSuchAlgorithmException {
         MessageDigest finalDigest = MessageDigest.getInstance("SHA-256");
-        finalDigest.update(digest);
+        if (digest != null) {
+            finalDigest.update(digest);
+        }
         finalDigest.update(name.getBytes());
         return finalDigest.digest();
     }

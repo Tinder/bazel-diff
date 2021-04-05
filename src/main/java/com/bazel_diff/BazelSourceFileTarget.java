@@ -24,7 +24,7 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
             String filenameSubstring = name.substring(2);
             String filenamePath = filenameSubstring.replaceFirst(":", "/");
             File sourceFile = new File(workingDirectory.toString(), filenamePath);
-            if (sourceFile.canRead()) {
+            if (sourceFile.isFile() && sourceFile.canRead()) {
                 ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
                 outputStream.write(Files.readAllBytes(sourceFile.toPath()));
                 outputStream.write(digest);
@@ -44,7 +44,9 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
     @Override
     public byte[] getDigest() throws NoSuchAlgorithmException {
         MessageDigest finalDigest = MessageDigest.getInstance("SHA-256");
-        finalDigest.update(digest);
+        if (digest != null) {
+            finalDigest.update(digest);
+        }
         finalDigest.update(name.getBytes());
         return finalDigest.digest();
     }

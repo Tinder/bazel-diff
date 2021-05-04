@@ -14,6 +14,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.Callable;
 import java.util.stream.Collectors;
 
@@ -121,7 +122,7 @@ class GenerateHashes implements Callable<Integer> {
             }
             Gson gson = new GsonBuilder().setPrettyPrinting().create();
             FileWriter myWriter = new FileWriter(outputPath);
-            myWriter.write(gson.toJson(hashes));
+            myWriter.write(gson.toJson(new TreeMap(hashes)));
             myWriter.close();
             return ExitCode.OK;
         } catch (GitClientException e) {

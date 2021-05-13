@@ -1,35 +1,39 @@
 package com.bazel_diff;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.stream.Collectors;
+import com.google.common.primitives.Bytes;
 
 interface TargetHashingClient {
-    Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths) throws IOException, NoSuchAlgorithmException;
-    Map<String, String> hashAllBazelTargetsAndSourcefiles() throws IOException, NoSuchAlgorithmException;
+    Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths, Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException;
+    Map<String, String> hashAllBazelTargetsAndSourcefiles(Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException;
     Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes, String avoidQuery, Boolean hashAllTargets) throws IOException;
 }
 
 class TargetHashingClientImpl implements TargetHashingClient {
     private BazelClient bazelClient;
+    private FilesClient files;
 
-    TargetHashingClientImpl(BazelClient bazelClient) {
+    TargetHashingClientImpl(BazelClient bazelClient, FilesClient files) {
         this.bazelClient = bazelClient;
+        this.files = files;
     }
 
     @Override
-    public Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths) throws IOException, NoSuchAlgorithmException {
+    public Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths, Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException {
         Set<BazelSourceFileTarget> bazelSourcefileTargets = bazelClient.convertFilepathsToSourceTargets(modifiedFilepaths);
-        return hashAllTargets(bazelSourcefileTargets);
+        return hashAllTargets(createSeedForFilepaths(seedFilepaths), bazelSourcefileTargets);
     }
 
     @Override
-    public Map<String, String> hashAllBazelTargetsAndSourcefiles() throws IOException, NoSuchAlgorithmException {
+    public Map<String, String> hashAllBazelTargetsAndSourcefiles(Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException {
         Set<BazelSourceFileTarget> bazelSourcefileTargets = bazelClient.queryAllSourcefileTargets();
-        return hashAllTargets(bazelSourcefileTargets);
+        return hashAllTargets(createSeedForFilepaths(seedFilepaths), bazelSourcefileTargets);
     }
 
     @Override
@@ -56,7 +60,8 @@ class TargetHashingClientImpl implements TargetHashingClient {
             BazelTarget target,
             Map<String, BazelRule> allRulesMap,
             Set<BazelSourceFileTarget> bazelSourcefileTargets,
-            Map<String, byte[]> ruleHashes
+            Map<String, byte[]> ruleHashes,
+            byte[] seedHash
     ) throws NoSuchAlgorithmException {
         BazelRule targetRule = target.getRule();
         if (target.hasSourceFile()) {
@@ -67,17 +72,21 @@ class TargetHashingClientImpl implements TargetHashingClient {
                 if (sourceTargetDigestBytes != null) {
                     digest.update(sourceTargetDigestBytes);
                 }
+                if (seedHash != null) {
+                    digest.update(seedHash);
+                }
                 return digest.digest().clone();
             }
         }
-        return createDigestForRule(targetRule, allRulesMap, ruleHashes, bazelSourcefileTargets);
+        return createDigestForRule(targetRule, allRulesMap, ruleHashes, bazelSourcefileTargets, seedHash);
     }
 
     private byte[] createDigestForRule(
             BazelRule rule,
             Map<String, BazelRule> allRulesMap,
             Map<String, byte[]> ruleHashes,
-            Set<BazelSourceFileTarget> bazelSourcefileTargets
+            Set<BazelSourceFileTarget> bazelSourcefileTargets,
+            byte[] seedHash
     ) throws NoSuchAlgorithmException {
         byte[] existingByteArray = ruleHashes.get(rule.getName());
         if (existingByteArray != null) {
@@ -85,6 +94,9 @@ class TargetHashingClientImpl implements TargetHashingClient {
         }
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         digest.update(rule.getDigest());
+        if (seedHash != null) {
+            digest.update(seedHash);
+        }
         for (String ruleInput : rule.getRuleInputList()) {
             digest.update(ruleInput.getBytes());
             BazelRule inputRule = allRulesMap.get(ruleInput);
@@ -94,7 +106,8 @@ class TargetHashingClientImpl implements TargetHashingClient {
                         inputRule,
                         allRulesMap,
                         ruleHashes,
-                        bazelSourcefileTargets
+                        bazelSourcefileTargets,
+                        seedHash
                 );
                 if (ruleInputHash != null) {
                     digest.update(ruleInputHash);
@@ -106,6 +119,17 @@ class TargetHashingClientImpl implements TargetHashingClient {
         byte[] finalHashValue = digest.digest().clone();
         ruleHashes.put(rule.getName(), finalHashValue);
         return finalHashValue;
+    }
+
+    private byte[] createSeedForFilepaths(Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException {
+        if (seedFilepaths == null || seedFilepaths.size() == 0) {
+            return new byte[0];
+        }
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        for (Path path: seedFilepaths) {
+            digest.update(this.files.readFile(path));
+        }
+        return digest.digest().clone();
     }
 
     private byte[] getDigestForSourceTargetName(
@@ -138,7 +162,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
         return null;
     }
 
-    private Map<String, String> hashAllTargets(Set<BazelSourceFileTarget> bazelSourcefileTargets) throws IOException, NoSuchAlgorithmException {
+    private Map<String, String> hashAllTargets(byte[] seedHash, Set<BazelSourceFileTarget> bazelSourcefileTargets) throws IOException, NoSuchAlgorithmException {
         List<BazelTarget> allTargets = bazelClient.queryAllTargets();
         Map<String, String> targetHashes = new HashMap<>();
         Map<String, byte[]> ruleHashes = new HashMap<>();
@@ -159,10 +183,13 @@ class TargetHashingClientImpl implements TargetHashingClient {
                     target,
                     allRulesMap,
                     bazelSourcefileTargets,
-                    ruleHashes
+                    ruleHashes,
+                    seedHash
             );
             if (targetDigest != null) {
-                targetHashes.put(targetName, convertByteArrayToString(targetDigest));
+                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                outputStream.write(targetDigest);
+                targetHashes.put(targetName, convertByteArrayToString(outputStream.toByteArray()));
             }
         }
         return targetHashes;

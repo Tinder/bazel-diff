@@ -158,6 +158,9 @@ class BazelDiff implements Callable<Integer> {
     @Option(names = {"-o", "--output"}, scope = ScopeType.LOCAL, description = "Filepath to write the impacted Bazel targets to, newline separated")
     File outputPath;
 
+    @Option(names = {"-a", "--all-sourcefiles"}, description = "Experimental: Hash all sourcefile targets (instead of relying on --modifiedFilepaths), Warning: Performance may degrade from reading all source files")
+    Boolean hashAllSourcefiles;
+
     @Option(names = {"-aq", "--avoid-query"}, scope = ScopeType.LOCAL, description = "A Bazel query string, any targets that pass this query will be removed from the returned set of targets")
     String avoidQuery;
 
@@ -207,7 +210,7 @@ class BazelDiff implements Callable<Integer> {
         Map<String, String > gsonHash = new HashMap<>();
         Map<String, String> startingHashes = gson.fromJson(startingFileReader, gsonHash.getClass());
         Map<String, String> finalHashes = gson.fromJson(finalFileReader, gsonHash.getClass());
-        Set<String> impactedTargets = hashingClient.getImpactedTargets(startingHashes, finalHashes, avoidQuery);
+        Set<String> impactedTargets = hashingClient.getImpactedTargets(startingHashes, finalHashes, avoidQuery, hashAllSourcefiles);
         try {
             FileWriter myWriter = new FileWriter(outputPath);
             myWriter.write(impactedTargets.stream().collect(Collectors.joining(System.lineSeparator())));

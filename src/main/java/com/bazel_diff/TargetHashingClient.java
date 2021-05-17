@@ -10,7 +10,7 @@ import java.util.stream.Collectors;
 interface TargetHashingClient {
     Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths) throws IOException, NoSuchAlgorithmException;
     Map<String, String> hashAllBazelTargetsAndSourcefiles() throws IOException, NoSuchAlgorithmException;
-    Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes, String avoidQuery) throws IOException;
+    Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes, String avoidQuery, Boolean hashAllTargets) throws IOException;
 }
 
 class TargetHashingClientImpl implements TargetHashingClient {
@@ -36,7 +36,8 @@ class TargetHashingClientImpl implements TargetHashingClient {
     public Set<String> getImpactedTargets(
         Map<String, String> startHashes,
         Map<String, String> endHashes,
-        String avoidQuery)
+        String avoidQuery,
+        Boolean hashAllTargets)
     throws IOException {
         Set<String> impactedTargets = new HashSet<>();
         for (Map.Entry<String,String> entry : endHashes.entrySet()) {
@@ -45,7 +46,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
                 impactedTargets.add(entry.getKey());
             }
         }
-        return bazelClient.queryForImpactedTargets(impactedTargets, avoidQuery);
+        return bazelClient.queryForImpactedTargets(impactedTargets, avoidQuery, hashAllTargets);
     }
 
     private byte[] createDigestForTarget(

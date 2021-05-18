@@ -130,6 +130,9 @@ class GenerateHashes implements Callable<Integer> {
         } catch (IOException | InterruptedException | NoSuchAlgorithmException e) {
             e.printStackTrace();
             return ExitCode.SOFTWARE;
+        } catch (BazelClientException e) {
+            System.out.println(String.format("Failed to run Bazel:\n%s", e));
+            return ExitCode.SOFTWARE;
         }
     }
 }
@@ -207,13 +210,16 @@ class BazelDiff implements Callable<Integer> {
         Map<String, String > gsonHash = new HashMap<>();
         Map<String, String> startingHashes = gson.fromJson(startingFileReader, gsonHash.getClass());
         Map<String, String> finalHashes = gson.fromJson(finalFileReader, gsonHash.getClass());
-        Set<String> impactedTargets = hashingClient.getImpactedTargets(startingHashes, finalHashes, avoidQuery);
         try {
+            Set<String> impactedTargets = hashingClient.getImpactedTargets(startingHashes, finalHashes, avoidQuery);
             FileWriter myWriter = new FileWriter(outputPath);
             myWriter.write(impactedTargets.stream().collect(Collectors.joining(System.lineSeparator())));
             myWriter.close();
         } catch (IOException e) {
             System.out.println("Unable to write to output filepath! Exiting!");
+            return ExitCode.SOFTWARE;
+        } catch (BazelClientException e) {
+            System.out.println(String.format("Failed to run Bazel:\n%s", e));
             return ExitCode.SOFTWARE;
         }
         return ExitCode.OK;

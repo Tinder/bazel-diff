@@ -85,7 +85,7 @@ class BazelClientImpl implements BazelClient {
 
     @Override
     public Set<BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException {
-        return processBazelSourcefileTargets(performBazelQuery("kind('source file', deps(//...))"), true);
+        return processBazelSourcefileTargets(performBazelQuery("kind('source file', deps(//Projects/Tinder/... + //Projects/Modules/...))"), true);
     }
 
     private Set<BazelSourceFileTarget> processBazelSourcefileTargets(List<Build.Target> targets, Boolean readSourcefileTargets) throws IOException, NoSuchAlgorithmException {

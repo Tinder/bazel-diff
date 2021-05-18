@@ -37,7 +37,7 @@ class BazelClientImpl implements BazelClient {
         this.bazelPath = bazelPath;
         this.startupOptions = startupOptions != null ? Arrays.asList(startupOptions.split(" ")): new ArrayList<String>();
         this.commandOptions = commandOptions != null ? Arrays.asList(commandOptions.split(" ")): new ArrayList<String>();
-        this.verbose = verbose;
+        this.verbose = true;
     }
 
     @Override

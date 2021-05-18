@@ -56,7 +56,7 @@ class BazelClientImpl implements BazelClient {
         if (hashAllTargets) {
             query = targetQuery;
         } else {
-            query = String.format("rdeps(//... except '//external:all-targets', %s)", targetQuery);
+            query = String.format("rdeps(//Projects/Tinder/... + //Projects/Modules/..., %s)", targetQuery);
         }
         if (avoidQuery != null) {
             query = String.format("(%s) except (%s)", query, avoidQuery);

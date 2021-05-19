@@ -129,7 +129,7 @@ public class TargetHashingClientImplTests {
         hash2.put("rule1", "differentrule1hash");
         hash2.put("rule2", "rule2hash");
         hash2.put("rule3", "rule3hash");
-        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, null);
+        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, null, false);
         Set<String> expectedSet = new HashSet<>();
         expectedSet.add("rule1");
         expectedSet.add("rule3");
@@ -149,7 +149,46 @@ public class TargetHashingClientImplTests {
         hash2.put("rule1", "differentrule1hash");
         hash2.put("rule2", "rule2hash");
         hash2.put("rule3", "rule3hash");
-        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, "some_query");
+        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, "some_query", false);
+        Set<String> expectedSet = new HashSet<>();
+        expectedSet.add("rule1");
+        assertEquals(expectedSet, impactedTargets);
+    }
+
+    @Test
+    public void getImpactedTargets_withHashAllTargets() throws IOException {
+        when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject())).thenReturn(
+                new HashSet<>(Arrays.asList("rule1"))
+        );
+        TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);
+        Map<String, String> hash1 = new HashMap<>();
+        hash1.put("rule1", "rule1hash");
+        hash1.put("rule2", "rule2hash");
+        Map<String, String> hash2 = new HashMap<>();
+        hash2.put("rule1", "differentrule1hash");
+        hash2.put("rule2", "rule2hash");
+        hash2.put("rule3", "rule3hash");
+        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, null, true);
+        Set<String> expectedSet = new HashSet<>();
+        expectedSet.add("rule1");
+        expectedSet.add("rule3");
+        assertEquals(expectedSet, impactedTargets);
+    }
+
+    @Test
+    public void getImpactedTargets_withHashAllTargets_withAvoidQuery() throws IOException {
+        when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"))).thenReturn(
+                new HashSet<>(Arrays.asList("rule1"))
+        );
+        TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);
+        Map<String, String> hash1 = new HashMap<>();
+        hash1.put("rule1", "rule1hash");
+        hash1.put("rule2", "rule2hash");
+        Map<String, String> hash2 = new HashMap<>();
+        hash2.put("rule1", "differentrule1hash");
+        hash2.put("rule2", "rule2hash");
+        hash2.put("rule3", "rule3hash");
+        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, "some_query", true);
         Set<String> expectedSet = new HashSet<>();
         expectedSet.add("rule1");
         assertEquals(expectedSet, impactedTargets);

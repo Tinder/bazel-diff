@@ -118,7 +118,7 @@ public class TargetHashingClientImplTests {
 
     @Test
     public void getImpactedTargets() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject(), Matchers.eq(false))).thenReturn(
+        when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject())).thenReturn(
                 new HashSet<>(Arrays.asList("rule1", "rule3"))
         );
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);
@@ -138,7 +138,7 @@ public class TargetHashingClientImplTests {
 
     @Test
     public void getImpactedTargets_withAvoidQuery() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"), Matchers.eq(false))).thenReturn(
+        when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"))).thenReturn(
                 new HashSet<>(Arrays.asList("rule1"))
         );
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);
@@ -157,7 +157,7 @@ public class TargetHashingClientImplTests {
 
     @Test
     public void getImpactedTargets_withHashAllTargets() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject(), Matchers.eq(true))).thenReturn(
+        when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject())).thenReturn(
                 new HashSet<>(Arrays.asList("rule1"))
         );
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);
@@ -171,12 +171,13 @@ public class TargetHashingClientImplTests {
         Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, null, true);
         Set<String> expectedSet = new HashSet<>();
         expectedSet.add("rule1");
+        expectedSet.add("rule3");
         assertEquals(expectedSet, impactedTargets);
     }
 
     @Test
     public void getImpactedTargets_withHashAllTargets_withAvoidQuery() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"), Matchers.eq(true))).thenReturn(
+        when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"))).thenReturn(
                 new HashSet<>(Arrays.asList("rule1"))
         );
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock);

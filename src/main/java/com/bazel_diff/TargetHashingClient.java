@@ -46,7 +46,10 @@ class TargetHashingClientImpl implements TargetHashingClient {
                 impactedTargets.add(entry.getKey());
             }
         }
-        return bazelClient.queryForImpactedTargets(impactedTargets, avoidQuery, hashAllTargets);
+        if (hashAllTargets != null && hashAllTargets && avoidQuery == null) {
+            return impactedTargets;
+        }
+        return bazelClient.queryForImpactedTargets(impactedTargets, avoidQuery);
     }
 
     private byte[] createDigestForTarget(

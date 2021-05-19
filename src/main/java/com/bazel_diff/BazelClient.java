@@ -53,7 +53,7 @@ class BazelClientImpl implements BazelClient {
                                             .map(target -> String.format("'%s'", target))
                                             .collect(Collectors.joining(" + "));
         String query = "";
-        if (hashAllTargets) {
+        if (hashAllTargets != null && hashAllTargets) {
             query = targetQuery;
         } else {
             query = String.format("rdeps(//... except '//external:all-targets', %s)", targetQuery);

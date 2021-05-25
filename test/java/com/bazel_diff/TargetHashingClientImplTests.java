@@ -66,7 +66,7 @@ public class TargetHashingClientImplTests {
     @Test
     public void hashAllBazelTargets_ruleTargets_seedFilepaths() throws IOException {
         Set<Path> seedFilepaths = new HashSet<>();
-        seedFilepaths.add(Path.of("somefile.txt"));
+        seedFilepaths.add(Paths.get("somefile.txt"));
         when(filesClientMock.readFile(anyObject())).thenReturn("somecontent".getBytes());
         when(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets);
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
@@ -141,7 +141,7 @@ public class TargetHashingClientImplTests {
     @Test
     public void hashAllBazelTargets_sourceTargets_modifiedSources_seedFilepaths() throws IOException, NoSuchAlgorithmException {
         Set<Path> seedFilepaths = new HashSet<>();
-        seedFilepaths.add(Path.of("somefile.txt"));
+        seedFilepaths.add(Paths.get("somefile.txt"));
         when(filesClientMock.readFile(anyObject())).thenReturn("somecontent".getBytes());
         createSourceTarget("sourceFile1");
         defaultTargets.add(createSourceTarget("sourceFile1"));

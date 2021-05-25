@@ -134,31 +134,39 @@ Writes to the file the modified filepaths between two revisions.
 `generate-hashes` Command
 
 ```terminal
-Usage: bazel-diff generate-hashes [-hV] -b=<bazelPath>
-                                  [-co=<bazelCommandOptions>]
-                                  [-m=<modifiedFilepaths>]
+Usage: bazel-diff generate-hashes [-m=<modifiedFilepaths> | -a] [-hV]
+                                  -b=<bazelPath> [-co=<bazelCommandOptions>]
+                                  [-s=<seedFilepaths>]
                                   [-so=<bazelStartupOptions>]
                                   -w=<workspacePath> <outputPath>
 Writes to a file the SHA256 hashes for each Bazel Target in the provided
 workspace.
-      <outputPath>   The filepath to write the resulting JSON of dictionary
-                       target => SHA-256 values
+      <outputPath>        The filepath to write the resulting JSON of
+                            dictionary target => SHA-256 values
+  -a, --all-sourcefiles   Experimental: Hash all sourcefile targets (instead of
+                            relying on --modifiedFilepaths), Warning:
+                            Performance may degrade from reading all source
+                            files
   -b, --bazelPath=<bazelPath>
-                     Path to Bazel binary
+                          Path to Bazel binary
       -co, --bazelCommandOptions=<bazelCommandOptions>
-                     Additional space separated Bazel command options used when
-                       invoking Bazel
-  -h, --help         Show this help message and exit.
+                          Additional space separated Bazel command options used
+                            when invoking Bazel
+  -h, --help              Show this help message and exit.
   -m, --modifiedFilepaths=<modifiedFilepaths>
-                     The path to a file containing the list of modified
-                       filepaths in the workspace, you can use the
-                       'modified-filepaths' command to get this list
+                          The path to a file containing the list of modified
+                            filepaths in the workspace, you can use the
+                            'modified-filepaths' command to get this list
+  -s, --seed-filepaths=<seedFilepaths>
+                          A text file containing a newline separated list of
+                            filepaths, each of these filepaths will be read and
+                            used as a seed for all targets.
       -so, --bazelStartupOptions=<bazelStartupOptions>
-                     Additional space separated Bazel client startup options
-                       used when invoking Bazel
-  -V, --version      Print version information and exit.
+                          Additional space separated Bazel client startup
+                            options used when invoking Bazel
+  -V, --version           Print version information and exit.
   -w, --workspacePath=<workspacePath>
-                     Path to Bazel workspace directory.
+                          Path to Bazel workspace directory.
 ```
 
 ## Installing

@@ -92,6 +92,9 @@ class GenerateHashes implements Callable<Integer> {
         Boolean hashAllSourcefiles;
     }
 
+    @Option(names = {"-s", "--seed-filepaths"}, description = "A text file containing a newline separated list of filepaths, each of these filepaths will be read and used as a seed for all targets.")
+    File seedFilepaths;
+
     @Parameters(index = "0", description = "The filepath to write the resulting JSON of dictionary target => SHA-256 values")
     File outputPath;
 
@@ -99,10 +102,18 @@ class GenerateHashes implements Callable<Integer> {
     public Integer call() {
         GitClient gitClient = new GitClientImpl(parent.workspacePath);
         BazelClient bazelClient = new BazelClientImpl(parent.workspacePath, parent.bazelPath, parent.bazelStartupOptions, parent.bazelCommandOptions, BazelDiff.isVerbose());
-        TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient);
+        TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient, new FilesClientImp());
         try {
             gitClient.ensureAllChangesAreCommitted();
             Set<Path> modifiedFilepathsSet = new HashSet<>();
+            Set<Path> seedFilepathsSet = new HashSet<>();
+            if (seedFilepaths != null) {
+                FileReader fileReader = new FileReader(seedFilepaths);
+                BufferedReader bufferedReader = new BufferedReader(fileReader);
+                seedFilepathsSet = bufferedReader.lines()
+                                                .map( line -> new File(line).toPath())
+                                                .collect(Collectors.toSet());
+            }
             Map<String, String> hashes = new HashMap<>();
             if (exclusive != null) {
                 if (exclusive.modifiedFilepaths != null) {
@@ -112,12 +123,12 @@ class GenerateHashes implements Callable<Integer> {
                             .lines()
                             .map( line -> new File(line).toPath())
                             .collect(Collectors.toSet());
-                    hashes = hashingClient.hashAllBazelTargets(modifiedFilepathsSet);
+                    hashes = hashingClient.hashAllBazelTargets(modifiedFilepathsSet, seedFilepathsSet);
                 } else if (exclusive.hashAllSourcefiles) {
-                    hashes = hashingClient.hashAllBazelTargetsAndSourcefiles();
+                    hashes = hashingClient.hashAllBazelTargetsAndSourcefiles(seedFilepathsSet);
                 }
             } else {
-                hashes = hashingClient.hashAllBazelTargets(modifiedFilepathsSet);
+                hashes = hashingClient.hashAllBazelTargets(modifiedFilepathsSet, seedFilepathsSet);
             }
             Gson gson = new GsonBuilder().setPrettyPrinting().create();
             FileWriter myWriter = new FileWriter(outputPath);
@@ -182,7 +193,7 @@ class BazelDiff implements Callable<Integer> {
         }
         GitClient gitClient = new GitClientImpl(workspacePath);
         BazelClient bazelClient = new BazelClientImpl(workspacePath, bazelPath, bazelStartupOptions, bazelCommandOptions, BazelDiff.isVerbose());
-        TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient);
+        TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient, new FilesClientImp());
         try {
             gitClient.ensureAllChangesAreCommitted();
         } catch (IOException | InterruptedException e) {

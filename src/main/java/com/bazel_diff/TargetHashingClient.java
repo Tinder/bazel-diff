@@ -12,7 +12,7 @@ import com.google.common.primitives.Bytes;
 interface TargetHashingClient {
     Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths, Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException;
     Map<String, String> hashAllBazelTargetsAndSourcefiles(Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException;
-    Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes, String avoidQuery, Boolean hashAllTargets) throws IOException;
+    Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes, String avoidQuery, String universeQuery, Boolean hashAllTargets) throws IOException;
 }
 
 class TargetHashingClientImpl implements TargetHashingClient {
@@ -41,6 +41,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
         Map<String, String> startHashes,
         Map<String, String> endHashes,
         String avoidQuery,
+        String universeQuery,
         Boolean hashAllTargets)
     throws IOException {
         Set<String> impactedTargets = new HashSet<>();
@@ -53,7 +54,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
         if (hashAllTargets != null && hashAllTargets && avoidQuery == null) {
             return impactedTargets;
         }
-        return bazelClient.queryForImpactedTargets(impactedTargets, avoidQuery);
+        return bazelClient.queryForImpactedTargets(impactedTargets, avoidQuery, universeQuery);
     }
 
     private byte[] createDigestForTarget(

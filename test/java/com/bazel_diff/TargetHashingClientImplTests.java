@@ -163,7 +163,7 @@ public class TargetHashingClientImplTests {
 
     @Test
     public void getImpactedTargets() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject())).thenReturn(
+        when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject(), anyObject())).thenReturn(
                 new HashSet<>(Arrays.asList("rule1", "rule3"))
         );
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
@@ -174,7 +174,7 @@ public class TargetHashingClientImplTests {
         hash2.put("rule1", "differentrule1hash");
         hash2.put("rule2", "rule2hash");
         hash2.put("rule3", "rule3hash");
-        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, null, false);
+        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, null, null, false);
         Set<String> expectedSet = new HashSet<>();
         expectedSet.add("rule1");
         expectedSet.add("rule3");
@@ -183,7 +183,7 @@ public class TargetHashingClientImplTests {
 
     @Test
     public void getImpactedTargets_withAvoidQuery() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"))).thenReturn(
+        when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"), eq("universe_query"))).thenReturn(
                 new HashSet<>(Arrays.asList("rule1"))
         );
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
@@ -194,7 +194,7 @@ public class TargetHashingClientImplTests {
         hash2.put("rule1", "differentrule1hash");
         hash2.put("rule2", "rule2hash");
         hash2.put("rule3", "rule3hash");
-        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, "some_query", false);
+        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, "some_query", "universe_query", false);
         Set<String> expectedSet = new HashSet<>();
         expectedSet.add("rule1");
         assertEquals(expectedSet, impactedTargets);
@@ -202,7 +202,7 @@ public class TargetHashingClientImplTests {
 
     @Test
     public void getImpactedTargets_withHashAllTargets() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject())).thenReturn(
+        when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject(), anyObject())).thenReturn(
                 new HashSet<>(Arrays.asList("rule1"))
         );
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
@@ -213,7 +213,7 @@ public class TargetHashingClientImplTests {
         hash2.put("rule1", "differentrule1hash");
         hash2.put("rule2", "rule2hash");
         hash2.put("rule3", "rule3hash");
-        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, null, true);
+        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, null, null, true);
         Set<String> expectedSet = new HashSet<>();
         expectedSet.add("rule1");
         expectedSet.add("rule3");
@@ -222,7 +222,7 @@ public class TargetHashingClientImplTests {
 
     @Test
     public void getImpactedTargets_withHashAllTargets_withAvoidQuery() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"))).thenReturn(
+        when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"), anyObject())).thenReturn(
                 new HashSet<>(Arrays.asList("rule1"))
         );
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
@@ -233,7 +233,7 @@ public class TargetHashingClientImplTests {
         hash2.put("rule1", "differentrule1hash");
         hash2.put("rule2", "rule2hash");
         hash2.put("rule3", "rule3hash");
-        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, "some_query", true);
+        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, "some_query", null, true);
         Set<String> expectedSet = new HashSet<>();
         expectedSet.add("rule1");
         assertEquals(expectedSet, impactedTargets);

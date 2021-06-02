@@ -153,6 +153,15 @@ class GenerateHashes implements Callable<Integer> {
         versionProvider = VersionProvider.class
 )
 class BazelDiff implements Callable<Integer> {
+    @ArgGroup(exclusive = true)
+    Exclusive exclusive;
+    static class Exclusive {
+        @Option(names = {"-a", "--all-sourcefiles"}, description = "Experimental: Hash all sourcefile targets (instead of relying on --modifiedFilepaths), Warning: Performance may degrade from reading all source files")
+        Boolean hashAllSourcefiles;
+
+        @Option(names = {"-u", "--universeQuery"}, description = "The universe query to use when executing `rdeps()` queries, use this to limit the search scope of impacted targets i.e. ignore external targets and such")
+        String universeRdepsQuery;
+    }
 
     @Option(names = {"-w", "--workspacePath"}, description = "Path to Bazel workspace directory.", scope = ScopeType.INHERIT, required = true)
     Path workspacePath;
@@ -168,9 +177,6 @@ class BazelDiff implements Callable<Integer> {
 
     @Option(names = {"-o", "--output"}, scope = ScopeType.LOCAL, description = "Filepath to write the impacted Bazel targets to, newline separated")
     File outputPath;
-
-    @Option(names = {"-a", "--all-sourcefiles"}, description = "Experimental: Hash all sourcefile targets (instead of relying on --modifiedFilepaths), Warning: Performance may degrade from reading all source files")
-    Boolean hashAllSourcefiles;
 
     @Option(names = {"-aq", "--avoid-query"}, scope = ScopeType.LOCAL, description = "A Bazel query string, any targets that pass this query will be removed from the returned set of targets")
     String avoidQuery;
@@ -221,7 +227,16 @@ class BazelDiff implements Callable<Integer> {
         Map<String, String > gsonHash = new HashMap<>();
         Map<String, String> startingHashes = gson.fromJson(startingFileReader, gsonHash.getClass());
         Map<String, String> finalHashes = gson.fromJson(finalFileReader, gsonHash.getClass());
-        Set<String> impactedTargets = hashingClient.getImpactedTargets(startingHashes, finalHashes, avoidQuery, hashAllSourcefiles);
+        Boolean shouldHashAllSourceFiles = false;
+        String universeQuery = "//...";
+        if (exclusive != null) {
+            if (exclusive.hashAllSourcefiles) {
+                shouldHashAllSourceFiles = exclusive.hashAllSourcefiles;
+            } else {
+                universeQuery = exclusive.universeRdepsQuery;
+            }
+        }
+        Set<String> impactedTargets = hashingClient.getImpactedTargets(startingHashes, finalHashes, avoidQuery, universeQuery, shouldHashAllSourceFiles);
         try {
             FileWriter myWriter = new FileWriter(outputPath);
             myWriter.write(impactedTargets.stream().collect(Collectors.joining(System.lineSeparator())));

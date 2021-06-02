@@ -12,7 +12,7 @@ final_hashes_json="$output_dir/final_hashes.json"
 impacted_targets_path="$output_dir/impacted_targets.txt"
 shared_flags=""
 
-export USE_BAZEL_VERSION=4.0.0
+export USE_BAZEL_VERSION=last_downstream_green
 
 containsElement () {
   local e match="$1"

@@ -230,7 +230,7 @@ class BazelDiff implements Callable<Integer> {
         Boolean shouldHashAllSourceFiles = false;
         String universeQuery = "//...";
         if (exclusive != null) {
-            if (exclusive.hashAllSourcefiles) {
+            if (exclusive.hashAllSourcefiles != null) {
                 shouldHashAllSourceFiles = exclusive.hashAllSourcefiles;
             } else {
                 universeQuery = exclusive.universeRdepsQuery;

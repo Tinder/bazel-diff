@@ -1,0 +1,30 @@
+name: Integration External Target
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  schedule:
+    - cron: "0 */12 * * *"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v1.4.3
+        with:
+          java-version: 1.8
+        id: java
+      - uses: actions/checkout@v2
+        with:
+          repository: tinder-maxwellelliott/bazel-diff-repro-1
+          ref: wip_fix
+          fetch-depth: 0
+      - name: Run External Target Impact test
+        run: ./bazel-diff.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
+      - name: Validate Impacted Targets
+        run: grep -q "//:yo" /tmp/impacted_targets.txt
+

@@ -18,13 +18,6 @@ jobs:
         with:
           java-version: 1.8
         id: java
-      - name: Setup Go environment
-        uses: actions/setup-go@v2
-        with:
-          go-version: ^1.14
-        id: go
-      - name: Setup Bazelisk
-        run: go get github.com/bazelbuild/bazelisk
       - uses: actions/checkout@v2
       - name: Run integration test
         run: ./integration/integration_test.sh -e

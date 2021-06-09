@@ -1,4 +1,4 @@
-name: Integration
+name: Integration External Target
 
 on:
   push:
@@ -19,5 +19,9 @@ jobs:
           java-version: 1.8
         id: java
       - uses: actions/checkout@v2
-      - name: Run integration test
-        run: ./integration/integration_test.sh -e
+        with:
+          repository: tinder-maxwellelliott/bazel-diff-repro-1
+          ref: wip_fix
+          fetch-depth: 0
+      - name: Run External Target Impact test
+        run: ./bazel-diff.sh -e

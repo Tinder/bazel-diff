@@ -24,4 +24,7 @@ jobs:
           ref: wip_fix
           fetch-depth: 0
       - name: Run External Target Impact test
-        run: ./bazel-diff.sh -e
+        run: ./bazel-diff.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
+      - name: Validate Impacted Targets
+        run: grep -q "//:yo" /tmp/impacted_targets.txt
+

@@ -60,27 +60,22 @@ Open `bazel-diff-example.sh` to see how this is implemented. This is purely an e
 
 `bazel-diff` works as follows
 
-* The `modified-filepaths` command is used to fetch the modified filepaths between two Git revisions, we write this list of modified filepaths to a file.
+* The previous revision is checked out, then we run `generate-hashes`. This gives us the hashmap representation for the entire Bazel graph, then we write this JSON to a file.
 
-* The previous revision is checked out, then we run `generate-hashes`. This gives us the hashmap representation for the entire Bazel graph, then we write this JSON to a file. We do not pass `modified-filepaths` here since it is the starting revision.
+* Next we checkout the initial revision, then we run `generate-hashes` and write that JSON to a file. Now we have our final hashmap representation for the Bazel graph.
 
-* Next we checkout the initial revision, then we run `generate-hashes` with the file output of `modified-filepaths` and write that JSON to a file. Now we have our final hashmap representation for the Bazel graph.
-
-* We run `bazel-diff` on the starting and final JSON hash filepaths to get our impacted set of targets. This impacted set of targets is written to a file. You can also pass the `-t` flag to only return tests
+* We run `bazel-diff` on the starting and final JSON hash filepaths to get our impacted set of targets. This impacted set of targets is written to a file.
 
 ## CLI Interface
 
 `bazel-diff` Command
 
 ```terminal
-Usage: bazel-diff [-hV] [-aq=<avoidQuery>] -b=<bazelPath>
-                  [-co=<bazelCommandOptions>] [-fh=<finalHashesJSONPath>]
-                  [-o=<outputPath>] [-sh=<startingHashesJSONPath>]
-                  [-so=<bazelStartupOptions>] -w=<workspacePath> [COMMAND]
+Usage: bazel-diff [-hV] -b=<bazelPath> [-co=<bazelCommandOptions>]
+                  [-fh=<finalHashesJSONPath>] [-o=<outputPath>]
+                  [-sh=<startingHashesJSONPath>] [-so=<bazelStartupOptions>]
+                  -w=<workspacePath> [COMMAND]
 Writes to a file the impacted targets between two Bazel graph JSON files
-      -aq, --avoid-query=<avoidQuery>
-                  A Bazel query string, any targets that pass this query will
-                    be removed from the returned set of targets
   -b, --bazelPath=<bazelPath>
                   Path to Bazel binary
       -co, --bazelCommandOptions=<bazelCommandOptions>
@@ -102,71 +97,39 @@ Writes to a file the impacted targets between two Bazel graph JSON files
   -V, --version   Print version information and exit.
   -w, --workspacePath=<workspacePath>
                   Path to Bazel workspace directory.
-```
-
-`modified-filepaths` Command
-
-```terminal
-Usage: bazel-diff modified-filepaths [-hV] -b=<bazelPath>
-                                     [-co=<bazelCommandOptions>]
-                                     [-so=<bazelStartupOptions>]
-                                     -w=<workspacePath> <startingGitRevision>
-                                     <endingGitRevision> <outputPath>
-Writes to the file the modified filepaths between two revisions.
-      <startingGitRevision> The starting Git revision, e.g. "HEAD^"
-      <endingGitRevision>   The final Git revision, e.g. "HEAD"
-      <outputPath>          Path that the list of modified files will be
-                              written to
-  -b, --bazelPath=<bazelPath>
-                            Path to Bazel binary
-      -co, --bazelCommandOptions=<bazelCommandOptions>
-                            Additional space separated Bazel command options
-                              used when invoking Bazel
-  -h, --help                Show this help message and exit.
-      -so, --bazelStartupOptions=<bazelStartupOptions>
-                            Additional space separated Bazel client startup
-                              options used when invoking Bazel
-  -V, --version             Print version information and exit.
-  -w, --workspacePath=<workspacePath>
-                            Path to Bazel workspace directory.
+Commands:
+  generate-hashes  Writes to a file the SHA256 hashes for each Bazel Target in
+                     the provided workspace.
 ```
 
 `generate-hashes` Command
 
 ```terminal
-Usage: bazel-diff generate-hashes [-m=<modifiedFilepaths> | -a] [-hV]
-                                  -b=<bazelPath> [-co=<bazelCommandOptions>]
+Usage: bazel-diff generate-hashes [-hV] -b=<bazelPath>
+                                  [-co=<bazelCommandOptions>]
                                   [-s=<seedFilepaths>]
                                   [-so=<bazelStartupOptions>]
                                   -w=<workspacePath> <outputPath>
 Writes to a file the SHA256 hashes for each Bazel Target in the provided
 workspace.
-      <outputPath>        The filepath to write the resulting JSON of
-                            dictionary target => SHA-256 values
-  -a, --all-sourcefiles   Experimental: Hash all sourcefile targets (instead of
-                            relying on --modifiedFilepaths), Warning:
-                            Performance may degrade from reading all source
-                            files
+      <outputPath>   The filepath to write the resulting JSON of dictionary
+                       target => SHA-256 values
   -b, --bazelPath=<bazelPath>
-                          Path to Bazel binary
+                     Path to Bazel binary
       -co, --bazelCommandOptions=<bazelCommandOptions>
-                          Additional space separated Bazel command options used
-                            when invoking Bazel
-  -h, --help              Show this help message and exit.
-  -m, --modifiedFilepaths=<modifiedFilepaths>
-                          The path to a file containing the list of modified
-                            filepaths in the workspace, you can use the
-                            'modified-filepaths' command to get this list
+                     Additional space separated Bazel command options used when
+                       invoking Bazel
+  -h, --help         Show this help message and exit.
   -s, --seed-filepaths=<seedFilepaths>
-                          A text file containing a newline separated list of
-                            filepaths, each of these filepaths will be read and
-                            used as a seed for all targets.
+                     A text file containing a newline separated list of
+                       filepaths, each of these filepaths will be read and used
+                       as a seed for all targets.
       -so, --bazelStartupOptions=<bazelStartupOptions>
-                          Additional space separated Bazel client startup
-                            options used when invoking Bazel
-  -V, --version           Print version information and exit.
+                     Additional space separated Bazel client startup options
+                       used when invoking Bazel
+  -V, --version      Print version information and exit.
   -w, --workspacePath=<workspacePath>
-                          Path to Bazel workspace directory.
+                     Path to Bazel workspace directory.
 ```
 
 ## Installing
@@ -204,7 +167,6 @@ now run the tool with
 ```terminal
 bazel run //:bazel-diff
 ```
-
 
 > Note, in releases prior to 2.0.0 the value for the `main_class` attribute is just `BazelDiff`
 

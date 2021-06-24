@@ -20,7 +20,6 @@ import java.util.Arrays;
 
 interface BazelClient {
     List<BazelTarget> queryAllTargets() throws IOException;
-    Set<String> queryForImpactedTargets(Set<String> impactedTargets, String avoidQuery, String universeQuery) throws IOException;
     Set<BazelSourceFileTarget> convertFilepathsToSourceTargets(Set<Path> filepaths) throws IOException, NoSuchAlgorithmException;
     Set<BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException;
 }
@@ -44,25 +43,6 @@ class BazelClientImpl implements BazelClient {
     public List<BazelTarget> queryAllTargets() throws IOException {
         List<Build.Target> targets = performBazelQuery("'//external:all-targets' + '//...:all-targets'");
         return targets.stream().map( target -> new BazelTargetImpl(target)).collect(Collectors.toList());
-    }
-
-    @Override
-    public Set<String> queryForImpactedTargets(Set<String> impactedTargets, String avoidQuery, String universeQuery) throws IOException {
-        Set<String> impactedTargetNames = new HashSet<>();
-        String targetQuery = impactedTargets.stream()
-                                            .map(target -> String.format("'%s'", target))
-                                            .collect(Collectors.joining(" + "));
-        String query = query = String.format("rdeps(%s except '//external:all-targets', %s)", universeQuery, targetQuery);
-        if (avoidQuery != null) {
-            query = String.format("(%s) except (%s)", query, avoidQuery);
-        }
-        List<Build.Target> targets = performBazelQuery(query);
-        for (Build.Target target : targets) {
-            if (target.hasRule()) {
-                impactedTargetNames.add(target.getRule().getName());
-            }
-        }
-        return impactedTargetNames;
     }
 
     @Override

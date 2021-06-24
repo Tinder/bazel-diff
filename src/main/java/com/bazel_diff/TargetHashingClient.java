@@ -10,9 +10,8 @@ import java.util.stream.Collectors;
 import com.google.common.primitives.Bytes;
 
 interface TargetHashingClient {
-    Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths, Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException;
     Map<String, String> hashAllBazelTargetsAndSourcefiles(Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException;
-    Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes, String avoidQuery, String universeQuery, Boolean hashAllTargets) throws IOException;
+    Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes) throws IOException;
 }
 
 class TargetHashingClientImpl implements TargetHashingClient {
@@ -25,12 +24,6 @@ class TargetHashingClientImpl implements TargetHashingClient {
     }
 
     @Override
-    public Map<String, String> hashAllBazelTargets(Set<Path> modifiedFilepaths, Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException {
-        Set<BazelSourceFileTarget> bazelSourcefileTargets = bazelClient.convertFilepathsToSourceTargets(modifiedFilepaths);
-        return hashAllTargets(createSeedForFilepaths(seedFilepaths), bazelSourcefileTargets);
-    }
-
-    @Override
     public Map<String, String> hashAllBazelTargetsAndSourcefiles(Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException {
         Set<BazelSourceFileTarget> bazelSourcefileTargets = bazelClient.queryAllSourcefileTargets();
         return hashAllTargets(createSeedForFilepaths(seedFilepaths), bazelSourcefileTargets);
@@ -39,10 +32,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
     @Override
     public Set<String> getImpactedTargets(
         Map<String, String> startHashes,
-        Map<String, String> endHashes,
-        String avoidQuery,
-        String universeQuery,
-        Boolean hashAllTargets)
+        Map<String, String> endHashes)
     throws IOException {
         Set<String> impactedTargets = new HashSet<>();
         for (Map.Entry<String,String> entry : endHashes.entrySet()) {
@@ -51,10 +41,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
                 impactedTargets.add(entry.getKey());
             }
         }
-        if (hashAllTargets != null && hashAllTargets && avoidQuery == null) {
-            return impactedTargets;
-        }
-        return bazelClient.queryForImpactedTargets(impactedTargets, avoidQuery, universeQuery);
+        return impactedTargets;
     }
 
     private byte[] createDigestForTarget(

@@ -40,7 +40,7 @@ public class TargetHashingClientImplTests {
         when(bazelClientMock.queryAllTargets()).thenReturn(new ArrayList<>());
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
         try {
-            Map<String, String> hash = client.hashAllBazelTargets(new HashSet<>(), new HashSet<>());
+            Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
             assertEquals(hash.size(), 0);
         } catch (IOException e) {
             assertTrue(false);
@@ -54,7 +54,7 @@ public class TargetHashingClientImplTests {
         when(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets);
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
         try {
-            Map<String, String> hash = client.hashAllBazelTargets(new HashSet<>(), new HashSet<>());
+            Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
             assertEquals(2, hash.size());
             assertEquals("2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775", hash.get("rule1"));
             assertEquals("bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9", hash.get("rule2"));
@@ -71,7 +71,7 @@ public class TargetHashingClientImplTests {
         when(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets);
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
         try {
-            Map<String, String> hash = client.hashAllBazelTargets(new HashSet<>(), seedFilepaths);
+            Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(seedFilepaths);
             assertEquals(2, hash.size());
             assertEquals("0404d80eadcc2dbfe9f0d7935086e1115344a06bd76d4e16af0dfd7b4913ee60", hash.get("rule1"));
             assertEquals("6fe63fa16340d18176e6d6021972c65413441b72135247179362763508ebddfe", hash.get("rule2"));
@@ -91,7 +91,7 @@ public class TargetHashingClientImplTests {
         when(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets);
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
         try {
-            Map<String, String> hash = client.hashAllBazelTargets(new HashSet<>(), new HashSet<>());
+            Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
             assertEquals(4, hash.size());
             assertEquals("2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775", hash.get("rule1"));
             assertEquals("bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9", hash.get("rule2"));
@@ -100,143 +100,6 @@ public class TargetHashingClientImplTests {
         } catch (IOException | NoSuchAlgorithmException e) {
             fail(e.getMessage());
         }
-    }
-
-    @Test
-    public void hashAllBazelTargets_sourceTargets_unmodifiedSources() throws IOException {
-        defaultTargets.add(createSourceTarget("sourceFile1"));
-        when(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets);
-        TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
-        try {
-            Map<String, String> hash = client.hashAllBazelTargets(new HashSet<>(), new HashSet());
-            assertEquals(3, hash.size());
-            assertEquals("2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775", hash.get("rule1"));
-            assertEquals("bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9", hash.get("rule2"));
-            assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", hash.get("sourceFile1"));
-        } catch (IOException | NoSuchAlgorithmException e) {
-            fail(e.getMessage());
-        }
-    }
-
-    @Test
-    public void hashAllBazelTargets_sourceTargets_modifiedSources() throws IOException, NoSuchAlgorithmException {
-        createSourceTarget("sourceFile1");
-        defaultTargets.add(createSourceTarget("sourceFile1"));
-        Set<BazelSourceFileTarget> modifiedFileTargets = new HashSet<>();
-        modifiedFileTargets.add(createSourceFileTarget("sourceFile1", "digest"));
-        when(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets);
-        when(bazelClientMock.convertFilepathsToSourceTargets(anySet())).thenReturn(modifiedFileTargets);
-        TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
-        try {
-            Map<String, String> hash = client.hashAllBazelTargets(new HashSet<>(), new HashSet<>());
-            assertEquals(3, hash.size());
-            assertEquals("2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775", hash.get("rule1"));
-            assertEquals("bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9", hash.get("rule2"));
-            assertEquals("0bf474896363505e5ea5e5d6ace8ebfb13a760a409b1fb467d428fc716f9f284", hash.get("sourceFile1"));
-        } catch (IOException | NoSuchAlgorithmException e) {
-            fail(e.getMessage());
-        }
-    }
-
-    @Test
-    public void hashAllBazelTargets_sourceTargets_modifiedSources_seedFilepaths() throws IOException, NoSuchAlgorithmException {
-        Set<Path> seedFilepaths = new HashSet<>();
-        seedFilepaths.add(Paths.get("somefile.txt"));
-        when(filesClientMock.readFile(anyObject())).thenReturn("somecontent".getBytes());
-        createSourceTarget("sourceFile1");
-        defaultTargets.add(createSourceTarget("sourceFile1"));
-        Set<BazelSourceFileTarget> modifiedFileTargets = new HashSet<>();
-        modifiedFileTargets.add(createSourceFileTarget("sourceFile1", "digest"));
-        when(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets);
-        when(bazelClientMock.convertFilepathsToSourceTargets(anySet())).thenReturn(modifiedFileTargets);
-        TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
-        try {
-            Map<String, String> hash = client.hashAllBazelTargets(new HashSet<>(), seedFilepaths);
-            assertEquals(3, hash.size());
-            assertEquals("0404d80eadcc2dbfe9f0d7935086e1115344a06bd76d4e16af0dfd7b4913ee60", hash.get("rule1"));
-            assertEquals("6fe63fa16340d18176e6d6021972c65413441b72135247179362763508ebddfe", hash.get("rule2"));
-            assertEquals("e0c3b2abd374fa00c23696c561b3797038fd8cf05de09377aef6a5dcd7529b13", hash.get("sourceFile1"));
-        } catch (IOException | NoSuchAlgorithmException e) {
-            fail(e.getMessage());
-        }
-    }
-
-    @Test
-    public void getImpactedTargets() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject(), anyObject())).thenReturn(
-                new HashSet<>(Arrays.asList("rule1", "rule3"))
-        );
-        TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
-        Map<String, String> hash1 = new HashMap<>();
-        hash1.put("rule1", "rule1hash");
-        hash1.put("rule2", "rule2hash");
-        Map<String, String> hash2 = new HashMap<>();
-        hash2.put("rule1", "differentrule1hash");
-        hash2.put("rule2", "rule2hash");
-        hash2.put("rule3", "rule3hash");
-        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, null, null, false);
-        Set<String> expectedSet = new HashSet<>();
-        expectedSet.add("rule1");
-        expectedSet.add("rule3");
-        assertEquals(expectedSet, impactedTargets);
-    }
-
-    @Test
-    public void getImpactedTargets_withAvoidQuery() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"), eq("universe_query"))).thenReturn(
-                new HashSet<>(Arrays.asList("rule1"))
-        );
-        TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
-        Map<String, String> hash1 = new HashMap<>();
-        hash1.put("rule1", "rule1hash");
-        hash1.put("rule2", "rule2hash");
-        Map<String, String> hash2 = new HashMap<>();
-        hash2.put("rule1", "differentrule1hash");
-        hash2.put("rule2", "rule2hash");
-        hash2.put("rule3", "rule3hash");
-        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, "some_query", "universe_query", false);
-        Set<String> expectedSet = new HashSet<>();
-        expectedSet.add("rule1");
-        assertEquals(expectedSet, impactedTargets);
-    }
-
-    @Test
-    public void getImpactedTargets_withHashAllTargets() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet(), anyObject(), anyObject())).thenReturn(
-                new HashSet<>(Arrays.asList("rule1"))
-        );
-        TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
-        Map<String, String> hash1 = new HashMap<>();
-        hash1.put("rule1", "rule1hash");
-        hash1.put("rule2", "rule2hash");
-        Map<String, String> hash2 = new HashMap<>();
-        hash2.put("rule1", "differentrule1hash");
-        hash2.put("rule2", "rule2hash");
-        hash2.put("rule3", "rule3hash");
-        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, null, null, true);
-        Set<String> expectedSet = new HashSet<>();
-        expectedSet.add("rule1");
-        expectedSet.add("rule3");
-        assertEquals(expectedSet, impactedTargets);
-    }
-
-    @Test
-    public void getImpactedTargets_withHashAllTargets_withAvoidQuery() throws IOException {
-        when(bazelClientMock.queryForImpactedTargets(anySet(), eq("some_query"), anyObject())).thenReturn(
-                new HashSet<>(Arrays.asList("rule1"))
-        );
-        TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
-        Map<String, String> hash1 = new HashMap<>();
-        hash1.put("rule1", "rule1hash");
-        hash1.put("rule2", "rule2hash");
-        Map<String, String> hash2 = new HashMap<>();
-        hash2.put("rule1", "differentrule1hash");
-        hash2.put("rule2", "rule2hash");
-        hash2.put("rule3", "rule3hash");
-        Set<String> impactedTargets = client.getImpactedTargets(hash1, hash2, "some_query", null, true);
-        Set<String> expectedSet = new HashSet<>();
-        expectedSet.add("rule1");
-        assertEquals(expectedSet, impactedTargets);
     }
 
     private BazelTarget createRuleTarget(String ruleName, List<String> ruleInputs, String ruleDigest) throws NoSuchAlgorithmException {

@@ -89,7 +89,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
             digest.update(ruleInput.getBytes());
             BazelRule inputRule = allRulesMap.get(ruleInput);
             byte[] sourceFileDigest = getDigestForSourceTargetName(ruleInput, bazelSourcefileTargets);
-            if (inputRule != null) {
+            if (inputRule != null && !inputRule.getName().equals(rule.getName())) {
                 byte[] ruleInputHash = createDigestForRule(
                         inputRule,
                         allRulesMap,

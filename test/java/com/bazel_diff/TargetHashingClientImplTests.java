@@ -102,6 +102,26 @@ public class TargetHashingClientImplTests {
         }
     }
 
+    @Test
+    public void hashAllBazelTargets_ruleTargets_ruleInputsWithSelfInput() throws IOException, NoSuchAlgorithmException {
+        List<String> ruleInputs = new ArrayList<>();
+        ruleInputs.add("rule1");
+        ruleInputs.add("rule4");
+        BazelTarget rule3 = createRuleTarget("rule3", ruleInputs, "digest");
+        defaultTargets.add(rule3);
+        BazelTarget rule4 = createRuleTarget("rule4", ruleInputs, "digest2");
+        defaultTargets.add(rule4);
+        when(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets);
+        TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
+        try {
+            Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
+            assertEquals(4, hash.size());
+            assertEquals("bf15e616e870aaacb02493ea0b8e90c6c750c266fa26375e22b30b78954ee523", hash.get("rule4"));
+        } catch (IOException | NoSuchAlgorithmException e) {
+            fail(e.getMessage());
+        }
+    }
+
     private BazelTarget createRuleTarget(String ruleName, List<String> ruleInputs, String ruleDigest) throws NoSuchAlgorithmException {
         BazelTarget target = mock(BazelTarget.class);
         BazelRule rule = mock(BazelRule.class);

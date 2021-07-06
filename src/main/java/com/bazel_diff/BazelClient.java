@@ -99,7 +99,6 @@ class BazelClientImpl implements BazelClient {
         cmd.add("--output");
         cmd.add("streamed_proto");
         cmd.add("--order_output=no");
-        cmd.add("--keep_going");
         cmd.addAll(this.commandOptions);
         cmd.add("--query_file");
         cmd.add(tempFile.toString());

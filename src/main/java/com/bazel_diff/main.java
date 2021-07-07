@@ -38,7 +38,13 @@ class GenerateHashes implements Callable<Integer> {
 
     @Override
     public Integer call() {
-        BazelClient bazelClient = new BazelClientImpl(parent.workspacePath, parent.bazelPath, parent.bazelStartupOptions, parent.bazelCommandOptions, BazelDiff.isVerbose());
+        BazelClient bazelClient = new BazelClientImpl(
+                parent.workspacePath,
+                parent.bazelPath,
+                parent.bazelStartupOptions,
+                parent.bazelCommandOptions,
+                BazelDiff.isVerbose(),
+                parent.keepGoing);
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient, new FilesClientImp());
         try {
             Set<Path> seedFilepathsSet = new HashSet<>();
@@ -92,6 +98,9 @@ class BazelDiff implements Callable<Integer> {
     @Option(names = {"-co", "--bazelCommandOptions"}, description = "Additional space separated Bazel command options used when invoking Bazel", scope = ScopeType.INHERIT)
     String bazelCommandOptions;
 
+    @Option(names = {"-k", "--keep_going"}, negatable = true, description = "This flag controls if `bazel query` will be executed with the `--keep_going` flag or not. Disabling this flag allows you to catch configuration issues in your Bazel graph, but may not work for some Bazel setups. Defaults to `true`")
+    Boolean keepGoing = true;
+
     @Override
     public Integer call() throws IOException {
         if (startingHashesJSONPath == null || !startingHashesJSONPath.canRead()) {
@@ -103,7 +112,14 @@ class BazelDiff implements Callable<Integer> {
             return ExitCode.USAGE;
         }
         GitClient gitClient = new GitClientImpl(workspacePath);
-        BazelClient bazelClient = new BazelClientImpl(workspacePath, bazelPath, bazelStartupOptions, bazelCommandOptions, BazelDiff.isVerbose());
+        BazelClient bazelClient = new BazelClientImpl(
+                workspacePath,
+                bazelPath,
+                bazelStartupOptions,
+                bazelCommandOptions,
+                BazelDiff.isVerbose(),
+                keepGoing
+        );
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient, new FilesClientImp());
         try {
             gitClient.ensureAllChangesAreCommitted();

@@ -20,7 +20,6 @@ import java.util.Arrays;
 
 interface BazelClient {
     List<BazelTarget> queryAllTargets() throws IOException;
-    Set<BazelSourceFileTarget> convertFilepathsToSourceTargets(Set<Path> filepaths) throws IOException, NoSuchAlgorithmException;
     Set<BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException;
 }
 
@@ -28,34 +27,30 @@ class BazelClientImpl implements BazelClient {
     private Path workingDirectory;
     private Path bazelPath;
     private Boolean verbose;
+    private Boolean keepGoing;
     private List<String> startupOptions;
     private List<String> commandOptions;
 
-    BazelClientImpl(Path workingDirectory, Path bazelPath, String startupOptions, String commandOptions, Boolean verbose) {
+    BazelClientImpl(
+            Path workingDirectory,
+            Path bazelPath,
+            String startupOptions,
+            String commandOptions,
+            Boolean verbose,
+            Boolean keepGoing
+    ) {
         this.workingDirectory = workingDirectory.normalize();
         this.bazelPath = bazelPath;
         this.startupOptions = startupOptions != null ? Arrays.asList(startupOptions.split(" ")): new ArrayList<String>();
         this.commandOptions = commandOptions != null ? Arrays.asList(commandOptions.split(" ")): new ArrayList<String>();
         this.verbose = verbose;
+        this.keepGoing = keepGoing;
     }
 
     @Override
     public List<BazelTarget> queryAllTargets() throws IOException {
         List<Build.Target> targets = performBazelQuery("'//external:all-targets' + '//...:all-targets'");
         return targets.stream().map( target -> new BazelTargetImpl(target)).collect(Collectors.toList());
-    }
-
-    @Override
-    public Set<BazelSourceFileTarget> convertFilepathsToSourceTargets(Set<Path> filepaths) throws IOException, NoSuchAlgorithmException {
-        Set<BazelSourceFileTarget> sourceTargets = new HashSet<>();
-        for (List<Path> partition : Iterables.partition(filepaths, 100)) {
-            String targetQuery = partition
-                    .stream()
-                    .map(path -> String.format("'%s'", path.toString()))
-                    .collect(Collectors.joining(" + "));
-            sourceTargets.addAll(processBazelSourcefileTargets(performBazelQuery(targetQuery), false));
-        }
-        return sourceTargets;
     }
 
     @Override
@@ -99,7 +94,9 @@ class BazelClientImpl implements BazelClient {
         cmd.add("--output");
         cmd.add("streamed_proto");
         cmd.add("--order_output=no");
-        cmd.add("--keep_going");
+        if (keepGoing != null && keepGoing) {
+            cmd.add("--keep_going");
+        }
         cmd.addAll(this.commandOptions);
         cmd.add("--query_file");
         cmd.add(tempFile.toString());

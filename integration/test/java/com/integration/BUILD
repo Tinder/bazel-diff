@@ -9,8 +9,9 @@ java_test(
 java_library(
     name = "bazel-diff-integration-test-lib",
     srcs = glob(["*.java"]),
+    testonly = True,
     deps = [
-        "//src/main/java/com/integration:bazel-diff-integration-lib",
+        "//integration/src/main/java/com/integration:bazel-diff-integration-lib",
         "@bazel_diff_maven//:junit_junit"
     ]
 )

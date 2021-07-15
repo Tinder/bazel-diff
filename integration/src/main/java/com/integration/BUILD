@@ -4,7 +4,7 @@ java_library(
     name = "bazel-diff-integration-lib",
     srcs = glob(["*.java"]),
     deps = [
-        "//src/main/java/com/integration/submodule:Submodule"
+        "//integration/src/main/java/com/integration/submodule:Submodule"
     ],
     visibility = ["//visibility:public"]
 )

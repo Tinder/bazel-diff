@@ -98,7 +98,7 @@ class BazelDiff implements Callable<Integer> {
     @Option(names = {"-co", "--bazelCommandOptions"}, description = "Additional space separated Bazel command options used when invoking Bazel", scope = ScopeType.INHERIT)
     String bazelCommandOptions;
 
-    @Option(names = {"-k", "--keep_going"}, negatable = true, description = "This flag controls if `bazel query` will be executed with the `--keep_going` flag or not. Disabling this flag allows you to catch configuration issues in your Bazel graph, but may not work for some Bazel setups. Defaults to `true`")
+    @Option(names = {"-k", "--keep_going"}, negatable = true, description = "This flag controls if `bazel query` will be executed with the `--keep_going` flag or not. Disabling this flag allows you to catch configuration issues in your Bazel graph, but may not work for some Bazel setups. Defaults to `true`", scope = ScopeType.INHERIT)
     Boolean keepGoing = true;
 
     @Override

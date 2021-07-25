@@ -71,65 +71,74 @@ Open `bazel-diff-example.sh` to see how this is implemented. This is purely an e
 `bazel-diff` Command
 
 ```terminal
-Usage: bazel-diff [-hV] -b=<bazelPath> [-co=<bazelCommandOptions>]
+Usage: bazel-diff [-hkV] -b=<bazelPath> [-co=<bazelCommandOptions>]
                   [-fh=<finalHashesJSONPath>] [-o=<outputPath>]
                   [-sh=<startingHashesJSONPath>] [-so=<bazelStartupOptions>]
                   -w=<workspacePath> [COMMAND]
 Writes to a file the impacted targets between two Bazel graph JSON files
   -b, --bazelPath=<bazelPath>
-                  Path to Bazel binary
+                          Path to Bazel binary
       -co, --bazelCommandOptions=<bazelCommandOptions>
-                  Additional space separated Bazel command options used when
-                    invoking Bazel
+                          Additional space separated Bazel command options used
+                            when invoking Bazel
       -fh, --finalHashes=<finalHashesJSONPath>
-                  The path to the JSON file of target hashes for the final
-                    revision. Run 'generate-hashes' to get this value.
-  -h, --help      Show this help message and exit.
+                          The path to the JSON file of target hashes for the
+                            final revision. Run 'generate-hashes' to get this
+                            value.
+  -h, --help              Show this help message and exit.
+  -k, --[no-]keep_going   This flag controls if `bazel query` will be executed
+                            with the `--keep_going` flag or not. Disabling this
+                            flag allows you to catch configuration issues in
+                            your Bazel graph, but may not work for some Bazel
+                            setups. Defaults to `true`
   -o, --output=<outputPath>
-                  Filepath to write the impacted Bazel targets to, newline
-                    separated
+                          Filepath to write the impacted Bazel targets to,
+                            newline separated
       -sh, --startingHashes=<startingHashesJSONPath>
-                  The path to the JSON file of target hashes for the initial
-                    revision. Run 'generate-hashes' to get this value.
+                          The path to the JSON file of target hashes for the
+                            initial revision. Run 'generate-hashes' to get this
+                            value.
       -so, --bazelStartupOptions=<bazelStartupOptions>
-                  Additional space separated Bazel client startup options used
-                    when invoking Bazel
-  -V, --version   Print version information and exit.
+                          Additional space separated Bazel client startup
+                            options used when invoking Bazel
+  -V, --version           Print version information and exit.
   -w, --workspacePath=<workspacePath>
-                  Path to Bazel workspace directory.
-Commands:
-  generate-hashes  Writes to a file the SHA256 hashes for each Bazel Target in
-                     the provided workspace.
+                          Path to Bazel workspace directory.
 ```
 
 `generate-hashes` Command
 
 ```terminal
-Usage: bazel-diff generate-hashes [-hV] -b=<bazelPath>
+Usage: bazel-diff generate-hashes [-hkV] -b=<bazelPath>
                                   [-co=<bazelCommandOptions>]
                                   [-s=<seedFilepaths>]
                                   [-so=<bazelStartupOptions>]
                                   -w=<workspacePath> <outputPath>
 Writes to a file the SHA256 hashes for each Bazel Target in the provided
 workspace.
-      <outputPath>   The filepath to write the resulting JSON of dictionary
-                       target => SHA-256 values
+      <outputPath>        The filepath to write the resulting JSON of
+                            dictionary target => SHA-256 values
   -b, --bazelPath=<bazelPath>
-                     Path to Bazel binary
+                          Path to Bazel binary
       -co, --bazelCommandOptions=<bazelCommandOptions>
-                     Additional space separated Bazel command options used when
-                       invoking Bazel
-  -h, --help         Show this help message and exit.
+                          Additional space separated Bazel command options used
+                            when invoking Bazel
+  -h, --help              Show this help message and exit.
+  -k, --[no-]keep_going   This flag controls if `bazel query` will be executed
+                            with the `--keep_going` flag or not. Disabling this
+                            flag allows you to catch configuration issues in
+                            your Bazel graph, but may not work for some Bazel
+                            setups. Defaults to `true`
   -s, --seed-filepaths=<seedFilepaths>
-                     A text file containing a newline separated list of
-                       filepaths, each of these filepaths will be read and used
-                       as a seed for all targets.
+                          A text file containing a newline separated list of
+                            filepaths, each of these filepaths will be read and
+                            used as a seed for all targets.
       -so, --bazelStartupOptions=<bazelStartupOptions>
-                     Additional space separated Bazel client startup options
-                       used when invoking Bazel
-  -V, --version      Print version information and exit.
+                          Additional space separated Bazel client startup
+                            options used when invoking Bazel
+  -V, --version           Print version information and exit.
   -w, --workspacePath=<workspacePath>
-                     Path to Bazel workspace directory.
+                          Path to Bazel workspace directory.
 ```
 
 ## Installing

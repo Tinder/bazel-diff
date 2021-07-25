@@ -12,15 +12,15 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.Arrays;
 
 interface BazelClient {
     List<BazelTarget> queryAllTargets() throws IOException;
-    Set<BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException;
+    Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException;
 }
 
 class BazelClientImpl implements BazelClient {
@@ -54,12 +54,12 @@ class BazelClientImpl implements BazelClient {
     }
 
     @Override
-    public Set<BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException {
+    public Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException {
         return processBazelSourcefileTargets(performBazelQuery("kind('source file', deps(//...))"), true);
     }
 
-    private Set<BazelSourceFileTarget> processBazelSourcefileTargets(List<Build.Target> targets, Boolean readSourcefileTargets) throws IOException, NoSuchAlgorithmException {
-        Set<BazelSourceFileTarget> sourceTargets = new HashSet<>();
+    private Map<String, BazelSourceFileTarget> processBazelSourcefileTargets(List<Build.Target> targets, Boolean readSourcefileTargets) throws IOException, NoSuchAlgorithmException {
+        Map<String, BazelSourceFileTarget> sourceTargets = new HashMap<>();
         for (Build.Target target : targets) {
             Build.SourceFile sourceFile = target.getSourceFile();
             if (sourceFile != null) {
@@ -73,7 +73,7 @@ class BazelClientImpl implements BazelClient {
                         digest.digest().clone(),
                         readSourcefileTargets ? workingDirectory : null
                 );
-                sourceTargets.add(sourceFileTarget);
+                sourceTargets.put(sourceFileTarget.getName(), sourceFileTarget);
             }
         }
         return sourceTargets;

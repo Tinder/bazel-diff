@@ -7,6 +7,9 @@ interface BazelTarget {
     BazelRule getRule();
     boolean hasSourceFile();
     String getSourceFileName();
+    boolean hasGeneratedFile();
+    String getGeneratedFileName();
+    String getGeneratingRuleName();
 }
 
 class BazelTargetImpl implements BazelTarget {
@@ -38,6 +41,27 @@ class BazelTargetImpl implements BazelTarget {
     public String getSourceFileName() {
         if (this.hasSourceFile()) {
             return this.target.getSourceFile().getName();
+        }
+        return null;
+    }
+
+    @Override
+    public boolean hasGeneratedFile() {
+        return target.hasGeneratedFile();
+    }
+
+    @Override
+    public String getGeneratedFileName() {
+        if (this.hasGeneratedFile()) {
+            return this.target.getGeneratedFile().getName();
+        }
+        return null;
+    }
+
+    @Override
+    public String getGeneratingRuleName() {
+        if (this.hasGeneratedFile()) {
+            return this.target.getGeneratedFile().getGeneratingRule();
         }
         return null;
     }

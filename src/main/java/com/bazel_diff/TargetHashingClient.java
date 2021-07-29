@@ -51,7 +51,6 @@ class TargetHashingClientImpl implements TargetHashingClient {
             Map<String, byte[]> ruleHashes,
             byte[] seedHash
     ) throws NoSuchAlgorithmException {
-        BazelRule targetRule = target.getRule();
         if (target.hasSourceFile()) {
             String sourceFileName = getNameForTarget(target);
             if (sourceFileName != null) {
@@ -66,6 +65,14 @@ class TargetHashingClientImpl implements TargetHashingClient {
                 return digest.digest().clone();
             }
         }
+        if (target.hasGeneratedFile()){
+            byte[] generatingRuleDigest = ruleHashes.get(target.getGeneratingRuleName());
+            if(generatingRuleDigest == null) {
+                return createDigestForRule(allRulesMap.get(target.getGeneratingRuleName()), allRulesMap, ruleHashes, bazelSourcefileTargets, seedHash);
+            }
+            return ruleHashes.get(target.getGeneratingRuleName()).clone();
+        }
+        BazelRule targetRule = target.getRule();
         return createDigestForRule(targetRule, allRulesMap, ruleHashes, bazelSourcefileTargets, seedHash);
     }
 
@@ -143,6 +150,9 @@ class TargetHashingClientImpl implements TargetHashingClient {
         if (target.hasSourceFile()) {
             return target.getSourceFileName();
         }
+        if (target.hasGeneratedFile()) {
+            return target.getGeneratedFileName();
+        }
         return null;
     }
 
@@ -153,10 +163,15 @@ class TargetHashingClientImpl implements TargetHashingClient {
         Map<String, BazelRule> allRulesMap = new HashMap<>();
         for (BazelTarget target : allTargets) {
             String targetName = getNameForTarget(target);
-            if (targetName == null || !target.hasRule()) {
+            if (targetName == null) {
                 continue;
             }
-            allRulesMap.put(targetName, target.getRule());
+            if(target.hasGeneratedFile()) {
+                allRulesMap.put(targetName, allRulesMap.get(target.getGeneratingRuleName()));
+            }
+            if(target.hasRule()) {
+                allRulesMap.put(targetName, target.getRule());
+            }
         }
         for (BazelTarget target : allTargets) {
             String targetName = getNameForTarget(target);

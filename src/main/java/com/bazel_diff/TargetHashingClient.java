@@ -67,7 +67,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
         }
         if (target.hasGeneratedFile()){
             byte[] generatingRuleDigest = ruleHashes.get(target.getGeneratingRuleName());
-            if(generatingRuleDigest == null) {
+            if (generatingRuleDigest == null) {
                 return createDigestForRule(allRulesMap.get(target.getGeneratingRuleName()), allRulesMap, ruleHashes, bazelSourcefileTargets, seedHash);
             }
             return ruleHashes.get(target.getGeneratingRuleName()).clone();

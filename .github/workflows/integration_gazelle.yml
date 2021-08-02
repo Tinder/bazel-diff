@@ -1,4 +1,4 @@
-name: Integration External Target
+name: Integration Gazelle Target
 
 on:
   push:
@@ -18,11 +18,11 @@ jobs:
         id: java
       - uses: actions/checkout@v2
         with:
-          repository: tinder-maxwellelliott/bazel-diff-repro-1
-          ref: wip_fix
+          repository: tinder-maxwellelliott/bazel-diff-problem
+          ref: add_bazel_diff
           fetch-depth: 0
       - name: Run External Target Impact test
-        run: ./bazel-diff.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
+        run: ./bazel-diff-example.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
       - name: Validate Impacted Targets
-        run: grep -q "//:yo" /tmp/impacted_targets.txt
+        run: "[ -s /tmp/impacted_targets.txt ] && exit 1 || exit 0"
 

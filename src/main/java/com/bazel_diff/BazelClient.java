@@ -104,11 +104,35 @@ class BazelClientImpl implements BazelClient {
         ProcessBuilder pb = new ProcessBuilder(cmd).directory(workingDirectory.toFile());
         Process process = pb.start();
         ArrayList<Build.Target> targets = new ArrayList<>();
+        
+        // Prevent process hang in the case where bazel writes to stderr.
+        // See https://stackoverflow.com/questions/3285408/java-processbuilder-resultant-process-hangs
+        BufferedReader stdError = new BufferedReader(new InputStreamReader(process.getErrorStream()));
+        Thread tStdError = new Thread(new Runnable() {
+            String line = null;
+            public void run() {
+                try {
+                    while ((line = stdError.readLine()) != null) {
+                        if (verbose) {
+                            System.out.println(line);
+                        }
+
+                        if(Thread.currentThread().isInterrupted()) {
+                            return;
+                        }
+                    }
+                } catch(IOException e) {}
+            }
+        });
+        tStdError.start();
+        
         while (true) {
             Build.Target target = Build.Target.parseDelimitedFrom(process.getInputStream());
             if (target == null) break;  // EOF
             targets.add(target);
         }
+        
+        tStdError.interrupt();        
 
         Files.delete(tempFile);
 

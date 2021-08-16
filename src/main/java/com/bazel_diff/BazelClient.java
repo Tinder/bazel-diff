@@ -2,8 +2,6 @@ package com.bazel_diff;
 
 import com.google.devtools.build.lib.query2.proto.proto2api.Build;
 
-import com.google.common.collect.Iterables;
-
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.io.IOException;
@@ -19,8 +17,16 @@ import java.util.stream.Collectors;
 import java.util.Arrays;
 
 interface BazelClient {
-    List<BazelTarget> queryAllTargets() throws IOException;
-    Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException;
+    List<BazelTarget> queryAllTargets() throws IOException, BazelClientQueryError, InterruptedException;
+    Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException, BazelClientQueryError, InterruptedException;
+}
+
+class BazelClientQueryError extends Exception
+{
+    BazelClientQueryError(int exitCode, String stdError)
+    {
+        super(String.format("exitCode %d, stdError: %s", exitCode, stdError));
+    }
 }
 
 class BazelClientImpl implements BazelClient {
@@ -48,13 +54,13 @@ class BazelClientImpl implements BazelClient {
     }
 
     @Override
-    public List<BazelTarget> queryAllTargets() throws IOException {
+    public List<BazelTarget> queryAllTargets() throws IOException, BazelClientQueryError, InterruptedException {
         List<Build.Target> targets = performBazelQuery("'//external:all-targets' + '//...:all-targets'");
         return targets.stream().map( target -> new BazelTargetImpl(target)).collect(Collectors.toList());
     }
 
     @Override
-    public Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException {
+    public Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException, BazelClientQueryError, InterruptedException {
         return processBazelSourcefileTargets(performBazelQuery("kind('source file', deps(//...))"), true);
     }
 
@@ -79,9 +85,11 @@ class BazelClientImpl implements BazelClient {
         return sourceTargets;
     }
 
-    private List<Build.Target> performBazelQuery(String query) throws IOException {
+    private List<Build.Target> performBazelQuery(String query) throws IOException, BazelClientQueryError, InterruptedException {
         Path tempFile = Files.createTempFile(null, ".txt");
         Files.write(tempFile, query.getBytes(StandardCharsets.UTF_8));
+
+        int[] allowedExitCodes = {0};
 
         List<String> cmd = new ArrayList<String>();
         cmd.add((bazelPath.toString()));
@@ -95,6 +103,10 @@ class BazelClientImpl implements BazelClient {
         cmd.add("streamed_proto");
         cmd.add("--order_output=no");
         if (keepGoing != null && keepGoing) {
+            // Exit Code 3 is used to express that the query
+            // would have failed without the --keep_going flag
+            // therefore we must allow this code
+            allowedExitCodes = new int[]{0, 3};
             cmd.add("--keep_going");
         }
         cmd.addAll(this.commandOptions);
@@ -104,7 +116,7 @@ class BazelClientImpl implements BazelClient {
         ProcessBuilder pb = new ProcessBuilder(cmd).directory(workingDirectory.toFile());
         Process process = pb.start();
         ArrayList<Build.Target> targets = new ArrayList<>();
-        
+
         // Prevent process hang in the case where bazel writes to stderr.
         // See https://stackoverflow.com/questions/3285408/java-processbuilder-resultant-process-hangs
         BufferedReader stdError = new BufferedReader(new InputStreamReader(process.getErrorStream()));
@@ -125,16 +137,24 @@ class BazelClientImpl implements BazelClient {
             }
         });
         tStdError.start();
-        
+
         while (true) {
             Build.Target target = Build.Target.parseDelimitedFrom(process.getInputStream());
             if (target == null) break;  // EOF
             targets.add(target);
         }
-        
-        tStdError.interrupt();        
+
+        tStdError.interrupt();
 
         Files.delete(tempFile);
+
+        int exitValue = process.waitFor();
+
+        if (Arrays.stream(allowedExitCodes).noneMatch(value -> exitValue == value)) {
+            throw new BazelClientQueryError(
+                    exitValue,
+                    stdError.lines().collect(Collectors.joining(System.lineSeparator())));
+        }
 
         return targets;
     }

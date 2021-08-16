@@ -36,7 +36,7 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void hashAllBazelTargets_noTargets() throws IOException {
+    public void hashAllBazelTargets_noTargets() throws IOException, BazelClientQueryError, InterruptedException {
         when(bazelClientMock.queryAllTargets()).thenReturn(new ArrayList<>());
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
         try {
@@ -50,7 +50,7 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void hashAllBazelTargets_ruleTargets() throws IOException {
+    public void hashAllBazelTargets_ruleTargets() throws IOException, BazelClientQueryError, InterruptedException {
         when(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets);
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
         try {
@@ -64,7 +64,7 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void hashAllBazelTargets_ruleTargets_seedFilepaths() throws IOException {
+    public void hashAllBazelTargets_ruleTargets_seedFilepaths() throws IOException, BazelClientQueryError, InterruptedException {
         Set<Path> seedFilepaths = new HashSet<>();
         seedFilepaths.add(Paths.get("somefile.txt"));
         when(filesClientMock.readFile(anyObject())).thenReturn("somecontent".getBytes());
@@ -81,7 +81,7 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void hashAllBazelTargets_ruleTargets_ruleInputs() throws IOException, NoSuchAlgorithmException {
+    public void hashAllBazelTargets_ruleTargets_ruleInputs() throws IOException, NoSuchAlgorithmException, BazelClientQueryError, InterruptedException {
         List<String> ruleInputs = new ArrayList<>();
         ruleInputs.add("rule1");
         BazelTarget rule3 = createRuleTarget("rule3", ruleInputs, "digest");
@@ -103,7 +103,7 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void hashAllBazelTargets_ruleTargets_ruleInputsWithSelfInput() throws IOException, NoSuchAlgorithmException {
+    public void hashAllBazelTargets_ruleTargets_ruleInputsWithSelfInput() throws IOException, NoSuchAlgorithmException, BazelClientQueryError, InterruptedException {
         List<String> ruleInputs = new ArrayList<>();
         ruleInputs.add("rule1");
         ruleInputs.add("rule4");

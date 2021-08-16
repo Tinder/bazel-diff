@@ -10,7 +10,7 @@ import java.util.stream.Collectors;
 import com.google.common.primitives.Bytes;
 
 interface TargetHashingClient {
-    Map<String, String> hashAllBazelTargetsAndSourcefiles(Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException;
+    Map<String, String> hashAllBazelTargetsAndSourcefiles(Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException, BazelClientQueryError, InterruptedException;
     Set<String> getImpactedTargets(Map<String, String> startHashes, Map<String, String> endHashes) throws IOException;
 }
 
@@ -24,7 +24,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
     }
 
     @Override
-    public Map<String, String> hashAllBazelTargetsAndSourcefiles(Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException {
+    public Map<String, String> hashAllBazelTargetsAndSourcefiles(Set<Path> seedFilepaths) throws IOException, NoSuchAlgorithmException, BazelClientQueryError, InterruptedException {
         Map<String, BazelSourceFileTarget> bazelSourcefileTargets = bazelClient.queryAllSourcefileTargets();
         return hashAllTargets(createSeedForFilepaths(seedFilepaths), bazelSourcefileTargets);
     }
@@ -156,7 +156,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
         return null;
     }
 
-    private Map<String, String> hashAllTargets(byte[] seedHash, Map<String, BazelSourceFileTarget> bazelSourcefileTargets) throws IOException, NoSuchAlgorithmException {
+    private Map<String, String> hashAllTargets(byte[] seedHash, Map<String, BazelSourceFileTarget> bazelSourcefileTargets) throws IOException, NoSuchAlgorithmException, BazelClientQueryError, InterruptedException {
         List<BazelTarget> allTargets = bazelClient.queryAllTargets();
         Map<String, String> targetHashes = new HashMap<>();
         Map<String, byte[]> ruleHashes = new HashMap<>();

@@ -61,8 +61,12 @@ class GenerateHashes implements Callable<Integer> {
             myWriter.write(gson.toJson(hashes));
             myWriter.close();
             return ExitCode.OK;
-        } catch (IOException | NoSuchAlgorithmException e) {
+        } catch (IOException | InterruptedException | NoSuchAlgorithmException e) {
             e.printStackTrace();
+            return ExitCode.SOFTWARE;
+        } catch (BazelClientQueryError e) {
+            System.out.println("Invalid Bazel Query:");
+            System.out.println(e.getMessage());
             return ExitCode.SOFTWARE;
         }
     }

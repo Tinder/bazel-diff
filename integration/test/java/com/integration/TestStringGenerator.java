@@ -1,4 +1,8 @@
+package integration.test.java.com.integration;
+
 import static org.junit.Assert.*;
+
+import integration.src.main.java.com.integration.StringGenerator;
 import org.junit.Test;
 
 public class TestStringGenerator {

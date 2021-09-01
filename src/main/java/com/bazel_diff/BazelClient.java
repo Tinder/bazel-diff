@@ -55,7 +55,7 @@ class BazelClientImpl implements BazelClient {
 
     @Override
     public Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException {
-        return processBazelSourcefileTargets(performBazelQuery("kind('source file', deps(//...))"), true);
+        return processBazelSourcefileTargets(performBazelQuery("kind('source file', //...:all-targets)"), true);
     }
 
     private Map<String, BazelSourceFileTarget> processBazelSourcefileTargets(List<Build.Target> targets, Boolean readSourcefileTargets) throws IOException, NoSuchAlgorithmException {

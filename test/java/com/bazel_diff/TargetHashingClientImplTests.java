@@ -122,6 +122,40 @@ public class TargetHashingClientImplTests {
         }
     }
 
+    @Test
+    public void HashAllBazelTargets_generatedTargets() throws IOException, NoSuchAlgorithmException {
+        BazelTarget generator = createRuleTarget("rule1", new ArrayList<String>(), "rule1Digest");
+        BazelTarget target = createGeneratedTarget("rule0", "rule1");
+
+        List<String> ruleInputs = new ArrayList<>();
+        ruleInputs.add("rule0");
+        BazelTarget rule3 = createRuleTarget("rule3", ruleInputs, "digest");
+
+        String oldHash = "";
+        String newHash = "";
+
+        when(bazelClientMock.queryAllTargets()).thenReturn(Arrays.asList(rule3, target, generator));
+        TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
+        try {
+            Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
+            assertEquals(3, hash.size());
+            oldHash = hash.get("rule3");
+        } catch (IOException | NoSuchAlgorithmException e) {
+            fail(e.getMessage());
+        }
+
+        when(generator.getRule().getDigest()).thenReturn("newDigest".getBytes());
+        try {
+            Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
+            assertEquals(3, hash.size());
+            newHash = hash.get("rule3");
+        } catch (IOException | NoSuchAlgorithmException e) {
+            fail(e.getMessage());
+        }
+
+        assertNotEquals(oldHash, newHash);
+    }
+
     private BazelTarget createRuleTarget(String ruleName, List<String> ruleInputs, String ruleDigest) throws NoSuchAlgorithmException {
         BazelTarget target = mock(BazelTarget.class);
         BazelRule rule = mock(BazelRule.class);
@@ -147,6 +181,16 @@ public class TargetHashingClientImplTests {
         BazelSourceFileTarget target = mock(BazelSourceFileTarget.class);
         when(target.getName()).thenReturn(name);
         when(target.getDigest()).thenReturn(digest.getBytes());
+        return target;
+    }
+
+    private BazelTarget createGeneratedTarget(String name, String generatingRuleName) throws NoSuchAlgorithmException {
+        BazelTarget target = mock(BazelTarget.class);
+        when(target.hasRule()).thenReturn(false);
+        when(target.hasSourceFile()).thenReturn(false);
+        when(target.hasGeneratedFile()).thenReturn(true);
+        when(target.getGeneratedFileName()).thenReturn(name);
+        when(target.getGeneratingRuleName()).thenReturn(generatingRuleName);
         return target;
     }
 }

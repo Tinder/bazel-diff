@@ -55,7 +55,7 @@ class BazelClientImpl implements BazelClient {
 
     @Override
     public Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException {
-        return processBazelSourcefileTargets(performBazelQuery("kind('source file', deps(//...))"), true);
+        return processBazelSourcefileTargets(performBazelQuery("kind('source file', //...:all-targets)"), true);
     }
 
     private Map<String, BazelSourceFileTarget> processBazelSourcefileTargets(List<Build.Target> targets, Boolean readSourcefileTargets) throws IOException, NoSuchAlgorithmException {
@@ -102,9 +102,10 @@ class BazelClientImpl implements BazelClient {
         cmd.add(tempFile.toString());
 
         ProcessBuilder pb = new ProcessBuilder(cmd).directory(workingDirectory.toFile());
+        pb.redirectError(ProcessBuilder.Redirect.INHERIT);
         Process process = pb.start();
         ArrayList<Build.Target> targets = new ArrayList<>();
-        
+
         // Prevent process hang in the case where bazel writes to stderr.
         // See https://stackoverflow.com/questions/3285408/java-processbuilder-resultant-process-hangs
         BufferedReader stdError = new BufferedReader(new InputStreamReader(process.getErrorStream()));
@@ -125,14 +126,14 @@ class BazelClientImpl implements BazelClient {
             }
         });
         tStdError.start();
-        
+
         while (true) {
             Build.Target target = Build.Target.parseDelimitedFrom(process.getInputStream());
             if (target == null) break;  // EOF
             targets.add(target);
         }
-        
-        tStdError.interrupt();        
+
+        tStdError.interrupt();
 
         Files.delete(tempFile);
 

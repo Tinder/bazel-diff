@@ -166,16 +166,13 @@ class TargetHashingClientImpl implements TargetHashingClient {
             if (targetName == null) {
                 continue;
             }
+            if(target.hasGeneratedFile()) {
+                allRulesMap.put(targetName, allRulesMap.get(target.getGeneratingRuleName()));
+            }
             if(target.hasRule()) {
                 allRulesMap.put(targetName, target.getRule());
             }
         }
-        for (BazelTarget target: allTargets) {
-            if(target.hasGeneratedFile()) {
-                allRulesMap.put(getNameForTarget(target), allRulesMap.get(target.getGeneratingRuleName()));
-            }
-        }
-
         for (BazelTarget target : allTargets) {
             String targetName = getNameForTarget(target);
             if (targetName == null) {

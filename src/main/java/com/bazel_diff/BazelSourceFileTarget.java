@@ -10,7 +10,7 @@ import java.io.IOException;
 
 interface BazelSourceFileTarget {
     String getName();
-    byte[] getDigest() throws NoSuchAlgorithmException;
+    byte[] getDigest();
 }
 
 class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
@@ -18,8 +18,9 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
     private String name;
     private byte[] digest;
 
-    BazelSourceFileTargetImpl(String name, byte[] digest, Path workingDirectory) throws IOException {
+    BazelSourceFileTargetImpl(String name, byte[] digest, Path workingDirectory) throws IOException, NoSuchAlgorithmException {
         this.name = name;
+        byte[] data = null;
         if (workingDirectory != null && name.startsWith("//")) {
             String filenameSubstring = name.substring(2);
             String filenamePath = filenameSubstring.replaceFirst(":", "/");
@@ -28,12 +29,18 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
                 ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
                 outputStream.write(Files.readAllBytes(sourceFile.toPath()));
                 outputStream.write(digest);
-                this.digest = outputStream.toByteArray();
+                data = outputStream.toByteArray();
                 outputStream.close();
             }
         } else {
-            this.digest = digest;
+            data = digest;
         }
+        MessageDigest finalDigest = MessageDigest.getInstance("SHA-256");
+        if (data != null) {
+            finalDigest.update(data);
+        }
+        finalDigest.update(name.getBytes());
+        this.digest = finalDigest.digest();
     }
 
     @Override
@@ -42,12 +49,7 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
     }
 
     @Override
-    public byte[] getDigest() throws NoSuchAlgorithmException {
-        MessageDigest finalDigest = MessageDigest.getInstance("SHA-256");
-        if (digest != null) {
-            finalDigest.update(digest);
-        }
-        finalDigest.update(name.getBytes());
-        return finalDigest.digest();
+    public byte[] getDigest() {
+        return this.digest;
     }
 }

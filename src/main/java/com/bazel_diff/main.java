@@ -111,6 +111,10 @@ class BazelDiff implements Callable<Integer> {
             System.out.println("finalHashesJSONPath does not exist! Exiting");
             return ExitCode.USAGE;
         }
+        if (outputPath == null) {
+            System.out.println("outputPath was not provided! Exiting");
+            return ExitCode.USAGE;
+        }
         GitClient gitClient = new GitClientImpl(workspacePath);
         BazelClient bazelClient = new BazelClientImpl(
                 workspacePath,

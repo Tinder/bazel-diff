@@ -189,9 +189,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
                     seedHash
             );
             if (targetDigest != null) {
-                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-                outputStream.write(targetDigest);
-                targetHashes.put(targetName, convertByteArrayToString(outputStream.toByteArray()));
+                targetHashes.put(targetName, convertByteArrayToString(targetDigest));
             }
         }
         return targetHashes;

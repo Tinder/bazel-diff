@@ -35,7 +35,7 @@ class GenerateHashes implements Callable<Integer> {
     @Option(names = {"-s", "--seed-filepaths"}, description = "A text file containing a newline separated list of filepaths, each of these filepaths will be read and used as a seed for all targets.")
     File seedFilepaths;
 
-    @Option(names = {"--display-elapsed-time"}, description = "This flag controls whether to print out elapsed time for bazel query and content hashing")
+    @Option(names = {"--displayElapsedTime"}, description = "This flag controls whether to print out elapsed time for bazel query and content hashing")
     boolean displayElapsedTime;
 
     @Parameters(index = "0", description = "The filepath to write the resulting JSON of dictionary target => SHA-256 values")

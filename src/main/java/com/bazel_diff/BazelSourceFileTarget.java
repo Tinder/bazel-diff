@@ -2,11 +2,12 @@ package com.bazel_diff;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.nio.file.Path;
+import java.io.FileInputStream;
+import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.io.IOException;
 
 interface BazelSourceFileTarget {
     String getName();
@@ -14,31 +15,28 @@ interface BazelSourceFileTarget {
 }
 
 class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
-
     private String name;
     private byte[] digest;
 
-    BazelSourceFileTargetImpl(String name, byte[] digest, Path workingDirectory) throws IOException, NoSuchAlgorithmException {
+    BazelSourceFileTargetImpl(String name, byte[] digest, Path workingDirectory)
+        throws IOException, NoSuchAlgorithmException {
         this.name = name;
-        byte[] data = null;
+        MessageDigest finalDigest = MessageDigest.getInstance("SHA-256");
         if (workingDirectory != null && name.startsWith("//")) {
             String filenameSubstring = name.substring(2);
             String filenamePath = filenameSubstring.replaceFirst(":", "/");
             File sourceFile = new File(workingDirectory.toString(), filenamePath);
             if (sourceFile.isFile() && sourceFile.canRead()) {
-                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-                outputStream.write(Files.readAllBytes(sourceFile.toPath()));
-                outputStream.write(digest);
-                data = outputStream.toByteArray();
-                outputStream.close();
+                byte[] buffer = new byte[16384];
+                FileInputStream in = new FileInputStream(sourceFile);
+                int rc = in.read(buffer);
+                while (rc != -1) {
+                    finalDigest.update(buffer, 0, rc);
+                    rc = in.read(buffer);
+                }
             }
-        } else {
-            data = digest;
         }
-        MessageDigest finalDigest = MessageDigest.getInstance("SHA-256");
-        if (data != null) {
-            finalDigest.update(data);
-        }
+        finalDigest.update(digest);
         finalDigest.update(name.getBytes());
         this.digest = finalDigest.digest();
     }

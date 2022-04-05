@@ -10,6 +10,8 @@ import com.google.gson.*;
 import java.io.*;
 import java.nio.file.Path;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -33,6 +35,9 @@ class GenerateHashes implements Callable<Integer> {
     @Option(names = {"-s", "--seed-filepaths"}, description = "A text file containing a newline separated list of filepaths, each of these filepaths will be read and used as a seed for all targets.")
     File seedFilepaths;
 
+    @Option(names = {"--display-elapsed-time"}, description = "This flag controls whether to print out elapsed time for bazel query and content hashing")
+    boolean displayElapsedTime;
+
     @Parameters(index = "0", description = "The filepath to write the resulting JSON of dictionary target => SHA-256 values")
     File outputPath;
 
@@ -44,9 +49,11 @@ class GenerateHashes implements Callable<Integer> {
                 parent.bazelStartupOptions,
                 parent.bazelCommandOptions,
                 BazelDiff.isVerbose(),
-                parent.keepGoing);
+                parent.keepGoing,
+                displayElapsedTime);
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient, new FilesClientImp());
         try {
+            Instant generateHashStartTime = Instant.now();
             Set<Path> seedFilepathsSet = new HashSet<>();
             if (seedFilepaths != null) {
                 FileReader fileReader = new FileReader(seedFilepaths);
@@ -60,6 +67,11 @@ class GenerateHashes implements Callable<Integer> {
             FileWriter myWriter = new FileWriter(outputPath);
             myWriter.write(gson.toJson(hashes));
             myWriter.close();
+            Instant generateHashEndTime = Instant.now();
+            if (displayElapsedTime) {
+                long generateHashSeconds = Duration.between(generateHashStartTime, generateHashEndTime).toSeconds();
+                System.out.printf("generate-hashes command finishes in %d seconds%n", generateHashSeconds);
+            }
             return ExitCode.OK;
         } catch (IOException | NoSuchAlgorithmException e) {
             e.printStackTrace();
@@ -121,7 +133,8 @@ class BazelDiff implements Callable<Integer> {
                 bazelStartupOptions,
                 bazelCommandOptions,
                 BazelDiff.isVerbose(),
-                keepGoing
+                keepGoing,
+                false
         );
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient, new FilesClientImp());
         Gson gson = new Gson();

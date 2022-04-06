@@ -19,10 +19,10 @@ jobs:
       - name: Setup Go environment
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.14
+          go-version: ^1.17
         id: go
       - name: Setup Bazelisk
-        run: go get github.com/bazelbuild/bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v2
       - name: Run bazel-diff tests
         run: USE_BAZEL_VERSION=last_downstream_green ~/go/bin/bazelisk test //test/...

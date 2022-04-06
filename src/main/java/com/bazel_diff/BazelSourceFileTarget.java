@@ -27,7 +27,7 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
             try (RandomAccessFile sourceFile = new RandomAccessFile(absoluteFilePath, "r")) {
                 FileChannel inChannel = sourceFile.getChannel();
                 long fileSize = inChannel.size();
-                ByteBuffer buffer = ByteBuffer.allocate((int) fileSize + digest.length + 1);
+                ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
                 inChannel.read(buffer);
                 buffer.flip();
                 inChannel.close();

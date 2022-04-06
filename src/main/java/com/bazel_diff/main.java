@@ -115,7 +115,6 @@ class BazelDiff implements Callable<Integer> {
             System.out.println("outputPath was not provided! Exiting");
             return ExitCode.USAGE;
         }
-        GitClient gitClient = new GitClientImpl(workspacePath);
         BazelClient bazelClient = new BazelClientImpl(
                 workspacePath,
                 bazelPath,
@@ -125,15 +124,6 @@ class BazelDiff implements Callable<Integer> {
                 keepGoing
         );
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient, new FilesClientImp());
-        try {
-            gitClient.ensureAllChangesAreCommitted();
-        } catch (IOException | InterruptedException e) {
-            e.printStackTrace();
-            return ExitCode.SOFTWARE;
-        } catch (GitClientException e) {
-            System.out.println(String.format("There are active changes in '%s', please commit these changes before running bazel-diffs", workspacePath));
-            return ExitCode.USAGE;
-        }
         Gson gson = new Gson();
         FileReader startingFileReader;
         FileReader finalFileReader;

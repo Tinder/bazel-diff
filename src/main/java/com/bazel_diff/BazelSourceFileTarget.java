@@ -5,6 +5,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.io.IOException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
@@ -14,7 +15,6 @@ interface BazelSourceFileTarget {
 }
 
 class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
-
     private String name;
     private byte[] digest;
 
@@ -36,7 +36,8 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
         finalDigest.update(buffer);
     }
 
-    BazelSourceFileTargetImpl(String name, byte[] digest, Path workingDirectory) throws IOException, NoSuchAlgorithmException {
+    BazelSourceFileTargetImpl(String name, byte[] digest, Path workingDirectory)
+        throws IOException, NoSuchAlgorithmException {
         this.name = name;
         MessageDigest finalDigest = MessageDigest.getInstance("SHA-256");
         if (workingDirectory != null && name.startsWith("//")) {
@@ -50,13 +51,11 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
                 } else {
                     digestSmallFile(finalDigest, inChannel);
                 }
-                inChannel.close();
                 sourceFile.close();
-                finalDigest.update(digest);
+                inChannel.close();
             } catch (FileNotFoundException e) {}
-        } else if (digest != null ) {
-            finalDigest.update(digest);
         }
+        finalDigest.update(digest);
         finalDigest.update(name.getBytes());
         this.digest = finalDigest.digest();
     }

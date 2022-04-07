@@ -59,7 +59,7 @@ class BazelClientImpl implements BazelClient {
         Instant queryEndTime = Instant.now();
         if (displayElapsedTime) {
             long querySeconds = Duration.between(queryStartTime, queryEndTime).getSeconds();
-            System.out.printf("all targets queried in %d seconds%n", querySeconds);
+            System.out.printf("BazelDiff: All targets queried in %d seconds%n", querySeconds);
         }
         return targets.stream().map( target -> new BazelTargetImpl(target)).collect(Collectors.toList());
     }
@@ -74,8 +74,8 @@ class BazelClientImpl implements BazelClient {
         if (displayElapsedTime) {
             long querySeconds = Duration.between(queryStartTime, queryEndTime).getSeconds();
             long contentHashSeconds = Duration.between(queryEndTime, contentHashEndTime).getSeconds();
-            System.out.printf("all source files queried in %d seconds%n", querySeconds);
-            System.out.printf("content hash calculated in %d seconds%n", contentHashSeconds);
+            System.out.printf("BazelDiff: All source files queried in %d seconds%n", querySeconds);
+            System.out.printf("BazelDiff: Content hash calculated in %d seconds%n", contentHashSeconds);
         }
         return sourceFileTargets;
     }

@@ -70,7 +70,7 @@ class GenerateHashes implements Callable<Integer> {
             Instant generateHashEndTime = Instant.now();
             if (displayElapsedTime) {
                 long generateHashSeconds = Duration.between(generateHashStartTime, generateHashEndTime).getSeconds();
-                System.out.printf("generate-hashes command finishes in %d seconds%n", generateHashSeconds);
+                System.out.printf("BazelDiff: Generate-hashes command finishes in %d seconds%n", generateHashSeconds);
             }
             return ExitCode.OK;
         } catch (IOException | NoSuchAlgorithmException e) {

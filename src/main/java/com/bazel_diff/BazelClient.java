@@ -2,8 +2,6 @@ package com.bazel_diff;
 
 import com.google.devtools.build.lib.query2.proto.proto2api.Build;
 
-import com.google.common.collect.Iterables;
-
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.io.IOException;

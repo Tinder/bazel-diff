@@ -18,6 +18,24 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
     private String name;
     private byte[] digest;
 
+    private void digestLargeFile(MessageDigest finalDigest, FileChannel inChannel) throws IOException {
+        int bufferSize = 10240; // 10kb
+        ByteBuffer buffer = ByteBuffer.allocate(bufferSize);
+        while (inChannel.read(buffer) != -1) {
+            buffer.flip();
+            finalDigest.update(buffer);
+            buffer.clear();
+        }
+    }
+
+    private void digestSmallFile(MessageDigest finalDigest, FileChannel inChannel) throws IOException {
+        long fileSize = inChannel.size();
+        ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
+        inChannel.read(buffer);
+        buffer.flip();
+        finalDigest.update(buffer);
+    }
+
     BazelSourceFileTargetImpl(String name, byte[] digest, Path workingDirectory) throws IOException, NoSuchAlgorithmException {
         this.name = name;
         MessageDigest finalDigest = MessageDigest.getInstance("SHA-256");
@@ -27,13 +45,13 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
             Path absoluteFilePath = Paths.get(workingDirectory.toString(), filenamePath);
             try (RandomAccessFile sourceFile = new RandomAccessFile(absoluteFilePath.toString(), "r")) {
                 FileChannel inChannel = sourceFile.getChannel();
-                long fileSize = inChannel.size();
-                ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
-                inChannel.read(buffer);
-                buffer.flip();
+                if (inChannel.size() > 1048576) { // 1mb
+                    digestLargeFile(finalDigest, inChannel);
+                } else {
+                    digestSmallFile(finalDigest, inChannel);
+                }
                 inChannel.close();
                 sourceFile.close();
-                finalDigest.update(buffer);
                 finalDigest.update(digest);
             } catch (FileNotFoundException e) {}
         } else if (digest != null ) {

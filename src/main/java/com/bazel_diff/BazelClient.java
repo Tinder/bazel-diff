@@ -69,7 +69,8 @@ class BazelClientImpl implements BazelClient {
                 BazelSourceFileTargetImpl sourceFileTarget = new BazelSourceFileTargetImpl(
                         sourceFile.getName(),
                         digest.digest().clone(),
-                        readSourcefileTargets ? workingDirectory : null
+                        readSourcefileTargets ? workingDirectory : null,
+                        verbose
                 );
                 sourceTargets.put(sourceFileTarget.getName(), sourceFileTarget);
             }

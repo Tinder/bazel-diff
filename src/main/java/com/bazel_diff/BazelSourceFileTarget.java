@@ -36,7 +36,7 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
         finalDigest.update(buffer);
     }
 
-    BazelSourceFileTargetImpl(String name, byte[] digest, Path workingDirectory)
+    BazelSourceFileTargetImpl(String name, byte[] digest, Path workingDirectory, Boolean verbose)
         throws IOException, NoSuchAlgorithmException {
         this.name = name;
         MessageDigest finalDigest = MessageDigest.getInstance("SHA-256");
@@ -53,7 +53,11 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
                 }
                 sourceFile.close();
                 inChannel.close();
-            } catch (FileNotFoundException e) {}
+            } catch (FileNotFoundException e) {
+                if (verbose) {
+                    System.out.printf("BazelDiff: [Warning] file %s not found%n", absoluteFilePath);
+                }
+            }
         }
         finalDigest.update(digest);
         finalDigest.update(name.getBytes());

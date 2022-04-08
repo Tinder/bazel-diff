@@ -139,6 +139,8 @@ workspace.
   -V, --version           Print version information and exit.
   -w, --workspacePath=<workspacePath>
                           Path to Bazel workspace directory.
+  --displayElapsedTime    This flag controls whether to print out elapsed time
+                          for bazel query and content hashing
 ```
 
 ## Installing

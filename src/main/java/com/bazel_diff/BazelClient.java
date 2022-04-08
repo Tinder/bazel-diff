@@ -11,6 +11,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -28,6 +30,7 @@ class BazelClientImpl implements BazelClient {
     private Path bazelPath;
     private Boolean verbose;
     private Boolean keepGoing;
+    private Boolean displayElapsedTime;
     private List<String> startupOptions;
     private List<String> commandOptions;
 
@@ -37,7 +40,8 @@ class BazelClientImpl implements BazelClient {
             String startupOptions,
             String commandOptions,
             Boolean verbose,
-            Boolean keepGoing
+            Boolean keepGoing,
+            Boolean displayElapsedTime
     ) {
         this.workingDirectory = workingDirectory.normalize();
         this.bazelPath = bazelPath;
@@ -45,17 +49,35 @@ class BazelClientImpl implements BazelClient {
         this.commandOptions = commandOptions != null ? Arrays.asList(commandOptions.split(" ")): new ArrayList<String>();
         this.verbose = verbose;
         this.keepGoing = keepGoing;
+        this.displayElapsedTime = displayElapsedTime;
     }
 
     @Override
     public List<BazelTarget> queryAllTargets() throws IOException {
+        Instant queryStartTime = Instant.now();
         List<Build.Target> targets = performBazelQuery("'//external:all-targets' + '//...:all-targets'");
+        Instant queryEndTime = Instant.now();
+        if (displayElapsedTime) {
+            long querySeconds = Duration.between(queryStartTime, queryEndTime).getSeconds();
+            System.out.printf("BazelDiff: All targets queried in %d seconds%n", querySeconds);
+        }
         return targets.stream().map( target -> new BazelTargetImpl(target)).collect(Collectors.toList());
     }
 
     @Override
     public Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException {
-        return processBazelSourcefileTargets(performBazelQuery("kind('source file', //...:all-targets)"), true);
+        Instant queryStartTime = Instant.now();
+        List<Build.Target> targets = performBazelQuery("kind('source file', //...:all-targets)");
+        Instant queryEndTime = Instant.now();
+        Map<String, BazelSourceFileTarget> sourceFileTargets = processBazelSourcefileTargets(targets, true);
+        Instant contentHashEndTime = Instant.now();
+        if (displayElapsedTime) {
+            long querySeconds = Duration.between(queryStartTime, queryEndTime).getSeconds();
+            long contentHashSeconds = Duration.between(queryEndTime, contentHashEndTime).getSeconds();
+            System.out.printf("BazelDiff: All source files queried in %d seconds%n", querySeconds);
+            System.out.printf("BazelDiff: Content hash calculated in %d seconds%n", contentHashSeconds);
+        }
+        return sourceFileTargets;
     }
 
     private Map<String, BazelSourceFileTarget> processBazelSourcefileTargets(List<Build.Target> targets, Boolean readSourcefileTargets) throws IOException, NoSuchAlgorithmException {

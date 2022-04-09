@@ -110,7 +110,7 @@ class BazelDiff implements Callable<Integer> {
     Boolean keepGoing = true;
 
     @Option(names = {"-v", "--verbose"}, description = "Display query string, missing files and elapsed time", scope = ScopeType.INHERIT)
-    Boolean verbose;
+    Boolean verbose = false;
 
     @Override
     public Integer call() throws IOException {

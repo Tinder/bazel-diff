@@ -35,9 +35,6 @@ class GenerateHashes implements Callable<Integer> {
     @Option(names = {"-s", "--seed-filepaths"}, description = "A text file containing a newline separated list of filepaths, each of these filepaths will be read and used as a seed for all targets.")
     File seedFilepaths;
 
-    @Option(names = {"--displayElapsedTime"}, description = "This flag controls whether to print out elapsed time for bazel query and content hashing")
-    boolean displayElapsedTime;
-
     @Parameters(index = "0", description = "The filepath to write the resulting JSON of dictionary target => SHA-256 values")
     File outputPath;
 
@@ -48,9 +45,8 @@ class GenerateHashes implements Callable<Integer> {
                 parent.bazelPath,
                 parent.bazelStartupOptions,
                 parent.bazelCommandOptions,
-                BazelDiff.isVerbose(),
-                parent.keepGoing,
-                displayElapsedTime);
+                parent.isVerbose(),
+                parent.keepGoing);
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient, new FilesClientImp());
         try {
             Instant generateHashStartTime = Instant.now();
@@ -68,7 +64,7 @@ class GenerateHashes implements Callable<Integer> {
             myWriter.write(gson.toJson(hashes));
             myWriter.close();
             Instant generateHashEndTime = Instant.now();
-            if (displayElapsedTime) {
+            if (parent.isVerbose()) {
                 long generateHashSeconds = Duration.between(generateHashStartTime, generateHashEndTime).getSeconds();
                 System.out.printf("BazelDiff: Generate-hashes command finishes in %d seconds%n", generateHashSeconds);
             }
@@ -113,6 +109,9 @@ class BazelDiff implements Callable<Integer> {
     @Option(names = {"-k", "--keep_going"}, negatable = true, description = "This flag controls if `bazel query` will be executed with the `--keep_going` flag or not. Disabling this flag allows you to catch configuration issues in your Bazel graph, but may not work for some Bazel setups. Defaults to `true`", scope = ScopeType.INHERIT)
     Boolean keepGoing = true;
 
+    @Option(names = {"-v", "--verbose"}, description = "Display query string, missing files and elapsed time", scope = ScopeType.INHERIT)
+    Boolean verbose;
+
     @Override
     public Integer call() throws IOException {
         if (startingHashesJSONPath == null || !startingHashesJSONPath.canRead()) {
@@ -132,9 +131,8 @@ class BazelDiff implements Callable<Integer> {
                 bazelPath,
                 bazelStartupOptions,
                 bazelCommandOptions,
-                BazelDiff.isVerbose(),
-                keepGoing,
-                false
+                isVerbose(),
+                keepGoing
         );
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient, new FilesClientImp());
         Gson gson = new Gson();
@@ -167,9 +165,9 @@ class BazelDiff implements Callable<Integer> {
         return ExitCode.OK;
     }
 
-    static Boolean isVerbose() {
+    Boolean isVerbose() {
         String verboseFlag = System.getProperty("VERBOSE", "false");
-        return verboseFlag.equals("true");
+        return verboseFlag.equals("true") || verbose;
     }
 
     public static void main(String[] args) {

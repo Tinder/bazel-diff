@@ -28,7 +28,6 @@ class BazelClientImpl implements BazelClient {
     private Path bazelPath;
     private Boolean verbose;
     private Boolean keepGoing;
-    private Boolean displayElapsedTime;
     private List<String> startupOptions;
     private List<String> commandOptions;
 
@@ -38,8 +37,7 @@ class BazelClientImpl implements BazelClient {
             String startupOptions,
             String commandOptions,
             Boolean verbose,
-            Boolean keepGoing,
-            Boolean displayElapsedTime
+            Boolean keepGoing
     ) {
         this.workingDirectory = workingDirectory.normalize();
         this.bazelPath = bazelPath;
@@ -47,7 +45,6 @@ class BazelClientImpl implements BazelClient {
         this.commandOptions = commandOptions != null ? Arrays.asList(commandOptions.split(" ")): new ArrayList<String>();
         this.verbose = verbose;
         this.keepGoing = keepGoing;
-        this.displayElapsedTime = displayElapsedTime;
     }
 
     @Override
@@ -55,7 +52,7 @@ class BazelClientImpl implements BazelClient {
         Instant queryStartTime = Instant.now();
         List<Build.Target> targets = performBazelQuery("'//external:all-targets' + '//...:all-targets'");
         Instant queryEndTime = Instant.now();
-        if (displayElapsedTime) {
+        if (verbose) {
             long querySeconds = Duration.between(queryStartTime, queryEndTime).getSeconds();
             System.out.printf("BazelDiff: All targets queried in %d seconds%n", querySeconds);
         }
@@ -69,7 +66,7 @@ class BazelClientImpl implements BazelClient {
         Instant queryEndTime = Instant.now();
         Map<String, BazelSourceFileTarget> sourceFileTargets = processBazelSourcefileTargets(targets, true);
         Instant contentHashEndTime = Instant.now();
-        if (displayElapsedTime) {
+        if (verbose) {
             long querySeconds = Duration.between(queryStartTime, queryEndTime).getSeconds();
             long contentHashSeconds = Duration.between(queryEndTime, contentHashEndTime).getSeconds();
             System.out.printf("BazelDiff: All source files queried in %d seconds%n", querySeconds);

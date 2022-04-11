@@ -108,7 +108,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
                 if (ruleInputHash != null) {
                     digest.update(ruleInputHash);
                 }
-            } else
+            } else {
                 byte[] sourceFileDigest = getDigestForSourceTargetName(ruleInput, bazelSourcefileTargets);
                 if (sourceFileDigest != null) {
                     digest.update(sourceFileDigest);

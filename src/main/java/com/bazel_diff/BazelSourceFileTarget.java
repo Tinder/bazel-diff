@@ -1,6 +1,7 @@
 package com.bazel_diff;
 
 import java.io.*;
+import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
@@ -22,7 +23,7 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
         int bufferSize = 10240; // 10kb
         ByteBuffer buffer = ByteBuffer.allocate(bufferSize);
         while (inChannel.read(buffer) != -1) {
-            buffer.flip();
+            ((Buffer)buffer).flip();
             finalDigest.update(buffer);
             buffer.clear();
         }
@@ -32,7 +33,7 @@ class BazelSourceFileTargetImpl implements BazelSourceFileTarget {
         long fileSize = inChannel.size();
         ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
         inChannel.read(buffer);
-        buffer.flip();
+        ((Buffer)buffer).flip();
         finalDigest.update(buffer);
     }
 

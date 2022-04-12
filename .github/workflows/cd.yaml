@@ -1,0 +1,35 @@
+name: CD
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  BuildJAR:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java: [ '8' ]
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.java }}
+        id: java
+      - name: Setup Go environment
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.17
+        id: go
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+      - uses: actions/checkout@v2
+      - name: Build deployable JAR
+        run: USE_BAZEL_VERSION=last_downstream_green ~/go/bin/bazelisk bazelisk build //src/main/java/com/bazel_diff:bazel-diff_deploy.jar
+      - uses: actions/upload-artifact@v3
+        with:
+          name: bazel-diff_deploy.jar
+          path: bazel-bin/src/main/java/com/bazel_diff/bazel-diff_deploy.jar

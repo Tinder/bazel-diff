@@ -9,7 +9,7 @@ on:
     - cron: "0 */12 * * *"
 
 jobs:
-  build:
+  Integration:
     runs-on: ubuntu-latest
     strategy:
       matrix:

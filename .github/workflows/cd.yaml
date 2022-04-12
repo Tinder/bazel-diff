@@ -33,3 +33,4 @@ jobs:
         with:
           name: bazel-diff_deploy.jar
           path: bazel-bin/src/main/java/com/bazel_diff/bazel-diff_deploy.jar
+          if-no-files-found: error

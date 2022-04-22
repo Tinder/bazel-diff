@@ -42,10 +42,8 @@ public class TargetHashingClientImplTests {
         try {
             Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
             assertEquals(hash.size(), 0);
-        } catch (IOException e) {
-            assertTrue(false);
-        } catch (NoSuchAlgorithmException e) {
-            assertTrue(false);
+        } catch (Exception e) {
+            fail(e.getMessage());
         }
     }
 
@@ -58,7 +56,7 @@ public class TargetHashingClientImplTests {
             assertEquals(2, hash.size());
             assertEquals("2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775", hash.get("rule1"));
             assertEquals("bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9", hash.get("rule2"));
-        } catch (IOException | NoSuchAlgorithmException e) {
+        } catch (Exception e) {
             fail(e.getMessage());
         }
     }
@@ -75,7 +73,7 @@ public class TargetHashingClientImplTests {
             assertEquals(2, hash.size());
             assertEquals("0404d80eadcc2dbfe9f0d7935086e1115344a06bd76d4e16af0dfd7b4913ee60", hash.get("rule1"));
             assertEquals("6fe63fa16340d18176e6d6021972c65413441b72135247179362763508ebddfe", hash.get("rule2"));
-        } catch (IOException | NoSuchAlgorithmException e) {
+        } catch (Exception e) {
             fail(e.getMessage());
         }
     }
@@ -97,7 +95,7 @@ public class TargetHashingClientImplTests {
             assertEquals("bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9", hash.get("rule2"));
             assertEquals("87dd050f1ca0f684f37970092ff6a02677d995718b5a05461706c0f41ffd4915", hash.get("rule3"));
             assertEquals("a7bc5d23cd98c4942dc879c649eb9646e38eddd773f9c7996fa0d96048cf63dc", hash.get("rule4"));
-        } catch (IOException | NoSuchAlgorithmException e) {
+        } catch (Exception e) {
             fail(e.getMessage());
         }
     }
@@ -117,7 +115,7 @@ public class TargetHashingClientImplTests {
             Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
             assertEquals(4, hash.size());
             assertEquals("bf15e616e870aaacb02493ea0b8e90c6c750c266fa26375e22b30b78954ee523", hash.get("rule4"));
-        } catch (IOException | NoSuchAlgorithmException e) {
+        } catch (Exception e) {
             fail(e.getMessage());
         }
     }
@@ -140,7 +138,7 @@ public class TargetHashingClientImplTests {
             Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
             assertEquals(3, hash.size());
             oldHash = hash.get("rule3");
-        } catch (IOException | NoSuchAlgorithmException e) {
+        } catch (Exception e) {
             fail(e.getMessage());
         }
 
@@ -149,11 +147,30 @@ public class TargetHashingClientImplTests {
             Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
             assertEquals(3, hash.size());
             newHash = hash.get("rule3");
-        } catch (IOException | NoSuchAlgorithmException e) {
+        } catch (Exception e) {
             fail(e.getMessage());
         }
 
         assertNotEquals(oldHash, newHash);
+    }
+
+    @Test
+    public void TestImpactedTargets() {
+        TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
+        try {
+            Map<String, String> start = new HashMap<>();
+            start.put("1", "a");
+            start.put("2", "b");
+            Map<String, String> end = new HashMap<>();
+            end.put("1", "c");
+            end.put("2", "b");
+            end.put("3", "d");
+            Set<String> impacted = client.getImpactedTargets(start, end);
+            assertEquals(2, impacted.size());
+            assertArrayEquals(new String[] {"1", "3"}, impacted.toArray());
+        } catch (Exception e) {
+            fail(e.getMessage());
+        }
     }
 
     private BazelTarget createRuleTarget(String ruleName, List<String> ruleInputs, String ruleDigest) throws NoSuchAlgorithmException {

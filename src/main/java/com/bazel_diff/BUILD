@@ -27,7 +27,8 @@ java_library(
         "@com_google_protobuf//:protobuf_java",
         "@bazel_diff_maven//:info_picocli_picocli",
         "@bazel_diff_maven//:com_google_code_gson_gson",
-        "@bazel_diff_maven//:com_google_guava_guava"
+        "@bazel_diff_maven//:com_google_guava_guava",
+        "@bazel_diff_maven//:org_apache_commons_commons_pool2"
     ],
     javacopts = select({
         ":enable_verbose": ["-AVERBOSE=true"],

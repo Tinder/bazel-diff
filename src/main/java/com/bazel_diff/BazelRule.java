@@ -1,13 +1,14 @@
 package com.bazel_diff;
 
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.List;
+
+import com.google.common.hash.Hasher;
+import com.google.common.hash.Hashing;
 import com.google.devtools.build.lib.query2.proto.proto2api.Build;
 import java.util.stream.Collectors;
 
 interface BazelRule {
-    byte[] getDigest() throws NoSuchAlgorithmException;
+    byte[] getDigest();
     List<String> getRuleInputList();
     String getName();
 }
@@ -20,15 +21,15 @@ class BazelRuleImpl implements BazelRule {
     }
 
     @Override
-    public byte[] getDigest() throws NoSuchAlgorithmException {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        digest.update(rule.getRuleClassBytes().toByteArray());
-        digest.update(rule.getNameBytes().toByteArray());
-        digest.update(rule.getSkylarkEnvironmentHashCodeBytes().toByteArray());
+    public byte[] getDigest() {
+        Hasher hasher = Hashing.sha256().newHasher();
+        hasher.putBytes(rule.getRuleClassBytes().toByteArray());
+        hasher.putBytes(rule.getNameBytes().toByteArray());
+        hasher.putBytes(rule.getSkylarkEnvironmentHashCodeBytes().toByteArray());
         for (Build.Attribute attribute : rule.getAttributeList()) {
-            digest.update(attribute.toByteArray());
+            hasher.putBytes(attribute.toByteArray());
         }
-        return digest.digest();
+        return hasher.hash().asBytes();
     }
 
     @Override

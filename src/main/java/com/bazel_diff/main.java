@@ -45,8 +45,9 @@ class GenerateHashes implements Callable<Integer> {
                 parent.bazelPath,
                 parent.bazelStartupOptions,
                 parent.bazelCommandOptions,
+                parent.keepGoing,
                 parent.isVerbose(),
-                parent.keepGoing);
+                parent.isDebug());
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient, new FilesClientImp());
         try {
             Instant generateHashStartTime = Instant.now();
@@ -131,8 +132,9 @@ class BazelDiff implements Callable<Integer> {
                 bazelPath,
                 bazelStartupOptions,
                 bazelCommandOptions,
+                keepGoing,
                 isVerbose(),
-                keepGoing
+                isDebug()
         );
         TargetHashingClient hashingClient = new TargetHashingClientImpl(bazelClient, new FilesClientImp());
         Gson gson = new Gson();
@@ -150,7 +152,7 @@ class BazelDiff implements Callable<Integer> {
             System.out.println("Final Hashes JSON filepath does not exist! Exiting");
             return ExitCode.USAGE;
         }
-        Map<String, String > gsonHash = new HashMap<>();
+        Map<String, String> gsonHash = new HashMap<>();
         Map<String, String> startingHashes = gson.fromJson(startingFileReader, gsonHash.getClass());
         Map<String, String> finalHashes = gson.fromJson(finalFileReader, gsonHash.getClass());
         Set<String> impactedTargets = hashingClient.getImpactedTargets(startingHashes, finalHashes);
@@ -166,8 +168,12 @@ class BazelDiff implements Callable<Integer> {
     }
 
     Boolean isVerbose() {
-        String verboseFlag = System.getProperty("VERBOSE", "false");
-        return verboseFlag.equals("true") || verbose;
+        return verbose || this.isDebug();
+    }
+
+    Boolean isDebug() {
+        String debugFlag = System.getProperty("DEBUG", "false");
+        return debugFlag.equals("true");
     }
 
     public static void main(String[] args) {

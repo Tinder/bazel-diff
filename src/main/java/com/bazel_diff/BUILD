@@ -2,7 +2,7 @@ load("@rules_java//java:defs.bzl", "java_binary", "java_library", "java_proto_li
 load("@rules_proto//proto:defs.bzl", "proto_library")
 
 config_setting(
-    name = "enable_verbose",
+    name = "enable_debug",
     values = {
         "compilation_mode": "dbg",
     },
@@ -14,7 +14,7 @@ java_binary(
     runtime_deps = [":java-bazel-diff-lib"],
     visibility = ["//visibility:public"],
     jvm_flags = select({
-        ":enable_verbose": ["-DVERBOSE=true"],
+        ":enable_debug": ["-DDEBUG=true"],
         "//conditions:default": [],
     }),
 )
@@ -31,7 +31,7 @@ java_library(
         "@bazel_diff_maven//:org_apache_commons_commons_pool2"
     ],
     javacopts = select({
-        ":enable_verbose": ["-AVERBOSE=true"],
+        ":enable_debug": ["-ADEBUG=true"],
         "//conditions:default": [],
     }),
     visibility = ["//test/java/com/bazel_diff:__pkg__"]

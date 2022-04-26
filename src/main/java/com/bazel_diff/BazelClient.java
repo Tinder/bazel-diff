@@ -29,6 +29,7 @@ class BazelClientImpl implements BazelClient {
     private Path bazelPath;
     private Boolean verbose;
     private Boolean keepGoing;
+    private Boolean debug;
     private List<String> startupOptions;
     private List<String> commandOptions;
 
@@ -37,8 +38,9 @@ class BazelClientImpl implements BazelClient {
             Path bazelPath,
             String startupOptions,
             String commandOptions,
+            Boolean keepGoing,
             Boolean verbose,
-            Boolean keepGoing
+            Boolean debug
     ) {
         this.workingDirectory = workingDirectory.normalize();
         this.bazelPath = bazelPath;
@@ -46,6 +48,7 @@ class BazelClientImpl implements BazelClient {
         this.commandOptions = commandOptions != null ? Arrays.asList(commandOptions.split(" ")) : new ArrayList<String>();
         this.verbose = verbose;
         this.keepGoing = keepGoing;
+        this.debug = debug;
     }
 
     @Override
@@ -139,6 +142,8 @@ class BazelClientImpl implements BazelClient {
         cmd.add((bazelPath.toString()));
         if (verbose) {
             System.out.println(String.format("Executing Query: %s", query));
+        }
+        if (debug) {
             cmd.add("--bazelrc=/dev/null");
         }
         cmd.addAll(this.startupOptions);

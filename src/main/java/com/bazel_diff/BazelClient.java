@@ -1,5 +1,7 @@
 package com.bazel_diff;
 
+import com.google.common.hash.Hasher;
+import com.google.common.hash.Hashing;
 import com.google.devtools.build.lib.query2.proto.proto2api.Build;
 
 import java.io.*;
@@ -7,20 +9,19 @@ import java.nio.charset.StandardCharsets;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.Arrays;
 
 interface BazelClient {
     List<BazelTarget> queryAllTargets() throws IOException;
-    Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException;
+
+    Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws Exception;
 }
 
 class BazelClientImpl implements BazelClient {
@@ -43,8 +44,8 @@ class BazelClientImpl implements BazelClient {
     ) {
         this.workingDirectory = workingDirectory.normalize();
         this.bazelPath = bazelPath;
-        this.startupOptions = startupOptions != null ? Arrays.asList(startupOptions.split(" ")): new ArrayList<String>();
-        this.commandOptions = commandOptions != null ? Arrays.asList(commandOptions.split(" ")): new ArrayList<String>();
+        this.startupOptions = startupOptions != null ? Arrays.asList(startupOptions.split(" ")) : new ArrayList<String>();
+        this.commandOptions = commandOptions != null ? Arrays.asList(commandOptions.split(" ")) : new ArrayList<String>();
         this.verbose = verbose;
         this.keepGoing = keepGoing;
         this.debug = debug;
@@ -59,11 +60,11 @@ class BazelClientImpl implements BazelClient {
             long querySeconds = Duration.between(queryStartTime, queryEndTime).getSeconds();
             System.out.printf("BazelDiff: All targets queried in %d seconds%n", querySeconds);
         }
-        return targets.stream().map( target -> new BazelTargetImpl(target)).collect(Collectors.toList());
+        return targets.stream().map(target -> new BazelTargetImpl(target)).collect(Collectors.toList());
     }
 
     @Override
-    public Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws IOException, NoSuchAlgorithmException {
+    public Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws Exception {
         Instant queryStartTime = Instant.now();
         List<Build.Target> targets = performBazelQuery("kind('source file', //...:all-targets)");
         Instant queryEndTime = Instant.now();
@@ -78,26 +79,59 @@ class BazelClientImpl implements BazelClient {
         return sourceFileTargets;
     }
 
-    private Map<String, BazelSourceFileTarget> processBazelSourcefileTargets(List<Build.Target> targets, Boolean readSourcefileTargets) throws IOException, NoSuchAlgorithmException {
-        Map<String, BazelSourceFileTarget> sourceTargets = new HashMap<>();
-        for (Build.Target target : targets) {
-            Build.SourceFile sourceFile = target.getSourceFile();
-            if (sourceFile != null) {
-                MessageDigest digest = MessageDigest.getInstance("SHA-256");
-                digest.update(sourceFile.getNameBytes().toByteArray());
-                for (String subinclude : sourceFile.getSubincludeList()) {
-                    digest.update(subinclude.getBytes());
-                }
-                BazelSourceFileTargetImpl sourceFileTarget = new BazelSourceFileTargetImpl(
-                        sourceFile.getName(),
-                        digest.digest().clone(),
-                        readSourcefileTargets ? workingDirectory : null,
-                        verbose
-                );
-                sourceTargets.put(sourceFileTarget.getName(), sourceFileTarget);
-            }
+    private Map<String, BazelSourceFileTarget> processBazelSourcefileTargets(List<Build.Target> targets, Boolean readSourcefileTargets) throws Exception {
+        AtomicReference<Exception> exception = new AtomicReference(null);
+        Map<String, BazelSourceFileTarget> result = targets.parallelStream().map((target -> {
+                    Build.SourceFile sourceFile = target.getSourceFile();
+                    if (sourceFile != null) {
+                        Hasher hasher = Hashing.sha256().newHasher();
+                        hasher.putBytes(sourceFile.getNameBytes().toByteArray());
+                        for (String subinclude : sourceFile.getSubincludeList()) {
+                            hasher.putBytes(subinclude.getBytes());
+                        }
+                        BazelSourceFileTargetImpl sourceFileTarget = null;
+                        try {
+                            sourceFileTarget = new BazelSourceFileTargetImpl(
+                                    sourceFile.getName(),
+                                    hasher.hash().asBytes().clone(),
+                                    readSourcefileTargets ? workingDirectory : null,
+                                    verbose
+                            );
+                        } catch (Exception e) {
+                            exception.set(e);
+                        }
+                        return new SourceTargetEntry(sourceFileTarget.getName(), sourceFileTarget);
+                    }
+                    return null;
+                }))
+                .filter(pair -> pair != null)
+                .collect(Collectors.toMap(SourceTargetEntry::getKey, SourceTargetEntry::getValue));
+
+        //Rethrowing nested parallel exception
+        Exception nestedException = exception.get();
+        if (nestedException != null) {
+            throw nestedException;
         }
-        return sourceTargets;
+
+        return result;
+    }
+
+    private static class SourceTargetEntry<K extends String, V extends BazelSourceFileTargetImpl> {
+        private K key;
+        private V value;
+
+        public SourceTargetEntry(K key, V value) {
+            this.key = key;
+            this.value = value;
+        }
+
+        public K getKey() {
+            return key;
+        }
+
+        public V getValue() {
+            return value;
+        }
     }
 
     private List<Build.Target> performBazelQuery(String query) throws IOException {
@@ -134,6 +168,7 @@ class BazelClientImpl implements BazelClient {
         BufferedReader stdError = new BufferedReader(new InputStreamReader(process.getErrorStream()));
         Thread tStdError = new Thread(new Runnable() {
             String line = null;
+
             public void run() {
                 try {
                     while ((line = stdError.readLine()) != null) {
@@ -141,11 +176,12 @@ class BazelClientImpl implements BazelClient {
                             System.out.println(line);
                         }
 
-                        if(Thread.currentThread().isInterrupted()) {
+                        if (Thread.currentThread().isInterrupted()) {
                             return;
                         }
                     }
-                } catch(IOException e) {}
+                } catch (IOException e) {
+                }
             }
         });
         tStdError.start();

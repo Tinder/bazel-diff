@@ -70,7 +70,7 @@ class GenerateHashes implements Callable<Integer> {
                 System.out.printf("BazelDiff: Generate-hashes command finishes in %d seconds%n", generateHashSeconds);
             }
             return ExitCode.OK;
-        } catch (IOException | NoSuchAlgorithmException e) {
+        } catch (Exception e) {
             e.printStackTrace();
             return ExitCode.SOFTWARE;
         }

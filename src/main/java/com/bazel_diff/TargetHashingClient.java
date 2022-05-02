@@ -101,7 +101,22 @@ class TargetHashingClientImpl implements TargetHashingClient {
             Map<String, BazelSourceFileTarget> bazelSourcefileTargets,
             byte[] seedHash
     ) {
-        return ruleHashes.computeIfAbsent(rule.getName(), (String) -> {
+        System.out.println("createDigestForRule: " + rule.getName());
+        //Precompute all the inputs first
+        for (String ruleInput : rule.getRuleInputList()) {
+            BazelRule inputRule = allRulesMap.get(ruleInput);
+            if (inputRule != null && inputRule.getName() != null && !inputRule.getName().equals(rule.getName())) {
+                createDigestForRule(
+                        inputRule,
+                        allRulesMap,
+                        ruleHashes,
+                        bazelSourcefileTargets,
+                        seedHash
+                );
+            }
+        }
+
+        if(!ruleHashes.containsKey(rule.getName())) {
             Hasher hasher = Hashing.sha256().newHasher();
             hasher.putBytes(rule.getDigest());
             if (seedHash != null) {
@@ -128,8 +143,13 @@ class TargetHashingClientImpl implements TargetHashingClient {
                     }
                 }
             }
-            return hasher.hash().asBytes().clone();
-        });
+            byte[] value = hasher.hash().asBytes().clone();
+            ruleHashes.put(rule.getName(), value);
+
+            return value;
+        } else {
+            return ruleHashes.get(rule.getName());
+        }
     }
 
     private byte[] createSeedForFilepaths(Set<Path> seedFilepaths) throws IOException {
@@ -223,7 +243,12 @@ class TargetHashingClientImpl implements TargetHashingClient {
             this.value = value;
         }
 
-        public K getKey() { return key; }
-        public V getValue() { return value; }
+        public K getKey() {
+            return key;
+        }
+
+        public V getValue() {
+            return value;
+        }
     }
 }

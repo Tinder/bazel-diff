@@ -19,7 +19,7 @@ import java.util.stream.Collectors;
 import java.util.Arrays;
 
 interface BazelClient {
-    List<BazelTarget> queryAllTargets() throws IOException;
+    List<BazelTarget> queryAllTargets() throws IOException, BazelQueryException;
 
     Map<String, BazelSourceFileTarget> queryAllSourcefileTargets() throws Exception;
 }
@@ -52,7 +52,7 @@ class BazelClientImpl implements BazelClient {
     }
 
     @Override
-    public List<BazelTarget> queryAllTargets() throws IOException {
+    public List<BazelTarget> queryAllTargets() throws IOException, BazelQueryException {
         Instant queryStartTime = Instant.now();
         List<Build.Target> targets = performBazelQuery("'//external:all-targets' + '//...:all-targets'");
         Instant queryEndTime = Instant.now();
@@ -134,7 +134,7 @@ class BazelClientImpl implements BazelClient {
         }
     }
 
-    private List<Build.Target> performBazelQuery(String query) throws IOException {
+    private List<Build.Target> performBazelQuery(String query) throws IOException, BazelQueryException {
         Path tempFile = Files.createTempFile(null, ".txt");
         Files.write(tempFile, query.getBytes(StandardCharsets.UTF_8));
 
@@ -195,6 +195,11 @@ class BazelClientImpl implements BazelClient {
         tStdError.interrupt();
 
         Files.delete(tempFile);
+
+        int exitStatus = process.exitValue();
+        if(exitStatus != 0){
+            throw new BazelQueryException("bazel query exited with code " + exitStatus);
+        }
 
         return targets;
     }

@@ -170,7 +170,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
         return null;
     }
 
-    private Map<String, String> hashAllTargets(byte[] seedHash, Map<String, BazelSourceFileTarget> bazelSourcefileTargets) throws IOException {
+    private Map<String, String> hashAllTargets(byte[] seedHash, Map<String, BazelSourceFileTarget> bazelSourcefileTargets) throws IOException, BazelQueryException {
         List<BazelTarget> allTargets = bazelClient.queryAllTargets();
         Map<String, byte[]> ruleHashes = new HashMap<>();
         Map<String, BazelRule> allRulesMap = new HashMap<>();

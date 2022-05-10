@@ -4,12 +4,20 @@ import com.google.devtools.build.lib.query2.proto.proto2api.Build;
 
 interface BazelTarget {
     boolean hasRule();
+
     BazelRule getRule();
+
     boolean hasSourceFile();
+
     String getSourceFileName();
+
     boolean hasGeneratedFile();
+
     String getGeneratedFileName();
+
     String getGeneratingRuleName();
+
+    TargetType getType();
 }
 
 class BazelTargetImpl implements BazelTarget {
@@ -22,6 +30,23 @@ class BazelTargetImpl implements BazelTarget {
     @Override
     public boolean hasRule() {
         return target.hasRule();
+    }
+
+    public TargetType getType() {
+        switch (target.getType()) {
+            case RULE:
+                return TargetType.RULE;
+            case SOURCE_FILE:
+                return TargetType.SOURCE_FILE;
+            case GENERATED_FILE:
+                return TargetType.GENERATED_FILE;
+            case PACKAGE_GROUP:
+                return TargetType.PACKAGE_GROUP;
+            case ENVIRONMENT_GROUP:
+                return TargetType.ENVIRONMENT_GROUP;
+            default:
+                return TargetType.UNKNOWN;
+        }
     }
 
     @Override
@@ -66,4 +91,3 @@ class BazelTargetImpl implements BazelTarget {
         return null;
     }
 }
-

@@ -6,6 +6,7 @@ import java.util.*;
 
 import com.google.common.collect.MapDifference;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 import com.google.common.hash.Hasher;
 import com.google.common.hash.Hashing;
 
@@ -108,7 +109,12 @@ class TargetHashingClientImpl implements TargetHashingClient {
         for (String ruleInput : rule.getRuleInputList()) {
             hasher.putBytes(ruleInput.getBytes());
             BazelRule inputRule = allRulesMap.get(ruleInput);
-            if (inputRule != null && inputRule.getName() != null && !inputRule.getName().equals(rule.getName())) {
+            if(inputRule == null && bazelSourcefileTargets.containsKey(ruleInput)) {
+                byte[] sourceFileDigest = getDigestForSourceTargetName(ruleInput, bazelSourcefileTargets);
+                if (sourceFileDigest != null) {
+                    hasher.putBytes(sourceFileDigest);
+                }
+            } else if (inputRule != null && inputRule.getName() != null && !inputRule.getName().equals(rule.getName())) {
                 byte[] ruleInputHash = createDigestForRule(
                         inputRule,
                         allRulesMap,
@@ -120,10 +126,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
                     hasher.putBytes(ruleInputHash);
                 }
             } else {
-                byte[] sourceFileDigest = getDigestForSourceTargetName(ruleInput, bazelSourcefileTargets);
-                if (sourceFileDigest != null) {
-                    hasher.putBytes(sourceFileDigest);
-                }
+                System.out.printf("BazelDiff: [Warning] Unable to calculate digest for input %s for rule %s%n", ruleInput, rule.getName());
             }
         }
         byte[] finalHashValue = hasher.hash().asBytes().clone();
@@ -177,17 +180,39 @@ class TargetHashingClientImpl implements TargetHashingClient {
         ConcurrentMap<String, byte[]> ruleHashes = new ConcurrentHashMap<>();
         Map<String, BazelRule> targetToRule = new HashMap<>();
 
-        for (BazelTarget target : allTargets) {
-            String targetName = getNameForTarget(target);
-            if (targetName == null) {
-                continue;
+        Set<BazelTarget> targetsToAnalyse = Sets.newHashSet(allTargets);
+        while (!targetsToAnalyse.isEmpty()) {
+            int initialSize = targetsToAnalyse.size();
+            Set<BazelTarget> nextTargets = Sets.newHashSet();
+            for (BazelTarget target : targetsToAnalyse) {
+                String targetName = getNameForTarget(target);
+                if (targetName == null) {
+                    System.out.printf("BazelDiff: [Warning] Unknown target name in the build graph. Target type is %s%n", target.getType().name());
+                    continue;
+                }
+
+                if (target.hasRule()) {
+                    targetToRule.put(targetName, target.getRule());
+                } else if (target.hasGeneratedFile()) {
+                    String generatingRuleName = target.getGeneratingRuleName();
+                    BazelRule generatingRule = targetToRule.get(generatingRuleName);
+                    if (generatingRule == null) {
+                        nextTargets.add(target);
+                    } else {
+                        targetToRule.put(targetName, generatingRule);
+                    }
+                } else if(target.hasSourceFile()) {
+                    //Source files are hashed separately
+                    continue;
+                } else {
+                    throw new RuntimeException("Unsupported target type in the build graph: " + target.getType().name());
+                }
             }
-            if (target.hasRule()) {
-                targetToRule.put(targetName, target.getRule());
+            int newSize = nextTargets.size();
+            if(newSize >= initialSize) {
+                throw new RuntimeException("Not possible to traverse the build graph");
             }
-            if (target.hasGeneratedFile()) {
-                targetToRule.put(getNameForTarget(target), targetToRule.get(target.getGeneratingRuleName()));
-            }
+            targetsToAnalyse = nextTargets;
         }
 
         return allTargets.parallelStream()
@@ -220,7 +245,12 @@ class TargetHashingClientImpl implements TargetHashingClient {
             this.value = value;
         }
 
-        public K getKey() { return key; }
-        public V getValue() { return value; }
+        public K getKey() {
+            return key;
+        }
+
+        public V getValue() {
+            return value;
+        }
     }
 }

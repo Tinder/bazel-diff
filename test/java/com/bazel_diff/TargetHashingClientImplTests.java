@@ -121,7 +121,7 @@ public class TargetHashingClientImplTests {
     }
 
     @Test
-    public void HashAllBazelTargets_generatedTargets() throws IOException, NoSuchAlgorithmException {
+    public void HashAllBazelTargets_generatedTargets() throws Exception {
         BazelTarget generator = createRuleTarget("rule1", new ArrayList<String>(), "rule1Digest");
         BazelTarget target = createGeneratedTarget("rule0", "rule1");
 
@@ -134,22 +134,14 @@ public class TargetHashingClientImplTests {
 
         when(bazelClientMock.queryAllTargets()).thenReturn(Arrays.asList(rule3, target, generator));
         TargetHashingClientImpl client = new TargetHashingClientImpl(bazelClientMock, filesClientMock);
-        try {
-            Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
-            assertEquals(3, hash.size());
-            oldHash = hash.get("rule3");
-        } catch (Exception e) {
-            fail(e.getMessage());
-        }
+        Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
+        assertEquals(3, hash.size());
+        oldHash = hash.get("rule3");
 
         when(generator.getRule().getDigest()).thenReturn("newDigest".getBytes());
-        try {
-            Map<String, String> hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
-            assertEquals(3, hash.size());
-            newHash = hash.get("rule3");
-        } catch (Exception e) {
-            fail(e.getMessage());
-        }
+        hash = client.hashAllBazelTargetsAndSourcefiles(new HashSet<>());
+        assertEquals(3, hash.size());
+        newHash = hash.get("rule3");
 
         assertNotEquals(oldHash, newHash);
     }
@@ -167,7 +159,7 @@ public class TargetHashingClientImplTests {
             end.put("3", "d");
             Set<String> impacted = client.getImpactedTargets(start, end);
             assertEquals(2, impacted.size());
-            assertArrayEquals(new String[] {"1", "3"}, impacted.toArray());
+            assertArrayEquals(new String[]{"1", "3"}, impacted.toArray());
         } catch (Exception e) {
             fail(e.getMessage());
         }

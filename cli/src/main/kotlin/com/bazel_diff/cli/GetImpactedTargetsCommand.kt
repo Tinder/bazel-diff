@@ -5,7 +5,10 @@ import com.bazel_diff.interactor.CalculateImpactedTargetsInteractor
 import com.bazel_diff.interactor.DeserialiseHashesInteractor
 import org.koin.core.context.startKoin
 import picocli.CommandLine
+import java.io.BufferedWriter
 import java.io.File
+import java.io.FileWriter
+import java.io.IOException
 import java.util.concurrent.Callable
 
 @CommandLine.Command(
@@ -44,7 +47,7 @@ class GetImpactedTargetsCommand : Callable<Int> {
     lateinit var spec: CommandLine.Model.CommandSpec
 
     override fun call(): Int {
-        startKoin {
+        val application = startKoin {
             modules(
                 mainModule(
                     parent.workspacePath,
@@ -63,9 +66,19 @@ class GetImpactedTargetsCommand : Callable<Int> {
         val from = deserialiser.execute(startingHashesJSONPath)
         val to = deserialiser.execute(finalHashesJSONPath)
 
-        return when (CalculateImpactedTargetsInteractor().execute(from, to, outputPath)) {
-            true -> CommandLine.ExitCode.OK
-            false -> CommandLine.ExitCode.SOFTWARE
+        val impactedTargets = CalculateImpactedTargetsInteractor().execute(from, to)
+
+        return try {
+            BufferedWriter(FileWriter(outputPath)).use { writer ->
+                impactedTargets.forEach {
+                    writer.write(it)
+                    //Should not be depend on OS
+                    writer.write("\n")
+                }
+            }
+            CommandLine.ExitCode.OK
+        } catch (e: IOException) {
+            CommandLine.ExitCode.SOFTWARE
         }
     }
 

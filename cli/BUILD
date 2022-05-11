@@ -1,6 +1,6 @@
 load("@rules_java//java:defs.bzl", "java_binary", "java_library", "java_proto_library")
 load("@rules_proto//proto:defs.bzl", "proto_library")
-load("@io_bazel_rules_kotlin//kotlin:jvm.bzl", "kt_jvm_binary", "kt_jvm_import", "kt_jvm_library")
+load("@io_bazel_rules_kotlin//kotlin:jvm.bzl", "kt_jvm_binary", "kt_jvm_library", "kt_jvm_test")
 load("@rules_jvm_external//:defs.bzl", "artifact")
 
 config_setting(
@@ -18,13 +18,12 @@ kt_jvm_binary(
     }),
     main_class = "com.bazel_diff.Main",
     visibility = ["//visibility:public"],
-    runtime_deps = [":java-bazel-diff-lib"],
+    runtime_deps = [":cli-lib"],
 )
 
 kt_jvm_library(
-    name = "java-bazel-diff-lib",
-    srcs = glob(["**/*.kt"]),
-    visibility = ["//test/java/com/bazel_diff:__pkg__"],
+    name = "cli-lib",
+    srcs = glob(["src/main/kotlin/**/*.kt"]),
     deps = [
         ":build_java_proto",
         "@bazel_diff_maven//:com_google_code_gson_gson",
@@ -52,4 +51,31 @@ genrule(
     srcs = ["@bazel_tools//src/main/protobuf:build.proto"],
     outs = ["build.proto"],
     cmd = "cp $< $@",
+)
+
+kt_jvm_test(
+    name = "BuildGraphHasherTest",
+    test_class = "com.bazel_diff.hash.BuildGraphHasherTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "CalculateImpactedTargetsInteractorTest",
+    test_class = "com.bazel_diff.interactor.CalculateImpactedTargetsInteractorTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_library(
+    name = "cli-test-lib",
+    testonly = True,
+    srcs = glob(["src/test/kotlin/**/*.kt"]),
+    resources = glob(["src/test/resources/**/*"]),
+    deps = [
+        ":cli-lib",
+        "@bazel_diff_maven//:com_willowtreeapps_assertk_assertk_jvm",
+        "@bazel_diff_maven//:io_insert_koin_koin_test_junit4",
+        "@bazel_diff_maven//:io_insert_koin_koin_test_jvm",
+        "@bazel_diff_maven//:junit_junit",
+        "@bazel_diff_maven//:org_mockito_kotlin_mockito_kotlin",
+    ],
 )

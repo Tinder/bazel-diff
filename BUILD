@@ -1,4 +1,9 @@
-alias(
-    name = "bazel-diff",
-    actual = "//src/main/kotlin/com/bazel_diff:bazel-diff"
-)
+#alias(
+#    name = "bazel-diff",
+#    actual = "//bazel-diff",
+#)
+#
+#alias(
+#    name = "tests",
+#    actual = "//bazel-diff:tests",
+#)

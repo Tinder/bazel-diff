@@ -7,7 +7,6 @@ import com.bazel_diff.bazel.BazelTarget
 import com.bazel_diff.log.Logger
 import com.google.common.collect.Sets
 import com.google.devtools.build.lib.query2.proto.proto2api.Build
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
@@ -29,7 +28,7 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
     private val logger: Logger by inject()
 
     @OptIn(ExperimentalTime::class)
-    fun hashAllBazelTargetsAndSourcefiles(seedFilepaths: Set<Path>): Map<String, String> {
+    fun hashAllBazelTargetsAndSourcefiles(seedFilepaths: Set<Path> = emptySet()): Map<String, String> {
         /**
          * Bazel will lock parallel queries but this is still allowing us to hash source files while executing a parallel query
          */

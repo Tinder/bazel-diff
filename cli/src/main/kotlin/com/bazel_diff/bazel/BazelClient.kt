@@ -21,8 +21,12 @@ class BazelClient : KoinComponent {
         return targets.mapNotNull { target: Build.Target ->
             when (target.type) {
                 Build.Target.Discriminator.RULE -> BazelTarget.Rule(target)
-                Build.Target.Discriminator.SOURCE_FILE -> BazelTarget.SourceFile(target)
-                Build.Target.Discriminator.GENERATED_FILE -> BazelTarget.GeneratedFile(target)
+                Build.Target.Discriminator.SOURCE_FILE -> BazelTarget.SourceFile(
+                    target
+                )
+                Build.Target.Discriminator.GENERATED_FILE -> BazelTarget.GeneratedFile(
+                    target
+                )
                 else -> {
                     logger.w { "Unsupported target type in the build graph: ${target.type.name}" }
                     null

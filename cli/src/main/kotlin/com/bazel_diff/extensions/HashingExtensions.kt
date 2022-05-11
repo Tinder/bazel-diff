@@ -19,11 +19,11 @@ fun Hasher.putFile(file: File) {
     BufferedInputStream(FileInputStream(file.absolutePath.toString())).use { stream ->
         val buffer = pool.borrow()
         val array = buffer!!.array() //Available for non-direct buffers
-        var length: Int? = 0
         while (true) {
+            var length: Int
             if (stream.read(array).also { length = it } == -1) break
             buffer.flip()
-            putBytes(array, 0, length!!)
+            putBytes(array, 0, length)
             buffer.clear()
         }
         pool.recycle(buffer)

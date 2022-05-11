@@ -1,4 +1,4 @@
 alias(
     name = "bazel-diff",
-    actual = "//src/main/java/com/bazel_diff:bazel-diff"
+    actual = "//src/main/kotlin/com/bazel_diff:bazel-diff"
 )

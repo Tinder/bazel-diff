@@ -9,4 +9,6 @@ BAZEL_DIFF_MAVEN_ARTIFACTS = [
     "com.google.code.gson:gson:jar:2.8.6",
     "com.google.guava:guava:29.0-jre",
     "org.apache.commons:commons-pool2:2.11.1",
+    "io.insert-koin:koin-core-jvm:3.1.6",
+    "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.5.2",
 ]

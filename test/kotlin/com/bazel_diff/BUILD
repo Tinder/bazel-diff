@@ -6,11 +6,11 @@ java_test(
     test_class = "com.bazel_diff.TargetHashingClientImplTests"
 )
 
-java_library(
+kt_jvm_library(
     name = "java-bazel-diff-test-lib",
-    srcs = glob(["*.java"]),
+    srcs = glob(["*.kt"]),
     deps = [
-        "//src/main/java/com/bazel_diff:java-bazel-diff-lib",
+        "//src/main/kotlin/com/bazel_diff:java-bazel-diff-lib",
         "@bazel_diff_maven//:org_mockito_mockito_core",
         "@bazel_diff_maven//:junit_junit"
     ],

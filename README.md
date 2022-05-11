@@ -167,7 +167,7 @@ load("@rules_java//java:defs.bzl", "java_binary")
 
 java_binary(
     name = "bazel-diff",
-    main_class = "com.bazel_diff.BazelDiff",
+    main_class = "com.bazel_diff.cli.BazelDiff",
     runtime_deps = ["@bazel_diff//jar"],
 )
 ```

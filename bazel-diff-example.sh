@@ -33,7 +33,7 @@ echo "Generating Hashes for Revision '$final_revision'"
 $bazel_diff generate-hashes -w $workspace_path -b $bazel_path $final_hashes_json
 
 echo "Determining Impacted Targets"
-$bazel_diff -sh $starting_hashes_json -fh $final_hashes_json -w $workspace_path -b $bazel_path -o $impacted_targets_path
+$bazel_diff get-impacted-targets -sh $starting_hashes_json -fh $final_hashes_json -o $impacted_targets_path
 
 IFS=$'\n' read -d '' -r -a impacted_targets < $impacted_targets_path
 formatted_impacted_targets=$(IFS=$'\n'; echo "${impacted_targets[*]}")

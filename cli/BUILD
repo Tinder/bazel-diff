@@ -65,6 +65,30 @@ kt_jvm_test(
     runtime_deps = [":cli-test-lib"],
 )
 
+kt_jvm_test(
+    name = "NormalisingPathConverterTest",
+    test_class = "com.bazel_diff.cli.converter.NormalisingPathConverterTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "OptionsConverterTest",
+    test_class = "com.bazel_diff.cli.converter.OptionsConverterTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "DeserialiseHashesInteractorTest",
+    test_class = "com.bazel_diff.interactor.DeserialiseHashesInteractorTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "E2ETest",
+    test_class = "com.bazel_diff.e2e.E2ETest",
+    runtime_deps = [":cli-test-lib"],
+)
+
 kt_jvm_library(
     name = "cli-test-lib",
     testonly = True,

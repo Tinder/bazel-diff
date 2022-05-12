@@ -17,47 +17,6 @@ import java.nio.file.Path
 )
 class BazelDiff : Runnable {
     @CommandLine.Option(
-        names = ["-w", "--workspacePath"],
-        description = ["Path to Bazel workspace directory."],
-        scope = CommandLine.ScopeType.INHERIT,
-        required = true,
-        converter = [NormalisingPathConverter::class]
-    )
-    lateinit var workspacePath: Path
-
-    @CommandLine.Option(
-        names = ["-b", "--bazelPath"],
-        description = ["Path to Bazel binary"],
-        scope = CommandLine.ScopeType.INHERIT,
-        required = true,
-    )
-    lateinit var bazelPath: Path
-
-    @CommandLine.Option(
-        names = ["-so", "--bazelStartupOptions"],
-        description = ["Additional space separated Bazel client startup options used when invoking Bazel"],
-        scope = CommandLine.ScopeType.INHERIT,
-        converter = [OptionsConverter::class],
-    )
-    var bazelStartupOptions: List<String> = emptyList()
-
-    @CommandLine.Option(
-        names = ["-co", "--bazelCommandOptions"],
-        description = ["Additional space separated Bazel command options used when invoking Bazel"],
-        scope = CommandLine.ScopeType.INHERIT,
-        converter = [OptionsConverter::class],
-    )
-    var bazelCommandOptions: List<String> = emptyList()
-
-    @CommandLine.Option(
-        names = ["-k", "--keep_going"],
-        negatable = true,
-        description = ["This flag controls if `bazel query` will be executed with the `--keep_going` flag or not. Disabling this flag allows you to catch configuration issues in your Bazel graph, but may not work for some Bazel setups. Defaults to `true`"],
-        scope = CommandLine.ScopeType.INHERIT
-    )
-    var keepGoing = true
-
-    @CommandLine.Option(
         names = ["-v", "--verbose"],
         description = ["Display query string, missing files and elapsed time"],
         scope = CommandLine.ScopeType.INHERIT,

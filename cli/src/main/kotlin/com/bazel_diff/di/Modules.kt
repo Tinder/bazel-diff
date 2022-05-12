@@ -14,16 +14,14 @@ import org.koin.core.qualifier.named
 import org.koin.dsl.module
 import java.nio.file.Path
 
-fun mainModule(
+fun hasherModule(
     workingDirectory: Path,
     bazelPath: Path,
     startupOptions: List<String>,
     commandOptions: List<String>,
     keepGoing: Boolean?,
-    verbose: Boolean,
     debug: Boolean
 ): Module = module {
-    single<Logger> { StdoutLogger(verbose) }
     single {
         BazelQueryService(
             workingDirectory,
@@ -39,6 +37,13 @@ fun mainModule(
     single { TargetHasher() }
     single { RuleHasher() }
     single { SourceFileHasher() }
-    single { GsonBuilder().setPrettyPrinting().create() }
     single(named("working-directory")) { workingDirectory }
+}
+
+fun loggingModule(verbose: Boolean) = module {
+    single<Logger> { StdoutLogger(verbose) }
+}
+
+fun serialisationModule() = module {
+    single { GsonBuilder().setPrettyPrinting().create() }
 }

@@ -38,7 +38,7 @@ class BuildGraphHasherTest : KoinTest {
     }
 
     @get:Rule
-    val temp: TemporaryFolder = TemporaryFolder();
+    val temp: TemporaryFolder = TemporaryFolder()
 
     val bazelClientMock: BazelClient = mock()
     val hasher = BuildGraphHasher(bazelClientMock)

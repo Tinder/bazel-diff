@@ -1,9 +1,11 @@
 package com.bazel_diff.cli
 
-import com.bazel_diff.di.mainModule
+import com.bazel_diff.di.loggingModule
+import com.bazel_diff.di.serialisationModule
 import com.bazel_diff.interactor.CalculateImpactedTargetsInteractor
 import com.bazel_diff.interactor.DeserialiseHashesInteractor
 import org.koin.core.context.startKoin
+import org.koin.core.context.stopKoin
 import picocli.CommandLine
 import java.io.BufferedWriter
 import java.io.File
@@ -47,17 +49,10 @@ class GetImpactedTargetsCommand : Callable<Int> {
     lateinit var spec: CommandLine.Model.CommandSpec
 
     override fun call(): Int {
-        val application = startKoin {
+        startKoin {
             modules(
-                mainModule(
-                    parent.workspacePath,
-                    parent.bazelPath,
-                    parent.bazelStartupOptions,
-                    parent.bazelCommandOptions,
-                    parent.keepGoing,
-                    parent.isVerbose(),
-                    parent.debug
-                )
+                serialisationModule(),
+                loggingModule(parent.verbose)
             )
         }
 
@@ -79,7 +74,7 @@ class GetImpactedTargetsCommand : Callable<Int> {
             CommandLine.ExitCode.OK
         } catch (e: IOException) {
             CommandLine.ExitCode.SOFTWARE
-        }
+        }.also { stopKoin() }
     }
 
     private fun validate() {

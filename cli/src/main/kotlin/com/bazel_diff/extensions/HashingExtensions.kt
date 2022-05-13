@@ -1,5 +1,7 @@
 package com.bazel_diff.hash
 
+import com.bazel_diff.extensions.compatClear
+import com.bazel_diff.extensions.compatFlip
 import com.bazel_diff.io.ByteBufferPool
 import com.google.common.hash.Hasher
 import com.google.common.hash.Hashing
@@ -22,9 +24,9 @@ fun Hasher.putFile(file: File) {
         while (true) {
             var length: Int
             if (stream.read(array).also { length = it } == -1) break
-            buffer.flip()
+            buffer.compatFlip()
             putBytes(array, 0, length)
-            buffer.clear()
+            buffer.compatClear()
         }
         pool.recycle(buffer)
     }

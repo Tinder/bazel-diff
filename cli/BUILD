@@ -10,7 +10,7 @@ config_setting(
     },
 )
 
-kt_jvm_binary(
+java_binary(
     name = "bazel-diff",
     jvm_flags = select({
         ":enable_debug": ["-DDEBUG=true"],

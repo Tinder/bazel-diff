@@ -27,6 +27,5 @@ maven_install(
     generate_compat_repositories = True,
     repositories = [
         "https://repo1.maven.org/maven2/",
-        "https://jcenter.bintray.com/",
     ],
 )

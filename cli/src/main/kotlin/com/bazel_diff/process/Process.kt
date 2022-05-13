@@ -82,7 +82,7 @@ suspend fun process(
         ProcessResult(
             // Consume the output before waitFor,
             // ensuring no content is skipped.
-            output = awaitAll(output).last() as List<String>,
+            output = awaitAll(output).last(),
             resultCode = runInterruptible { process.waitFor() },
         )
     } catch (e: CancellationException) {

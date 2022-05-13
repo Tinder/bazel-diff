@@ -4,6 +4,7 @@ import com.bazel_diff.log.Logger
 import com.bazel_diff.process.Redirect
 import com.bazel_diff.process.process
 import com.google.devtools.build.lib.query2.proto.proto2api.Build
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
@@ -21,6 +22,7 @@ class BazelQueryService(
 ) : KoinComponent {
     private val logger: Logger by inject()
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     suspend fun query(query: String): List<Build.Target> {
         val tempFile = Files.createTempFile(null, ".txt")
         val outputFile = Files.createTempFile(null, ".bin")

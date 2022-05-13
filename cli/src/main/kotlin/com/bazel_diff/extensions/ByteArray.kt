@@ -1,3 +1,5 @@
+package com.bazel_diff.extensions
+
 import java.nio.charset.StandardCharsets
 
 fun ByteArray.toHexString(): String {

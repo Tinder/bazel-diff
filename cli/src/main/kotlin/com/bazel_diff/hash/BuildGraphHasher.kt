@@ -4,6 +4,7 @@ import com.bazel_diff.bazel.BazelClient
 import com.bazel_diff.bazel.BazelRule
 import com.bazel_diff.bazel.BazelSourceFileTarget
 import com.bazel_diff.bazel.BazelTarget
+import com.bazel_diff.extensions.toHexString
 import com.bazel_diff.log.Logger
 import com.google.common.collect.Sets
 import com.google.devtools.build.lib.query2.proto.proto2api.Build
@@ -12,7 +13,6 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
-import toHexString
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentMap
@@ -104,16 +104,14 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
 
         return allTargets.parallelStream()
             .map { target: BazelTarget ->
-                target.name?.let { targetName ->
-                    val targetDigest = targetHasher.digest(
-                        target,
-                        targetToRule,
-                        sourceDigests,
-                        ruleHashes,
-                        seedHash
-                    )
-                    Pair(targetName, targetDigest.toHexString())
-                }
+                val targetDigest = targetHasher.digest(
+                    target,
+                    targetToRule,
+                    sourceDigests,
+                    ruleHashes,
+                    seedHash
+                )
+                Pair(target.name, targetDigest.toHexString())
             }
             .filter { targetEntry: Pair<String, String>? -> targetEntry != null }
             .collect(
@@ -137,10 +135,6 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
             val nextTargets: MutableSet<BazelTarget> = Sets.newHashSet()
             for (target in targetsToAnalyse) {
                 val targetName = target.name
-                if (targetName == null) {
-                    logger.w { "Unknown target name in the build graph. Target type is ${target.type.name}" }
-                    continue
-                }
                 when (target) {
                     is BazelTarget.GeneratedFile -> {
                         targetToRule[target.generatingRuleName]?.let {

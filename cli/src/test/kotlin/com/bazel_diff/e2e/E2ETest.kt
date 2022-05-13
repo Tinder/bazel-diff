@@ -36,7 +36,7 @@ class E2ETest {
 
         val workingDirectoryA = File(projectA, "integration")
         val workingDirectoryB = File(projectB, "integration")
-        val bazelPath = "/opt/homebrew/bin/bazel"
+        val bazelPath = "bazel"
         val outputDir = temp.newFolder()
         val from = File(outputDir, "starting_hashes.json")
         val to = File(outputDir, "final_hashes.json")

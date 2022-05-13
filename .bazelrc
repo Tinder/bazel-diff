@@ -1,2 +1,4 @@
 run -c opt --show_loading_progress=false --show_progress=false --ui_event_filters='ERROR'
 run:verbose -c dbg --show_loading_progress=true --show_progress=true --ui_event_filters='INFO,ERROR,DEBUG'
+# https://github.com/mockito/mockito/issues/1879
+test --sandbox_tmpfs_path=/tmp

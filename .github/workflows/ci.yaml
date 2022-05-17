@@ -7,11 +7,78 @@ on:
     branches: [ master ]
 
 jobs:
-  Tests:
+  test-jre8:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '8'
+        id: java
+      - name: Setup Go environment
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.17
+        id: go
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+      - uses: actions/checkout@v2
+      - name: Run bazel-diff tests
+        run: USE_BAZEL_VERSION=latest ~/go/bin/bazelisk test //cli/...
+      - name: archive testlogs
+        if: always()
+        run: cp -R $(~/go/bin/bazelisk info bazel-testlogs) ./test-logs; (cd test-logs; zip -r -X ../test-logs.zip .)
+      - name: Save test logs
+        uses: actions/upload-artifact@master
+        if: always()
+        with:
+          name: test-logs-jre8
+          path: test-logs.zip
+  test-jre11:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+      - name: Setup Go environment
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.17
+        id: go
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+      - uses: actions/checkout@v2
+      - name: Run bazel-diff tests
+        run: USE_BAZEL_VERSION=latest ~/go/bin/bazelisk coverage --combined_report=lcov //cli/...
+      - name: archive testlogs
+        if: always()
+        run: cp -R $(~/go/bin/bazelisk info bazel-testlogs) ./test-logs; (cd test-logs; zip -r -X ../test-logs.zip .)
+      - name: Save test logs
+        uses: actions/upload-artifact@master
+        if: always()
+        with:
+          name: test-logs-jre11
+          path: test-logs.zip
+      - name: Generate code coverage
+        run: |
+          sudo apt-get install -y lcov
+          genhtml $(~/go/bin/bazelisk info output_path)/_coverage/_coverage_report.dat -o coverage/html
+          (cd coverage/html; zip -r -X ../../coverage-jre11.zip .)
+      - name: Save code coverage
+        uses: actions/upload-artifact@master
+        if: always()
+        with:
+          name: coverage-jre11-jre11
+          path: coverage-jre11.zip
+  deploy:
+    needs: [test-jre8, test-jre11]
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        java: [ '8', '11' ]
+        java: [ '8' ]
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v3
@@ -27,5 +94,10 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v2
-      - name: Run bazel-diff tests
-        run: USE_BAZEL_VERSION=last_downstream_green ~/go/bin/bazelisk test //test/...
+      - name: Build deployable JAR
+        run: USE_BAZEL_VERSION=latest ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar
+      - uses: actions/upload-artifact@v3
+        with:
+          name: bazel-diff_deploy.jar
+          path: bazel-bin/cli/bazel-diff_deploy.jar
+          if-no-files-found: error

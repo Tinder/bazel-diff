@@ -3,14 +3,16 @@ Methods to assist in loading dependencies for bazel-diff in WORKSPACE files
 """
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-load("//:constants.bzl", "DEFAULT_JVM_EXTERNAL_TAG", "RULES_JVM_EXTERNAL_SHA")
+load("//:constants.bzl", "DEFAULT_JVM_EXTERNAL_TAG", "RULES_JVM_EXTERNAL_SHA", "DEFAULT_KOTLIN_EXTERNAL_VERSION", "RULES_KOTLIN_EXTERNAL_SHA" )
 
 def _maybe(repo_rule, name, **kwargs):
     if not native.existing_rule(name):
         repo_rule(name = name, **kwargs)
 
 def bazel_diff_dependencies(rules_jvm_external_tag=DEFAULT_JVM_EXTERNAL_TAG,
-                            rules_jvm_external_sha=RULES_JVM_EXTERNAL_SHA):
+                            rules_jvm_external_sha=RULES_JVM_EXTERNAL_SHA,
+                            rules_kotlin_external_version=DEFAULT_KOTLIN_EXTERNAL_VERSION,
+                            rules_kotlin_external_sha=RULES_KOTLIN_EXTERNAL_SHA):
     _maybe(
         http_archive,
         name = "bazel_skylib",
@@ -37,4 +39,11 @@ def bazel_diff_dependencies(rules_jvm_external_tag=DEFAULT_JVM_EXTERNAL_TAG,
         strip_prefix = "rules_jvm_external-%s" % rules_jvm_external_tag,
         sha256 = rules_jvm_external_sha,
         url = "https://github.com/bazelbuild/rules_jvm_external/archive/%s.zip" % rules_jvm_external_tag
+    )
+
+    _maybe(
+        http_archive,
+        name = "io_bazel_rules_kotlin",
+        sha256 = rules_kotlin_external_sha,
+        url = "https://github.com/bazelbuild/rules_kotlin/releases/download/v%s/rules_kotlin_release.tgz" % rules_kotlin_external_version
     )

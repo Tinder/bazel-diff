@@ -1,6 +1,7 @@
 package com.bazel_diff.hash
 
 import com.bazel_diff.bazel.BazelSourceFileTarget
+import com.bazel_diff.io.ContentHash
 import com.bazel_diff.log.Logger
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
@@ -11,6 +12,7 @@ import java.nio.file.Paths
 class SourceFileHasher : KoinComponent {
     private val workingDirectory: Path by inject(qualifier = named("working-directory"))
     private val logger: Logger by inject()
+    private val contentHash: ContentHash by inject()
 
     fun digest(sourceFileTarget: BazelSourceFileTarget): ByteArray {
         return sha256 {

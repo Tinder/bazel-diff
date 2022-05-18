@@ -89,6 +89,18 @@ kt_jvm_test(
     runtime_deps = [":cli-test-lib"],
 )
 
+kt_jvm_test(
+    name = "ContentHashTest",
+    data = [
+        ":src/test/kotlin/com/bazel_diff/io/fixture/correct.json",
+        ":src/test/kotlin/com/bazel_diff/io/fixture/wrong.json",
+    ],
+    test_class = "com.bazel_diff.io.ContentHashTest",
+    runtime_deps = [
+        ":cli-test-lib",
+    ],
+)
+
 kt_jvm_library(
     name = "cli-test-lib",
     testonly = True,

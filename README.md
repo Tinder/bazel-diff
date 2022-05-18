@@ -256,7 +256,7 @@ bazel run @bazel_diff//:bazel-diff -- bazel-diff -h
 To run the tests simply run
 
 ```terminal
-bazel test //test/...
+bazel test //...
 ```
 
 ## Versioning

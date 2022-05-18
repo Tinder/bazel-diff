@@ -6,7 +6,7 @@ import com.bazel_diff.hash.BuildGraphHasher
 import com.bazel_diff.hash.RuleHasher
 import com.bazel_diff.hash.SourceFileHasher
 import com.bazel_diff.hash.TargetHasher
-import com.bazel_diff.io.ContentHash
+import com.bazel_diff.io.ContentHashProvider
 import com.bazel_diff.log.Logger
 import com.bazel_diff.log.StdoutLogger
 import com.google.gson.GsonBuilder
@@ -40,7 +40,7 @@ fun hasherModule(
     single { RuleHasher() }
     single { SourceFileHasher() }
     single(named("working-directory")) { workingDirectory }
-    single { ContentHash(contentHashPath) }
+    single { ContentHashProvider(contentHashPath) }
 }
 
 fun loggingModule(verbose: Boolean) = module {

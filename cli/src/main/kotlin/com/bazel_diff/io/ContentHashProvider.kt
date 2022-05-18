@@ -5,16 +5,9 @@ import com.google.gson.reflect.TypeToken
 import java.nio.file.Files
 import java.nio.file.Path
 
-
-class ContentHash(path: Path?) {
+class ContentHashProvider(path: Path?) {
     // filename relative to workspace -> content hash of the file
-    var filenameToHash: Map<String, String>? = null
-
-    init {
-        path?.let {
-            this.filenameToHash = readJson(it)
-        }
-    }
+    val filenameToHash: Map<String, String>? = if (path == null) null else readJson(path)
 
     private fun readJson(file: Path): Map<String, String> {
         val gson = Gson()

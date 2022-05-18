@@ -60,6 +60,15 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "SourceFileHasherTest",
+    data = [
+        ":src/test/kotlin/com/bazel_diff/hash/fixture/foo.ts",
+    ],
+    test_class = "com.bazel_diff.hash.SourceFileHasherTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "CalculateImpactedTargetsInteractorTest",
     test_class = "com.bazel_diff.interactor.CalculateImpactedTargetsInteractorTest",
     runtime_deps = [":cli-test-lib"],
@@ -90,12 +99,12 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
-    name = "ContentHashTest",
+    name = "ContentHashProviderTest",
     data = [
         ":src/test/kotlin/com/bazel_diff/io/fixture/correct.json",
         ":src/test/kotlin/com/bazel_diff/io/fixture/wrong.json",
     ],
-    test_class = "com.bazel_diff.io.ContentHashTest",
+    test_class = "com.bazel_diff.io.ContentHashProviderTest",
     runtime_deps = [
         ":cli-test-lib",
     ],

@@ -69,51 +69,26 @@ Open `bazel-diff-example.sh` to see how this is implemented. This is purely an e
 ## CLI Interface
 
 `bazel-diff` Command
-
 ```terminal
-Usage: bazel-diff [-hkV] -b=<bazelPath> [-co=<bazelCommandOptions>]
-                  [-fh=<finalHashesJSONPath>] [-o=<outputPath>]
-                  [-sh=<startingHashesJSONPath>] [-so=<bazelStartupOptions>]
-                  -w=<workspacePath> [COMMAND]
+Usage: bazel-diff [-hvV] [COMMAND]
 Writes to a file the impacted targets between two Bazel graph JSON files
-  -b, --bazelPath=<bazelPath>
-                          Path to Bazel binary
-      -co, --bazelCommandOptions=<bazelCommandOptions>
-                          Additional space separated Bazel command options used
-                            when invoking Bazel
-      -fh, --finalHashes=<finalHashesJSONPath>
-                          The path to the JSON file of target hashes for the
-                            final revision. Run 'generate-hashes' to get this
-                            value.
-  -h, --help              Show this help message and exit.
-  -k, --[no-]keep_going   This flag controls if `bazel query` will be executed
-                            with the `--keep_going` flag or not. Disabling this
-                            flag allows you to catch configuration issues in
-                            your Bazel graph, but may not work for some Bazel
-                            setups. Defaults to `true`
-  -o, --output=<outputPath>
-                          Filepath to write the impacted Bazel targets to,
-                            newline separated
-      -sh, --startingHashes=<startingHashesJSONPath>
-                          The path to the JSON file of target hashes for the
-                            initial revision. Run 'generate-hashes' to get this
-                            value.
-      -so, --bazelStartupOptions=<bazelStartupOptions>
-                          Additional space separated Bazel client startup
-                            options used when invoking Bazel
-  -V, --version           Print version information and exit.
-  -w, --workspacePath=<workspacePath>
-                          Path to Bazel workspace directory.
+  -h, --help      Show this help message and exit.
+  -v, --verbose   Display query string, missing files and elapsed time
+  -V, --version   Print version information and exit.
+Commands:
+  generate-hashes       Writes to a file the SHA256 hashes for each Bazel
+                          Target in the provided workspace.
+  get-impacted-targets  Command-line utility to analyze the state of the bazel
+                          build graph
 ```
 
-`generate-hashes` Command
+### `generate-hashes` command
 
 ```terminal
-Usage: bazel-diff generate-hashes [-hkV] -b=<bazelPath>
-                                  [-co=<bazelCommandOptions>]
-                                  [-s=<seedFilepaths>]
-                                  [-so=<bazelStartupOptions>]
-                                  -w=<workspacePath> <outputPath>
+Usage: bazel-diff generate-hashes [-hkvV] -b=<bazelPath> [-s=<seedFilepaths>]
+                                  -w=<workspacePath>
+                                  [-co=<bazelCommandOptions>]...
+                                  [-so=<bazelStartupOptions>]... <outputPath>
 Writes to a file the SHA256 hashes for each Bazel Target in the provided
 workspace.
       <outputPath>        The filepath to write the resulting JSON of
@@ -136,10 +111,29 @@ workspace.
       -so, --bazelStartupOptions=<bazelStartupOptions>
                           Additional space separated Bazel client startup
                             options used when invoking Bazel
+  -v, --verbose           Display query string, missing files and elapsed time
   -V, --version           Print version information and exit.
   -w, --workspacePath=<workspacePath>
                           Path to Bazel workspace directory.
-  -v, --verbose           Display query string, missing files and elapsed time
+```
+
+### `get-impacted-targets` command
+
+```terminal
+Usage: bazel-diff get-impacted-targets [-v] -fh=<finalHashesJSONPath>
+                                       -o=<outputPath>
+                                       -sh=<startingHashesJSONPath>
+Command-line utility to analyze the state of the bazel build graph
+      -fh, --finalHashes=<finalHashesJSONPath>
+                  The path to the JSON file of target hashes for the final
+                    revision. Run 'generate-hashes' to get this value.
+  -o, --output=<outputPath>
+                  Filepath to write the impacted Bazel targets to, newline
+                    separated
+      -sh, --startingHashes=<startingHashesJSONPath>
+                  The path to the JSON file of target hashes for the initial
+                    revision. Run 'generate-hashes' to get this value.
+  -v, --verbose   Display query string, missing files and elapsed time
 ```
 
 ## Installing

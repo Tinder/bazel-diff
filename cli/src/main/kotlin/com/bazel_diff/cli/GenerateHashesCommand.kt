@@ -46,7 +46,7 @@ class GenerateHashesCommand : Callable<Int> {
         scope = CommandLine.ScopeType.INHERIT,
         required = false
     )
-    var contentHashPath: Path? = null
+    var contentHashPath: File? = null
 
     @CommandLine.Option(
         names = ["-so", "--bazelStartupOptions"],
@@ -89,6 +89,7 @@ class GenerateHashesCommand : Callable<Int> {
 
     override fun call(): Int {
         val output = validateOutput(outputPath)
+        validate(contentHashPath=contentHashPath)
 
         startKoin {
             modules(
@@ -117,5 +118,16 @@ class GenerateHashesCommand : Callable<Int> {
             spec.commandLine(),
             "No output path specified."
         )
+    }
+
+    private fun validate(contentHashPath: File?) {
+        contentHashPath?.let {
+            if (!it.canRead()) {
+                throw CommandLine.ParameterException(
+                    spec.commandLine(),
+                    "Incorrect contentHashFilePath: file doesn't exist or can't be read."
+                )
+            }
+        }
     }
 }

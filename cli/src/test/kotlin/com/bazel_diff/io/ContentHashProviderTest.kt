@@ -9,7 +9,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.koin.test.KoinTest
 import org.koin.test.KoinTestRule
-import kotlin.io.path.Path
+import java.io.File
 
 internal class ContentHashProviderTest: KoinTest {
     @get:Rule
@@ -26,25 +26,26 @@ internal class ContentHashProviderTest: KoinTest {
     @Test
     fun testNonExistingPath() = runBlocking {
         assertThat {
-            ContentHashProvider(Path("/not/exists"))
-        }.isFailure().hasClass(java.nio.file.NoSuchFileException::class)
+            ContentHashProvider(File("/not/exists"))
+        }.isFailure().hasClass(java.io.FileNotFoundException::class)
     }
 
     @Test
     fun testParseJsonFileWithWrongShape() = runBlocking {
-        val path = Path("cli/src/test/kotlin/com/bazel_diff/io/fixture/wrong.json")
+        val file = File("cli/src/test/kotlin/com/bazel_diff/io/fixture/wrong.json")
         assertThat {
-            ContentHashProvider(path)
+            val a = ContentHashProvider(file)
+            println(a.filenameToHash)
         }.isFailure().hasClass(JsonSyntaxException::class)
     }
 
     @Test
     fun testParseJsonFileWithCorrectShape() = runBlocking {
-        val path = Path("cli/src/test/kotlin/com/bazel_diff/io/fixture/correct.json")
-        val map = ContentHashProvider(path).filenameToHash
+        val file = File("cli/src/test/kotlin/com/bazel_diff/io/fixture/correct.json")
+        val map = ContentHashProvider(file).filenameToHash
         assertThat(map).isNotNull().containsOnly(
-                "foo" to "content-hash-for-foo",
-                "bar" to "content-hash-for-bar"
+            "foo" to "content-hash-for-foo",
+            "bar" to "content-hash-for-bar"
         )
     }
 }

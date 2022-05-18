@@ -13,12 +13,13 @@ import com.google.gson.GsonBuilder
 import org.koin.core.module.Module
 import org.koin.core.qualifier.named
 import org.koin.dsl.module
+import java.io.File
 import java.nio.file.Path
 
 fun hasherModule(
     workingDirectory: Path,
     bazelPath: Path,
-    contentHashPath: Path?,
+    contentHashPath: File?,
     startupOptions: List<String>,
     commandOptions: List<String>,
     keepGoing: Boolean?,

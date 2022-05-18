@@ -1,18 +1,14 @@
 package com.bazel_diff.io
 
-import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
-import java.nio.file.Files
-import java.nio.file.Path
+import com.bazel_diff.interactor.DeserialiseHashesInteractor
+import java.io.File
 
-class ContentHashProvider(path: Path?) {
+class ContentHashProvider(file: File?) {
     // filename relative to workspace -> content hash of the file
-    val filenameToHash: Map<String, String>? = if (path == null) null else readJson(path)
+    val filenameToHash: Map<String, String>? = if (file == null) null else readJson(file)
 
-    private fun readJson(file: Path): Map<String, String> {
-        val gson = Gson()
-        val reader = Files.newBufferedReader(file)
-        val shape = object : TypeToken<Map<String, String>>() {}.type
-        return gson.fromJson(reader, shape)
+    private fun readJson(file: File): Map<String, String> {
+        val deserialiser = DeserialiseHashesInteractor()
+        return deserialiser.execute(file)
     }
 }

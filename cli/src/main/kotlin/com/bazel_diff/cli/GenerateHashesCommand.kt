@@ -41,10 +41,10 @@ class GenerateHashesCommand : Callable<Int> {
     lateinit var bazelPath: Path
 
     @CommandLine.Option(
-            names = ["--contentHashPath"],
-            description = ["Path to content hash json file. It's a map which maps relative file path from workspace path to its content hash. Files in this map will skip content hashing"],
-            scope = CommandLine.ScopeType.INHERIT,
-            required = false
+        names = ["--contentHashPath"],
+        description = ["Path to content hash json file. It's a map which maps relative file path from workspace path to its content hash. Files in this map will skip content hashing and use provided value"],
+        scope = CommandLine.ScopeType.INHERIT,
+        required = false
     )
     var contentHashPath: Path? = null
 

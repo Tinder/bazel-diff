@@ -45,8 +45,10 @@ class SourceFileHasher : KoinComponent {
                 } else {
                     val absoluteFilePath = Paths.get(workingDirectory.toString(), filenamePath)
                     val file = absoluteFilePath.toFile()
-                    if (file.exists() && file.isFile) {
-                        putFile(file)
+                    if (file.exists()) {
+                        if (file.isFile) {
+                            putFile(file)
+                        }
                     } else {
                         logger.w { "File $absoluteFilePath not found" }
                     }

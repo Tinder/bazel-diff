@@ -20,8 +20,8 @@ fun hasherModule(
     startupOptions: List<String>,
     commandOptions: List<String>,
     keepGoing: Boolean?,
-    debug: Boolean
 ): Module = module {
+    val debug = System.getProperty("DEBUG", "false").equals("true")
     single {
         BazelQueryService(
             workingDirectory,

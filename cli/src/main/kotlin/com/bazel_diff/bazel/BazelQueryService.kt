@@ -32,7 +32,7 @@ class BazelQueryService(
         val cmd: MutableList<String> = ArrayList<String>().apply {
             add(bazelPath.toString())
             if (debug) {
-                add("--bazelrc=/dev/null")
+                println("in debug")
             }
             addAll(startupOptions)
             add("query")

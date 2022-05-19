@@ -18,7 +18,7 @@ class BazelQueryService(
     private val startupOptions: List<String>,
     private val commandOptions: List<String>,
     private val keepGoing: Boolean?,
-    private val debug: Boolean,
+    private val noBazelrc: Boolean,
 ) : KoinComponent {
     private val logger: Logger by inject()
 
@@ -31,7 +31,7 @@ class BazelQueryService(
 
         val cmd: MutableList<String> = ArrayList<String>().apply {
             add(bazelPath.toString())
-            if (debug) {
+            if (noBazelrc) {
                 add("--bazelrc=/dev/null")
             }
             addAll(startupOptions)

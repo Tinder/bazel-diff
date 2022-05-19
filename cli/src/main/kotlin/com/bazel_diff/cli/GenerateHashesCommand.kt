@@ -90,7 +90,6 @@ class GenerateHashesCommand : Callable<Int> {
                     bazelStartupOptions,
                     bazelCommandOptions,
                     keepGoing,
-                    parent.isVerbose(),
                 ),
                 loggingModule(parent.verbose),
                 serialisationModule(),

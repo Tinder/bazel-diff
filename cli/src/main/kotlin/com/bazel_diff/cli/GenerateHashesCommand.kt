@@ -41,6 +41,14 @@ class GenerateHashesCommand : Callable<Int> {
     lateinit var bazelPath: Path
 
     @CommandLine.Option(
+        names = ["--contentHashPath"],
+        description = ["Path to content hash json file. It's a map which maps relative file path from workspace path to its content hash. Files in this map will skip content hashing and use provided value"],
+        scope = CommandLine.ScopeType.INHERIT,
+        required = false
+    )
+    var contentHashPath: File? = null
+
+    @CommandLine.Option(
         names = ["-so", "--bazelStartupOptions"],
         description = ["Additional space separated Bazel client startup options used when invoking Bazel"],
         scope = CommandLine.ScopeType.INHERIT,
@@ -81,12 +89,14 @@ class GenerateHashesCommand : Callable<Int> {
 
     override fun call(): Int {
         val output = validateOutput(outputPath)
+        validate(contentHashPath=contentHashPath)
 
         startKoin {
             modules(
                 hasherModule(
                     workspacePath,
                     bazelPath,
+                    contentHashPath,
                     bazelStartupOptions,
                     bazelCommandOptions,
                     keepGoing,
@@ -107,5 +117,16 @@ class GenerateHashesCommand : Callable<Int> {
             spec.commandLine(),
             "No output path specified."
         )
+    }
+
+    private fun validate(contentHashPath: File?) {
+        contentHashPath?.let {
+            if (!it.canRead()) {
+                throw CommandLine.ParameterException(
+                    spec.commandLine(),
+                    "Incorrect contentHashFilePath: file doesn't exist or can't be read."
+                )
+            }
+        }
     }
 }

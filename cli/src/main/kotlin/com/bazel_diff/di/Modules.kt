@@ -6,17 +6,20 @@ import com.bazel_diff.hash.BuildGraphHasher
 import com.bazel_diff.hash.RuleHasher
 import com.bazel_diff.hash.SourceFileHasher
 import com.bazel_diff.hash.TargetHasher
+import com.bazel_diff.io.ContentHashProvider
 import com.bazel_diff.log.Logger
 import com.bazel_diff.log.StdoutLogger
 import com.google.gson.GsonBuilder
 import org.koin.core.module.Module
 import org.koin.core.qualifier.named
 import org.koin.dsl.module
+import java.io.File
 import java.nio.file.Path
 
 fun hasherModule(
     workingDirectory: Path,
     bazelPath: Path,
+    contentHashPath: File?,
     startupOptions: List<String>,
     commandOptions: List<String>,
     keepGoing: Boolean?,
@@ -38,6 +41,7 @@ fun hasherModule(
     single { RuleHasher() }
     single { SourceFileHasher() }
     single(named("working-directory")) { workingDirectory }
+    single { ContentHashProvider(contentHashPath) }
 }
 
 fun loggingModule(verbose: Boolean) = module {

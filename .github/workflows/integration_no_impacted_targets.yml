@@ -31,6 +31,7 @@ jobs:
       - name: Validate Impacted Targets
         run: |
           if [ -s /tmp/impacted_targets.txt ]
+          then
             echo "Found impacted targets when expected none!"
             cat /tmp/impacted_targets.txt
             exit 1

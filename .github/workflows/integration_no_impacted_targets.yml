@@ -1,0 +1,39 @@
+name: Integration No Impacted Targets
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  schedule:
+    - cron: "0 */12 * * *"
+
+jobs:
+  IntegrationNoImpactedTargets:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java: [ '8', '11' ]
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.java }}
+        id: java
+      - uses: actions/checkout@v2
+        with:
+          repository: maxwellE/examples
+          ref: add_bazel_diff_impact
+          fetch-depth: 0
+      - name: Run No Impacted Targets Test
+        run: cd java-tutorial && ./bazel-diff-example.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
+      - name: Validate Impacted Targets
+        run: |
+          if [ -s /tmp/impacted_targets.txt ]
+          then
+            echo "Found impacted targets when expected none!"
+            cat /tmp/impacted_targets.txt
+            exit 1
+          fi
+

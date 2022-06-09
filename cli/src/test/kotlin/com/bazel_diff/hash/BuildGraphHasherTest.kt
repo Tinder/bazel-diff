@@ -1,7 +1,10 @@
 package com.bazel_diff.hash
 
+import assertk.all
+import assertk.assertAll
 import assertk.assertThat
 import assertk.assertions.*
+import assertk.assertions.any
 import com.bazel_diff.bazel.BazelClient
 import com.bazel_diff.bazel.BazelRule
 import com.bazel_diff.bazel.BazelTarget
@@ -18,6 +21,7 @@ import org.koin.test.mock.MockProviderRule
 import org.koin.test.mock.declareMock
 import org.mockito.Mockito
 import org.mockito.junit.MockitoJUnit
+import org.mockito.kotlin.any
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
 import java.util.*
@@ -139,7 +143,14 @@ class BuildGraphHasherTest : KoinTest {
         whenever(bazelClientMock.queryAllSourcefileTargets()).thenReturn(emptyList())
         assertThat {
             hasher.hashAllBazelTargetsAndSourcefiles()
-        }.isFailure().messageContains("rule4 -> rule3 -> rule4")
+        }.isFailure().all {
+            isInstanceOf(RuleHasher.CircularDependencyException::class)
+            // they are run in parallel, so we don't know whether rule3 or rule4 will be processed first
+            message().matchesPredicate {
+                it!!.contains("\\brule3 -> rule4 -> rule3\\b".toRegex()) ||
+                it.contains("\\brule4 -> rule3 -> rule4\\b".toRegex())
+            }
+        }
     }
 
     @Test

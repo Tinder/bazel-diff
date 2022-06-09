@@ -10,7 +10,7 @@ import java.util.concurrent.ConcurrentMap
 class RuleHasher : KoinComponent {
     private val logger: Logger by inject()
     private val sourceFileHasher: SourceFileHasher by inject()
-    private class CircularDependencyException(message: String) : Exception(message)
+    class CircularDependencyException(message: String) : Exception(message)
 
 
     private fun raiseCircularDependency(depPath: LinkedHashSet<String>, begin: String): CircularDependencyException {

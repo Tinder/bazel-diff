@@ -1,7 +1,10 @@
 package com.bazel_diff.hash
 
+import assertk.all
+import assertk.assertAll
 import assertk.assertThat
 import assertk.assertions.*
+import assertk.assertions.any
 import com.bazel_diff.bazel.BazelClient
 import com.bazel_diff.bazel.BazelRule
 import com.bazel_diff.bazel.BazelTarget
@@ -18,6 +21,7 @@ import org.koin.test.mock.MockProviderRule
 import org.koin.test.mock.declareMock
 import org.mockito.Mockito
 import org.mockito.junit.MockitoJUnit
+import org.mockito.kotlin.any
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
 import java.util.*
@@ -127,6 +131,26 @@ class BuildGraphHasherTest : KoinTest {
             "rule3" to "ca2f970a5a5a18730d7633cc32b48b1d94679f4ccaea56c4924e1f9913bd9cb5",
             "rule4" to "bf15e616e870aaacb02493ea0b8e90c6c750c266fa26375e22b30b78954ee523",
         )
+    }
+
+    @Test
+    fun testCircularDependency() = runBlocking {
+        val rule3 = createRuleTarget("rule3", listOf("rule2", "rule4"), "digest3")
+        val rule4 = createRuleTarget("rule4", listOf("rule1", "rule3"), "digest4")
+        defaultTargets.add(rule3)
+        defaultTargets.add(rule4)
+        whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
+        whenever(bazelClientMock.queryAllSourcefileTargets()).thenReturn(emptyList())
+        assertThat {
+            hasher.hashAllBazelTargetsAndSourcefiles()
+        }.isFailure().all {
+            isInstanceOf(RuleHasher.CircularDependencyException::class)
+            // they are run in parallel, so we don't know whether rule3 or rule4 will be processed first
+            message().matchesPredicate {
+                it!!.contains("\\brule3 -> rule4 -> rule3\\b".toRegex()) ||
+                it.contains("\\brule4 -> rule3 -> rule4\\b".toRegex())
+            }
+        }
     }
 
     @Test

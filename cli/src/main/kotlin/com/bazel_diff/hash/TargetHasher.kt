@@ -29,12 +29,13 @@ class TargetHasher : KoinComponent {
                         allRulesMap,
                         ruleHashes,
                         sourceDigests,
-                        seedHash
+                        seedHash,
+                        depPath = null
                     )
                 }
             }
             is BazelTarget.Rule -> {
-                ruleHasher.digest(target.rule, allRulesMap, ruleHashes, sourceDigests, seedHash)
+                ruleHasher.digest(target.rule, allRulesMap, ruleHashes, sourceDigests, seedHash, depPath = null)
             }
             is BazelTarget.SourceFile -> sha256 {
                 safePutBytes(sourceDigests[target.sourceFileName])

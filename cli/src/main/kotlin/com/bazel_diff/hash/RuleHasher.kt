@@ -10,14 +10,30 @@ import java.util.concurrent.ConcurrentMap
 class RuleHasher : KoinComponent {
     private val logger: Logger by inject()
     private val sourceFileHasher: SourceFileHasher by inject()
+    private class CircularDependencyException(message: String) : Exception(message)
+
+
+    private fun raiseCircularDependency(depPath: LinkedHashSet<String>, begin: String): CircularDependencyException {
+        val sb = StringBuilder().appendLine("Circular dependency detected: ").append(begin).append(" -> ")
+        val circularPath = depPath.toList().takeLastWhile { it != begin }
+        circularPath.forEach { sb.append(it).append(" -> ") }
+        sb.append(begin)
+        return CircularDependencyException(sb.toString())
+    }
 
     fun digest(
         rule: BazelRule,
         allRulesMap: Map<String, BazelRule>,
         ruleHashes: ConcurrentMap<String, ByteArray>,
         sourceDigests: ConcurrentMap<String, ByteArray>,
-        seedHash: ByteArray?
+        seedHash: ByteArray?,
+        depPath: LinkedHashSet<String>?
     ): ByteArray {
+        val depPathClone = if (depPath != null) LinkedHashSet(depPath) else LinkedHashSet()
+        if (depPathClone.contains(rule.name)) {
+            throw raiseCircularDependency(depPathClone, rule.name)
+        }
+        depPathClone.add(rule.name)
         ruleHashes[rule.name]?.let { return it }
 
         val finalHashValue = sha256 {
@@ -38,7 +54,8 @@ class RuleHasher : KoinComponent {
                             allRulesMap,
                             ruleHashes,
                             sourceDigests,
-                            seedHash
+                            seedHash,
+                            depPathClone,
                         )
                         safePutBytes(ruleInputHash)
                     }

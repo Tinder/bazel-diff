@@ -130,6 +130,19 @@ class BuildGraphHasherTest : KoinTest {
     }
 
     @Test
+    fun testCircularDependency() = runBlocking {
+        val rule3 = createRuleTarget("rule3", listOf("rule2", "rule4"), "digest3")
+        val rule4 = createRuleTarget("rule4", listOf("rule1", "rule3"), "digest4")
+        defaultTargets.add(rule3)
+        defaultTargets.add(rule4)
+        whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
+        whenever(bazelClientMock.queryAllSourcefileTargets()).thenReturn(emptyList())
+        assertThat {
+            hasher.hashAllBazelTargetsAndSourcefiles()
+        }.isFailure().messageContains("rule4 -> rule3 -> rule4")
+    }
+
+    @Test
     fun testGeneratedTargets() = runBlocking {
         val generator = createRuleTarget("rule1", emptyList(), "rule1Digest")
         val target = createGeneratedTarget("rule0", "rule1")

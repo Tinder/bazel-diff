@@ -3,6 +3,7 @@ package com.bazel_diff.hash
 import com.bazel_diff.bazel.BazelRule
 import com.bazel_diff.bazel.BazelSourceFileTarget
 import com.bazel_diff.log.Logger
+import com.google.common.annotations.VisibleForTesting
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import java.util.concurrent.ConcurrentMap
@@ -10,6 +11,7 @@ import java.util.concurrent.ConcurrentMap
 class RuleHasher : KoinComponent {
     private val logger: Logger by inject()
     private val sourceFileHasher: SourceFileHasher by inject()
+    @VisibleForTesting
     class CircularDependencyException(message: String) : Exception(message)
 
 

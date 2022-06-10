@@ -115,25 +115,6 @@ class BuildGraphHasherTest : KoinTest {
     }
 
     @Test
-    fun testCyclicRuleInput() = runBlocking {
-        val ruleInputs = listOf("rule1", "rule4")
-        val rule3 = createRuleTarget("rule3", ruleInputs, "digest")
-        val rule4 = createRuleTarget("rule4", ruleInputs, "digest2")
-        defaultTargets.add(rule3)
-        defaultTargets.add(rule4)
-
-        whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
-        whenever(bazelClientMock.queryAllSourcefileTargets()).thenReturn(emptyList())
-        val hash = hasher.hashAllBazelTargetsAndSourcefiles()
-        assertThat(hash).containsOnly(
-            "rule1" to "2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775",
-            "rule2" to "bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9",
-            "rule3" to "ca2f970a5a5a18730d7633cc32b48b1d94679f4ccaea56c4924e1f9913bd9cb5",
-            "rule4" to "bf15e616e870aaacb02493ea0b8e90c6c750c266fa26375e22b30b78954ee523",
-        )
-    }
-
-    @Test
     fun testCircularDependency() = runBlocking {
         val rule3 = createRuleTarget("rule3", listOf("rule2", "rule4"), "digest3")
         val rule4 = createRuleTarget("rule4", listOf("rule1", "rule3"), "digest4")

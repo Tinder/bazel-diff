@@ -18,7 +18,9 @@ class StdoutLogger(private val verbose: Boolean) : Logger {
     }
 
     override fun w(block: () -> String) {
-        println("[Warning] ${block.invoke()}")
+        if (verbose) {
+            println("[Warning] ${block.invoke()}")
+        }
     }
 
     override fun i(block: () -> String) {

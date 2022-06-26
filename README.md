@@ -153,9 +153,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
 http_jar(
     name = "bazel_diff",
     urls = [
-        "https://github.com/Tinder/bazel-diff/releases/download/4.0.2/bazel-diff_deploy.jar",
+        "https://github.com/Tinder/bazel-diff/releases/download/4.0.5/bazel-diff_deploy.jar",
     ],
-    sha256 = "2814abd89064e917bf60a347c13cef52f02b8b09d76363cbc2f1bfc5f2901612",
+    sha256 = "59f2a614f90b4c2a6c83f1e6146d8722dfaac3a1d8f42734dcbb6ccf373a1cbd",
 )
 ```
 

@@ -93,6 +93,12 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "BazelRuleTest",
+    test_class = "com.bazel_diff.bazel.BazelRuleTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "E2ETest",
     test_class = "com.bazel_diff.e2e.E2ETest",
     runtime_deps = [":cli-test-lib"],

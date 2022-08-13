@@ -182,7 +182,7 @@ bazel run //:bazel-diff
 ### Run Via JAR Release
 
 ```terminal
-curl -LO bazel-diff.jar GITHUB_RELEASE_JAR_URL
+curl -Lo bazel-diff.jar https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff_deploy.jar
 java -jar bazel-diff.jar -h
 ```
 

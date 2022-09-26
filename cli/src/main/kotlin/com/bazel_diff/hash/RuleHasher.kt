@@ -50,7 +50,7 @@ class RuleHasher : KoinComponent {
                     inputRule == null && sourceDigests.containsKey(ruleInput) -> {
                         safePutBytes(sourceDigests[ruleInput])
                     }
-                    inputRule?.name != null -> {
+                    inputRule?.name != null && inputRule.name != rule.name -> {
                         val ruleInputHash = digest(
                             inputRule,
                             allRulesMap,

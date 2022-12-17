@@ -34,9 +34,9 @@ class GenerateHashesCommand : Callable<Int> {
 
     @CommandLine.Option(
         names = ["-b", "--bazelPath"],
-        description = ["Path to Bazel binary"],
+        description = ["Path to Bazel binary. If not specified, the Bazel binary available in PATH will be used."],
         scope = CommandLine.ScopeType.INHERIT,
-        required = true,
+        defaultValue = "bazel",
     )
     lateinit var bazelPath: Path
 

@@ -9,6 +9,7 @@ import org.koin.core.context.stopKoin
 import picocli.CommandLine
 import java.io.BufferedWriter
 import java.io.File
+import java.io.FileDescriptor
 import java.io.FileWriter
 import java.io.IOException
 import java.util.concurrent.Callable
@@ -40,10 +41,9 @@ class GetImpactedTargetsCommand : Callable<Int> {
     @CommandLine.Option(
         names = ["-o", "--output"],
         scope = CommandLine.ScopeType.LOCAL,
-        description = ["Filepath to write the impacted Bazel targets to, newline separated"],
-        required = true,
+        description = ["Filepath to write the impacted Bazel targets to, newline separated. If not specified, the targets will be written to STDOUT."],
     )
-    lateinit var outputPath: File
+    var outputPath: File? = null
 
     @CommandLine.Spec
     lateinit var spec: CommandLine.Model.CommandSpec
@@ -64,7 +64,10 @@ class GetImpactedTargetsCommand : Callable<Int> {
         val impactedTargets = CalculateImpactedTargetsInteractor().execute(from, to)
 
         return try {
-            BufferedWriter(FileWriter(outputPath)).use { writer ->
+            BufferedWriter(when (val path=outputPath) {
+                null -> FileWriter(FileDescriptor.out)
+                else -> FileWriter(path)
+            }).use { writer ->
                 impactedTargets.forEach {
                     writer.write(it)
                     //Should not be depend on OS

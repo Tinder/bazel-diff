@@ -26,3 +26,4 @@ out
 user.bazelrc
 !bazel-diff-example.sh
 .DS_Store
+!.bazelversion

@@ -21,7 +21,7 @@ jobs:
           distribution: 'temurin'
           java-version: ${{ matrix.java }}
         id: java
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           repository: tinder-maxwellelliott/bazel-diff-repro-1
           ref: wip_fix

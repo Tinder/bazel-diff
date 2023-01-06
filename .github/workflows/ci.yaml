@@ -65,8 +65,8 @@ jobs:
       - name: Generate code coverage
         run: |
           sudo apt-get install -y lcov
-          genhtml $(~/go/bin/bazelisk info output_path)/_coverage/_coverage_report.dat -o coverage/html
-          (cd coverage/html; zip -r -X ../../coverage-jre11.zip .)
+          genhtml $(~/go/bin/bazelisk info output_path)/_coverage/_coverage_report.dat -o coverage/html || true
+          [ -d coverage/html ] && (cd coverage/html; zip -r -X ../../coverage-jre11.zip .)
       - name: Save code coverage
         uses: actions/upload-artifact@master
         if: always()

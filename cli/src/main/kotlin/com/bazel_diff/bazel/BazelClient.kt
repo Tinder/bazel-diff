@@ -5,15 +5,14 @@ import com.google.devtools.build.lib.query2.proto.proto2api.Build
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import java.util.concurrent.ConcurrentMap
-import kotlin.system.measureTimeMillis
-import java.util.Calendar;
+import java.util.Calendar
 
 class BazelClient : KoinComponent {
     private val logger: Logger by inject()
     private val queryService: BazelQueryService by inject()
 
     suspend fun queryAllTargets(): List<BazelTarget> {
-        var calendar = Calendar.getInstance();
+        var calendar = Calendar.getInstance()
         val queryEpoch = calendar.getTimeInMillis()
         val targets = queryService.query("'//external:all-targets' + '//...:all-targets'")
         val queryDuration = calendar.getTimeInMillis() - queryEpoch
@@ -36,7 +35,7 @@ class BazelClient : KoinComponent {
     }
 
     suspend fun queryAllSourcefileTargets(): List<Build.Target> {
-        var calendar = Calendar.getInstance();
+        var calendar = Calendar.getInstance()
         val queryEpoch = calendar.getTimeInMillis()
         val targets = queryService.query("kind('source file', //...:all-targets)")
         val queryDuration = calendar.getTimeInMillis() - queryEpoch

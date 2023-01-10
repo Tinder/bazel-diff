@@ -19,8 +19,7 @@ import java.util.concurrent.ConcurrentMap
 import java.util.concurrent.atomic.AtomicReference
 import java.util.stream.Collectors
 import kotlin.io.path.readBytes
-import kotlin.system.measureTimeMillis
-import java.util.Calendar;
+import java.util.Calendar
 
 class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
     private val targetHasher: TargetHasher by inject()
@@ -44,7 +43,7 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
              * Querying targets and source hashing is done in parallel
              */
             val sourceDigestsFuture = async(Dispatchers.IO) {
-                var calendar = Calendar.getInstance();
+                var calendar = Calendar.getInstance()
                 val sourceHashDurationEpoch = calendar.getTimeInMillis()
                 val sourceFileTargets = hashSourcefiles(sourceTargets)
                 val sourceHashDuration = calendar.getTimeInMillis() - sourceHashDurationEpoch

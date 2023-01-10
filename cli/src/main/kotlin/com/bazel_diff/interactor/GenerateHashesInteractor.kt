@@ -11,7 +11,7 @@ import java.io.FileDescriptor
 import java.io.FileReader
 import java.io.FileWriter
 import java.nio.file.Path
-import kotlin.system.measureTimeMillis
+import java.util.Calendar
 
 class GenerateHashesInteractor : KoinComponent {
     private val buildGraphHasher: BuildGraphHasher by inject()
@@ -20,25 +20,26 @@ class GenerateHashesInteractor : KoinComponent {
 
     fun execute(seedFilepaths: File?, outputPath: File?): Boolean {
         return try {
-            val duration = measureTimeMillis {
-                var seedFilepathsSet: Set<Path> = when {
-                    seedFilepaths != null -> {
-                        BufferedReader(FileReader(seedFilepaths)).use {
-                            it.readLines()
-                                .map { line: String -> File(line).toPath() }
-                                .toSet()
-                        }
+            var calendar = Calendar.getInstance()
+            val epoch = calendar.getTimeInMillis()
+            var seedFilepathsSet: Set<Path> = when {
+                seedFilepaths != null -> {
+                    BufferedReader(FileReader(seedFilepaths)).use {
+                        it.readLines()
+                            .map { line: String -> File(line).toPath() }
+                            .toSet()
                     }
-                    else -> emptySet()
                 }
-                val hashes = buildGraphHasher.hashAllBazelTargetsAndSourcefiles(seedFilepathsSet)
-                when (outputPath) {
-                    null -> FileWriter(FileDescriptor.out)
-                    else -> FileWriter(outputPath)
-                }.use {
-                    it.write(gson.toJson(hashes))
-                }
+                else -> emptySet()
             }
+            val hashes = buildGraphHasher.hashAllBazelTargetsAndSourcefiles(seedFilepathsSet)
+            when (outputPath) {
+                null -> FileWriter(FileDescriptor.out)
+                else -> FileWriter(outputPath)
+            }.use {
+                it.write(gson.toJson(hashes))
+            }
+            val duration = calendar.getTimeInMillis() - epoch;
             logger.i { "generate-hashes finished in $duration" }
             true
         } catch (e: Exception) {

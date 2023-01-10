@@ -52,6 +52,8 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
       - name: Run bazel-diff example script
         run: USE_BAZEL_VERSION=latest ./bazel-diff.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   test-jre11:
@@ -98,6 +100,8 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
       - name: Run bazel-diff example script
         run: USE_BAZEL_VERSION=latest ./bazel-diff.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   deploy:

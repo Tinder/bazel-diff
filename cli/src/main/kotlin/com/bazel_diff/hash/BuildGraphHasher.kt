@@ -19,15 +19,13 @@ import java.util.concurrent.ConcurrentMap
 import java.util.concurrent.atomic.AtomicReference
 import java.util.stream.Collectors
 import kotlin.io.path.readBytes
-import kotlin.time.ExperimentalTime
-import kotlin.time.measureTimedValue
+import java.util.Calendar
 
 class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
     private val targetHasher: TargetHasher by inject()
     private val sourceFileHasher: SourceFileHasher by inject()
     private val logger: Logger by inject()
 
-    @OptIn(ExperimentalTime::class)
     fun hashAllBazelTargetsAndSourcefiles(seedFilepaths: Set<Path> = emptySet()): Map<String, String> {
         /**
          * Bazel will lock parallel queries but this is still allowing us to hash source files while executing a parallel query
@@ -45,9 +43,10 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
              * Querying targets and source hashing is done in parallel
              */
             val sourceDigestsFuture = async(Dispatchers.IO) {
-                val (sourceFileTargets, sourceHashDuration) = measureTimedValue {
-                    hashSourcefiles(sourceTargets)
-                }
+                var calendar = Calendar.getInstance()
+                val sourceHashDurationEpoch = calendar.getTimeInMillis()
+                val sourceFileTargets = hashSourcefiles(sourceTargets)
+                val sourceHashDuration = calendar.getTimeInMillis() - sourceHashDurationEpoch
                 logger.i { "Source file hashes calculated in $sourceHashDuration" }
                 sourceFileTargets
             }

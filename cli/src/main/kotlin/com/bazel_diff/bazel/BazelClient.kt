@@ -5,18 +5,17 @@ import com.google.devtools.build.lib.query2.proto.proto2api.Build
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import java.util.concurrent.ConcurrentMap
-import kotlin.time.ExperimentalTime
-import kotlin.time.measureTimedValue
+import java.util.Calendar
 
 class BazelClient : KoinComponent {
     private val logger: Logger by inject()
     private val queryService: BazelQueryService by inject()
 
-    @OptIn(ExperimentalTime::class)
     suspend fun queryAllTargets(): List<BazelTarget> {
-        val (targets, queryDuration) = measureTimedValue {
-            queryService.query("'//external:all-targets' + '//...:all-targets'")
-        }
+        var calendar = Calendar.getInstance()
+        val queryEpoch = calendar.getTimeInMillis()
+        val targets = queryService.query("'//external:all-targets' + '//...:all-targets'")
+        val queryDuration = calendar.getTimeInMillis() - queryEpoch
         logger.i { "All targets queried in $queryDuration" }
         return targets.mapNotNull { target: Build.Target ->
             when (target.type) {
@@ -35,11 +34,11 @@ class BazelClient : KoinComponent {
         }
     }
 
-    @OptIn(ExperimentalTime::class)
     suspend fun queryAllSourcefileTargets(): List<Build.Target> {
-        val (targets, queryDuration) = measureTimedValue {
-            queryService.query("kind('source file', //...:all-targets)")
-        }
+        var calendar = Calendar.getInstance()
+        val queryEpoch = calendar.getTimeInMillis()
+        val targets = queryService.query("kind('source file', //...:all-targets)")
+        val queryDuration = calendar.getTimeInMillis() - queryEpoch
         logger.i { "All source files queried in $queryDuration" }
 
         return targets

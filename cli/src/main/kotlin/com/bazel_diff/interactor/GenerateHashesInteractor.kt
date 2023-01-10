@@ -11,18 +11,16 @@ import java.io.FileDescriptor
 import java.io.FileReader
 import java.io.FileWriter
 import java.nio.file.Path
-import kotlin.time.ExperimentalTime
-import kotlin.time.measureTime
+import kotlin.system.measureTimeMillis
 
 class GenerateHashesInteractor : KoinComponent {
     private val buildGraphHasher: BuildGraphHasher by inject()
     private val logger: Logger by inject()
     private val gson: Gson by inject()
 
-    @OptIn(ExperimentalTime::class)
     fun execute(seedFilepaths: File?, outputPath: File?): Boolean {
         return try {
-            val duration = measureTime {
+            val duration = measureTimeMillis {
                 var seedFilepathsSet: Set<Path> = when {
                     seedFilepaths != null -> {
                         BufferedReader(FileReader(seedFilepaths)).use {

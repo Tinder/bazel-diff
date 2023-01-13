@@ -55,7 +55,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Run bazel-diff example script
-        run: USE_BAZEL_VERSION=latest ./bazel-diff-example.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
+        run: USE_BAZEL_VERSION=latest ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   test-jre11:
     runs-on: ubuntu-latest
     steps:
@@ -103,7 +103,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Run bazel-diff example script
-        run: USE_BAZEL_VERSION=latest ./bazel-diff-example.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
+        run: USE_BAZEL_VERSION=latest ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   deploy:
     needs: [test-jre8, test-jre11]
     runs-on: ubuntu-latest

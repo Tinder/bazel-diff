@@ -31,7 +31,8 @@ $bazel_diff generate-hashes -w "$workspace_path" -b "$bazel_path" $final_hashes_
 echo "Determining Impacted Targets"
 $bazel_diff get-impacted-targets -sh $starting_hashes_json -fh $final_hashes_json -o $impacted_targets_path
 
-IFS=$'\n' read -d '' -r -a impacted_targets < $impacted_targets_path
+impacted_targets=()
+IFS=$'\n' read -d '' -r -a impacted_targets < $impacted_targets_path || true
 formatted_impacted_targets=$(IFS=$'\n'; echo "${impacted_targets[*]}")
 echo "Impacted Targets between $previous_revision and $final_revision:"
 echo "$formatted_impacted_targets"

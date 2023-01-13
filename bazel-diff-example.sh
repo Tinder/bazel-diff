@@ -16,12 +16,7 @@ final_hashes_json="/tmp/final_hashes.json"
 impacted_targets_path="/tmp/impacted_targets.txt"
 bazel_diff="/tmp/bazel_diff"
 
-shared_flags=""
-
-# Uncomment the line below to see debug information
-# shared_flags="--config=verbose"
-
-"$bazel_path" run :bazel-diff "$shared_flags" --script_path="$bazel_diff"
+"$bazel_path" run :bazel-diff --script_path="$bazel_diff"
 
 git -C "$workspace_path" checkout "$previous_revision" --quiet
 

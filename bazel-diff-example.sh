@@ -26,7 +26,7 @@ git -C "$workspace_path" checkout "$previous_revision" --quiet
 echo "Generating Hashes for Revision '$previous_revision'"
 $bazel_diff generate-hashes -w "$workspace_path" -b "$bazel_path" $starting_hashes_json
 
-git -C "$workspace_path" checkout $final_revision --quiet
+git -C "$workspace_path" checkout "$final_revision" --quiet
 
 echo "Generating Hashes for Revision '$final_revision'"
 $bazel_diff generate-hashes -w "$workspace_path" -b "$bazel_path" $final_hashes_json

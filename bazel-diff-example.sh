@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -ex
+
 # Path to your Bazel WORKSPACE directory
 workspace_path=$1
 # Path to your Bazel executable

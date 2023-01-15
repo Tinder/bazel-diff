@@ -102,7 +102,7 @@ workspace.
                           Path to content hash json file. It's a map which maps
                             relative file path from workspace path to its
                             content hash. Files in this map will skip content
-                            hashing and use provided value                            
+                            hashing and use provided value
   -h, --help              Show this help message and exit.
   -k, --[no-]keep_going   This flag controls if `bazel query` will be executed
                             with the `--keep_going` flag or not. Disabling this
@@ -153,9 +153,8 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
 http_jar(
     name = "bazel_diff",
     urls = [
-        "https://github.com/Tinder/bazel-diff/releases/download/4.0.5/bazel-diff_deploy.jar",
+        "https://github.com/Tinder/bazel-diff/releases/download/4.3.0/bazel-diff_deploy.jar",
     ],
-    sha256 = "59f2a614f90b4c2a6c83f1e6146d8722dfaac3a1d8f42734dcbb6ccf373a1cbd",
 )
 ```
 
@@ -216,30 +215,33 @@ java -jar bazel-bin/src/main/java/com/bazel_diff/bazel-diff_deploy.jar # This JA
 Add the following to your `WORKSPACE` file to add the external repositories, replacing the `RELEASE_ARCHIVE_URL` with the archive url of the bazel-diff release you wish to depend on:
 
 ```bazel
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-
-http_archive(
-  name = "bazel_diff",
-  urls = [
-        "RELEASE_ARCHIVE_URL",
-    ],
-    sha256 = "UPDATE_ME",
-    strip_prefix = "UPDATE_ME"
-)
-
-load("@bazel_diff//:repositories.bzl", "bazel_diff_dependencies")
+load("//:repositories.bzl", "bazel_diff_dependencies")
 
 bazel_diff_dependencies()
 
+load("@rules_proto//proto:repositories.bzl", "rules_proto_dependencies", "rules_proto_toolchains")
+
+rules_proto_dependencies()
+
+rules_proto_toolchains()
+
 load("@rules_jvm_external//:defs.bzl", "maven_install")
-load("@bazel_diff//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
+load("//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
+load("@io_bazel_rules_kotlin//kotlin:repositories.bzl", "kotlin_repositories")
+
+kotlin_repositories()
+
+load("@io_bazel_rules_kotlin//kotlin:core.bzl", "kt_register_toolchains")
+
+kt_register_toolchains()
 
 maven_install(
     name = "bazel_diff_maven",
     artifacts = BAZEL_DIFF_MAVEN_ARTIFACTS,
+    fetch_sources = True,
+    generate_compat_repositories = True,
     repositories = [
-        "http://uk.maven.org/maven2",
-        "https://jcenter.bintray.com/",
+        "https://repo1.maven.org/maven2/",
     ],
 )
 ```

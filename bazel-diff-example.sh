@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -ex
+set -e
 
 # Path to your Bazel WORKSPACE directory
 workspace_path=$1

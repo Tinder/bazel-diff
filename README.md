@@ -7,14 +7,7 @@
 `bazel-diff` offers several key advantages over rolling your own target diffing solution
 
 1. `bazel-diff` is designed for very large Bazel projects. We use Java Protobuf's `parseDelimitedFrom` method alongside Bazel Query's `streamed_proto` output option. These two together allow you to parse Gigabyte or larger protobuf messages. We have tested it with projects containing tens of thousands of targets.
-2. We avoid usage of large command line query lists when interacting with Bazel, [issue here](https://github.com/bazelbuild/bazel/issues/8609). When you interact with Bazel with thousands of query parameters you can reach an upper maximum limit, seeing this error:
-
-  ```terminal
-  bash: /usr/local/bin/bazel: Argument list too long
-  ```
-
-`bazel-diff` is smart enough to prevent these errors
-
+2. We avoid usage of large command line query lists when interacting with Bazel, [issue here](https://github.com/bazelbuild/bazel/issues/8609). When you interact with Bazel with thousands of query parameters you can reach an upper maximum limit, seeing this error `bash: /usr/local/bin/bazel: Argument list too long`. `bazel-diff` is smart enough to avoid these errors.
 3. `bazel-diff` has been tested with file renames, deletions, and modifications. Works on `bzl` files, `WORKSPACE` files, `BUILD` files and regular files
 
 Track the feature request for target diffing in Bazel [here](https://github.com/bazelbuild/bazel/issues/7962)
@@ -71,6 +64,7 @@ Open `bazel-diff-example.sh` to see how this is implemented. This is purely an e
 ## CLI Interface
 
 `bazel-diff` Command
+
 ```terminal
 Usage: bazel-diff [-hvV] [COMMAND]
 Writes to a file the impacted targets between two Bazel graph JSON files
@@ -104,7 +98,7 @@ workspace.
                           Path to content hash json file. It's a map which maps
                             relative file path from workspace path to its
                             content hash. Files in this map will skip content
-                            hashing and use provided value                            
+                            hashing and use provided value
   -h, --help              Show this help message and exit.
   -k, --[no-]keep_going   This flag controls if `bazel query` will be executed
                             with the `--keep_going` flag or not. Disabling this
@@ -123,6 +117,14 @@ workspace.
   -w, --workspacePath=<workspacePath>
                           Path to Bazel workspace directory.
 ```
+
+### What does the SHA256 value of `generate-hashes` represent?
+
+`generate-hashes` is a canonical SHA256 value representing all attributes and inputs into a target. These inputs
+are the summation of the of the rule implementation hash, the SHA256 value
+for every attribute of the rule and then the summation of the SHA256 value for
+all `rule_inputs` using the same exact algorithm. For source_file inputs the
+content of the file are converted into a SHA256 value.
 
 ### `get-impacted-targets` command
 

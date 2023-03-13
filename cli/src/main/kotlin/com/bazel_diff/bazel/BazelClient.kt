@@ -12,10 +12,9 @@ class BazelClient : KoinComponent {
     private val queryService: BazelQueryService by inject()
 
     suspend fun queryAllTargets(): List<BazelTarget> {
-        var calendar = Calendar.getInstance()
-        val queryEpoch = calendar.getTimeInMillis()
+        val queryEpoch = Calendar.getInstance().getTimeInMillis()
         val targets = queryService.query("'//external:all-targets' + '//...:all-targets'")
-        val queryDuration = calendar.getTimeInMillis() - queryEpoch
+        val queryDuration = Calendar.getInstance().getTimeInMillis() - queryEpoch
         logger.i { "All targets queried in $queryDuration" }
         return targets.mapNotNull { target: Build.Target ->
             when (target.type) {
@@ -35,10 +34,9 @@ class BazelClient : KoinComponent {
     }
 
     suspend fun queryAllSourcefileTargets(): List<Build.Target> {
-        var calendar = Calendar.getInstance()
-        val queryEpoch = calendar.getTimeInMillis()
+        val queryEpoch = Calendar.getInstance().getTimeInMillis()
         val targets = queryService.query("kind('source file', //...:all-targets)")
-        val queryDuration = calendar.getTimeInMillis() - queryEpoch
+        val queryDuration = Calendar.getInstance().getTimeInMillis() - queryEpoch
         logger.i { "All source files queried in $queryDuration" }
 
         return targets

@@ -20,8 +20,7 @@ class GenerateHashesInteractor : KoinComponent {
 
     fun execute(seedFilepaths: File?, outputPath: File?): Boolean {
         return try {
-            var calendar = Calendar.getInstance()
-            val epoch = calendar.getTimeInMillis()
+            val epoch = Calendar.getInstance().getTimeInMillis()
             var seedFilepathsSet: Set<Path> = when {
                 seedFilepaths != null -> {
                     BufferedReader(FileReader(seedFilepaths)).use {
@@ -39,7 +38,7 @@ class GenerateHashesInteractor : KoinComponent {
             }.use {
                 it.write(gson.toJson(hashes))
             }
-            val duration = calendar.getTimeInMillis() - epoch;
+            val duration = Calendar.getInstance().getTimeInMillis() - epoch;
             logger.i { "generate-hashes finished in $duration" }
             true
         } catch (e: Exception) {

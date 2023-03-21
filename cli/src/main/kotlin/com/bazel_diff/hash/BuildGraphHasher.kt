@@ -43,10 +43,9 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
              * Querying targets and source hashing is done in parallel
              */
             val sourceDigestsFuture = async(Dispatchers.IO) {
-                var calendar = Calendar.getInstance()
-                val sourceHashDurationEpoch = calendar.getTimeInMillis()
+                val sourceHashDurationEpoch = Calendar.getInstance().getTimeInMillis()
                 val sourceFileTargets = hashSourcefiles(sourceTargets)
-                val sourceHashDuration = calendar.getTimeInMillis() - sourceHashDurationEpoch
+                val sourceHashDuration = Calendar.getInstance().getTimeInMillis() - sourceHashDurationEpoch
                 logger.i { "Source file hashes calculated in $sourceHashDuration" }
                 sourceFileTargets
             }

@@ -21,12 +21,13 @@ class BazelClient(private val fineGrainedHashExternalRepos: Set<String>) : KoinC
             when (target.type) {
                 Build.Target.Discriminator.RULE -> BazelTarget.Rule(target)
                 Build.Target.Discriminator.SOURCE_FILE -> BazelTarget.SourceFile(
-                        target
+                    target
                 )
 
                 Build.Target.Discriminator.GENERATED_FILE -> BazelTarget.GeneratedFile(
-                        target
+                    target
                 )
+
                 else -> {
                     logger.w { "Unsupported target type in the build graph: ${target.type.name}" }
                     null

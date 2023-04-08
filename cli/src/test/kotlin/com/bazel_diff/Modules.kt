@@ -15,10 +15,10 @@ import java.nio.file.Paths
 
 fun testModule(): Module = module {
     single<Logger> { SilentLogger }
-    single { BazelClient() }
+    single { BazelClient(emptySet()) }
     single { BuildGraphHasher(get()) }
     single { TargetHasher() }
-    single { RuleHasher() }
+    single { RuleHasher(emptySet()) }
     single { SourceFileHasher() }
     single { GsonBuilder().setPrettyPrinting().create() }
     single(named("working-directory")) { Paths.get("working-directory") }

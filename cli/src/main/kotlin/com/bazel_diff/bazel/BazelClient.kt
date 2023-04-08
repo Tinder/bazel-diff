@@ -4,26 +4,28 @@ import com.bazel_diff.log.Logger
 import com.google.devtools.build.lib.query2.proto.proto2api.Build
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
-import java.util.concurrent.ConcurrentMap
-import java.util.Calendar
+import java.util.*
 
-class BazelClient : KoinComponent {
+class BazelClient(private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
     private val logger: Logger by inject()
     private val queryService: BazelQueryService by inject()
 
     suspend fun queryAllTargets(): List<BazelTarget> {
         val queryEpoch = Calendar.getInstance().getTimeInMillis()
-        val targets = queryService.query("'//external:all-targets' + '//...:all-targets'")
+
+        val query = listOf("//external:all-targets", "//...:all-targets") + fineGrainedHashExternalRepos.map { "@$it//...:all-targets" }
+        val targets = queryService.query(query.joinToString(" + ") { "'$it'" })
         val queryDuration = Calendar.getInstance().getTimeInMillis() - queryEpoch
         logger.i { "All targets queried in $queryDuration" }
         return targets.mapNotNull { target: Build.Target ->
             when (target.type) {
                 Build.Target.Discriminator.RULE -> BazelTarget.Rule(target)
                 Build.Target.Discriminator.SOURCE_FILE -> BazelTarget.SourceFile(
-                    target
+                        target
                 )
+
                 Build.Target.Discriminator.GENERATED_FILE -> BazelTarget.GeneratedFile(
-                    target
+                        target
                 )
                 else -> {
                     logger.w { "Unsupported target type in the build graph: ${target.type.name}" }

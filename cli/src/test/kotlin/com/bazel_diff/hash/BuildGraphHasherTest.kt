@@ -144,7 +144,7 @@ class BuildGraphHasherTest : KoinTest {
             // they are run in parallel, so we don't know whether rule3 or rule4 will be processed first
             message().matchesPredicate {
                 it!!.contains("\\brule3 -> rule4 -> rule3\\b".toRegex()) ||
-                it.contains("\\brule4 -> rule3 -> rule4\\b".toRegex())
+                    it.contains("\\brule4 -> rule3 -> rule4\\b".toRegex())
             }
         }
     }

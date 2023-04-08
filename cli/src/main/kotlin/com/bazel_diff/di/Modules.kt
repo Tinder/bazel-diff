@@ -17,23 +17,23 @@ import java.io.File
 import java.nio.file.Path
 
 fun hasherModule(
-        workingDirectory: Path,
-        bazelPath: Path,
-        contentHashPath: File?,
-        startupOptions: List<String>,
-        commandOptions: List<String>,
-        keepGoing: Boolean?,
-        fineGrainedHashExternalRepos: Set<String>,
+    workingDirectory: Path,
+    bazelPath: Path,
+    contentHashPath: File?,
+    startupOptions: List<String>,
+    commandOptions: List<String>,
+    keepGoing: Boolean?,
+    fineGrainedHashExternalRepos: Set<String>,
 ): Module = module {
     val debug = System.getProperty("DEBUG", "false").equals("true")
     single {
         BazelQueryService(
-                workingDirectory,
-                bazelPath,
-                startupOptions,
-                commandOptions,
-                keepGoing,
-                debug
+            workingDirectory,
+            bazelPath,
+            startupOptions,
+            commandOptions,
+            keepGoing,
+            debug
         )
     }
     single { BazelClient(fineGrainedHashExternalRepos) }

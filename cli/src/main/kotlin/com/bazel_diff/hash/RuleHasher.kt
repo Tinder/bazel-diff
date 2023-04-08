@@ -54,15 +54,16 @@ class RuleHasher(private val fineGrainedHashExternalRepos: Set<String>) : KoinCo
 
                     inputRule?.name != null && inputRule.name != rule.name -> {
                         val ruleInputHash = digest(
-                                inputRule,
-                                allRulesMap,
-                                ruleHashes,
-                                sourceDigests,
-                                seedHash,
-                                depPathClone,
+                            inputRule,
+                            allRulesMap,
+                            ruleHashes,
+                            sourceDigests,
+                            seedHash,
+                            depPathClone,
                         )
                         safePutBytes(ruleInputHash)
                     }
+
                     else -> {
                         val heuristicDigest = sourceFileHasher.softDigest(BazelSourceFileTarget(ruleInput, ByteArray(0)))
                         when {
@@ -71,6 +72,7 @@ class RuleHasher(private val fineGrainedHashExternalRepos: Set<String>) : KoinCo
                                 sourceDigests[ruleInput] = heuristicDigest
                                 safePutBytes(heuristicDigest)
                             }
+
                             else -> logger.w { "Unable to calculate digest for input $ruleInput for rule ${rule.name}" }
                         }
                     }

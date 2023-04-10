@@ -66,7 +66,7 @@ class GenerateHashesCommand : Callable<Int> {
     var bazelCommandOptions: List<String> = emptyList()
 
     @CommandLine.Option(
-        names = ["--fineGrainedHashExternalRepos"],
+        names = ["--fine_grained_hash_external_repos"],
         description = ["Comma separate list of external repos in which fine-grained hashes are computed for the targets. By default, external repos are treated as an opaque blob. If an external repo is specified here, bazel-diff instead computes the hash for individual targets. For example, one wants to specify `maven` here if they user rules_jvm_external so that individual third party dependency change won't invalidate all targets in the mono repo."],
         scope = CommandLine.ScopeType.INHERIT,
         converter = [CommaSeparatedValueConverter::class],

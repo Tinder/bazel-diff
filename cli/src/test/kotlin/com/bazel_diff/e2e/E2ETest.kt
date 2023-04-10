@@ -89,11 +89,11 @@ class E2ETest {
         val cli = CommandLine(BazelDiff())
         //From
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, "--fine_grained_hash_external_repos", "bazel_diff_maven", from.absolutePath
+            "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", "bazel_diff_maven", from.absolutePath
         )
         //To
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, "--fine_grained_hash_external_repos", "bazel_diff_maven", to.absolutePath
+            "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", "bazel_diff_maven", to.absolutePath
         )
         //Impacted targets
         cli.execute(

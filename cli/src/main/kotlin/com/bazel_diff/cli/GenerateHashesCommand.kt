@@ -1,5 +1,6 @@
 package com.bazel_diff.cli
 
+import com.bazel_diff.cli.converter.CommaSeparatedValueConverter
 import com.bazel_diff.cli.converter.NormalisingPathConverter
 import com.bazel_diff.cli.converter.OptionsConverter
 import com.bazel_diff.di.hasherModule
@@ -65,6 +66,14 @@ class GenerateHashesCommand : Callable<Int> {
     var bazelCommandOptions: List<String> = emptyList()
 
     @CommandLine.Option(
+        names = ["--fineGrainedHashExternalRepos"],
+        description = ["Comma separate list of external repos in which fine-grained hashes are computed for the targets. By default, external repos are treated as an opaque blob. If an external repo is specified here, bazel-diff instead computes the hash for individual targets. For example, one wants to specify `maven` here if they user rules_jvm_external so that individual third party dependency change won't invalidate all targets in the mono repo."],
+        scope = CommandLine.ScopeType.INHERIT,
+        converter = [CommaSeparatedValueConverter::class],
+    )
+    var fineGrainedHashExternalRepos: Set<String> = emptySet()
+
+    @CommandLine.Option(
         names = ["-k", "--keep_going"],
         negatable = true,
         description = ["This flag controls if `bazel query` will be executed with the `--keep_going` flag or not. Disabling this flag allows you to catch configuration issues in your Bazel graph, but may not work for some Bazel setups. Defaults to `true`"],
@@ -89,7 +98,7 @@ class GenerateHashesCommand : Callable<Int> {
     lateinit var spec: CommandLine.Model.CommandSpec
 
     override fun call(): Int {
-        validate(contentHashPath=contentHashPath)
+        validate(contentHashPath = contentHashPath)
 
         startKoin {
             modules(
@@ -100,6 +109,7 @@ class GenerateHashesCommand : Callable<Int> {
                     bazelStartupOptions,
                     bazelCommandOptions,
                     keepGoing,
+                    fineGrainedHashExternalRepos,
                 ),
                 loggingModule(parent.verbose),
                 serialisationModule(),

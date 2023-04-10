@@ -1,10 +1,8 @@
 package com.bazel_diff.hash
 
 import assertk.all
-import assertk.assertAll
 import assertk.assertThat
 import assertk.assertions.*
-import assertk.assertions.any
 import com.bazel_diff.bazel.BazelClient
 import com.bazel_diff.bazel.BazelRule
 import com.bazel_diff.bazel.BazelTarget
@@ -21,10 +19,8 @@ import org.koin.test.mock.MockProviderRule
 import org.koin.test.mock.declareMock
 import org.mockito.Mockito
 import org.mockito.junit.MockitoJUnit
-import org.mockito.kotlin.any
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
-import java.util.*
 
 
 class BuildGraphHasherTest : KoinTest {
@@ -148,7 +144,7 @@ class BuildGraphHasherTest : KoinTest {
             // they are run in parallel, so we don't know whether rule3 or rule4 will be processed first
             message().matchesPredicate {
                 it!!.contains("\\brule3 -> rule4 -> rule3\\b".toRegex()) ||
-                it.contains("\\brule4 -> rule3 -> rule4\\b".toRegex())
+                    it.contains("\\brule4 -> rule3 -> rule4\\b".toRegex())
             }
         }
     }
@@ -178,7 +174,7 @@ class BuildGraphHasherTest : KoinTest {
         val target = mock<BazelTarget.Rule>()
         val rule = mock<BazelRule>()
         whenever(rule.name).thenReturn(name)
-        whenever(rule.ruleInputList).thenReturn(inputs)
+        whenever(rule.ruleInputList(emptySet())).thenReturn(inputs)
         whenever(rule.digest).thenReturn(digest.toByteArray())
         whenever(target.rule).thenReturn(rule)
         whenever(target.name).thenReturn(name)

@@ -21,13 +21,15 @@ class BazelRule(private val rule: Build.Rule) {
             }
         }
     }
-    val ruleInputList: List<String>
-        get() = rule.ruleInputList.map { ruleInput: String -> transformRuleInput(ruleInput) }
+
+    fun ruleInputList(fineGrainedHashExternalRepos: Set<String>): List<String> {
+        return rule.ruleInputList.map { ruleInput: String -> transformRuleInput(fineGrainedHashExternalRepos, ruleInput) }
+    }
 
     val name: String = rule.name
 
-    private fun transformRuleInput(ruleInput: String): String {
-        if (ruleInput.startsWith("@")) {
+    private fun transformRuleInput(fineGrainedHashExternalRepos: Set<String>, ruleInput: String): String {
+        if (ruleInput.startsWith("@") && fineGrainedHashExternalRepos.none { ruleInput.startsWith("@$it") }) {
             val splitRule = ruleInput.split("//".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
             if (splitRule.size == 2) {
                 var externalRule = splitRule[0]

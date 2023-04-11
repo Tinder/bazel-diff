@@ -2,9 +2,12 @@
 //src/main/java/com/integration:guava-user
 //src/main/java/com/integration:libguava-user-src.jar
 //src/main/java/com/integration:libguava-user.jar
+@bazel_diff_maven//:BUILD
 @bazel_diff_maven//:com_google_errorprone_error_prone_annotations
 @bazel_diff_maven//:com_google_errorprone_error_prone_annotations_2_11_0
 @bazel_diff_maven//:com_google_guava_guava
 @bazel_diff_maven//:com_google_guava_guava_31_1_jre
+@bazel_diff_maven//:pin
+@bazel_diff_maven//:pin.sh
 @bazel_diff_maven//:v1/https/jcenter.bintray.com/com/google/errorprone/error_prone_annotations/2.11.0/error_prone_annotations-2.11.0.jar
 @bazel_diff_maven//:v1/https/jcenter.bintray.com/com/google/guava/guava/31.1-jre/guava-31.1-jre.jar

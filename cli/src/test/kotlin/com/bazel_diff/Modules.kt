@@ -1,6 +1,7 @@
 package com.bazel_diff
 
 import com.bazel_diff.bazel.BazelClient
+import com.bazel_diff.bazel.BazelQueryService
 import com.bazel_diff.hash.BuildGraphHasher
 import com.bazel_diff.hash.RuleHasher
 import com.bazel_diff.hash.SourceFileHasher
@@ -22,6 +23,7 @@ fun testModule(): Module = module {
     single { SourceFileHasher() }
     single { GsonBuilder().setPrettyPrinting().create() }
     single(named("working-directory")) { Paths.get("working-directory") }
+    single(named("output-base")) { Paths.get("output-base") }
     single { ContentHashProvider(null) }
 }
 

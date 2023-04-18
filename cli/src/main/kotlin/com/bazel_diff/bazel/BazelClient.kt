@@ -38,7 +38,8 @@ class BazelClient(private val fineGrainedHashExternalRepos: Set<String>) : KoinC
 
     suspend fun queryAllSourcefileTargets(): List<Build.Target> {
         val queryEpoch = Calendar.getInstance().getTimeInMillis()
-        val targets = queryService.query("kind('source file', //...:all-targets)")
+        val allReposToQuery = listOf("@") + fineGrainedHashExternalRepos.map { "@$it" }
+        val targets = queryService.query("kind('source file', ${allReposToQuery.joinToString(" + ") { "'$it//...:all-targets'" }})")
         val queryDuration = Calendar.getInstance().getTimeInMillis() - queryEpoch
         logger.i { "All source files queried in $queryDuration" }
 

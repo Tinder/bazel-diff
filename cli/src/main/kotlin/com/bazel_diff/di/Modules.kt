@@ -9,13 +9,19 @@ import com.bazel_diff.hash.TargetHasher
 import com.bazel_diff.io.ContentHashProvider
 import com.bazel_diff.log.Logger
 import com.bazel_diff.log.StderrLogger
+import com.bazel_diff.process.Redirect
+import com.bazel_diff.process.process
 import com.google.gson.GsonBuilder
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.runBlocking
 import org.koin.core.module.Module
 import org.koin.core.qualifier.named
 import org.koin.dsl.module
 import java.io.File
 import java.nio.file.Path
+import java.nio.file.Paths
 
+@OptIn(ExperimentalCoroutinesApi::class)
 fun hasherModule(
     workingDirectory: Path,
     bazelPath: Path,
@@ -40,8 +46,20 @@ fun hasherModule(
     single { BuildGraphHasher(get()) }
     single { TargetHasher() }
     single { RuleHasher(fineGrainedHashExternalRepos) }
-    single { SourceFileHasher() }
+    single { SourceFileHasher(fineGrainedHashExternalRepos) }
     single(named("working-directory")) { workingDirectory }
+    single(named("output-base")) {
+        val result = runBlocking {
+            process(
+                bazelPath.toString(), "info", "output_base",
+                stdout = Redirect.CAPTURE,
+                workingDirectory = workingDirectory.toFile(),
+                stderr = Redirect.PRINT,
+                destroyForcibly = true,
+            )
+        }
+        Paths.get(result.output.single())
+    }
     single { ContentHashProvider(contentHashPath) }
 }
 

@@ -88,9 +88,11 @@ Usage: bazel-diff generate-hashes [-hkvV] -b=<bazelPath> [-s=<seedFilepaths>]
 Writes to a file the SHA256 hashes for each Bazel Target in the provided
 workspace.
       <outputPath>        The filepath to write the resulting JSON of
-                            dictionary target => SHA-256 values
+                            dictionary target => SHA-256 values. If not
+                            specified, the JSON will be written to STDOUT.
   -b, --bazelPath=<bazelPath>
-                          Path to Bazel binary
+                          Path to Bazel binary. If not specified, the Bazel
+                            binary available in PATH will be used.
       -co, --bazelCommandOptions=<bazelCommandOptions>
                           Additional space separated Bazel command options used
                             when invoking Bazel
@@ -99,6 +101,16 @@ workspace.
                             relative file path from workspace path to its
                             content hash. Files in this map will skip content
                             hashing and use provided value
+      --fineGrainedHashExternalRepos=<fineGrainedHashExternalRepos>
+                          Comma separate list of external repos in which
+                            fine-grained hashes are computed for the targets.
+                            By default, external repos are treated as an opaque
+                            blob. If an external repo is specified here,
+                            bazel-diff instead computes the hash for individual
+                            targets. For example, one wants to specify `maven`
+                            here if they user rules_jvm_external so that
+                            individual third party dependency change won't
+                            invalidate all targets in the mono repo.
   -h, --help              Show this help message and exit.
   -k, --[no-]keep_going   This flag controls if `bazel query` will be executed
                             with the `--keep_going` flag or not. Disabling this

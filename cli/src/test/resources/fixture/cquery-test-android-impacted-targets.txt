@@ -1,0 +1,8 @@
+//external:bazel_diff_maven_android
+//src/main/java/com/integration:android
+//src/main/java/com/integration:guava-user
+@bazel_diff_maven_android//:com_google_errorprone_error_prone_annotations
+@bazel_diff_maven_android//:com_google_guava_guava
+@bazel_diff_maven_android//:com_google_j2objc_j2objc_annotations
+@bazel_diff_maven_android//:org_checkerframework_checker_qual
+@bazel_diff_maven_android//:pin

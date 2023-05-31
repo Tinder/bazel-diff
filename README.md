@@ -81,9 +81,14 @@ Commands:
 ### `generate-hashes` command
 
 ```terminal
-Usage: bazel-diff generate-hashes [-hkvV] -b=<bazelPath> [-s=<seedFilepaths>]
-                                  -w=<workspacePath>
+Usage: bazel-diff generate-hashes [-hkvV] [--[no-]useCquery] [-b=<bazelPath>]
+                                  [--contentHashPath=<contentHashPath>]
+                                  [-s=<seedFilepaths>] -w=<workspacePath>
                                   [-co=<bazelCommandOptions>]...
+                                  [--cqueryCommandOptions=<cqueryCommandOptions>
+                                  ]...
+                                  [--fineGrainedHashExternalRepos=<fineGrainedHa
+                                  shExternalRepos>]...
                                   [-so=<bazelStartupOptions>]... <outputPath>
 Writes to a file the SHA256 hashes for each Bazel Target in the provided
 workspace.
@@ -95,12 +100,16 @@ workspace.
                             binary available in PATH will be used.
       -co, --bazelCommandOptions=<bazelCommandOptions>
                           Additional space separated Bazel command options used
-                            when invoking Bazel
+                            when invoking `bazel query`
       --contentHashPath=<contentHashPath>
                           Path to content hash json file. It's a map which maps
                             relative file path from workspace path to its
                             content hash. Files in this map will skip content
                             hashing and use provided value
+      --cqueryCommandOptions=<cqueryCommandOptions>
+                          Additional space separated Bazel command options used
+                            when invoking `bazel cquery`. This flag is has no
+                            effect if `--useCquery`is false.
       --fineGrainedHashExternalRepos=<fineGrainedHashExternalRepos>
                           Comma separate list of external repos in which
                             fine-grained hashes are computed for the targets.
@@ -124,11 +133,23 @@ workspace.
       -so, --bazelStartupOptions=<bazelStartupOptions>
                           Additional space separated Bazel client startup
                             options used when invoking Bazel
+      --[no-]useCquery    If true, use cquery instead of query when generating
+                            dependency graphs. Using cquery would yield more
+                            accurate build graph at the cost of slower query
+                            execution. When this is set, one usually also wants
+                            to set `--cqueryCommandOptions` to specify a
+                            targeting platform. Note that this flag only works
+                            with Bazel 6.2.0 or above because lower versions
+                            does not support `--query_file` flag.
   -v, --verbose           Display query string, missing files and elapsed time
   -V, --version           Print version information and exit.
   -w, --workspacePath=<workspacePath>
                           Path to Bazel workspace directory.
 ```
+
+**Note**: `--useCquery` flag may not work with very large repos due to limitation
+of Bazel. You may want to fallback to use normal query mode in that case.
+See https://github.com/bazelbuild/bazel/issues/17743 for more details.
 
 ### What does the SHA256 value of `generate-hashes` represent?
 

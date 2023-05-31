@@ -3,12 +3,13 @@ package com.bazel_diff.bazel
 import com.bazel_diff.log.Logger
 import com.bazel_diff.process.Redirect
 import com.bazel_diff.process.process
+import com.google.devtools.build.lib.analysis.AnalysisProtosV2
 import com.google.devtools.build.lib.query2.proto.proto2api.Build
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
-import java.nio.charset.StandardCharsets
+import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -17,16 +18,53 @@ class BazelQueryService(
     private val bazelPath: Path,
     private val startupOptions: List<String>,
     private val commandOptions: List<String>,
-    private val keepGoing: Boolean?,
+    private val cqueryOptions: List<String>,
+    private val keepGoing: Boolean,
     private val noBazelrc: Boolean,
 ) : KoinComponent {
     private val logger: Logger by inject()
 
+    suspend fun query(query: String, useCquery: Boolean = false): List<Build.Target> {
+        // Unfortunately, there is still no direct way to tell if a target is compatible or not with the proto output
+        // by itself. So we do an extra cquery with the trick at
+        // https://bazel.build/extending/platforms#cquery-incompatible-target-detection to first find all compatible
+        // targets.
+        val compatibleTargetSet =
+            if (useCquery) {
+                runQuery(query, useCquery = true, outputCompatibleTargets = true).useLines {
+                    it.filter { it.isNotBlank() }.toSet()
+                }
+            } else {
+                emptySet()
+            }
+        val outputFile = runQuery(query, useCquery)
+
+        val targets = outputFile.inputStream().buffered().use { proto ->
+            if (useCquery) {
+                val cqueryResult = AnalysisProtosV2.CqueryResult.parseFrom(proto)
+                cqueryResult.resultsList.filter { it.target.rule.name in compatibleTargetSet }.map { it.target }
+            } else {
+                mutableListOf<Build.Target>().apply {
+                    while (true) {
+                        val target = Build.Target.parseDelimitedFrom(proto) ?: break
+                        // EOF
+                        add(target)
+                    }
+                }
+            }
+        }
+
+        return targets
+    }
+
     @OptIn(ExperimentalCoroutinesApi::class)
-    suspend fun query(query: String): List<Build.Target> {
-        val tempFile = Files.createTempFile(null, ".txt")
-        val outputFile = Files.createTempFile(null, ".bin")
-        Files.write(tempFile, query.toByteArray(StandardCharsets.UTF_8))
+    private suspend fun runQuery(query: String, useCquery: Boolean, outputCompatibleTargets: Boolean = false): File {
+        val queryFile = Files.createTempFile(null, ".txt").toFile()
+        queryFile.deleteOnExit()
+        val outputFile = Files.createTempFile(null, ".bin").toFile()
+        outputFile.deleteOnExit()
+
+        queryFile.writeText(query)
         logger.i { "Executing Query: $query" }
 
         val cmd: MutableList<String> = ArrayList<String>().apply {
@@ -35,41 +73,65 @@ class BazelQueryService(
                 add("--bazelrc=/dev/null")
             }
             addAll(startupOptions)
-            add("query")
+            if (useCquery) {
+                add("cquery")
+                add("--transitions=lite")
+            } else {
+                add("query")
+            }
             add("--output")
-            add("streamed_proto")
-            add("--order_output=no")
-            if (keepGoing != null && keepGoing) {
+            if (useCquery) {
+                if (outputCompatibleTargets) {
+                    add("starlark")
+                    add("--starlark:file")
+                    val cqueryOutputFile = Files.createTempFile(null, ".cquery").toFile()
+                    cqueryOutputFile.deleteOnExit()
+                    cqueryOutputFile.writeText("""
+                    def format(target):
+                        if "IncompatiblePlatformProvider" not in providers(target):
+                            label = str(target.label)
+                            if label.startswith("@//"):
+                                # normalize label to be consistent with content inside proto
+                                return label[1:]
+                            else:
+                                return label
+                        return ""
+                    """.trimIndent())
+                    add(cqueryOutputFile.toString())
+                } else {
+                    // Unfortunately, cquery does not support streamed_proto yet.
+                    // See https://github.com/bazelbuild/bazel/issues/17743. This poses an issue for large monorepos.
+                    add("proto")
+                }
+            } else {
+                add("streamed_proto")
+            }
+            if (!useCquery) {
+                add("--order_output=no")
+            }
+            if (keepGoing) {
                 add("--keep_going")
             }
-            addAll(commandOptions)
+            if (useCquery) {
+                addAll(cqueryOptions)
+            } else {
+                addAll(commandOptions)
+            }
             add("--query_file")
-            add(tempFile.toString())
+            add(queryFile.toString())
         }
 
         val result = runBlocking {
             process(
                 *cmd.toTypedArray(),
-                stdout = Redirect.ToFile(outputFile.toFile()),
+                stdout = Redirect.ToFile(outputFile),
                 workingDirectory = workingDirectory.toFile(),
                 stderr = Redirect.PRINT,
                 destroyForcibly = true,
             )
         }
 
-        if(result.resultCode != 0) throw RuntimeException("Bazel query failed, exit code ${result.resultCode}")
-
-        val targets = mutableListOf<Build.Target>()
-        outputFile.toFile().inputStream().buffered().use {stream ->
-            while (true) {
-                val target = Build.Target.parseDelimitedFrom(stream) ?: break
-                // EOF
-                targets.add(target)
-            }
-        }
-
-        Files.delete(tempFile)
-        Files.delete(outputFile)
-        return targets
+        if (result.resultCode != 0) throw RuntimeException("Bazel query failed, exit code ${result.resultCode}")
+        return outputFile
     }
 }

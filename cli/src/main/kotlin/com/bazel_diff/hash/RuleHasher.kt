@@ -8,7 +8,7 @@ import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import java.util.concurrent.ConcurrentMap
 
-class RuleHasher(private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
+class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
     private val logger: Logger by inject()
     private val sourceFileHasher: SourceFileHasher by inject()
 
@@ -43,7 +43,7 @@ class RuleHasher(private val fineGrainedHashExternalRepos: Set<String>) : KoinCo
             safePutBytes(rule.digest)
             safePutBytes(seedHash)
 
-            for (ruleInput in rule.ruleInputList(fineGrainedHashExternalRepos)) {
+            for (ruleInput in rule.ruleInputList(useCquery, fineGrainedHashExternalRepos)) {
                 safePutBytes(ruleInput.toByteArray())
 
                 val inputRule = allRulesMap[ruleInput]

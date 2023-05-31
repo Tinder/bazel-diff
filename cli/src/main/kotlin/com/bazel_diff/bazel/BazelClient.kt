@@ -6,15 +6,22 @@ import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import java.util.*
 
-class BazelClient(private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
+class BazelClient(private val useCquery: Boolean, private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
     private val logger: Logger by inject()
     private val queryService: BazelQueryService by inject()
 
     suspend fun queryAllTargets(): List<BazelTarget> {
         val queryEpoch = Calendar.getInstance().getTimeInMillis()
 
-        val query = listOf("//external:all-targets", "//...:all-targets") + fineGrainedHashExternalRepos.map { "@$it//...:all-targets" }
-        val targets = queryService.query(query.joinToString(" + ") { "'$it'" })
+        val repoTargetsQuery = listOf("//external:all-targets")
+        val buildTargetsQuery = listOf("//...:all-targets") + fineGrainedHashExternalRepos.map { "@$it//...:all-targets" }
+        val targets = if (useCquery) {
+            (queryService.query(buildTargetsQuery.joinToString(" + ") { "'$it'" }, useCquery = true) +
+                queryService.query(repoTargetsQuery.joinToString(" + ") { "'$it'" }))
+                .distinctBy { it.rule.name }
+        } else {
+            queryService.query((repoTargetsQuery + buildTargetsQuery).joinToString(" + ") { "'$it'" })
+        }
         val queryDuration = Calendar.getInstance().getTimeInMillis() - queryEpoch
         logger.i { "All targets queried in $queryDuration" }
         return targets.mapNotNull { target: Build.Target ->

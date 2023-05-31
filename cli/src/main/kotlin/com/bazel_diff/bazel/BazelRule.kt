@@ -22,8 +22,16 @@ class BazelRule(private val rule: Build.Rule) {
         }
     }
 
-    fun ruleInputList(fineGrainedHashExternalRepos: Set<String>): List<String> {
-        return rule.ruleInputList.map { ruleInput: String -> transformRuleInput(fineGrainedHashExternalRepos, ruleInput) }
+    fun ruleInputList(useCquery: Boolean, fineGrainedHashExternalRepos: Set<String>): List<String> {
+        return if (useCquery) {
+            rule.configuredRuleInputList.map { it.label } +
+                rule.ruleInputList.map { ruleInput: String -> transformRuleInput(fineGrainedHashExternalRepos, ruleInput) }
+                    // Only keep the non-fine-grained ones because the others are already covered by configuredRuleInputList
+                    .filter { it.startsWith("//external:") }
+                    .distinct()
+        } else {
+            rule.ruleInputList.map { ruleInput: String -> transformRuleInput(fineGrainedHashExternalRepos, ruleInput) }
+        }
     }
 
     val name: String = rule.name

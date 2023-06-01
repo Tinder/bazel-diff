@@ -14,12 +14,18 @@ class BazelClient(private val useCquery: Boolean, private val fineGrainedHashExt
         val queryEpoch = Calendar.getInstance().getTimeInMillis()
 
         val repoTargetsQuery = listOf("//external:all-targets")
-        val buildTargetsQuery = listOf("//...:all-targets") + fineGrainedHashExternalRepos.map { "@$it//...:all-targets" }
         val targets = if (useCquery) {
-            (queryService.query(buildTargetsQuery.joinToString(" + ") { "'$it'" }, useCquery = true) +
+            // Explicitly listing external repos here sometimes causes issues mentioned at
+            // https://bazel.build/query/cquery#recursive-target-patterns. Hence, we query all dependencies with `deps`
+            // instead. However, we still need to append all "//external:*" targets because fine-grained hash
+            // computation depends on hashing of source files in external repos as well, which is limited to repos
+            // explicitly mentioned in `fineGrainedHashExternalRepos` flag. Therefore, for any repos not mentioned there
+            // we are still relying on the repo-generation target under `//external` to compute the hash.
+            (queryService.query("deps(//...:all-targets)", useCquery = true) +
                 queryService.query(repoTargetsQuery.joinToString(" + ") { "'$it'" }))
                 .distinctBy { it.rule.name }
         } else {
+            val buildTargetsQuery = listOf("//...:all-targets") + fineGrainedHashExternalRepos.map { "@$it//...:all-targets" }
             queryService.query((repoTargetsQuery + buildTargetsQuery).joinToString(" + ") { "'$it'" })
         }
         val queryDuration = Calendar.getInstance().getTimeInMillis() - queryEpoch

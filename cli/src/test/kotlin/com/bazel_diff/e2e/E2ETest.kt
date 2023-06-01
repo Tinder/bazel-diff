@@ -107,35 +107,38 @@ class E2ETest {
     }
 
     @Test
-    fun testUseCquery() {
+    fun testUseCqueryWithExternalDependencyChange() {
         // The difference between these two snapshots is simply upgrading the Guava version for Android platform.
         // Following is the diff.
         //
-        //    diff --git a/WORKSPACE b/WORKSPACE
-        //        index 0fa6bdc..5791c1a 100644
-        //    --- a/WORKSPACE
-        //    +++ b/WORKSPACE
-        //    @@ -27,7 +27,7 @@ maven_install(
-        //    name = "bazel_diff_maven_android",
-        //    artifacts = [
+        // diff --git a/WORKSPACE b/WORKSPACE
+        // index 0fa6bdc..378ba11 100644
+        // --- a/WORKSPACE
+        // +++ b/WORKSPACE
+        // @@ -27,7 +27,7 @@ maven_install(
+        //      name = "bazel_diff_maven_android",
+        //      artifacts = [
         //        "junit:junit:4.12",
-        //  -       "com.google.guava:guava:31.0-android",
-        //  +       "com.google.guava:guava:32.0-android",
-        //    ],
-        //    repositories = [
-        //        "http://uk.maven.org/maven2",
+        // -      "com.google.guava:guava:31.0-android",
+        // +      "com.google.guava:guava:32.0.0-android",
+        //      ],
+        //      repositories = [
+        //          "http://uk.maven.org/maven2",
         //
         // The project contains the following targets related to the test
         //
-        //   java_library(
-        //       name = "guava-user",
-        //       srcs = glob(["GuavaUser.java"]),
-        //       visibility = ["//visibility:public"],
-        //       deps = select({
-        //           "//:android_system": ["@bazel_diff_maven_android//:com_google_guava_guava"],
-        //           "//:jre_system": ["@bazel_diff_maven//:com_google_guava_guava"],
-        //       }),
-        //   )
+        // java_library(
+        //     name = "guava-user",
+        //     srcs = ["GuavaUser.java"] + select({
+        //         "//:android_system": ["GuavaUserAndroid.java"],
+        //         "//:jre_system": ["GuavaUserJre.java"],
+        //     }),
+        //     visibility = ["//visibility:public"],
+        //     deps = select({
+        //         "//:android_system": ["@bazel_diff_maven_android//:com_google_guava_guava"],
+        //         "//:jre_system": ["@bazel_diff_maven//:com_google_guava_guava"],
+        //     }),
+        // )
 
         //   java_binary(
         //       name = "android",

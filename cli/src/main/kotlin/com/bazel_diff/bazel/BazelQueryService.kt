@@ -88,6 +88,10 @@ class BazelQueryService(
                     cqueryOutputFile.deleteOnExit()
                     cqueryOutputFile.writeText("""
                     def format(target):
+                        if providers(target) == None:
+                            # skip printing non-target results. That is, source files and generated files won't be
+                            # printed
+                            return ""
                         if "IncompatiblePlatformProvider" not in providers(target):
                             label = str(target.label)
                             if label.startswith("@//"):

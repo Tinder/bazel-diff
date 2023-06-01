@@ -68,5 +68,5 @@ fun loggingModule(verbose: Boolean) = module {
 }
 
 fun serialisationModule() = module {
-    single { GsonBuilder().setPrettyPrinting().create() }
+    single { GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create() }
 }

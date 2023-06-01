@@ -21,7 +21,7 @@ fun testModule(): Module = module {
     single { TargetHasher() }
     single { RuleHasher(emptySet()) }
     single { SourceFileHasher() }
-    single { GsonBuilder().setPrettyPrinting().create() }
+    single { GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create() }
     single(named("working-directory")) { Paths.get("working-directory") }
     single(named("output-base")) { Paths.get("output-base") }
     single { ContentHashProvider(null) }

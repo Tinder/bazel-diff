@@ -21,6 +21,11 @@ class BazelClient(private val useCquery: Boolean, private val fineGrainedHashExt
             // computation depends on hashing of source files in external repos as well, which is limited to repos
             // explicitly mentioned in `fineGrainedHashExternalRepos` flag. Therefore, for any repos not mentioned there
             // we are still relying on the repo-generation target under `//external` to compute the hash.
+            //
+            // In addition, we must include all source dependencies in this query in order for them to show up in
+            // `configuredRuleInput`. Hence, one must not filter them out with `kind(rule, deps(..))`. However, these
+            // source targets are omitted inside BazelQueryService with the custom starlark function used to print
+            // labels.
             (queryService.query("deps(//...:all-targets)", useCquery = true) +
                 queryService.query(repoTargetsQuery.joinToString(" + ") { "'$it'" }))
                 .distinctBy { it.rule.name }

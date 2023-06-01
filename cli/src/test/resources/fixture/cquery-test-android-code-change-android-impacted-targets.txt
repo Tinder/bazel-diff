@@ -1,0 +1,2 @@
+//src/main/java/com/integration:android
+//src/main/java/com/integration:guava-user

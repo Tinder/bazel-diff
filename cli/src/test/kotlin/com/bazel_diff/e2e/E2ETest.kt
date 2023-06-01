@@ -158,8 +158,8 @@ class E2ETest {
         // in the user repo changed. Querying changed targets for the `android` platform should only return `guava-user`
         // and `android` targets above because `jre` target above is not compatible with the `android` platform.
 
-        val workingDirectoryA = extractFixtureProject("/fixture/cquery-test-1.zip")
-        val workingDirectoryB = extractFixtureProject("/fixture/cquery-test-2.zip")
+        val workingDirectoryA = extractFixtureProject("/fixture/cquery-test-base.zip")
+        val workingDirectoryB = extractFixtureProject("/fixture/cquery-test-guava-upgrade.zip")
         val outputDir = temp.newFolder()
         val from = File(outputDir, "starting_hashes.json")
         val to = File(outputDir, "final_hashes.json")
@@ -183,7 +183,7 @@ class E2ETest {
 
         var actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
         var expected: Set<String> =
-            javaClass.getResourceAsStream("/fixture/cquery-test-android-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+            javaClass.getResourceAsStream("/fixture/cquery-test-guava-upgrade-android-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
         assertThat(actual).isEqualTo(expected)
 
@@ -203,7 +203,109 @@ class E2ETest {
         )
 
         actual = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
-        expected = javaClass.getResourceAsStream("/fixture/cquery-test-jre-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+        expected = javaClass.getResourceAsStream("/fixture/cquery-test-guava-upgrade-jre-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+
+        assertThat(actual).isEqualTo(expected)
+    }
+
+    @Test
+    fun testUseCqueryWithAndroidCodeChange() {
+        // The difference between these two snapshots is simply upgrading the Guava version for Android platform.
+        // Following is the diff.
+        //
+        // diff --git a/src/main/java/com/integration/GuavaUserAndroid.java b/src/main/java/com/integration/GuavaUserAndroid.java
+        // index 8a9289e..cb645dc 100644
+        // --- a/src/main/java/com/integration/GuavaUserAndroid.java
+        // +++ b/src/main/java/com/integration/GuavaUserAndroid.java
+        // @@ -2,4 +2,6 @@ package cli.src.test.resources.integration.src.main.java.com.integration;
+        //
+        //  import com.google.common.collect.ImmutableList;
+        //
+        // -public class GuavaUserAndroid {}
+        // +public class GuavaUserAndroid {
+        // +  // add a comment
+        // +}
+        //
+        // The project contains the following targets related to the test
+        //
+        // java_library(
+        //     name = "guava-user",
+        //     srcs = ["GuavaUser.java"] + select({
+        //         "//:android_system": ["GuavaUserAndroid.java"],
+        //         "//:jre_system": ["GuavaUserJre.java"],
+        //     }),
+        //     visibility = ["//visibility:public"],
+        //     deps = select({
+        //         "//:android_system": ["@bazel_diff_maven_android//:com_google_guava_guava"],
+        //         "//:jre_system": ["@bazel_diff_maven//:com_google_guava_guava"],
+        //     }),
+        // )
+
+        //   java_binary(
+        //       name = "android",
+        //       main_class = "cli.src.test.resources.integration.src.main.java.com.integration.GuavaUser",
+        //       runtime_deps = ["guava-user"],
+        //       target_compatible_with = ["//:android_system"]
+        //   )
+
+        //   java_binary(
+        //       name = "jre",
+        //       main_class = "cli.src.test.resources.integration.src.main.java.com.integration.GuavaUser",
+        //       runtime_deps = ["guava-user"],
+        //       target_compatible_with = ["//:jre_system"]
+        //   )
+        //
+        // So with the above android code change, querying changed targets for the `jre` platform should not return
+        // anything in the user repo changed. Querying changed targets for the `android` platform should only return
+        // `guava-user` and `android` targets above because `jre` target above is not compatible with the `android`
+        // platform.
+
+        val workingDirectoryA = extractFixtureProject("/fixture/cquery-test-base.zip")
+        val workingDirectoryB = extractFixtureProject("/fixture/cquery-test-android-code-change.zip")
+        val outputDir = temp.newFolder()
+        val from = File(outputDir, "starting_hashes.json")
+        val to = File(outputDir, "final_hashes.json")
+        val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+        val cli = CommandLine(BazelDiff())
+        // Query Android platform
+
+        //From
+        cli.execute(
+            "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:android", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", from.absolutePath
+        )
+        //To
+        cli.execute(
+            "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:android", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", to.absolutePath
+        )
+        //Impacted targets
+        cli.execute(
+            "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
+        )
+
+        var actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+        var expected: Set<String> =
+            javaClass.getResourceAsStream("/fixture/cquery-test-android-code-change-android-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+
+        assertThat(actual).isEqualTo(expected)
+
+        // Query JRE platform
+
+        //From
+        cli.execute(
+            "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:jre", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", from.absolutePath
+        )
+        //To
+        cli.execute(
+            "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:jre", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", to.absolutePath
+        )
+        //Impacted targets
+        cli.execute(
+            "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
+        )
+
+        actual = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+        expected = javaClass.getResourceAsStream("/fixture/cquery-test-android-code-change-jre-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
         assertThat(actual).isEqualTo(expected)
     }

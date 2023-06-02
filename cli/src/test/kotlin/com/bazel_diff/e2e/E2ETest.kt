@@ -210,7 +210,7 @@ class E2ETest {
 
     @Test
     fun testUseCqueryWithAndroidCodeChange() {
-        // The difference between these two snapshots is simply upgrading the Guava version for Android platform.
+        // The difference between these two snapshots is simply making a code change to Android-only source code.
         // Following is the diff.
         //
         // diff --git a/src/main/java/com/integration/GuavaUserAndroid.java b/src/main/java/com/integration/GuavaUserAndroid.java

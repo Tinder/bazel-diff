@@ -59,7 +59,7 @@ class GenerateHashesCommand : Callable<Int> {
 
     @CommandLine.Option(
         names = ["-co", "--bazelCommandOptions"],
-        description = ["Additional space separated Bazel command options used when invoking Bazel"],
+        description = ["Additional space separated Bazel command options used when invoking `bazel query`"],
         scope = CommandLine.ScopeType.INHERIT,
         converter = [OptionsConverter::class],
     )
@@ -72,6 +72,22 @@ class GenerateHashesCommand : Callable<Int> {
         converter = [CommaSeparatedValueConverter::class],
     )
     var fineGrainedHashExternalRepos: Set<String> = emptySet()
+
+    @CommandLine.Option(
+        names = ["--useCquery"],
+        negatable = true,
+        description = ["If true, use cquery instead of query when generating dependency graphs. Using cquery would yield more accurate build graph at the cost of slower query execution. When this is set, one usually also wants to set `--cqueryCommandOptions` to specify a targeting platform. Note that this flag only works with Bazel 6.2.0 or above because lower versions does not support `--query_file` flag."],
+        scope = CommandLine.ScopeType.INHERIT
+    )
+    var useCquery = false
+
+    @CommandLine.Option(
+        names = ["--cqueryCommandOptions"],
+        description = ["Additional space separated Bazel command options used when invoking `bazel cquery`. This flag is has no effect if `--useCquery`is false."],
+        scope = CommandLine.ScopeType.INHERIT,
+        converter = [OptionsConverter::class],
+    )
+    var cqueryCommandOptions: List<String> = emptyList()
 
     @CommandLine.Option(
         names = ["-k", "--keep_going"],
@@ -108,6 +124,8 @@ class GenerateHashesCommand : Callable<Int> {
                     contentHashPath,
                     bazelStartupOptions,
                     bazelCommandOptions,
+                    cqueryCommandOptions,
+                    useCquery,
                     keepGoing,
                     fineGrainedHashExternalRepos,
                 ),

@@ -1,7 +1,6 @@
 package com.bazel_diff
 
 import com.bazel_diff.bazel.BazelClient
-import com.bazel_diff.bazel.BazelQueryService
 import com.bazel_diff.hash.BuildGraphHasher
 import com.bazel_diff.hash.RuleHasher
 import com.bazel_diff.hash.SourceFileHasher
@@ -16,10 +15,10 @@ import java.nio.file.Paths
 
 fun testModule(): Module = module {
     single<Logger> { SilentLogger }
-    single { BazelClient(emptySet()) }
+    single { BazelClient(false, emptySet()) }
     single { BuildGraphHasher(get()) }
     single { TargetHasher() }
-    single { RuleHasher(emptySet()) }
+    single { RuleHasher(false, emptySet()) }
     single { SourceFileHasher() }
     single { GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create() }
     single(named("working-directory")) { Paths.get("working-directory") }

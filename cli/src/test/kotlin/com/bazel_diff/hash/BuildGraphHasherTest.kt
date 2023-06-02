@@ -174,7 +174,7 @@ class BuildGraphHasherTest : KoinTest {
         val target = mock<BazelTarget.Rule>()
         val rule = mock<BazelRule>()
         whenever(rule.name).thenReturn(name)
-        whenever(rule.ruleInputList(emptySet())).thenReturn(inputs)
+        whenever(rule.ruleInputList(false, emptySet())).thenReturn(inputs)
         whenever(rule.digest).thenReturn(digest.toByteArray())
         whenever(target.rule).thenReturn(rule)
         whenever(target.name).thenReturn(name)

@@ -1,0 +1,1 @@
+//external:bazel_diff_maven_android

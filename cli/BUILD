@@ -25,32 +25,16 @@ kt_jvm_library(
     name = "cli-lib",
     srcs = glob(["src/main/kotlin/**/*.kt"]),
     deps = [
-        ":build_java_proto",
         "@bazel_diff_maven//:com_google_code_gson_gson",
         "@bazel_diff_maven//:com_google_guava_guava",
         "@bazel_diff_maven//:info_picocli_picocli",
         "@bazel_diff_maven//:io_insert_koin_koin_core_jvm",
         "@bazel_diff_maven//:org_apache_commons_commons_pool2",
         "@bazel_diff_maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core_jvm",
+        "@bazel_tools//src/main/protobuf:analysis_v2_java_proto",
+        "@bazel_tools//src/main/protobuf:build_java_proto",
         "@com_google_protobuf//:protobuf_java",
     ],
-)
-
-java_proto_library(
-    name = "build_java_proto",
-    deps = [":build_proto"],
-)
-
-proto_library(
-    name = "build_proto",
-    srcs = [":build_proto_gen"],
-)
-
-genrule(
-    name = "build_proto_gen",
-    srcs = ["@bazel_tools//src/main/protobuf:build.proto"],
-    outs = ["build.proto"],
-    cmd = "cp $< $@",
 )
 
 kt_jvm_test(

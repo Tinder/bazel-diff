@@ -75,7 +75,10 @@ class BazelQueryService(
             addAll(startupOptions)
             if (useCquery) {
                 add("cquery")
-                add("--transitions=lite")
+                if (!outputCompatibleTargets) {
+                    // There is no need to query the transitions when querying for compatible targets.
+                    add("--transitions=lite")
+                }
             } else {
                 add("query")
             }

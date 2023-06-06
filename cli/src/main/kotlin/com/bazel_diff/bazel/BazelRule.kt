@@ -7,7 +7,7 @@ import com.google.devtools.build.lib.query2.proto.proto2api.Build
 // Ignore generator_location when computing a target's hash since it is likely to change and does not
 // affect a target's generated actions. Internally, Bazel also does this when computing a target's hash:
 // https://github.com/bazelbuild/bazel/blob/6971b016f1e258e3bb567a0f9fe7a88ad565d8f2/src/main/java/com/google/devtools/build/lib/query2/query/output/SyntheticAttributeHashCalculator.java#L78-L81
-private val IGNORED_ATTRS = arrayOf("generator_location")
+private val IGNORED_ATTRS = arrayOf("generator_location", "location")
 
 class BazelRule(private val rule: Build.Rule) {
     val digest: ByteArray by lazy {

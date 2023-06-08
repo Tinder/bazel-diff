@@ -30,7 +30,8 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
         ruleHashes: ConcurrentMap<String, ByteArray>,
         sourceDigests: ConcurrentMap<String, ByteArray>,
         seedHash: ByteArray?,
-        depPath: LinkedHashSet<String>?
+        depPath: LinkedHashSet<String>?,
+        ignoredAttrs: Set<String>
     ): ByteArray {
         val depPathClone = if (depPath != null) LinkedHashSet(depPath) else LinkedHashSet()
         if (depPathClone.contains(rule.name)) {
@@ -40,7 +41,7 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
         ruleHashes[rule.name]?.let { return it }
 
         val finalHashValue = sha256 {
-            safePutBytes(rule.digest)
+            safePutBytes(rule.digest(ignoredAttrs))
             safePutBytes(seedHash)
 
             for (ruleInput in rule.ruleInputList(useCquery, fineGrainedHashExternalRepos)) {
@@ -60,6 +61,7 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
                             sourceDigests,
                             seedHash,
                             depPathClone,
+                            ignoredAttrs
                         )
                         safePutBytes(ruleInputHash)
                     }

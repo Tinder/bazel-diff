@@ -121,6 +121,9 @@ workspace.
                             individual third party dependency change won't
                             invalidate all targets in the mono repo.
   -h, --help              Show this help message and exit.
+      --ignoredRuleHashingAttributes=<ignoredRuleHashingAttributes>
+                          Attributes that should be ignored when hashing rule
+                            targets.
   -k, --[no-]keep_going   This flag controls if `bazel query` will be executed
                             with the `--keep_going` flag or not. Disabling this
                             flag allows you to catch configuration issues in

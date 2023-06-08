@@ -162,7 +162,7 @@ class BuildGraphHasherTest : KoinTest {
         assertThat(hash).hasSize(3)
         val oldHash = hash["rule3"]!!
 
-        whenever(generator.rule.digest).thenReturn("newDigest".toByteArray())
+        whenever(generator.rule.digest(emptySet())).thenReturn("newDigest".toByteArray())
         hash = hasher.hashAllBazelTargetsAndSourcefiles()
         assertThat(hash).hasSize(3)
         val newHash = hash["rule3"]!!
@@ -175,7 +175,7 @@ class BuildGraphHasherTest : KoinTest {
         val rule = mock<BazelRule>()
         whenever(rule.name).thenReturn(name)
         whenever(rule.ruleInputList(false, emptySet())).thenReturn(inputs)
-        whenever(rule.digest).thenReturn(digest.toByteArray())
+        whenever(rule.digest(emptySet())).thenReturn(digest.toByteArray())
         whenever(target.rule).thenReturn(rule)
         whenever(target.name).thenReturn(name)
         return target

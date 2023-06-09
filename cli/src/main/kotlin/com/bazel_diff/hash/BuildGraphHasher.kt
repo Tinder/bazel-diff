@@ -26,7 +26,10 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
     private val sourceFileHasher: SourceFileHasher by inject()
     private val logger: Logger by inject()
 
-    fun hashAllBazelTargetsAndSourcefiles(seedFilepaths: Set<Path> = emptySet()): Map<String, String> {
+    fun hashAllBazelTargetsAndSourcefiles(
+        seedFilepaths: Set<Path> = emptySet(),
+        ignoredAttrs: Set<String> = emptySet()
+    ): Map<String, String> {
         /**
          * Bazel will lock parallel queries but this is still allowing us to hash source files while executing a parallel query
          */
@@ -56,7 +59,12 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
             Pair(sourceDigestsFuture.await(), targetsTask.await())
         }
         val seedForFilepaths = createSeedForFilepaths(seedFilepaths)
-        return hashAllTargets(seedForFilepaths, sourceDigests, allTargets)
+        return hashAllTargets(
+            seedForFilepaths,
+            sourceDigests,
+            allTargets,
+            ignoredAttrs
+        )
     }
 
     private fun hashSourcefiles(targets: List<Build.Target>): ConcurrentMap<String, ByteArray> {
@@ -94,7 +102,8 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
     private fun hashAllTargets(
         seedHash: ByteArray,
         sourceDigests: ConcurrentMap<String, ByteArray>,
-        allTargets: List<BazelTarget>
+        allTargets: List<BazelTarget>,
+        ignoredAttrs: Set<String>
     ): Map<String, String> {
         val ruleHashes: ConcurrentMap<String, ByteArray> = ConcurrentHashMap()
         val targetToRule: MutableMap<String, BazelRule> = HashMap()
@@ -107,7 +116,8 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
                     targetToRule,
                     sourceDigests,
                     ruleHashes,
-                    seedHash
+                    seedHash,
+                    ignoredAttrs
                 )
                 Pair(target.name, targetDigest.toHexString())
             }

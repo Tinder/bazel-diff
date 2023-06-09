@@ -19,7 +19,7 @@ class BazelRuleTest {
                 .setRuleClass("java_library")
                 .setName("libbar")
                 .build()
-        assertThat(BazelRule(rule1Pb).digest).isNotEqualTo(BazelRule(rule2Pb).digest)
+        assertThat(BazelRule(rule1Pb).digest(emptySet())).isNotEqualTo(BazelRule(rule2Pb).digest(emptySet()))
     }
     @Test
     fun testIgnoreAttributes() {
@@ -41,6 +41,6 @@ class BazelRuleTest {
                         .setStringValue("path/to/BUILD:111:1").build())
                 .build()
 
-        assertThat(BazelRule(rule1Pb).digest).isEqualTo(BazelRule(rule2Pb).digest)
+        assertThat(BazelRule(rule1Pb).digest(emptySet())).isEqualTo(BazelRule(rule2Pb).digest(emptySet()))
     }
 }

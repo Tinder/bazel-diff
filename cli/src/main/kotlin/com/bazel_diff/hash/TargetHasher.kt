@@ -14,7 +14,8 @@ class TargetHasher : KoinComponent {
         allRulesMap: Map<String, BazelRule>,
         sourceDigests: ConcurrentMap<String, ByteArray>,
         ruleHashes: ConcurrentMap<String, ByteArray>,
-        seedHash: ByteArray?
+        seedHash: ByteArray?,
+        ignoredAttrs: Set<String>
     ): ByteArray {
         return when (target) {
             is BazelTarget.GeneratedFile -> {
@@ -30,12 +31,21 @@ class TargetHasher : KoinComponent {
                         ruleHashes,
                         sourceDigests,
                         seedHash,
-                        depPath = null
+                        depPath = null,
+                        ignoredAttrs
                     )
                 }
             }
             is BazelTarget.Rule -> {
-                ruleHasher.digest(target.rule, allRulesMap, ruleHashes, sourceDigests, seedHash, depPath = null)
+                ruleHasher.digest(
+                    target.rule,
+                    allRulesMap,
+                    ruleHashes,
+                    sourceDigests,
+                    seedHash,
+                    depPath = null,
+                    ignoredAttrs
+                )
             }
             is BazelTarget.SourceFile -> sha256 {
                 safePutBytes(sourceDigests[target.sourceFileName])

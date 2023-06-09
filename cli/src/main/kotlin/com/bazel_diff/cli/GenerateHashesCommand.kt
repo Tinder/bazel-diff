@@ -110,6 +110,14 @@ class GenerateHashesCommand : Callable<Int> {
     )
     var outputPath: File? = null
 
+    @CommandLine.Option(
+        names = ["--ignoredRuleHashingAttributes"],
+        description = ["Attributes that should be ignored when hashing rule targets."],
+        scope = CommandLine.ScopeType.INHERIT,
+        converter = [OptionsConverter::class],
+    )
+    var ignoredRuleHashingAttributes: Set<String> = emptySet()
+
     @CommandLine.Spec
     lateinit var spec: CommandLine.Model.CommandSpec
 
@@ -134,7 +142,7 @@ class GenerateHashesCommand : Callable<Int> {
             )
         }
 
-        return when (GenerateHashesInteractor().execute(seedFilepaths, outputPath)) {
+        return when (GenerateHashesInteractor().execute(seedFilepaths, outputPath, ignoredRuleHashingAttributes)) {
             true -> CommandLine.ExitCode.OK
             false -> CommandLine.ExitCode.SOFTWARE
         }.also { stopKoin() }

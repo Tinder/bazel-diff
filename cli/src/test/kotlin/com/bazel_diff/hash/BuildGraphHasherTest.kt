@@ -41,7 +41,7 @@ class BuildGraphHasherTest : KoinTest {
     val temp: TemporaryFolder = TemporaryFolder()
 
     val bazelClientMock: BazelClient = mock()
-    val hasher = BuildGraphHasher(bazelClientMock)
+    val hasher = BuildGraphHasher(bazelClientMock, null)
 
 
     var defaultTargets: MutableList<BazelTarget> = mutableListOf()

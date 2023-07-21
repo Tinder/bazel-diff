@@ -27,18 +27,19 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
     fun digest(
         rule: BazelRule,
         allRulesMap: Map<String, BazelRule>,
-        ruleHashes: ConcurrentMap<String, ByteArray>,
+        ruleHashes: ConcurrentMap<Pair<String, Int?>, ByteArray>,
         sourceDigests: ConcurrentMap<String, ByteArray>,
         seedHash: ByteArray?,
         depPath: LinkedHashSet<String>?,
-        ignoredAttrs: Set<String>
+        ignoredAttrs: Set<String>,
+        depth: Int?
     ): ByteArray {
         val depPathClone = if (depPath != null) LinkedHashSet(depPath) else LinkedHashSet()
         if (depPathClone.contains(rule.name)) {
             throw raiseCircularDependency(depPathClone, rule.name)
         }
         depPathClone.add(rule.name)
-        ruleHashes[rule.name]?.let { return it }
+        ruleHashes[Pair(rule.name, depth)]?.let { return it }
 
         val finalHashValue = sha256 {
             safePutBytes(rule.digest(ignoredAttrs))
@@ -49,11 +50,11 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
 
                 val inputRule = allRulesMap[ruleInput]
                 when {
-                    inputRule == null && sourceDigests.containsKey(ruleInput) -> {
+                    (depth == 0 || inputRule == null) && sourceDigests.containsKey(ruleInput) -> {
                         safePutBytes(sourceDigests[ruleInput])
                     }
 
-                    inputRule?.name != null && inputRule.name != rule.name -> {
+                    depth != 0 && inputRule?.name != null && inputRule.name != rule.name -> {
                         val ruleInputHash = digest(
                             inputRule,
                             allRulesMap,
@@ -61,7 +62,8 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
                             sourceDigests,
                             seedHash,
                             depPathClone,
-                            ignoredAttrs
+                            ignoredAttrs,
+                            depth?.minus(1)
                         )
                         safePutBytes(ruleInputHash)
                     }
@@ -82,6 +84,6 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
             }
         }
 
-        return finalHashValue.also { ruleHashes[rule.name] = it }
+        return finalHashValue.also { ruleHashes[Pair(rule.name, depth)] = it }
     }
 }

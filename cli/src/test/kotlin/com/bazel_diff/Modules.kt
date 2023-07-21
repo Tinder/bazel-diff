@@ -16,7 +16,7 @@ import java.nio.file.Paths
 fun testModule(): Module = module {
     single<Logger> { SilentLogger }
     single { BazelClient(false, emptySet()) }
-    single { BuildGraphHasher(get()) }
+    single { BuildGraphHasher(get(), null) }
     single { TargetHasher() }
     single { RuleHasher(false, emptySet()) }
     single { SourceFileHasher() }

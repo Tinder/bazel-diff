@@ -21,7 +21,7 @@ import java.util.stream.Collectors
 import kotlin.io.path.readBytes
 import java.util.Calendar
 
-class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
+class BuildGraphHasher(private val bazelClient: BazelClient, private val depth: Int?) : KoinComponent {
     private val targetHasher: TargetHasher by inject()
     private val sourceFileHasher: SourceFileHasher by inject()
     private val logger: Logger by inject()
@@ -105,7 +105,7 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
         allTargets: List<BazelTarget>,
         ignoredAttrs: Set<String>
     ): Map<String, String> {
-        val ruleHashes: ConcurrentMap<String, ByteArray> = ConcurrentHashMap()
+        val ruleHashes: ConcurrentMap<Pair<String, Int?>, ByteArray> = ConcurrentHashMap()
         val targetToRule: MutableMap<String, BazelRule> = HashMap()
         traverseGraph(allTargets, targetToRule)
 
@@ -117,7 +117,8 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
                     sourceDigests,
                     ruleHashes,
                     seedHash,
-                    ignoredAttrs
+                    ignoredAttrs,
+                    depth
                 )
                 Pair(target.name, targetDigest.toHexString())
             }

@@ -1,0 +1,15 @@
+name: Run Required Checks
+run-name: PR Checks for ${{ github.ref_name }}
+
+on:
+  push:
+    branches:
+      - trunk-merge/**
+
+jobs:
+  required_status:
+    runs-on: ubuntu-latest
+    name: Required Status A
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3

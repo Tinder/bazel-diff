@@ -1,0 +1,31 @@
+version: 0.1
+cli:
+  version: 1.13.0
+plugins:
+  sources:
+    - id: trunk
+      ref: v1.1.1
+      uri: https://github.com/trunk-io/plugins
+lint:
+  enabled:
+    - actionlint@1.6.25
+    - buildifier@6.1.2
+    - checkov@2.3.365
+    - git-diff-check
+    - ktlint@0.50.0
+    - markdownlint@0.35.0
+    - prettier@3.0.1
+    - shellcheck@0.9.0
+    - shfmt@3.6.0
+    - trivy@0.44.1
+    - trufflehog@3.48.0
+    - yamllint@1.32.0
+runtimes:
+  enabled:
+    - go@1.19.5
+    - java@13.0.11
+    - node@18.12.1
+    - python@3.10.8
+merge:
+  required_statuses:
+    - Required Status A

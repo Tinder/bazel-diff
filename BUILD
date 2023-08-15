@@ -1,4 +1,4 @@
 alias(
-    name = "bazel-diff",
+    name = "bazel-diff-2",
     actual = "//cli:bazel-diff",
 )

@@ -1,5 +1,3 @@
-A sample diff
-
 # bazel-diff
 
 [![Build status](https://github.com/Tinder/bazel-diff/actions/workflows/ci.yaml/badge.svg?branch=master)](https://github.com/Tinder/bazel-diff/actions/workflows/ci.yaml)

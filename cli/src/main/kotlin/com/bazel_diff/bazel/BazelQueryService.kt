@@ -127,11 +127,10 @@ class BazelQueryService(
             add(queryFile.toString())
         }
 
-        val command = *cmd.toTypedArray()
-        logger.i { "Executing Query: $query, Command: $command"}
+        logger.i { "Executing Query: $query, Command: ${cmd.toTypedArray().joinToString()}"}
         val result = runBlocking {
             process(
-                command,
+                *cmd.toTypedArray(),
                 stdout = Redirect.ToFile(outputFile),
                 workingDirectory = workingDirectory.toFile(),
                 stderr = Redirect.PRINT,

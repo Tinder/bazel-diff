@@ -127,7 +127,8 @@ class BazelQueryService(
             add(queryFile.toString())
         }
 
-        logger.i { "Executing Query: $query, Command: ${cmd.toTypedArray().joinToString()}"}
+        logger.i { "Executing Query: $query" }
+        logger.i { "Command: ${cmd.toTypedArray().joinToString()}" }
         val result = runBlocking {
             process(
                 *cmd.toTypedArray(),

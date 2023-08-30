@@ -65,7 +65,6 @@ class BazelQueryService(
         outputFile.deleteOnExit()
 
         queryFile.writeText(query)
-        logger.i { "Executing Query: $query" }
 
         val cmd: MutableList<String> = ArrayList<String>().apply {
             add(bazelPath.toString())
@@ -128,9 +127,11 @@ class BazelQueryService(
             add(queryFile.toString())
         }
 
+        val command = *cmd.toTypedArray()
+        logger.i { "Executing Query: $query, Command: $command"}
         val result = runBlocking {
             process(
-                *cmd.toTypedArray(),
+                command,
                 stdout = Redirect.ToFile(outputFile),
                 workingDirectory = workingDirectory.toFile(),
                 stderr = Redirect.PRINT,

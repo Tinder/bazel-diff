@@ -68,10 +68,14 @@ class BazelClient(private val useCquery: Boolean, private val fineGrainedHashExt
     suspend fun queryModifiedSourcefileTargets(
         modifiedFilepaths: Set<Path>
     ): List<Build.Target> {
+        logger.i { modifiedFilepaths.map { it.toString() }.joinToString("\n") }
         val queryEpoch = Calendar.getInstance().getTimeInMillis()
         val allReposToQuery = fineGrainedHashExternalRepos.map { "@$it" }
-        val fineGrainedHashExternalReposSourceTargets = queryService.query("kind('source file', ${allReposToQuery.joinToString(" + ") { "'$it//...:all-targets'" }})")
-        val modifiedSourceFileTargets = queryService.query("kind('source file', ${modifiedFilepaths.joinToString(" + ") { "'$it'" }})")
+        var fineGrainedHashExternalReposSourceTargets = emptyList<Build.Target>()
+        if (allReposToQuery.isNotEmpty()) {
+            fineGrainedHashExternalReposSourceTargets = queryService.query("kind('source file', ${allReposToQuery.joinToString(" + ") { "'$it//...:all-targets'" }})")
+        }
+        val modifiedSourceFileTargets = queryService.query("${modifiedFilepaths.joinToString(" + ") { "'$it'" }}", supressFailure = true)
         val queryDuration = Calendar.getInstance().getTimeInMillis() - queryEpoch
         logger.i { "Modified source files queried in $queryDuration" }
 

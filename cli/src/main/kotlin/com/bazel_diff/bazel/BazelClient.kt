@@ -2,9 +2,10 @@ package com.bazel_diff.bazel
 
 import com.bazel_diff.log.Logger
 import com.google.devtools.build.lib.query2.proto.proto2api.Build
-import org.koin.core.component.KoinComponent
-import org.koin.core.component.inject
+import java.nio.file.Path
 import java.util.*
+import org.koin.core.component.inject
+import org.koin.core.component.KoinComponent
 
 class BazelClient(private val useCquery: Boolean, private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
     private val logger: Logger by inject()
@@ -62,6 +63,19 @@ class BazelClient(private val useCquery: Boolean, private val fineGrainedHashExt
         logger.i { "All source files queried in $queryDuration" }
 
         return targets
+    }
+
+    suspend fun queryModifiedSourcefileTargets(
+        modifiedFilepaths: Set<Path>
+    ): List<Build.Target> {
+        val queryEpoch = Calendar.getInstance().getTimeInMillis()
+        val allReposToQuery = fineGrainedHashExternalRepos.map { "@$it" }
+        val fineGrainedHashExternalReposSourceTargets = queryService.query("kind('source file', ${allReposToQuery.joinToString(" + ") { "'$it//...:all-targets'" }})")
+        val modifiedSourceFileTargets = queryService.query("kind('source file', ${modifiedFilepaths.joinToString(" + ") { "'$it'" }})")
+        val queryDuration = Calendar.getInstance().getTimeInMillis() - queryEpoch
+        logger.i { "Modified source files queried in $queryDuration" }
+
+        return fineGrainedHashExternalReposSourceTargets + modifiedSourceFileTargets
     }
 }
 

@@ -8,18 +8,19 @@ import com.bazel_diff.extensions.toHexString
 import com.bazel_diff.log.Logger
 import com.google.common.collect.Sets
 import com.google.devtools.build.lib.query2.proto.proto2api.Build
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.runBlocking
-import org.koin.core.component.KoinComponent
-import org.koin.core.component.inject
+import java.io.File
 import java.nio.file.Path
+import java.util.Calendar
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentMap
-import java.util.concurrent.atomic.AtomicReference
 import java.util.stream.Collectors
 import kotlin.io.path.readBytes
-import java.util.Calendar
+import kotlinx.coroutines.async
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
+import org.koin.core.component.inject
+import org.koin.core.component.KoinComponent
 
 class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
     private val targetHasher: TargetHasher by inject()
@@ -28,7 +29,8 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
 
     fun hashAllBazelTargetsAndSourcefiles(
         seedFilepaths: Set<Path> = emptySet(),
-        ignoredAttrs: Set<String> = emptySet()
+        ignoredAttrs: Set<String> = emptySet(),
+        modifiedFilepaths: Set<Path> = emptySet()
     ): Map<String, String> {
         /**
          * Bazel will lock parallel queries but this is still allowing us to hash source files while executing a parallel query
@@ -38,6 +40,9 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
              * Source query is usually faster than targets query, so we prioritise it first
              */
             val sourceTargetsFuture = async(Dispatchers.IO) {
+                if (!modifiedFilepaths.isEmpty()) {
+                    return@async bazelClient.queryModifiedSourcefileTargets(modifiedFilepaths)
+                }
                 bazelClient.queryAllSourcefileTargets()
             }
             val sourceTargets = sourceTargetsFuture.await()
@@ -67,7 +72,9 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
         )
     }
 
-    private fun hashSourcefiles(targets: List<Build.Target>): ConcurrentMap<String, ByteArray> {
+    private fun hashSourcefiles(
+        targets: List<Build.Target>
+    ): ConcurrentMap<String, ByteArray> {
         val exception = AtomicReference<Exception?>(null)
         val result: ConcurrentMap<String, ByteArray> = targets.parallelStream()
             .map { target: Build.Target ->

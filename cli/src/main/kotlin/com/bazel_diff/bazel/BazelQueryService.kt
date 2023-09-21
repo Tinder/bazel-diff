@@ -148,7 +148,12 @@ class BazelQueryService(
             )
         }
 
-        if (!supressFailure && result.resultCode != 0) {
+        var allowedExitCodes = listOf(0)
+        if (supressFailure) {
+            allowedExitCodes += listOf(3)
+        }
+
+        if (!allowedExitCodes.contains(result.resultCode)) {
             throw RuntimeException("Bazel query failed, exit code ${result.resultCode}")
         }
         return outputFile

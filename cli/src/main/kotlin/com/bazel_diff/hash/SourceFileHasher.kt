@@ -38,7 +38,10 @@ class SourceFileHasher : KoinComponent {
         this.externalRepoResolver = externalRepoResolver
     }
 
-    fun digest(sourceFileTarget: BazelSourceFileTarget): ByteArray {
+    fun digest(
+        sourceFileTarget: BazelSourceFileTarget,
+        modifiedFilepaths: Set<Path> = emptySet()
+    ): ByteArray {
         return sha256 {
             val name = sourceFileTarget.name
             val filenamePath = if (name.startsWith("//")) {
@@ -69,7 +72,11 @@ class SourceFileHasher : KoinComponent {
                 val file = absoluteFilePath.toFile()
                 if (file.exists()) {
                     if (file.isFile) {
-                        putFile(file)
+                        if (modifiedFilepaths.isEmpty()) {
+                            putFile(file)
+                        } else if (modifiedFilepaths.stream().anyMatch { workingDirectory.resolve(it) == file }) {
+                            putFile(file)
+                        }
                     }
                 } else {
                     logger.w { "File $absoluteFilePath not found" }
@@ -80,7 +87,7 @@ class SourceFileHasher : KoinComponent {
         }
     }
 
-    fun softDigest(sourceFileTarget: BazelSourceFileTarget): ByteArray? {
+    fun softDigest(sourceFileTarget: BazelSourceFileTarget, modifiedFilepaths: Set<Path> = emptySet()): ByteArray? {
         val name = sourceFileTarget.name
         if (!name.startsWith("//")) return null
 
@@ -90,6 +97,6 @@ class SourceFileHasher : KoinComponent {
         val file = absoluteFilePath.toFile()
         if (!file.exists() || !file.isFile) return null
 
-        return digest(sourceFileTarget)
+        return digest(sourceFileTarget, modifiedFilepaths)
     }
 }

@@ -7,6 +7,7 @@ import com.google.common.annotations.VisibleForTesting
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import java.util.concurrent.ConcurrentMap
+import java.nio.file.Path
 
 class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
     private val logger: Logger by inject()
@@ -31,7 +32,8 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
         sourceDigests: ConcurrentMap<String, ByteArray>,
         seedHash: ByteArray?,
         depPath: LinkedHashSet<String>?,
-        ignoredAttrs: Set<String>
+        ignoredAttrs: Set<String>,
+        modifiedFilepaths: Set<Path>
     ): ByteArray {
         val depPathClone = if (depPath != null) LinkedHashSet(depPath) else LinkedHashSet()
         if (depPathClone.contains(rule.name)) {
@@ -61,13 +63,14 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
                             sourceDigests,
                             seedHash,
                             depPathClone,
-                            ignoredAttrs
+                            ignoredAttrs,
+                            modifiedFilepaths
                         )
                         safePutBytes(ruleInputHash)
                     }
 
                     else -> {
-                        val heuristicDigest = sourceFileHasher.softDigest(BazelSourceFileTarget(ruleInput, ByteArray(0)))
+                        val heuristicDigest = sourceFileHasher.softDigest(BazelSourceFileTarget(ruleInput, ByteArray(0)), modifiedFilepaths)
                         when {
                             heuristicDigest != null -> {
                                 logger.i { "Source file $ruleInput picked up as an input for rule ${rule.name}" }

@@ -24,7 +24,11 @@ class BazelQueryService(
 ) : KoinComponent {
     private val logger: Logger by inject()
 
-    suspend fun query(query: String, useCquery: Boolean = false): List<Build.Target> {
+    suspend fun query(
+        query: String,
+        useCquery: Boolean = false,
+        supressFailure: Boolean = false)
+    : List<Build.Target> {
         // Unfortunately, there is still no direct way to tell if a target is compatible or not with the proto output
         // by itself. So we do an extra cquery with the trick at
         // https://bazel.build/extending/platforms#cquery-incompatible-target-detection to first find all compatible
@@ -58,7 +62,12 @@ class BazelQueryService(
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    private suspend fun runQuery(query: String, useCquery: Boolean, outputCompatibleTargets: Boolean = false): File {
+    private suspend fun runQuery(
+        query: String,
+        useCquery: Boolean,
+        outputCompatibleTargets: Boolean = false,
+        supressFailure: Boolean = false
+    ): File {
         val queryFile = Files.createTempFile(null, ".txt").toFile()
         queryFile.deleteOnExit()
         val outputFile = Files.createTempFile(null, ".bin").toFile()

@@ -4,6 +4,6 @@ import picocli.CommandLine.IVersionProvider
 
 class VersionProvider : IVersionProvider {
     override fun getVersion(): Array<String> {
-        return arrayOf("4.8.2")
+        return arrayOf("5.0.0")
     }
 }

@@ -1,13 +1,18 @@
-load("@rules_java//java:defs.bzl", "java_binary", "java_library", "java_proto_library")
-load("@rules_proto//proto:defs.bzl", "proto_library")
-load("@io_bazel_rules_kotlin//kotlin:jvm.bzl", "kt_jvm_binary", "kt_jvm_library", "kt_jvm_test")
-load("@rules_jvm_external//:defs.bzl", "artifact")
+load("@rules_java//java:defs.bzl", "java_binary")
+load("@io_bazel_rules_kotlin//kotlin:jvm.bzl", "kt_jvm_library", "kt_jvm_test")
 
 config_setting(
     name = "enable_debug",
     values = {
         "compilation_mode": "dbg",
     },
+)
+
+config_setting(
+    name = "macos",
+    constraint_values = [
+        "@platforms//os:macos",
+    ],
 )
 
 java_binary(
@@ -39,6 +44,10 @@ kt_jvm_library(
 
 kt_jvm_test(
     name = "BuildGraphHasherTest",
+    jvm_flags = select({
+        ":macos": ["-Djava.security.manager=allow"],
+        "//conditions:default": [],
+    }),
     test_class = "com.bazel_diff.hash.BuildGraphHasherTest",
     runtime_deps = [":cli-test-lib"],
 )
@@ -48,42 +57,70 @@ kt_jvm_test(
     data = [
         ":src/test/kotlin/com/bazel_diff/hash/fixture/foo.ts",
     ],
+    jvm_flags = select({
+        ":macos": ["-Djava.security.manager=allow"],
+        "//conditions:default": [],
+    }),
     test_class = "com.bazel_diff.hash.SourceFileHasherTest",
     runtime_deps = [":cli-test-lib"],
 )
 
 kt_jvm_test(
     name = "CalculateImpactedTargetsInteractorTest",
+    jvm_flags = select({
+        ":macos": ["-Djava.security.manager=allow"],
+        "//conditions:default": [],
+    }),
     test_class = "com.bazel_diff.interactor.CalculateImpactedTargetsInteractorTest",
     runtime_deps = [":cli-test-lib"],
 )
 
 kt_jvm_test(
     name = "NormalisingPathConverterTest",
+    jvm_flags = select({
+        ":macos": ["-Djava.security.manager=allow"],
+        "//conditions:default": [],
+    }),
     test_class = "com.bazel_diff.cli.converter.NormalisingPathConverterTest",
     runtime_deps = [":cli-test-lib"],
 )
 
 kt_jvm_test(
     name = "OptionsConverterTest",
+    jvm_flags = select({
+        ":macos": ["-Djava.security.manager=allow"],
+        "//conditions:default": [],
+    }),
     test_class = "com.bazel_diff.cli.converter.OptionsConverterTest",
     runtime_deps = [":cli-test-lib"],
 )
 
 kt_jvm_test(
     name = "DeserialiseHashesInteractorTest",
+    jvm_flags = select({
+        ":macos": ["-Djava.security.manager=allow"],
+        "//conditions:default": [],
+    }),
     test_class = "com.bazel_diff.interactor.DeserialiseHashesInteractorTest",
     runtime_deps = [":cli-test-lib"],
 )
 
 kt_jvm_test(
     name = "BazelRuleTest",
+    jvm_flags = select({
+        ":macos": ["-Djava.security.manager=allow"],
+        "//conditions:default": [],
+    }),
     test_class = "com.bazel_diff.bazel.BazelRuleTest",
     runtime_deps = [":cli-test-lib"],
 )
 
 kt_jvm_test(
     name = "E2ETest",
+    jvm_flags = select({
+        ":macos": ["-Djava.security.manager=allow"],
+        "//conditions:default": [],
+    }),
     test_class = "com.bazel_diff.e2e.E2ETest",
     runtime_deps = [":cli-test-lib"],
 )
@@ -94,6 +131,10 @@ kt_jvm_test(
         ":src/test/kotlin/com/bazel_diff/io/fixture/correct.json",
         ":src/test/kotlin/com/bazel_diff/io/fixture/wrong.json",
     ],
+    jvm_flags = select({
+        ":macos": ["-Djava.security.manager=allow"],
+        "//conditions:default": [],
+    }),
     test_class = "com.bazel_diff.io.ContentHashProviderTest",
     runtime_deps = [
         ":cli-test-lib",

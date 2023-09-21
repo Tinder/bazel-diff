@@ -118,6 +118,12 @@ class GenerateHashesCommand : Callable<Int> {
     )
     var ignoredRuleHashingAttributes: Set<String> = emptySet()
 
+     @CommandLine.Option(
+        names = ["-m", "--modified-filepaths"],
+        description = ["Experimental: A text file containing a newline separated list of filepaths, these filepaths should represent the modified files between the specified revisions and will be used to scope what files are hashed during hash generation."]
+    )
+    var modifiedFilepaths: File? = null
+
     @CommandLine.Spec
     lateinit var spec: CommandLine.Model.CommandSpec
 
@@ -142,7 +148,12 @@ class GenerateHashesCommand : Callable<Int> {
             )
         }
 
-        return when (GenerateHashesInteractor().execute(seedFilepaths, outputPath, ignoredRuleHashingAttributes)) {
+        return when (GenerateHashesInteractor().execute(
+            seedFilepaths,
+            outputPath,
+            ignoredRuleHashingAttributes,
+            modifiedFilepaths
+        )) {
             true -> CommandLine.ExitCode.OK
             false -> CommandLine.ExitCode.SOFTWARE
         }.also { stopKoin() }

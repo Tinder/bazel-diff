@@ -16,8 +16,9 @@ class E2ETest {
     @get:Rule
     val temp: TemporaryFolder = TemporaryFolder()
 
-    @Test
-    fun testE2E() {
+    private fun CommandLine.execute(args: List<String>) = execute(*args.toTypedArray())
+
+    private fun testE2E(extraGenerateHashesArgs: List<String>, extraGetImpactedTargetsArgs: List<String>, expectedResultFile: String) {
         val projectA = extractFixtureProject("/fixture/integration-test-1.zip")
         val projectB = extractFixtureProject("/fixture/integration-test-2.zip")
 
@@ -32,22 +33,37 @@ class E2ETest {
         val cli = CommandLine(BazelDiff())
         //From
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, from.absolutePath
+            listOf("generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, from.absolutePath) + extraGenerateHashesArgs
         )
         //To
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, to.absolutePath
+            listOf("generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, to.absolutePath) + extraGenerateHashesArgs
         )
         //Impacted targets
         cli.execute(
-            "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
+            listOf("get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath) + extraGetImpactedTargetsArgs
         )
 
         val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
         val expected: Set<String> =
-            javaClass.getResourceAsStream("/fixture/impacted_targets-1-2.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+            javaClass.getResourceAsStream(expectedResultFile).use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
         assertThat(actual).isEqualTo(expected)
+    }
+
+    @Test
+    fun testE2E() {
+        testE2E(emptyList(), emptyList(), "/fixture/impacted_targets-1-2.txt")
+    }
+
+    @Test
+    fun testE2EIncludingTargetType() {
+        testE2E(listOf("-tt", "Rule,SourceFile"), emptyList(), "/fixture/impacted_targets-1-2-rule-sourcefile.txt")
+    }
+
+    @Test
+    fun testE2EWithTargetType() {
+        testE2E(listOf("--includeTargetType"), listOf("-tt", "Rule,SourceFile"), "/fixture/impacted_targets-1-2-rule-sourcefile.txt")
     }
 
     @Test

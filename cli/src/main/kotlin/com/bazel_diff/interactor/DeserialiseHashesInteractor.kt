@@ -12,9 +12,22 @@ class DeserialiseHashesInteractor : KoinComponent {
 
     /**
      * @param file path to file that has been pre-validated
+     * @param targetTypes the target types to filter. If null, all targets will be returned
      */
-    fun execute(file: File): Map<String, String> {
+    fun execute(file: File, targetTypes: Set<String>? = null): Map<String, String> {
         val shape = object : TypeToken<Map<String, String>>() {}.type
-        return gson.fromJson(FileReader(file), shape)
+        val result: Map<String, String> = gson.fromJson(FileReader(file), shape)
+        if (targetTypes == null) {
+            return result.mapValues { it.value.substringAfter("#") }
+        } else {
+            val prefixes = targetTypes.map { "${it}#" }.toSet()
+            return result.filter { entry ->
+                if (entry.value.contains("#")) {
+                    prefixes.any { entry.value.startsWith(it) }
+                } else {
+                    throw IllegalStateException("No type info found in ${file}, please re-generate the JSON with --includeTypeTarget!")
+                }
+            }.mapValues { it.value.substringAfter("#") }
+        }
     }
 }

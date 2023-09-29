@@ -18,10 +18,10 @@ class GenerateHashesInteractor : KoinComponent {
     private val logger: Logger by inject()
     private val gson: Gson by inject()
 
-    fun execute(seedFilepaths: File?, outputPath: File?, ignoredRuleHashingAttributes: Set<String>): Boolean {
+    fun execute(seedFilepaths: File?, outputPath: File?, ignoredRuleHashingAttributes: Set<String>, targetTypes:Set<String>?, includeTargetType: Boolean = false): Boolean {
         return try {
             val epoch = Calendar.getInstance().getTimeInMillis()
-            var seedFilepathsSet: Set<Path> = when {
+            val seedFilepathsSet: Set<Path> = when {
                 seedFilepaths != null -> {
                     BufferedReader(FileReader(seedFilepaths)).use {
                         it.readLines()
@@ -34,12 +34,18 @@ class GenerateHashesInteractor : KoinComponent {
             val hashes = buildGraphHasher.hashAllBazelTargetsAndSourcefiles(
                 seedFilepathsSet,
                 ignoredRuleHashingAttributes
-            )
+            ).let {
+                if(targetTypes == null) {
+                    it
+                } else {
+                    it.filter { targetTypes.contains(it.value.type) }
+                }
+            }
             when (outputPath) {
                 null -> FileWriter(FileDescriptor.out)
                 else -> FileWriter(outputPath)
-            }.use {
-                it.write(gson.toJson(hashes))
+            }.use { fileWriter ->
+                fileWriter.write(gson.toJson(hashes.mapValues { it.value.toJson(includeTargetType) }))
             }
             val duration = Calendar.getInstance().getTimeInMillis() - epoch;
             logger.i { "generate-hashes finished in $duration" }

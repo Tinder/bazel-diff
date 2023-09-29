@@ -21,11 +21,6 @@ import java.util.stream.Collectors
 import kotlin.io.path.readBytes
 import java.util.Calendar
 
-data class TargetHash(
-    val type: String,
-    val hash: String
-)
-
 class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
     private val targetHasher: TargetHasher by inject()
     private val sourceFileHasher: SourceFileHasher by inject()

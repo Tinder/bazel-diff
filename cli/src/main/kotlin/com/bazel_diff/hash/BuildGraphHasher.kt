@@ -29,7 +29,7 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
     fun hashAllBazelTargetsAndSourcefiles(
         seedFilepaths: Set<Path> = emptySet(),
         ignoredAttrs: Set<String> = emptySet()
-    ): Map<String, String> {
+    ): Map<String, TargetHash> {
         /**
          * Bazel will lock parallel queries but this is still allowing us to hash source files while executing a parallel query
          */
@@ -104,7 +104,7 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
         sourceDigests: ConcurrentMap<String, ByteArray>,
         allTargets: List<BazelTarget>,
         ignoredAttrs: Set<String>
-    ): Map<String, String> {
+    ): Map<String, TargetHash> {
         val ruleHashes: ConcurrentMap<String, ByteArray> = ConcurrentHashMap()
         val targetToRule: MutableMap<String, BazelRule> = HashMap()
         traverseGraph(allTargets, targetToRule)
@@ -119,13 +119,13 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
                     seedHash,
                     ignoredAttrs
                 )
-                Pair(target.name, targetDigest.toHexString())
+                Pair(target.name, TargetHash(target.javaClass.name.substringAfterLast('$'), targetDigest.toHexString()))
             }
-            .filter { targetEntry: Pair<String, String>? -> targetEntry != null }
+            .filter { targetEntry: Pair<String, TargetHash>? -> targetEntry != null }
             .collect(
                 Collectors.toMap(
-                    { obj: Pair<String, String> -> obj.first },
-                    { obj: Pair<String, String> -> obj.second },
+                    { obj: Pair<String, TargetHash> -> obj.first },
+                    { obj: Pair<String, TargetHash> -> obj.second },
                 )
             )
     }

@@ -82,6 +82,24 @@ class GenerateHashesCommand : Callable<Int> {
     var useCquery = false
 
     @CommandLine.Option(
+        names = ["--includeTargetType"],
+        negatable = true,
+        description = ["Whether include target type in the generated JSON or not.\n"
+            + "If false, the generate JSON schema is: {\"<target>\": \"<sha256>\"}\n"
+            + "If true, the generate JSON schema is: {\"<target>\": \"<type>#<sha256>\" }"],
+        scope = CommandLine.ScopeType.INHERIT
+    )
+    var includeTargetType = false
+
+    @CommandLine.Option(
+        names = ["-tt", "--targetType"],
+        split = ",",
+        scope = CommandLine.ScopeType.LOCAL,
+        description = ["The types of targets to filter. Use comma (,) to separate multiple values, e.g. '--targetType=SourceFile,Rule,GeneratedFile'."]
+    )
+    var targetType: Set<String>? = null
+
+    @CommandLine.Option(
         names = ["--cqueryCommandOptions"],
         description = ["Additional space separated Bazel command options used when invoking `bazel cquery`. This flag is has no effect if `--useCquery`is false."],
         scope = CommandLine.ScopeType.INHERIT,
@@ -142,7 +160,7 @@ class GenerateHashesCommand : Callable<Int> {
             )
         }
 
-        return when (GenerateHashesInteractor().execute(seedFilepaths, outputPath, ignoredRuleHashingAttributes)) {
+        return when (GenerateHashesInteractor().execute(seedFilepaths, outputPath, ignoredRuleHashingAttributes, targetType, includeTargetType)) {
             true -> CommandLine.ExitCode.OK
             false -> CommandLine.ExitCode.SOFTWARE
         }.also { stopKoin() }

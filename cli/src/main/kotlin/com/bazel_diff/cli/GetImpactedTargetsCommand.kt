@@ -39,6 +39,14 @@ class GetImpactedTargetsCommand : Callable<Int> {
     lateinit var finalHashesJSONPath: File
 
     @CommandLine.Option(
+            names = ["-tt", "--targetType"],
+            split = ",",
+            scope = CommandLine.ScopeType.LOCAL,
+            description = ["The types of targets to filter. Use comma (,) to separate multiple values, e.g. '--targetType=SourceFile,Rule,GeneratedFile'."]
+    )
+    var targetType: Set<String>? = null
+
+    @CommandLine.Option(
         names = ["-o", "--output"],
         scope = CommandLine.ScopeType.LOCAL,
         description = ["Filepath to write the impacted Bazel targets to, newline separated. If not specified, the targets will be written to STDOUT."],
@@ -58,8 +66,8 @@ class GetImpactedTargetsCommand : Callable<Int> {
 
         validate()
         val deserialiser = DeserialiseHashesInteractor()
-        val from = deserialiser.execute(startingHashesJSONPath)
-        val to = deserialiser.execute(finalHashesJSONPath)
+        val from = deserialiser.execute(startingHashesJSONPath, targetType)
+        val to = deserialiser.execute(finalHashesJSONPath, targetType)
 
         val impactedTargets = CalculateImpactedTargetsInteractor().execute(from, to)
 
@@ -70,7 +78,7 @@ class GetImpactedTargetsCommand : Callable<Int> {
             }).use { writer ->
                 impactedTargets.forEach {
                     writer.write(it)
-                    //Should not be depend on OS
+                    //Should not depend on OS
                     writer.write("\n")
                 }
             }

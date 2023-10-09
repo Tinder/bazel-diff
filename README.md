@@ -82,6 +82,7 @@ Commands:
 
 ```terminal
 Usage: bazel-diff generate-hashes [-hkvV] [--[no-]useCquery] [-b=<bazelPath>]
+                                  [--[no-]includeTargetType]
                                   [--contentHashPath=<contentHashPath>]
                                   [-s=<seedFilepaths>] -w=<workspacePath>
                                   [-co=<bazelCommandOptions>]...
@@ -92,10 +93,33 @@ Usage: bazel-diff generate-hashes [-hkvV] [--[no-]useCquery] [-b=<bazelPath>]
                                   [-so=<bazelStartupOptions>]... <outputPath>
 Writes to a file the SHA256 hashes for each Bazel Target in the provided
 workspace.
-      <outputPath>        The filepath to write the resulting JSON of
-                            dictionary target => SHA-256 values. If not
-                            specified, the JSON will be written to STDOUT.
-  -b, --bazelPath=<bazelPath>
+      <outputPath>        The filepath to write the resulting JSON to. 
+                            If not specified, the JSON will be written to STDOUT.
+                            
+                            By default the JSON schema is a dictionary of target => SHA-256 values. 
+                            Example:
+                                 {
+                                    "//cli:bazel-diff_deploy.jar":  "4ae310f8ad2bc728934e3509b6102ca658e828b9cd668f79990e95c6663f9633"
+                                    ...
+                                 }
+                            
+                            If --includeTargetType is specified, the JSON schema will include the target type (SourceFile/Rule/GeneratedFile)
+                            Example:
+                                {
+                                  "//cli:src/test/resources/fixture/integration-test-1.zip": "SourceFile#c259eba8539f4c14e4536c61975457c2990e090067893f4a2981e7bb5f4ef4cf",
+                                  "//external:android_gmaven_r8": "Rule#795f583449a40814c05e1cc5d833002afed8d12bce5b835579c7f139c2462d61",
+                                  "//cli:bazel-diff_deploy.jar": "GeneratedFile#4ae310f8ad2bc728934e3509b6102ca658e828b9cd668f79990e95c6663f9633",
+                                  ...
+                                }
+      ----[no-]includeTargetType
+                          Whether include target type in the generated JSON or not.
+                            If false, the generate JSON schema is: {"<target>": "<sha256>"}
+                            If true, the generate JSON schema is: {"<target>": "<type>#<sha256>" 
+      -tt, --targetType=<targetType>
+                          The type of targets to filter, available options are SourceFile/Rule/GeneratedFile
+                          Only works if the JSON was generated with `--includeTargetType` enabled.
+                          If not specified, all types of impacted targets will be returned.
+      -b, --bazelPath=<bazelPath>
                           Path to Bazel binary. If not specified, the Bazel
                             binary available in PATH will be used.
       -co, --bazelCommandOptions=<bazelCommandOptions>
@@ -157,7 +181,7 @@ See https://github.com/bazelbuild/bazel/issues/17743 for more details.
 ### What does the SHA256 value of `generate-hashes` represent?
 
 `generate-hashes` is a canonical SHA256 value representing all attributes and inputs into a target. These inputs
-are the summation of the of the rule implementation hash, the SHA256 value
+are the summation of the rule implementation hash, the SHA256 value
 for every attribute of the rule and then the summation of the SHA256 value for
 all `rule_inputs` using the same exact algorithm. For source_file inputs the
 content of the file are converted into a SHA256 value.
@@ -167,18 +191,24 @@ content of the file are converted into a SHA256 value.
 ```terminal
 Usage: bazel-diff get-impacted-targets [-v] -fh=<finalHashesJSONPath>
                                        -o=<outputPath>
+                                       -tt=<targetType>
                                        -sh=<startingHashesJSONPath>
 Command-line utility to analyze the state of the bazel build graph
       -fh, --finalHashes=<finalHashesJSONPath>
                   The path to the JSON file of target hashes for the final
                     revision. Run 'generate-hashes' to get this value.
-  -o, --output=<outputPath>
+      -o, --output=<outputPath>
                   Filepath to write the impacted Bazel targets to, newline
                     separated
       -sh, --startingHashes=<startingHashesJSONPath>
                   The path to the JSON file of target hashes for the initial
                     revision. Run 'generate-hashes' to get this value.
-  -v, --verbose   Display query string, missing files and elapsed time
+      -tt, --targetType=<targetType>
+                  The type of targets to filter, available options are SourceFile/Rule/GeneratedFile
+                  Only works if the JSON was generated with `--includeTargetType` enabled.
+                  If not specified, all types of impacted targets will be returned.
+      -v, --verbose   
+                  Display query string, missing files and elapsed time
 ```
 
 ## Installing

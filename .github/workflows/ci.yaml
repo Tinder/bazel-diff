@@ -25,7 +25,7 @@ jobs:
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v3
       - name: Run bazel-diff tests
-        run: USE_BAZEL_VERSION=latest ~/go/bin/bazelisk test //cli/...
+        run: USE_BAZEL_VERSION=6.3.2 ~/go/bin/bazelisk test //cli/...
       - name: archive testlogs
         if: always()
         run: cp -R $(~/go/bin/bazelisk info bazel-testlogs) ./test-logs; (cd test-logs; zip -r -X ../test-logs.zip .)
@@ -55,7 +55,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Run bazel-diff example script
-        run: USE_BAZEL_VERSION=latest ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
+        run: USE_BAZEL_VERSION=6.3.2 ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   test-jre11:
     runs-on: ubuntu-latest
     steps:
@@ -73,7 +73,7 @@ jobs:
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v3
       - name: Run bazel-diff tests
-        run: USE_BAZEL_VERSION=latest ~/go/bin/bazelisk coverage --combined_report=lcov //cli/...
+        run: USE_BAZEL_VERSION=6.3.2 ~/go/bin/bazelisk coverage --combined_report=lcov //cli/...
       - name: archive testlogs
         if: always()
         run: cp -R $(~/go/bin/bazelisk info bazel-testlogs) ./test-logs; (cd test-logs; zip -r -X ../test-logs.zip .)
@@ -103,7 +103,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Run bazel-diff example script
-        run: USE_BAZEL_VERSION=latest ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
+        run: USE_BAZEL_VERSION=6.3.2 ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   deploy:
     needs: [test-jre8, test-jre11]
     runs-on: ubuntu-latest
@@ -126,7 +126,7 @@ jobs:
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v3
       - name: Build deployable JAR
-        run: USE_BAZEL_VERSION=latest ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar
+        run: USE_BAZEL_VERSION=6.3.2 ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar
       - uses: actions/upload-artifact@v3
         with:
           name: bazel-diff_deploy.jar

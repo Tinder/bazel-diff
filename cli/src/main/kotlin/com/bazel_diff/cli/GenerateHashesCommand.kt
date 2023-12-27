@@ -13,6 +13,9 @@ import picocli.CommandLine
 import java.io.File
 import java.nio.file.Path
 import java.util.concurrent.Callable
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.io.IOException
 
 @CommandLine.Command(
     name = "generate-hashes",

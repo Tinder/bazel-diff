@@ -29,9 +29,8 @@ class GenerateHashesCommand : Callable<Int> {
 
     @CommandLine.Option(
         names = ["-w", "--workspacePath"],
-        description = ["Path to Bazel workspace directory."],
+        description = ["Path to Bazel workspace directory. If not specified, the path is read from '/tmp/workspace_path'."],
         scope = CommandLine.ScopeType.INHERIT,
-        required = true,
         converter = [NormalisingPathConverter::class]
     )
     lateinit var workspacePath: Path
@@ -143,9 +142,12 @@ class GenerateHashesCommand : Callable<Int> {
 
     override fun call(): Int {
         validate(contentHashPath = contentHashPath)
-        // Check if bazelPath is not set and read from file if necessary
+        // Check if workspacePath and bazelPath are not set and read from files if necessary
+        if (!::workspacePath.isInitialized) {
+            workspacePath = readPathFromFile("/tmp/workspace_path", "workspacePath")
+        }
         if (!::bazelPath.isInitialized) {
-            bazelPath = readBazelPathFromFile("/tmp/bazel_path")
+            bazelPath = readPathFromFile("/tmp/bazel_path", "bazelPath")
         }
 
         startKoin {
@@ -182,7 +184,7 @@ class GenerateHashesCommand : Callable<Int> {
             }
         }
     }
-    private fun readBazelPathFromFile(filePath: String): Path {
+    private fun readPathFromFile(filePath: String, paramName: String): Path {
         try {
             val path = Paths.get(filePath)
             if (Files.exists(path) && Files.isReadable(path)) {
@@ -190,13 +192,13 @@ class GenerateHashesCommand : Callable<Int> {
             } else {
                 throw CommandLine.ParameterException(
                     spec.commandLine(),
-                    "Unable to read bazelPath from $filePath"
+                    "Unable to read $paramName from $filePath"
                 )
             }
         } catch (e: IOException) {
             throw CommandLine.ParameterException(
                 spec.commandLine(),
-                "Error reading bazelPath from $filePath: ${e.message}"
+                "Error reading $paramName from $filePath: ${e.message}"
             )
         }
     }

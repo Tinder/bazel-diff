@@ -37,7 +37,6 @@ class GenerateHashesCommand : Callable<Int> {
         names = ["-b", "--bazelPath"],
         description = ["Path to Bazel binary. If not specified, the Bazel binary available in PATH will be used."],
         scope = CommandLine.ScopeType.INHERIT,
-        defaultValue = "bazel",
     )
     lateinit var bazelPath: Path
 
@@ -141,6 +140,10 @@ class GenerateHashesCommand : Callable<Int> {
 
     override fun call(): Int {
         validate(contentHashPath = contentHashPath)
+        // Check if bazelPath is not set and read from file if necessary
+        if (!::bazelPath.isInitialized) {
+            bazelPath = readBazelPathFromFile("/tmp/bazel_path")
+        }
 
         startKoin {
             modules(
@@ -174,6 +177,24 @@ class GenerateHashesCommand : Callable<Int> {
                     "Incorrect contentHashFilePath: file doesn't exist or can't be read."
                 )
             }
+        }
+    }
+    private fun readBazelPathFromFile(filePath: String): Path {
+        try {
+            val path = Paths.get(filePath)
+            if (Files.exists(path) && Files.isReadable(path)) {
+                return Paths.get(String(Files.readAllBytes(path)).trim())
+            } else {
+                throw CommandLine.ParameterException(
+                    spec.commandLine(),
+                    "Unable to read bazelPath from $filePath"
+                )
+            }
+        } catch (e: IOException) {
+            throw CommandLine.ParameterException(
+                spec.commandLine(),
+                "Error reading bazelPath from $filePath: ${e.message}"
+            )
         }
     }
 }

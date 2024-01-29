@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v3
         with:
           repository: tinder-maxwellelliott/bazel-diff-repro-1
-          ref: wip_fix
+          ref: master
           fetch-depth: 0
       - name: Run External Target Impact test
         run: ./bazel-diff.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)

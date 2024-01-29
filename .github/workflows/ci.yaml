@@ -7,55 +7,6 @@ on:
     branches: [ master ]
 
 jobs:
-  test-jre8:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v3
-        with:
-          distribution: 'temurin'
-          java-version: '8'
-        id: java
-      - name: Setup Go environment
-        uses: actions/setup-go@v3
-        with:
-          go-version: ^1.17
-        id: go
-      - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
-      - uses: actions/checkout@v3
-      - name: Run bazel-diff tests
-        run: USE_BAZEL_VERSION=latest ~/go/bin/bazelisk test //cli/...
-      - name: archive testlogs
-        if: always()
-        run: cp -R $(~/go/bin/bazelisk info bazel-testlogs) ./test-logs; (cd test-logs; zip -r -X ../test-logs.zip .)
-      - name: Save test logs
-        uses: actions/upload-artifact@master
-        if: always()
-        with:
-          name: test-logs-jre8
-          path: test-logs.zip
-  test-jre8-run-example:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v3
-        with:
-          distribution: 'temurin'
-          java-version: '8'
-        id: java
-      - name: Setup Go environment
-        uses: actions/setup-go@v3
-        with:
-          go-version: ^1.17
-        id: go
-      - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
-      - uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-      - name: Run bazel-diff example script
-        run: USE_BAZEL_VERSION=latest ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   test-jre11:
     runs-on: ubuntu-latest
     steps:
@@ -105,11 +56,11 @@ jobs:
       - name: Run bazel-diff example script
         run: USE_BAZEL_VERSION=latest ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   deploy:
-    needs: [test-jre8, test-jre11]
+    needs: [test-jre11]
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        java: [ '8' ]
+        java: [ '11' ]
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v3

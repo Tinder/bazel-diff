@@ -1,7 +1,5 @@
-load("@rules_java//java:defs.bzl", "java_binary", "java_library", "java_proto_library")
-load("@rules_proto//proto:defs.bzl", "proto_library")
-load("@io_bazel_rules_kotlin//kotlin:jvm.bzl", "kt_jvm_binary", "kt_jvm_library", "kt_jvm_test")
-load("@rules_jvm_external//:defs.bzl", "artifact")
+load("@rules_java//java:defs.bzl", "java_binary")
+load("@io_bazel_rules_kotlin//kotlin:jvm.bzl", "kt_jvm_library", "kt_jvm_test")
 
 config_setting(
     name = "enable_debug",

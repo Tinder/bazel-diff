@@ -101,8 +101,14 @@ kt_jvm_test(
 kt_jvm_library(
     name = "cli-test-lib",
     testonly = True,
-    srcs = glob(["src/test/kotlin/**/*.kt"]),
-    resources = glob(["src/test/resources/**/*"]),
+    srcs = glob(
+        ["src/test/kotlin/**/*.kt"],
+        allow_empty = False,
+    ),
+    resources = glob(
+        ["src/test/resources/**/*"],
+        allow_empty = False,
+    ),
     deps = [
         ":cli-lib",
         "@bazel_diff_maven//:com_willowtreeapps_assertk_assertk_jvm",

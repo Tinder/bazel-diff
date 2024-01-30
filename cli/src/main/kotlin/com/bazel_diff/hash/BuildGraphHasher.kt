@@ -30,17 +30,12 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
         seedFilepaths: Set<Path> = emptySet(),
         ignoredAttrs: Set<String> = emptySet()
     ): Map<String, TargetHash> {
-        /**
-         * Bazel will lock parallel queries but this is still allowing us to hash source files while executing a parallel query
-         */
         val (sourceDigests, allTargets) = runBlocking {
-            /**
-             * Source query is usually faster than targets query, so we prioritise it first
-             */
-            val sourceTargetsFuture = async(Dispatchers.IO) {
-                bazelClient.queryAllSourcefileTargets()
+            val targetsTask = async(Dispatchers.IO) {
+                bazelClient.queryAllTargets()
             }
-            val sourceTargets = sourceTargetsFuture.await()
+            val allTargets = targetsTask.await()
+            val sourceTargets = allTargets.filterIsInstance<BazelTarget.SourceFile>()
 
             /**
              * Querying targets and source hashing is done in parallel
@@ -52,11 +47,8 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
                 logger.i { "Source file hashes calculated in $sourceHashDuration" }
                 sourceFileTargets
             }
-            val targetsTask = async(Dispatchers.IO) {
-                bazelClient.queryAllTargets()
-            }
 
-            Pair(sourceDigestsFuture.await(), targetsTask.await())
+            Pair(sourceDigestsFuture.await(), allTargets)
         }
         val seedForFilepaths = createSeedForFilepaths(seedFilepaths)
         return hashAllTargets(
@@ -67,24 +59,22 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
         )
     }
 
-    private fun hashSourcefiles(targets: List<Build.Target>): ConcurrentMap<String, ByteArray> {
+    private fun hashSourcefiles(targets: List<BazelTarget.SourceFile>): ConcurrentMap<String, ByteArray> {
         val exception = AtomicReference<Exception?>(null)
         val result: ConcurrentMap<String, ByteArray> = targets.parallelStream()
-            .map { target: Build.Target ->
-                target.sourceFile?.let { sourceFile ->
-                    val seed = sha256 {
-                        safePutBytes(sourceFile.nameBytes.toByteArray())
-                        for (subinclude in sourceFile.subincludeList) {
-                            safePutBytes(subinclude.toByteArray())
-                        }
+            .map { sourceFile: BazelTarget.SourceFile ->
+                val seed = sha256 {
+                    safePutBytes(sourceFile.name.toByteArray())
+                    for (subinclude in sourceFile.subincludeList) {
+                        safePutBytes(subinclude.toByteArray())
                     }
-                    try {
-                        val sourceFileTarget = BazelSourceFileTarget(sourceFile.name, seed)
-                        Pair(sourceFileTarget.name, sourceFileHasher.digest(sourceFileTarget))
-                    } catch (e: Exception) {
-                        exception.set(e)
-                        null
-                    }
+                }
+                try {
+                    val sourceFileTarget = BazelSourceFileTarget(sourceFile.name, seed)
+                    Pair(sourceFileTarget.name, sourceFileHasher.digest(sourceFileTarget))
+                } catch (e: Exception) {
+                    exception.set(e)
+                    null
                 }
             }
             .filter { pair -> pair != null }

@@ -9,6 +9,7 @@ sealed class BazelTarget(private val target: Build.Target) {
         }
 
         val sourceFileName: String = target.sourceFile.name
+        val subincludeList: List<String> = target.sourceFile.subincludeList
         override val name: String
             get() = sourceFileName
     }

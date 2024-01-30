@@ -59,7 +59,6 @@ class BuildGraphHasherTest : KoinTest {
     fun testEmptyBuildGraph() = runBlocking {
         declareMock<Logger>()
         whenever(bazelClientMock.queryAllTargets()).thenReturn(emptyList())
-        whenever(bazelClientMock.queryAllSourcefileTargets()).thenReturn(emptyList())
 
         val hash = hasher.hashAllBazelTargetsAndSourcefiles()
         assertThat(hash).isEmpty()
@@ -69,7 +68,6 @@ class BuildGraphHasherTest : KoinTest {
     fun testRuleTargets() = runBlocking {
         declareMock<Logger>()
         whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
-        whenever(bazelClientMock.queryAllSourcefileTargets()).thenReturn(emptyList())
 
         val hash = hasher.hashAllBazelTargetsAndSourcefiles()
         assertThat(hash).containsOnly(
@@ -83,7 +81,6 @@ class BuildGraphHasherTest : KoinTest {
         val seedfile = temp.newFile().apply { writeText("somecontent") }.toPath()
         val seedFilepaths = setOf(seedfile)
         whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
-        whenever(bazelClientMock.queryAllSourcefileTargets()).thenReturn(emptyList())
         val hash = hasher.hashAllBazelTargetsAndSourcefiles(seedFilepaths)
         assertThat(hash).containsOnly(
             "rule1" to TargetHash("Rule", "0404d80eadcc2dbfe9f0d7935086e1115344a06bd76d4e16af0dfd7b4913ee60"),
@@ -100,7 +97,6 @@ class BuildGraphHasherTest : KoinTest {
         defaultTargets.add(rule4)
 
         whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
-        whenever(bazelClientMock.queryAllSourcefileTargets()).thenReturn(emptyList())
         val hash = hasher.hashAllBazelTargetsAndSourcefiles()
         assertThat(hash).containsOnly(
             "rule1" to TargetHash("Rule", "2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775"),
@@ -119,7 +115,6 @@ class BuildGraphHasherTest : KoinTest {
         defaultTargets.add(rule4)
 
         whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
-        whenever(bazelClientMock.queryAllSourcefileTargets()).thenReturn(emptyList())
         val hash = hasher.hashAllBazelTargetsAndSourcefiles()
         assertThat(hash).containsOnly(
             "rule1" to TargetHash("Rule", "2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775"),
@@ -136,7 +131,6 @@ class BuildGraphHasherTest : KoinTest {
         defaultTargets.add(rule3)
         defaultTargets.add(rule4)
         whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
-        whenever(bazelClientMock.queryAllSourcefileTargets()).thenReturn(emptyList())
         assertThat {
             hasher.hashAllBazelTargetsAndSourcefiles()
         }.isFailure().all {
@@ -156,7 +150,6 @@ class BuildGraphHasherTest : KoinTest {
         val ruleInputs = listOf("rule0")
         val rule3 = createRuleTarget("rule3", ruleInputs, "digest")
         whenever(bazelClientMock.queryAllTargets()).thenReturn(listOf(rule3, target, generator))
-        whenever(bazelClientMock.queryAllSourcefileTargets()).thenReturn(emptyList())
         var hash = hasher.hashAllBazelTargetsAndSourcefiles()
 
         assertThat(hash).hasSize(3)

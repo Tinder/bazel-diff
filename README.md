@@ -93,16 +93,16 @@ Usage: bazel-diff generate-hashes [-hkvV] [--[no-]useCquery] [-b=<bazelPath>]
                                   [-so=<bazelStartupOptions>]... <outputPath>
 Writes to a file the SHA256 hashes for each Bazel Target in the provided
 workspace.
-      <outputPath>        The filepath to write the resulting JSON to. 
+      <outputPath>        The filepath to write the resulting JSON to.
                             If not specified, the JSON will be written to STDOUT.
-                            
-                            By default the JSON schema is a dictionary of target => SHA-256 values. 
+
+                            By default the JSON schema is a dictionary of target => SHA-256 values.
                             Example:
                                  {
                                     "//cli:bazel-diff_deploy.jar":  "4ae310f8ad2bc728934e3509b6102ca658e828b9cd668f79990e95c6663f9633"
                                     ...
                                  }
-                            
+
                             If --includeTargetType is specified, the JSON schema will include the target type (SourceFile/Rule/GeneratedFile)
                             Example:
                                 {
@@ -114,7 +114,7 @@ workspace.
       ----[no-]includeTargetType
                           Whether include target type in the generated JSON or not.
                             If false, the generate JSON schema is: {"<target>": "<sha256>"}
-                            If true, the generate JSON schema is: {"<target>": "<type>#<sha256>" 
+                            If true, the generate JSON schema is: {"<target>": "<type>#<sha256>"
       -tt, --targetType=<targetType>
                           The type of targets to filter, available options are SourceFile/Rule/GeneratedFile
                           Only works if the JSON was generated with `--includeTargetType` enabled.
@@ -176,7 +176,7 @@ workspace.
 
 **Note**: `--useCquery` flag may not work with very large repos due to limitation
 of Bazel. You may want to fallback to use normal query mode in that case.
-See https://github.com/bazelbuild/bazel/issues/17743 for more details.
+See <https://github.com/bazelbuild/bazel/issues/17743> for more details.
 
 ### What does the SHA256 value of `generate-hashes` represent?
 
@@ -207,7 +207,7 @@ Command-line utility to analyze the state of the bazel build graph
                   The type of targets to filter, available options are SourceFile/Rule/GeneratedFile
                   Only works if the JSON was generated with `--includeTargetType` enabled.
                   If not specified, all types of impacted targets will be returned.
-      -v, --verbose   
+      -v, --verbose
                   Display query string, missing files and elapsed time
 ```
 
@@ -223,9 +223,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
 http_jar(
     name = "bazel_diff",
     urls = [
-        "https://github.com/Tinder/bazel-diff/releases/download/4.3.0/bazel-diff_deploy.jar",
+        "https://github.com/Tinder/bazel-diff/releases/download/5.0.1/bazel-diff_deploy.jar",
     ],
-    sha256 = "9c4546623a8b9444c06370165ea79a897fcb9881573b18fa5c9ee5c8ba0867e2",
+    sha256 = "eca2d221f5c3ec9545c841ed62d319bbb59e447a1ceade563bc8f8e1b9186a34",
 )
 ```
 

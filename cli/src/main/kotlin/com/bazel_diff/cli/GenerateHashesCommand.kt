@@ -132,7 +132,7 @@ class GenerateHashesCommand : Callable<Int> {
         names = ["--ignoredRuleHashingAttributes"],
         description = ["Attributes that should be ignored when hashing rule targets."],
         scope = CommandLine.ScopeType.INHERIT,
-        converter = [OptionsConverter::class],
+        converter = [CommaSeparatedValueConverter::class],
     )
     var ignoredRuleHashingAttributes: Set<String> = emptySet()
 

@@ -13,8 +13,8 @@ class SourceFileHasher : KoinComponent {
     private val workingDirectory: Path
     private val logger: Logger
     private val relativeFilenameToContentHash: Map<String, String>?
-    private val outputBase: Path
     private val fineGrainedHashExternalRepos: Set<String>
+    private val externalRepoResolver: ExternalRepoResolver
 
     init {
         val logger: Logger by inject()
@@ -26,16 +26,16 @@ class SourceFileHasher : KoinComponent {
         this.workingDirectory = workingDirectory
         val contentHashProvider: ContentHashProvider by inject()
         relativeFilenameToContentHash = contentHashProvider.filenameToHash
-        val outputBase: Path by inject(qualifier = named("output-base"))
-        this.outputBase = outputBase
         this.fineGrainedHashExternalRepos = fineGrainedHashExternalRepos
+        val externalRepoResolver: ExternalRepoResolver by inject()
+        this.externalRepoResolver = externalRepoResolver
     }
 
-    constructor(workingDirectory: Path, outputBase: Path, relativeFilenameToContentHash: Map<String, String>?, fineGrainedHashExternalRepos: Set<String> = emptySet()) {
+    constructor(workingDirectory: Path, relativeFilenameToContentHash: Map<String, String>?, externalRepoResolver: ExternalRepoResolver, fineGrainedHashExternalRepos: Set<String> = emptySet()) {
         this.workingDirectory = workingDirectory
-        this.outputBase = outputBase
         this.relativeFilenameToContentHash = relativeFilenameToContentHash
         this.fineGrainedHashExternalRepos = fineGrainedHashExternalRepos
+        this.externalRepoResolver = externalRepoResolver
     }
 
     fun digest(sourceFileTarget: BazelSourceFileTarget): ByteArray {
@@ -55,7 +55,8 @@ class SourceFileHasher : KoinComponent {
                     return@sha256
                 }
                 val relativePath = Paths.get(parts[1].removePrefix(":").replace(':', '/'))
-                outputBase.resolve("external/$repoName").resolve(relativePath)
+                val externalRepoRoot = externalRepoResolver.resolveExternalRepoRoot(repoName)
+                externalRepoRoot.resolve(relativePath)
             } else {
                 return@sha256
             }

@@ -14,13 +14,13 @@ import java.nio.file.Files
 import java.nio.file.Path
 
 class BazelQueryService(
-    private val workingDirectory: Path,
-    private val bazelPath: Path,
-    private val startupOptions: List<String>,
-    private val commandOptions: List<String>,
-    private val cqueryOptions: List<String>,
-    private val keepGoing: Boolean,
-    private val noBazelrc: Boolean,
+        private val workingDirectory: Path,
+        private val bazelPath: Path,
+        private val startupOptions: List<String>,
+        private val commandOptions: List<String>,
+        private val cqueryOptions: List<String>,
+        private val keepGoing: Boolean,
+        private val noBazelrc: Boolean,
 ) : KoinComponent {
     private val logger: Logger by inject()
 
@@ -30,13 +30,13 @@ class BazelQueryService(
         // https://bazel.build/extending/platforms#cquery-incompatible-target-detection to first find all compatible
         // targets.
         val compatibleTargetSet =
-            if (useCquery) {
-                runQuery(query, useCquery = true, outputCompatibleTargets = true).useLines {
-                    it.filter { it.isNotBlank() }.toSet()
+                if (useCquery) {
+                    runQuery(query, useCquery = true, outputCompatibleTargets = true).useLines {
+                        it.filter { it.isNotBlank() }.toSet()
+                    }
+                } else {
+                    emptySet()
                 }
-            } else {
-                emptySet()
-            }
         val outputFile = runQuery(query, useCquery)
 
         val targets = outputFile.inputStream().buffered().use { proto ->
@@ -131,15 +131,16 @@ class BazelQueryService(
         logger.i { "Command: ${cmd.toTypedArray().joinToString()}" }
         val result = runBlocking {
             process(
-                *cmd.toTypedArray(),
-                stdout = Redirect.ToFile(outputFile),
-                workingDirectory = workingDirectory.toFile(),
-                stderr = Redirect.PRINT,
-                destroyForcibly = true,
+                    *cmd.toTypedArray(),
+                    stdout = Redirect.ToFile(outputFile),
+                    workingDirectory = workingDirectory.toFile(),
+                    stderr = Redirect.PRINT,
+                    destroyForcibly = true,
             )
         }
 
-        if (result.resultCode != 0) throw RuntimeException("Bazel query failed, exit code ${result.resultCode}")
+        if (result.resultCode != 0)
+            throw RuntimeException("Bazel query failed, exit code ${result.resultCode}")
         return outputFile
     }
 }

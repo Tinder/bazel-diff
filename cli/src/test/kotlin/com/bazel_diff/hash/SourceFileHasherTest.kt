@@ -15,12 +15,13 @@ import java.nio.file.Files
 import java.nio.file.Paths
 
 
-internal class SourceFileHasherTest: KoinTest {
+internal class SourceFileHasherTest : KoinTest {
     private val repoAbsolutePath = Paths.get("").toAbsolutePath()
     private val outputBasePath = Files.createTempDirectory("SourceFileHasherTest")
     private val fixtureFileTarget = "//cli/src/test/kotlin/com/bazel_diff/hash/fixture:foo.ts"
     private val fixtureFileContent: ByteArray
     private val seed = "seed".toByteArray()
+    private val externalRepoResolver = ExternalRepoResolver(repoAbsolutePath, Paths.get("bazel"), outputBasePath)
 
     init {
         val path = Paths.get("cli/src/test/kotlin/com/bazel_diff/hash/fixture/foo.ts")
@@ -35,7 +36,7 @@ internal class SourceFileHasherTest: KoinTest {
 
     @Test
     fun testHashConcreteFile() = runBlocking {
-        val hasher = SourceFileHasher(repoAbsolutePath, outputBasePath, null)
+        val hasher = SourceFileHasher(repoAbsolutePath, null, externalRepoResolver)
         val bazelSourceFileTarget = BazelSourceFileTarget(fixtureFileTarget, seed)
         val actual = hasher.digest(bazelSourceFileTarget).toHexString()
         val expected = sha256 {
@@ -48,7 +49,7 @@ internal class SourceFileHasherTest: KoinTest {
 
     @Test
     fun testHashConcreteFileInExternalRepo() = runBlocking {
-        val hasher = SourceFileHasher(repoAbsolutePath, outputBasePath, null, setOf("external_repo"))
+        val hasher = SourceFileHasher(repoAbsolutePath, null, externalRepoResolver, setOf("external_repo"))
         val externalRepoFilePath = outputBasePath.resolve("external/external_repo/path/to/my_file.txt")
         Files.createDirectories(externalRepoFilePath.parent)
         val externalRepoFileTarget = "@external_repo//path/to:my_file.txt"
@@ -66,7 +67,7 @@ internal class SourceFileHasherTest: KoinTest {
 
     @Test
     fun testSoftHashConcreteFile() = runBlocking {
-        val hasher = SourceFileHasher(repoAbsolutePath, outputBasePath, null)
+        val hasher = SourceFileHasher(repoAbsolutePath, null, externalRepoResolver)
         val bazelSourceFileTarget = BazelSourceFileTarget(fixtureFileTarget, seed)
         val actual = hasher.softDigest(bazelSourceFileTarget)?.toHexString()
         val expected = sha256 {
@@ -79,7 +80,7 @@ internal class SourceFileHasherTest: KoinTest {
 
     @Test
     fun testSoftHashNonExistedFile() = runBlocking {
-        val hasher = SourceFileHasher(repoAbsolutePath, outputBasePath, null)
+        val hasher = SourceFileHasher(repoAbsolutePath, null, externalRepoResolver)
         val bazelSourceFileTarget = BazelSourceFileTarget("//i/do/not/exist", seed)
         val actual = hasher.softDigest(bazelSourceFileTarget)
         assertThat(actual).isNull()
@@ -88,7 +89,7 @@ internal class SourceFileHasherTest: KoinTest {
     @Test
     fun testSoftHashExternalTarget() = runBlocking {
         val target = "@bazel-diff//some:file"
-        val hasher = SourceFileHasher(repoAbsolutePath, outputBasePath, null)
+        val hasher = SourceFileHasher(repoAbsolutePath, null, externalRepoResolver)
         val bazelSourceFileTarget = BazelSourceFileTarget(target, seed)
         val actual = hasher.softDigest(bazelSourceFileTarget)
         assertThat(actual).isNull()
@@ -97,7 +98,7 @@ internal class SourceFileHasherTest: KoinTest {
     @Test
     fun testHashNonExistedFile() = runBlocking {
         val target = "//i/do/not/exist"
-        val hasher = SourceFileHasher(repoAbsolutePath, outputBasePath, null)
+        val hasher = SourceFileHasher(repoAbsolutePath, null, externalRepoResolver)
         val bazelSourceFileTarget = BazelSourceFileTarget(target, seed)
         val actual = hasher.digest(bazelSourceFileTarget).toHexString()
         val expected = sha256 {
@@ -110,7 +111,7 @@ internal class SourceFileHasherTest: KoinTest {
     @Test
     fun testHashExternalTarget() = runBlocking {
         val target = "@bazel-diff//some:file"
-        val hasher = SourceFileHasher(repoAbsolutePath, outputBasePath, null)
+        val hasher = SourceFileHasher(repoAbsolutePath, null, externalRepoResolver)
         val bazelSourceFileTarget = BazelSourceFileTarget(target, seed)
         val actual = hasher.digest(bazelSourceFileTarget).toHexString()
         val expected = sha256 {}.toHexString()
@@ -120,7 +121,7 @@ internal class SourceFileHasherTest: KoinTest {
     @Test
     fun testHashWithProvidedContentHash() = runBlocking {
         val filenameToContentHash = hashMapOf("cli/src/test/kotlin/com/bazel_diff/hash/fixture/foo.ts" to "foo-content-hash")
-        val hasher = SourceFileHasher(repoAbsolutePath, outputBasePath, filenameToContentHash)
+        val hasher = SourceFileHasher(repoAbsolutePath, filenameToContentHash, externalRepoResolver)
         val bazelSourceFileTarget = BazelSourceFileTarget(fixtureFileTarget, seed)
         val actual = hasher.digest(bazelSourceFileTarget).toHexString()
         val expected = sha256 {
@@ -134,7 +135,7 @@ internal class SourceFileHasherTest: KoinTest {
     @Test
     fun testHashWithProvidedContentHashButNotInKey() = runBlocking {
         val filenameToContentHash = hashMapOf("cli/src/test/kotlin/com/bazel_diff/hash/fixture/bar.ts" to "foo-content-hash")
-        val hasher = SourceFileHasher(repoAbsolutePath, outputBasePath, filenameToContentHash)
+        val hasher = SourceFileHasher(repoAbsolutePath, filenameToContentHash, externalRepoResolver)
         val bazelSourceFileTarget = BazelSourceFileTarget(fixtureFileTarget, seed)
         val actual = hasher.digest(bazelSourceFileTarget).toHexString()
         val expected = sha256 {
@@ -149,7 +150,7 @@ internal class SourceFileHasherTest: KoinTest {
     fun testHashWithProvidedContentHashWithLeadingColon() = runBlocking {
         val targetName = "//:cli/src/test/kotlin/com/bazel_diff/hash/fixture/bar.ts"
         val filenameToContentHash = hashMapOf("cli/src/test/kotlin/com/bazel_diff/hash/fixture/bar.ts" to "foo-content-hash")
-        val hasher = SourceFileHasher(repoAbsolutePath, outputBasePath, filenameToContentHash)
+        val hasher = SourceFileHasher(repoAbsolutePath, filenameToContentHash, externalRepoResolver)
         val bazelSourceFileTarget = BazelSourceFileTarget(targetName, seed)
         val actual = hasher.digest(bazelSourceFileTarget).toHexString()
         val expected = sha256 {

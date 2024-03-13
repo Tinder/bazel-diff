@@ -123,6 +123,62 @@ class E2ETest {
         assertThat(actual).isEqualTo(expected)
     }
 
+    @Test
+    fun testFineGrainedHashBzlMod() {
+        // The difference between these two snapshots is simply upgrading the Guava version.
+        // Following is the diff. (The diff on maven_install.json is omitted)
+        //
+        // diff --git a/MODULE.bazel b/MODULE.bazel
+        //         index 9a58823..3ffded3 100644
+        // --- a/MODULE.bazel
+        // +++ b/MODULE.bazel
+        // @@ -4,7 +4,7 @@ maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+        // maven.install(
+        //         artifacts = [
+        //             "junit:junit:4.12",
+        //             -        "com.google.guava:guava:31.1-jre",
+        //             +        "com.google.guava:guava:32.0.0-jre",
+        //         ],
+        //         lock_file = "//:maven_install.json",
+        //         repositories = [
+        //
+        // The project contains a single target that depends on Guava:
+        // //src/main/java/com/integration:guava-user
+        //
+        // So this target, its derived targets, and all other changed external targets should be
+        // the only impacted targets.
+        val projectA = extractFixtureProject("/fixture/fine-grained-hash-bzlmod-test-1.zip")
+        val projectB = extractFixtureProject("/fixture/fine-grained-hash-bzlmod-test-2.zip")
+
+        val workingDirectoryA = projectA
+        val workingDirectoryB = projectB
+        val bazelPath = "bazel"
+        val outputDir = temp.newFolder()
+        val from = File(outputDir, "starting_hashes.json")
+        val to = File(outputDir, "final_hashes.json")
+        val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+        val cli = CommandLine(BazelDiff())
+        //From
+        cli.execute(
+                "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", "bazel_diff_maven", from.absolutePath
+        )
+        //To
+        cli.execute(
+                "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", "bazel_diff_maven", to.absolutePath
+        )
+        //Impacted targets
+        cli.execute(
+                "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
+        )
+
+        val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+        val expected: Set<String> =
+                javaClass.getResourceAsStream("/fixture/fine-grained-hash-bzlmod-test-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+
+        assertThat(actual).isEqualTo(expected)
+    }
+
     // TODO: re-enable the test after https://github.com/bazelbuild/bazel/issues/21010 is fixed
     @Ignore("cquery mode is broken with Bazel 7 because --transition=lite is crashes due to https://github.com/bazelbuild/bazel/issues/21010")
     @Test

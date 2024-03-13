@@ -3,6 +3,7 @@ package com.bazel_diff.e2e
 import assertk.assertThat
 import assertk.assertions.isEqualTo
 import com.bazel_diff.cli.BazelDiff
+import org.junit.Ignore
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -33,20 +34,20 @@ class E2ETest {
         val cli = CommandLine(BazelDiff())
         //From
         cli.execute(
-            listOf("generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, from.absolutePath) + extraGenerateHashesArgs
+                listOf("generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, from.absolutePath) + extraGenerateHashesArgs
         )
         //To
         cli.execute(
-            listOf("generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, to.absolutePath) + extraGenerateHashesArgs
+                listOf("generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, to.absolutePath) + extraGenerateHashesArgs
         )
         //Impacted targets
         cli.execute(
-            listOf("get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath) + extraGetImpactedTargetsArgs
+                listOf("get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath) + extraGetImpactedTargetsArgs
         )
 
         val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
         val expected: Set<String> =
-            javaClass.getResourceAsStream(expectedResultFile).use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+                javaClass.getResourceAsStream(expectedResultFile).use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
         assertThat(actual).isEqualTo(expected)
     }
@@ -104,24 +105,26 @@ class E2ETest {
         val cli = CommandLine(BazelDiff())
         //From
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", "bazel_diff_maven", from.absolutePath
+                "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", "bazel_diff_maven", from.absolutePath
         )
         //To
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", "bazel_diff_maven", to.absolutePath
+                "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", "bazel_diff_maven", to.absolutePath
         )
         //Impacted targets
         cli.execute(
-            "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
+                "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
         )
 
         val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
         val expected: Set<String> =
-            javaClass.getResourceAsStream("/fixture/fine-grained-hash-external-repo-test-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+                javaClass.getResourceAsStream("/fixture/fine-grained-hash-external-repo-test-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
         assertThat(actual).isEqualTo(expected)
     }
 
+    // TODO: re-enable the test after https://github.com/bazelbuild/bazel/issues/21010 is fixed
+    @Ignore("cquery mode is broken with Bazel 7 because --transition=lite is crashes due to https://github.com/bazelbuild/bazel/issues/21010")
     @Test
     fun testUseCqueryWithExternalDependencyChange() {
         // The difference between these two snapshots is simply upgrading the Guava version for Android platform.
@@ -186,20 +189,20 @@ class E2ETest {
 
         //From
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:android", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", from.absolutePath
+                "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:android", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", from.absolutePath
         )
         //To
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:android", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", to.absolutePath
+                "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:android", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", to.absolutePath
         )
         //Impacted targets
         cli.execute(
-            "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
+                "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
         )
 
         var actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
         var expected: Set<String> =
-            javaClass.getResourceAsStream("/fixture/cquery-test-guava-upgrade-android-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+                javaClass.getResourceAsStream("/fixture/cquery-test-guava-upgrade-android-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
         assertThat(actual).isEqualTo(expected)
 
@@ -207,15 +210,15 @@ class E2ETest {
 
         //From
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:jre", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", from.absolutePath
+                "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:jre", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", from.absolutePath
         )
         //To
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:jre", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", to.absolutePath
+                "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:jre", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", to.absolutePath
         )
         //Impacted targets
         cli.execute(
-            "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
+                "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
         )
 
         actual = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
@@ -224,6 +227,8 @@ class E2ETest {
         assertThat(actual).isEqualTo(expected)
     }
 
+    // TODO: re-enable the test after https://github.com/bazelbuild/bazel/issues/21010 is fixed
+    @Ignore("cquery mode is broken with Bazel 7 because --transition=lite is crashes due to https://github.com/bazelbuild/bazel/issues/21010")
     @Test
     fun testUseCqueryWithAndroidCodeChange() {
         // The difference between these two snapshots is simply making a code change to Android-only source code.
@@ -288,20 +293,20 @@ class E2ETest {
 
         //From
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:android", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", from.absolutePath
+                "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:android", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", from.absolutePath
         )
         //To
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:android", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", to.absolutePath
+                "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:android", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", to.absolutePath
         )
         //Impacted targets
         cli.execute(
-            "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
+                "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
         )
 
         var actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
         var expected: Set<String> =
-            javaClass.getResourceAsStream("/fixture/cquery-test-android-code-change-android-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+                javaClass.getResourceAsStream("/fixture/cquery-test-android-code-change-android-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
         assertThat(actual).isEqualTo(expected)
 
@@ -309,15 +314,15 @@ class E2ETest {
 
         //From
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:jre", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", from.absolutePath
+                "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:jre", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", from.absolutePath
         )
         //To
         cli.execute(
-            "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:jre", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", to.absolutePath
+                "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", "bazel", "--useCquery", "--cqueryCommandOptions", "--platforms=//:jre", "--fineGrainedHashExternalRepos", "bazel_diff_maven,bazel_diff_maven_android", to.absolutePath
         )
         //Impacted targets
         cli.execute(
-            "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
+                "get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath
         )
 
         actual = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
@@ -340,6 +345,7 @@ class E2ETest {
                     entry.isDirectory -> {
                         Paths.get(testProject.absolutePath, entry.name).toFile().mkdirs()
                     }
+
                     else -> {
                         File(testProject, entry.name).apply {
                             parentFile.mkdir()

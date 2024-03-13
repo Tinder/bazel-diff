@@ -1,5 +1,5 @@
 load("@rules_java//java:defs.bzl", "java_binary")
-load("@io_bazel_rules_kotlin//kotlin:jvm.bzl", "kt_jvm_library", "kt_jvm_test")
+load("@rules_kotlin//kotlin:jvm.bzl", "kt_jvm_library", "kt_jvm_test")
 
 config_setting(
     name = "enable_debug",
@@ -31,7 +31,6 @@ kt_jvm_library(
         "@bazel_diff_maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core_jvm",
         "@bazel_tools//src/main/protobuf:analysis_v2_java_proto",
         "@bazel_tools//src/main/protobuf:build_java_proto",
-        "@com_google_protobuf//:protobuf_java",
     ],
 )
 

@@ -215,7 +215,9 @@ Command-line utility to analyze the state of the bazel build graph
 
 ### Integrate into your project (recommended)
 
-Add to your `WORKSPACE` file:
+First, add the following snippet to your project:
+
+#### WORKSPACE Snippet
 
 ```bazel
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
@@ -223,13 +225,26 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
 http_jar(
     name = "bazel_diff",
     urls = [
-        "https://github.com/Tinder/bazel-diff/releases/download/5.0.1/bazel-diff_deploy.jar",
+        "https://github.com/Tinder/bazel-diff/releases/download/6.1.0/bazel-diff_deploy.jar",
     ],
-    sha256 = "eca2d221f5c3ec9545c841ed62d319bbb59e447a1ceade563bc8f8e1b9186a34",
+    sha256 = "5d90de4561afd1e711bc62956560a9dfcbb4454bd6b209d6e68272b65c3cb50a",
 )
 ```
 
-and then in your root `BUILD.bazel` file:
+#### MODULE.bazel Snippet (if you are using Bzlmod)
+
+```bazel
+http_jar = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
+http_jar(
+    name = "bazel_diff",
+    urls = [
+        "https://github.com/Tinder/bazel-diff/releases/download/6.1.0/bazel-diff_deploy.jar"
+    ],
+    sha256 = "5d90de4561afd1e711bc62956560a9dfcbb4454bd6b209d6e68272b65c3cb50a",
+)
+```
+
+Second, add in your root `BUILD.bazel` file:
 
 ```bazel
 load("@rules_java//java:defs.bzl", "java_binary")
@@ -241,7 +256,7 @@ java_binary(
 )
 ```
 
-now run the tool with
+That's it! You can now run the tool with:
 
 ```terminal
 bazel run //:bazel-diff

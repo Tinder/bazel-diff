@@ -25,15 +25,6 @@ jobs:
       - uses: actions/checkout@v3
       - name: Run bazel-diff tests
         run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=true
-      - name: archive testlogs
-        if: always()
-        run: cp -R $(~/go/bin/bazelisk info bazel-testlogs) ./test-logs; (cd test-logs; zip -r -X ../test-logs.zip .)
-      - name: Save test logs
-        uses: actions/upload-artifact@master
-        if: always()
-        with:
-          name: test-logs-jre11
-          path: test-logs.zip
   test-jre11:
     runs-on: ubuntu-latest
     steps:
@@ -52,15 +43,6 @@ jobs:
       - uses: actions/checkout@v3
       - name: Run bazel-diff tests
         run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=false
-      - name: archive testlogs
-        if: always()
-        run: cp -R $(~/go/bin/bazelisk info bazel-testlogs) ./test-logs; (cd test-logs; zip -r -X ../test-logs.zip .)
-      - name: Save test logs
-        uses: actions/upload-artifact@master
-        if: always()
-        with:
-          name: test-logs-jre11
-          path: test-logs.zip
   test-jre11-run-example:
     runs-on: ubuntu-latest
     steps:

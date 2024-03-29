@@ -55,7 +55,6 @@ kt_register_toolchains()
 maven_install(
     name = "bazel_diff_maven",
     artifacts = BAZEL_DIFF_MAVEN_ARTIFACTS,
-    lock_file = "//:maven_install.json",
     repositories = [
         "https://repo1.maven.org/maven2/",
     ],

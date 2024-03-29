@@ -57,6 +57,7 @@ maven_install(
     artifacts = BAZEL_DIFF_MAVEN_ARTIFACTS,
     fetch_sources = True,
     generate_compat_repositories = True,
+    lock_file = "//:maven_install.json",
     repositories = [
         "https://repo1.maven.org/maven2/",
     ],

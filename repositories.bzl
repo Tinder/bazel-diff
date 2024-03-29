@@ -53,7 +53,7 @@ def bazel_diff_dependencies(
     _maybe(
         http_archive,
         name = "com_google_protobuf",
-        sha256 = "",
+        integrity = "sha256-T8X/Gywzn7hs06JfC1MRR4qwgeZa0ljGeJNZzYTUIfg=",
         strip_prefix = "protobuf-26.1",
         urls = [
             "https://github.com/protocolbuffers/protobuf/archive/v26.1.tar.gz",

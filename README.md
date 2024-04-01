@@ -238,10 +238,27 @@ http_jar = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_j
 http_jar(
     name = "bazel_diff",
     urls = [
-        "https://github.com/Tinder/bazel-diff/releases/download/6.1.0/bazel-diff_deploy.jar"
+        "https://github.com/Tinder/bazel-diff/releases/download/7.0.0/bazel-diff_deploy.jar"
     ],
-    sha256 = "5d90de4561afd1e711bc62956560a9dfcbb4454bd6b209d6e68272b65c3cb50a",
+    sha256 = "0b9e32f9c20e570846b083743fe967ae54d13e2a1f7364983e0a7792979442be",
 )
+```
+
+#### WORKSPACE snippet
+
+```bazel
+http_jar = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
+http_jar(
+    name = "bazel_diff",
+    urls = [
+        "https://github.com/Tinder/bazel-diff/releases/download/7.0.0/bazel-diff_deploy.jar"
+    ],
+    sha256 = "0b9e32f9c20e570846b083743fe967ae54d13e2a1f7364983e0a7792979442be",
+)
+
+load("//@bazel_diff:repositories.bzl", "bazel_diff_dependencies")
+
+bazel_diff_dependencies()
 ```
 
 Second, add in your root `BUILD.bazel` file:

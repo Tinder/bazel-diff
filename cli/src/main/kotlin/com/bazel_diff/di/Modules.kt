@@ -30,9 +30,15 @@ fun hasherModule(
         keepGoing: Boolean,
         fineGrainedHashExternalRepos: Set<String>,
 ): Module = module {
+    val cmd: MutableList<String> = ArrayList<String>().apply {
+            add(bazelPath.toString())
+            addAll(startupOptions)
+            add("info")
+            add("output_base")
+    }
     val result = runBlocking {
         process(
-                bazelPath.toString(), "info", "output_base",
+                *cmd.toTypedArray(),
                 stdout = Redirect.CAPTURE,
                 workingDirectory = workingDirectory.toFile(),
                 stderr = Redirect.PRINT,

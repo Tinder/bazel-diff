@@ -22,6 +22,7 @@ java_binary(
 kt_jvm_library(
     name = "cli-lib",
     srcs = glob(["src/main/kotlin/**/*.kt"]),
+    resources = ["//:.bazelversion"],
     deps = [
         "@bazel_diff_maven//:com_google_code_gson_gson",
         "@bazel_diff_maven//:com_google_guava_guava",
@@ -31,6 +32,7 @@ kt_jvm_library(
         "@bazel_diff_maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core_jvm",
         "@bazel_tools//src/main/protobuf:analysis_v2_java_proto",
         "@bazel_tools//src/main/protobuf:build_java_proto",
+        "@bazel_tools//tools/java/runfiles",
     ],
 )
 

@@ -2,3 +2,6 @@ run -c opt --show_loading_progress=false --show_progress=false --ui_event_filter
 run:verbose -c dbg --show_loading_progress=true --show_progress=true --ui_event_filters=info,error,debug
 # https://github.com/mockito/mockito/issues/1879
 test --sandbox_tmpfs_path=/tmp
+
+# To allow stamping git tag for version.
+build --workspace_status_command=$(pwd)/workspace_status.sh

@@ -8,6 +8,17 @@ config_setting(
     },
 )
 
+genrule(
+    name = "version_file",
+    srcs = [],
+    outs = ["version"],
+    cmd_bash = """
+        version_tag=$$(grep ^STABLE_GIT_TAG bazel-out/stable-status.txt | cut -d' ' -f2); \
+        printf '%s' $$version_tag > $@;
+    """,
+    stamp = 1,
+)
+
 java_binary(
     name = "bazel-diff",
     jvm_flags = select({
@@ -22,7 +33,7 @@ java_binary(
 kt_jvm_library(
     name = "cli-lib",
     srcs = glob(["src/main/kotlin/**/*.kt"]),
-    resources = ["//:.bazelversion"],
+    resources = [":version_file"],
     deps = [
         "@bazel_diff_maven//:com_google_code_gson_gson",
         "@bazel_diff_maven//:com_google_guava_guava",
@@ -32,7 +43,6 @@ kt_jvm_library(
         "@bazel_diff_maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core_jvm",
         "@bazel_tools//src/main/protobuf:analysis_v2_java_proto",
         "@bazel_tools//src/main/protobuf:build_java_proto",
-        "@bazel_tools//tools/java/runfiles",
     ],
 )
 

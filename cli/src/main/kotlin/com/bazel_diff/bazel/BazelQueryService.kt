@@ -26,8 +26,7 @@ class BazelQueryService(
 
     suspend fun query(
         query: String,
-        useCquery: Boolean = false,
-        supressFailure: Boolean = false)
+        useCquery: Boolean = false
     : List<Build.Target> {
         // Unfortunately, there is still no direct way to tell if a target is compatible or not with the proto output
         // by itself. So we do an extra cquery with the trick at
@@ -65,8 +64,7 @@ class BazelQueryService(
     private suspend fun runQuery(
         query: String,
         useCquery: Boolean,
-        outputCompatibleTargets: Boolean = false,
-        supressFailure: Boolean = false
+        outputCompatibleTargets: Boolean = false
     ): File {
         val queryFile = Files.createTempFile(null, ".txt").toFile()
         queryFile.deleteOnExit()

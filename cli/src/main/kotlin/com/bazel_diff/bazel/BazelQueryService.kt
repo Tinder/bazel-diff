@@ -96,11 +96,12 @@ class BazelQueryService(
                             return ""
                         if "IncompatiblePlatformProvider" not in providers(target):
                             label = str(target.label)
+                            # normalize label to be consistent with content inside proto
                             if label.startswith("@//"):
-                                # normalize label to be consistent with content inside proto
                                 return label[1:]
-                            else:
-                                return label
+                            if label.startswith("@@//"):
+                                return label[2:]
+                            return label
                         return ""
                     """.trimIndent())
                     add(cqueryOutputFile.toString())

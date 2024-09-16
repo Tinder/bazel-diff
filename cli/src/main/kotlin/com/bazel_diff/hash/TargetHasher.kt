@@ -5,6 +5,7 @@ import com.bazel_diff.bazel.BazelTarget
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import java.util.concurrent.ConcurrentMap
+import java.nio.file.Path
 
 class TargetHasher : KoinComponent {
     private val ruleHasher: RuleHasher by inject()
@@ -15,7 +16,8 @@ class TargetHasher : KoinComponent {
         sourceDigests: ConcurrentMap<String, ByteArray>,
         ruleHashes: ConcurrentMap<String, ByteArray>,
         seedHash: ByteArray?,
-        ignoredAttrs: Set<String>
+        ignoredAttrs: Set<String>,
+        modifiedFilepaths: Set<Path>
     ): ByteArray {
         return when (target) {
             is BazelTarget.GeneratedFile -> {
@@ -32,7 +34,8 @@ class TargetHasher : KoinComponent {
                         sourceDigests,
                         seedHash,
                         depPath = null,
-                        ignoredAttrs
+                        ignoredAttrs,
+                        modifiedFilepaths
                     )
                 }
             }
@@ -44,7 +47,8 @@ class TargetHasher : KoinComponent {
                     sourceDigests,
                     seedHash,
                     depPath = null,
-                    ignoredAttrs
+                    ignoredAttrs,
+                    modifiedFilepaths
                 )
             }
             is BazelTarget.SourceFile -> sha256 {

@@ -18,7 +18,7 @@ class GenerateHashesInteractor : KoinComponent {
     private val logger: Logger by inject()
     private val gson: Gson by inject()
 
-    fun execute(seedFilepaths: File?, outputPath: File?, ignoredRuleHashingAttributes: Set<String>, targetTypes:Set<String>?, includeTargetType: Boolean = false): Boolean {
+    fun execute(seedFilepaths: File?, outputPath: File?, ignoredRuleHashingAttributes: Set<String>, targetTypes:Set<String>?, includeTargetType: Boolean = false, modifiedFilepaths: File?): Boolean {
         return try {
             val epoch = Calendar.getInstance().getTimeInMillis()
             val seedFilepathsSet: Set<Path> = when {
@@ -31,9 +31,20 @@ class GenerateHashesInteractor : KoinComponent {
                 }
                 else -> emptySet()
             }
+            var modifiedFilepathsSet: Set<Path> = when {
+                modifiedFilepaths != null -> {
+                    BufferedReader(FileReader(modifiedFilepaths)).use {
+                        it.readLines()
+                            .map { line: String -> File(line).toPath() }
+                            .toSet()
+                    }
+                }
+                else -> emptySet()
+            }
             val hashes = buildGraphHasher.hashAllBazelTargetsAndSourcefiles(
                 seedFilepathsSet,
-                ignoredRuleHashingAttributes
+                ignoredRuleHashingAttributes,
+                modifiedFilepathsSet
             ).let {
                 if(targetTypes == null) {
                     it

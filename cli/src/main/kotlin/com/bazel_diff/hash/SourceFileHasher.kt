@@ -74,7 +74,9 @@ class SourceFileHasher : KoinComponent {
                     if (file.isFile) {
                         if (modifiedFilepaths.isEmpty()) {
                             putFile(file)
-                        } else if (modifiedFilepaths.stream().anyMatch { workingDirectory.resolve(it) == file }) {
+                        } else if (modifiedFilepaths.any {
+                            workingDirectory.resolve(it) == absoluteFilePath
+                        }) {
                             putFile(file)
                         }
                     }

@@ -18,13 +18,13 @@ import java.nio.file.Paths
 internal class SourceFileHasherTest : KoinTest {
     private val repoAbsolutePath = Paths.get("").toAbsolutePath()
     private val outputBasePath = Files.createTempDirectory("SourceFileHasherTest")
+    private val path = Paths.get("cli/src/test/kotlin/com/bazel_diff/hash/fixture/foo.ts")
     private val fixtureFileTarget = "//cli/src/test/kotlin/com/bazel_diff/hash/fixture:foo.ts"
     private val fixtureFileContent: ByteArray
     private val seed = "seed".toByteArray()
     private val externalRepoResolver = ExternalRepoResolver(repoAbsolutePath, Paths.get("bazel"), outputBasePath)
 
     init {
-        val path = Paths.get("cli/src/test/kotlin/com/bazel_diff/hash/fixture/foo.ts")
         fixtureFileContent = Files.readAllBytes(path)
     }
 
@@ -41,6 +41,37 @@ internal class SourceFileHasherTest : KoinTest {
         val actual = hasher.digest(bazelSourceFileTarget).toHexString()
         val expected = sha256 {
             safePutBytes(fixtureFileContent)
+            safePutBytes(seed)
+            safePutBytes(fixtureFileTarget.toByteArray())
+        }.toHexString()
+        assertThat(actual).isEqualTo(expected)
+    }
+
+    @Test
+    fun testHashConcreteFileWithModifiedFilepathsEnabled() = runBlocking {
+        val hasher = SourceFileHasher(repoAbsolutePath, null, externalRepoResolver)
+        val bazelSourceFileTarget = BazelSourceFileTarget(fixtureFileTarget, seed)
+        val actual = hasher.digest(
+            bazelSourceFileTarget,
+            setOf(path)
+        ).toHexString()
+        val expected = sha256 {
+            safePutBytes(fixtureFileContent)
+            safePutBytes(seed)
+            safePutBytes(fixtureFileTarget.toByteArray())
+        }.toHexString()
+        assertThat(actual).isEqualTo(expected)
+    }
+
+    @Test
+    fun testHashConcreteFileWithModifiedFilepathsEnabledNoMatch() = runBlocking {
+        val hasher = SourceFileHasher(repoAbsolutePath, null, externalRepoResolver)
+        val bazelSourceFileTarget = BazelSourceFileTarget(fixtureFileTarget, seed)
+        val actual = hasher.digest(
+            bazelSourceFileTarget,
+            setOf(Paths.get("some/other/path"))
+        ).toHexString()
+        val expected = sha256 {
             safePutBytes(seed)
             safePutBytes(fixtureFileTarget.toByteArray())
         }.toHexString()

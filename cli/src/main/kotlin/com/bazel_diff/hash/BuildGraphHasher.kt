@@ -99,7 +99,7 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
         ignoredAttrs: Set<String>,
         modifiedFilepaths: Set<Path>
     ): Map<String, TargetHash> {
-        val ruleHashes: ConcurrentMap<String, ByteArray> = ConcurrentHashMap()
+        val ruleHashes: ConcurrentMap<String, TargetDigest> = ConcurrentHashMap()
         val targetToRule: MutableMap<String, BazelRule> = HashMap()
         traverseGraph(allTargets, targetToRule)
 
@@ -114,7 +114,11 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
                     ignoredAttrs,
                     modifiedFilepaths
                 )
-                Pair(target.name, TargetHash(target.javaClass.name.substringAfterLast('$'), targetDigest.toHexString()))
+                Pair(target.name, TargetHash(
+                    target.javaClass.name.substringAfterLast('$'), 
+                    targetDigest.overallDigest.toHexString(),
+                    targetDigest.directDigest.toHexString(),
+                    ))
             }
             .filter { targetEntry: Pair<String, TargetHash>? -> targetEntry != null }
             .collect(

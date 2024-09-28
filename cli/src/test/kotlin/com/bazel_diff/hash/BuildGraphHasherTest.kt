@@ -71,8 +71,8 @@ class BuildGraphHasherTest : KoinTest {
 
         val hash = hasher.hashAllBazelTargetsAndSourcefiles()
         assertThat(hash).containsOnly(
-            "rule1" to TargetHash("Rule", "2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775"),
-            "rule2" to TargetHash("Rule", "bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9"),
+            "rule1" to TargetHash("Rule", "2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775", ""),
+            "rule2" to TargetHash("Rule", "bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9", ""),
         )
     }
 
@@ -83,8 +83,8 @@ class BuildGraphHasherTest : KoinTest {
         whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
         val hash = hasher.hashAllBazelTargetsAndSourcefiles(seedFilepaths)
         assertThat(hash).containsOnly(
-            "rule1" to TargetHash("Rule", "0404d80eadcc2dbfe9f0d7935086e1115344a06bd76d4e16af0dfd7b4913ee60"),
-            "rule2" to TargetHash("Rule", "6fe63fa16340d18176e6d6021972c65413441b72135247179362763508ebddfe"),
+            "rule1" to TargetHash("Rule", "0404d80eadcc2dbfe9f0d7935086e1115344a06bd76d4e16af0dfd7b4913ee60", ""),
+            "rule2" to TargetHash("Rule", "6fe63fa16340d18176e6d6021972c65413441b72135247179362763508ebddfe", ""),
         )
     }
 
@@ -99,10 +99,10 @@ class BuildGraphHasherTest : KoinTest {
         whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
         val hash = hasher.hashAllBazelTargetsAndSourcefiles()
         assertThat(hash).containsOnly(
-            "rule1" to TargetHash("Rule", "2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775"),
-            "rule2" to TargetHash("Rule", "bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9"),
-            "rule3" to TargetHash("Rule", "87dd050f1ca0f684f37970092ff6a02677d995718b5a05461706c0f41ffd4915"),
-            "rule4" to TargetHash("Rule", "a7bc5d23cd98c4942dc879c649eb9646e38eddd773f9c7996fa0d96048cf63dc"),
+            "rule1" to TargetHash("Rule", "2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775", ""),
+            "rule2" to TargetHash("Rule", "bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9", ""),
+            "rule3" to TargetHash("Rule", "87dd050f1ca0f684f37970092ff6a02677d995718b5a05461706c0f41ffd4915", ""),
+            "rule4" to TargetHash("Rule", "a7bc5d23cd98c4942dc879c649eb9646e38eddd773f9c7996fa0d96048cf63dc", ""),
         )
     }
 
@@ -117,10 +117,10 @@ class BuildGraphHasherTest : KoinTest {
         whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
         val hash = hasher.hashAllBazelTargetsAndSourcefiles()
         assertThat(hash).containsOnly(
-            "rule1" to TargetHash("Rule", "2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775"),
-            "rule2" to TargetHash("Rule", "bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9"),
-            "rule3" to TargetHash("Rule", "ca2f970a5a5a18730d7633cc32b48b1d94679f4ccaea56c4924e1f9913bd9cb5"),
-            "rule4" to TargetHash("Rule", "bf15e616e870aaacb02493ea0b8e90c6c750c266fa26375e22b30b78954ee523"),
+            "rule1" to TargetHash("Rule", "2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775", ""),
+            "rule2" to TargetHash("Rule", "bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9", ""),
+            "rule3" to TargetHash("Rule", "ca2f970a5a5a18730d7633cc32b48b1d94679f4ccaea56c4924e1f9913bd9cb5", ""),
+            "rule4" to TargetHash("Rule", "bf15e616e870aaacb02493ea0b8e90c6c750c266fa26375e22b30b78954ee523", ""),
         )
     }
 

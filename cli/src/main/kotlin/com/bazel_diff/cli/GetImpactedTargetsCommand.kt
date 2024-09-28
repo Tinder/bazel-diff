@@ -66,8 +66,8 @@ class GetImpactedTargetsCommand : Callable<Int> {
 
         validate()
         val deserialiser = DeserialiseHashesInteractor()
-        val from = deserialiser.execute(startingHashesJSONPath, targetType)
-        val to = deserialiser.execute(finalHashesJSONPath, targetType)
+        val from = deserialiser.executeTargetHash(startingHashesJSONPath, targetType)
+        val to = deserialiser.executeTargetHash(finalHashesJSONPath, targetType)
 
         val impactedTargets = CalculateImpactedTargetsInteractor().execute(from, to)
 

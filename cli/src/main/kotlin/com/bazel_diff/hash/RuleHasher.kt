@@ -9,6 +9,16 @@ import org.koin.core.component.inject
 import java.util.concurrent.ConcurrentMap
 import java.nio.file.Path
 
+data class TargetDigest(
+    val overallDigest: ByteArray,
+    val directDigest: ByteArray,
+) {
+
+    fun clone(): TargetDigest {
+        return TargetDigest(overallDigest.clone(), directDigest.clone())
+    }
+}
+
 class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
     private val logger: Logger by inject()
     private val sourceFileHasher: SourceFileHasher by inject()
@@ -28,13 +38,13 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
     fun digest(
         rule: BazelRule,
         allRulesMap: Map<String, BazelRule>,
-        ruleHashes: ConcurrentMap<String, ByteArray>,
+        ruleHashes: ConcurrentMap<String, TargetDigest>,
         sourceDigests: ConcurrentMap<String, ByteArray>,
         seedHash: ByteArray?,
         depPath: LinkedHashSet<String>?,
         ignoredAttrs: Set<String>,
         modifiedFilepaths: Set<Path>
-    ): ByteArray {
+    ): TargetDigest {
         val depPathClone = if (depPath != null) LinkedHashSet(depPath) else LinkedHashSet()
         if (depPathClone.contains(rule.name)) {
             throw raiseCircularDependency(depPathClone, rule.name)
@@ -42,7 +52,7 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
         depPathClone.add(rule.name)
         ruleHashes[rule.name]?.let { return it }
 
-        val finalHashValue = sha256 {
+        val overallDigest = sha256 {
             safePutBytes(rule.digest(ignoredAttrs))
             safePutBytes(seedHash)
 
@@ -66,7 +76,7 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
                             ignoredAttrs,
                             modifiedFilepaths
                         )
-                        safePutBytes(ruleInputHash)
+                        safePutBytes(ruleInputHash.overallDigest)
                     }
 
                     else -> {
@@ -84,6 +94,8 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
                 }
             }
         }
+
+        val finalHashValue = TargetDigest(overallDigest, ByteArray(0))
 
         return finalHashValue.also { ruleHashes[rule.name] = it }
     }

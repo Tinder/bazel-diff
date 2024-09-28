@@ -14,11 +14,11 @@ class TargetHasher : KoinComponent {
         target: BazelTarget,
         allRulesMap: Map<String, BazelRule>,
         sourceDigests: ConcurrentMap<String, ByteArray>,
-        ruleHashes: ConcurrentMap<String, ByteArray>,
+        ruleHashes: ConcurrentMap<String, TargetDigest>,
         seedHash: ByteArray?,
         ignoredAttrs: Set<String>,
         modifiedFilepaths: Set<Path>
-    ): ByteArray {
+    ): TargetDigest {
         return when (target) {
             is BazelTarget.GeneratedFile -> {
                 val generatingRuleDigest = ruleHashes[target.generatingRuleName]
@@ -51,9 +51,12 @@ class TargetHasher : KoinComponent {
                     modifiedFilepaths
                 )
             }
-            is BazelTarget.SourceFile -> sha256 {
-                safePutBytes(sourceDigests[target.sourceFileName])
-                safePutBytes(seedHash)
+            is BazelTarget.SourceFile -> {
+                val digest = sha256 {
+                    safePutBytes(sourceDigests[target.sourceFileName])
+                    safePutBytes(seedHash)
+                }
+                TargetDigest(digest, digest)
             }
         }
     }

@@ -62,7 +62,7 @@ fun hasherModule(
     single { BuildGraphHasher(get()) }
     single { TargetHasher() }
     single { RuleHasher(useCquery, fineGrainedHashExternalRepos) }
-    single { SourceFileHasher(fineGrainedHashExternalRepos) }
+    single<SourceFileHasher> { SourceFileHasherImpl(fineGrainedHashExternalRepos) }
     single { ExternalRepoResolver(workingDirectory, bazelPath, outputPath) }
     single(named("working-directory")) { workingDirectory }
     single(named("output-base")) { outputPath }

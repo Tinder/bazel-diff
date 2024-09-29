@@ -118,6 +118,7 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
                     target.javaClass.name.substringAfterLast('$'), 
                     targetDigest.overallDigest.toHexString(),
                     targetDigest.directDigest.toHexString(),
+                    targetDigest.deps,
                     ))
             }
             .filter { targetEntry: Pair<String, TargetHash>? -> targetEntry != null }

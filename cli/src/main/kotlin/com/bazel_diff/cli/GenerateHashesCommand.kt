@@ -136,6 +136,14 @@ class GenerateHashesCommand : Callable<Int> {
     )
     var ignoredRuleHashingAttributes: Set<String> = emptySet()
 
+    @CommandLine.Option(
+        names = ["-d", "--depsFile"],
+        description = ["Path to the file where dependency edges are written to. If not specified, the dependency edges will not be written to a file."],
+        scope = CommandLine.ScopeType.INHERIT,
+        defaultValue = CommandLine.Parameters.NULL_VALUE
+    )
+    var depsFile: File? = null
+
      @CommandLine.Option(
         names = ["-m", "--modified-filepaths"],
         description = ["Experimental: A text file containing a newline separated list of filepaths (relative to the workspace) these filepaths should represent the modified files between the specified revisions and will be used to scope what files are hashed during hash generation."]
@@ -159,6 +167,7 @@ class GenerateHashesCommand : Callable<Int> {
                     cqueryCommandOptions,
                     useCquery,
                     keepGoing,
+                    depsFile != null,
                     fineGrainedHashExternalRepos,
                 ),
                 loggingModule(parent.verbose),
@@ -166,7 +175,7 @@ class GenerateHashesCommand : Callable<Int> {
             )
         }
 
-        return when (GenerateHashesInteractor().execute(seedFilepaths, outputPath, ignoredRuleHashingAttributes, targetType, includeTargetType, modifiedFilepaths)) {
+        return when (GenerateHashesInteractor().execute(seedFilepaths, outputPath, depsFile, ignoredRuleHashingAttributes, targetType, includeTargetType, modifiedFilepaths)) {
             true -> CommandLine.ExitCode.OK
             false -> CommandLine.ExitCode.SOFTWARE
         }.also { stopKoin() }

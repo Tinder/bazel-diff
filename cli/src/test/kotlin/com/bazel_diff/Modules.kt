@@ -17,7 +17,7 @@ fun testModule(): Module = module {
     single { BazelClient(false, emptySet()) }
     single { BuildGraphHasher(get()) }
     single { TargetHasher() }
-    single { RuleHasher(false, emptySet()) }
+    single { RuleHasher(false, true, emptySet()) }
     single { ExternalRepoResolver(workingDirectory, Paths.get("bazel"), outputBase) }
     single<SourceFileHasher> { SourceFileHasherImpl() }
     single { GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create() }

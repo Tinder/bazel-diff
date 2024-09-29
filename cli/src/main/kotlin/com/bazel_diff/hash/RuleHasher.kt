@@ -9,7 +9,7 @@ import org.koin.core.component.inject
 import java.util.concurrent.ConcurrentMap
 import java.nio.file.Path
 
-class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
+class RuleHasher(private val useCquery: Boolean, private val trackDepLabels: Boolean, private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
     private val logger: Logger by inject()
     private val sourceFileHasher: SourceFileHasher by inject()
 
@@ -42,7 +42,7 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
         depPathClone.add(rule.name)
         ruleHashes[rule.name]?.let { return it }
 
-        val finalHashValue = targetSha256 {
+        val finalHashValue = targetSha256(trackDepLabels) {
             putDirectBytes(rule.digest(ignoredAttrs))
             putDirectBytes(seedHash)
 
@@ -66,7 +66,7 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
                             ignoredAttrs,
                             modifiedFilepaths
                         )
-                        putBytes(ruleInputHash.overallDigest)
+                        putTransitiveBytes(ruleInput, ruleInputHash.overallDigest)
                     }
 
                     else -> {

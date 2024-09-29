@@ -22,12 +22,13 @@ class TargetHasher : KoinComponent {
         return when (target) {
             is BazelTarget.GeneratedFile -> {
                 val generatingRuleDigest = ruleHashes[target.generatingRuleName]
+                var digest: TargetDigest
                 if (generatingRuleDigest != null) {
-                    generatingRuleDigest.clone()
+                    digest = generatingRuleDigest
                 } else {
                     val generatingRule = allRulesMap[target.generatingRuleName]
                         ?: throw RuntimeException("Unexpected generating rule ${target.generatingRuleName}")
-                    ruleHasher.digest(
+                    digest = ruleHasher.digest(
                         generatingRule,
                         allRulesMap,
                         ruleHashes,
@@ -38,6 +39,10 @@ class TargetHasher : KoinComponent {
                         modifiedFilepaths
                     )
                 }
+
+                // Add the generating rule name as a dep of the generated file.
+                digest = digest.clone(newDeps = listOf(target.generatingRuleName))
+                digest
             }
             is BazelTarget.Rule -> {
                 ruleHasher.digest(

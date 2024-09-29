@@ -28,6 +28,7 @@ fun hasherModule(
         cqueryOptions: List<String>,
         useCquery: Boolean,
         keepGoing: Boolean,
+        trackDeps: Boolean,
         fineGrainedHashExternalRepos: Set<String>,
 ): Module = module {
     val cmd: MutableList<String> = ArrayList<String>().apply {
@@ -61,7 +62,7 @@ fun hasherModule(
     single { BazelClient(useCquery, fineGrainedHashExternalRepos) }
     single { BuildGraphHasher(get()) }
     single { TargetHasher() }
-    single { RuleHasher(useCquery, fineGrainedHashExternalRepos) }
+    single { RuleHasher(useCquery, trackDeps, fineGrainedHashExternalRepos) }
     single<SourceFileHasher> { SourceFileHasherImpl(fineGrainedHashExternalRepos) }
     single { ExternalRepoResolver(workingDirectory, bazelPath, outputPath) }
     single(named("working-directory")) { workingDirectory }

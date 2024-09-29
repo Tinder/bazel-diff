@@ -3,7 +3,8 @@ package com.bazel_diff.hash
 data class TargetHash(
     val type: String, // Rule/GeneratedFile/SourceFile/...
     val hash: String,
-    val directHash: String
+    val directHash: String,
+    val deps: List<String>? = null
 ) {
     val hashWithType by lazy {
         "${type}#${hash}#${directHash}"

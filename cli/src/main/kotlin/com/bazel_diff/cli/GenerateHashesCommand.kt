@@ -142,7 +142,7 @@ class GenerateHashesCommand : Callable<Int> {
         scope = CommandLine.ScopeType.INHERIT,
         defaultValue = CommandLine.Parameters.NULL_VALUE
     )
-    var depsFile: File? = null
+    var depsMappingJSONPath: File? = null
 
      @CommandLine.Option(
         names = ["-m", "--modified-filepaths"],
@@ -167,7 +167,7 @@ class GenerateHashesCommand : Callable<Int> {
                     cqueryCommandOptions,
                     useCquery,
                     keepGoing,
-                    depsFile != null,
+                    depsMappingJSONPath != null,
                     fineGrainedHashExternalRepos,
                 ),
                 loggingModule(parent.verbose),
@@ -175,7 +175,7 @@ class GenerateHashesCommand : Callable<Int> {
             )
         }
 
-        return when (GenerateHashesInteractor().execute(seedFilepaths, outputPath, depsFile, ignoredRuleHashingAttributes, targetType, includeTargetType, modifiedFilepaths)) {
+        return when (GenerateHashesInteractor().execute(seedFilepaths, outputPath, depsMappingJSONPath, ignoredRuleHashingAttributes, targetType, includeTargetType, modifiedFilepaths)) {
             true -> CommandLine.ExitCode.OK
             false -> CommandLine.ExitCode.SOFTWARE
         }.also { stopKoin() }

@@ -19,7 +19,7 @@ class E2ETest {
 
     private fun CommandLine.execute(args: List<String>) = execute(*args.toTypedArray())
 
-    private fun testE2E(extraGenerateHashesArgs: List<String>, extraGetImpactedTargetsArgs: List<String>, expectedResultFile: String) {
+    private fun testE2E(extraGenerateHashesArgs: List<String>, extraGetImpactedTargetsArgs: List<String>, expectedResultFile: String, computeDistances: Boolean = false) {
         val projectA = extractFixtureProject("/fixture/integration-test-1.zip")
         val projectB = extractFixtureProject("/fixture/integration-test-2.zip")
 
@@ -29,6 +29,7 @@ class E2ETest {
         val outputDir = temp.newFolder()
         val from = File(outputDir, "starting_hashes.json")
         val to = File(outputDir, "final_hashes.json")
+        val depsFile = File(outputDir, "deps.json")
         val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
 
         val cli = CommandLine(BazelDiff())
@@ -38,11 +39,11 @@ class E2ETest {
         )
         //To
         cli.execute(
-                listOf("generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, to.absolutePath) + extraGenerateHashesArgs
+                listOf("generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, to.absolutePath) + extraGenerateHashesArgs + if (computeDistances) listOf("-d", depsFile.absolutePath) else emptyList()
         )
         //Impacted targets
         cli.execute(
-                listOf("get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath) + extraGetImpactedTargetsArgs
+                listOf("get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath) + extraGetImpactedTargetsArgs + if (computeDistances) listOf("-d", depsFile.absolutePath) else emptyList()
         )
 
         val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
@@ -56,6 +57,12 @@ class E2ETest {
     fun testE2E() {
         testE2E(emptyList(), emptyList(), "/fixture/impacted_targets-1-2.txt")
     }
+
+    @Test
+    fun testE2EDistances() {
+        testE2E(emptyList(), emptyList(), "/fixture/impacted_targets_distances-1-2.txt", computeDistances = true)
+    }
+
 
     @Test
     fun testE2EIncludingTargetType() {

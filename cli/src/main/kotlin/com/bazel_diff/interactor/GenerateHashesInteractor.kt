@@ -18,7 +18,7 @@ class GenerateHashesInteractor : KoinComponent {
     private val logger: Logger by inject()
     private val gson: Gson by inject()
 
-    fun execute(seedFilepaths: File?, outputPath: File?, depsFile: File?, ignoredRuleHashingAttributes: Set<String>, targetTypes:Set<String>?, includeTargetType: Boolean = false, modifiedFilepaths: File?): Boolean {
+    fun execute(seedFilepaths: File?, outputPath: File?, depsMappingJSONPath: File?, ignoredRuleHashingAttributes: Set<String>, targetTypes:Set<String>?, includeTargetType: Boolean = false, modifiedFilepaths: File?): Boolean {
         return try {
             val epoch = Calendar.getInstance().getTimeInMillis()
             val seedFilepathsSet: Set<Path> = when {
@@ -58,8 +58,8 @@ class GenerateHashesInteractor : KoinComponent {
             }.use { fileWriter ->
                 fileWriter.write(gson.toJson(hashes.mapValues { it.value.toJson(includeTargetType) }))
             }
-            if (depsFile != null) {
-                FileWriter(depsFile).use { fileWriter ->
+            if (depsMappingJSONPath != null) {
+                FileWriter(depsMappingJSONPath).use { fileWriter ->
                     fileWriter.write(gson.toJson(hashes.mapValues { it.value.deps }))
                 }
             }

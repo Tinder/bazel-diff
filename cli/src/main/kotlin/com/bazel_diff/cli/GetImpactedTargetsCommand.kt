@@ -39,6 +39,14 @@ class GetImpactedTargetsCommand : Callable<Int> {
     lateinit var finalHashesJSONPath: File
 
     @CommandLine.Option(
+        names = ["-d", "--depsFile"],
+        description = ["Path to the file where dependency edges are. If specified, build graph distance metrics will be computed from the given hash data."],
+        scope = CommandLine.ScopeType.INHERIT,
+        defaultValue = CommandLine.Parameters.NULL_VALUE
+    )
+    var depsMappingJSONPath: File? = null
+
+    @CommandLine.Option(
             names = ["-tt", "--targetType"],
             split = ",",
             scope = CommandLine.ScopeType.LOCAL,
@@ -69,16 +77,22 @@ class GetImpactedTargetsCommand : Callable<Int> {
         val from = deserialiser.executeTargetHash(startingHashesJSONPath, targetType)
         val to = deserialiser.executeTargetHash(finalHashesJSONPath, targetType)
 
-        val impactedTargets = CalculateImpactedTargetsInteractor().execute(from, to)
+        val impactedTargetsStream = if (depsMappingJSONPath != null) {
+            val depsMapping = deserialiser.deserializeDeps(depsMappingJSONPath!!)
+            CalculateImpactedTargetsInteractor().executeWithDistances(from, to, depsMapping).map { (label, metrics) ->
+                "${label}~${metrics.targetDistance}~${metrics.packageDistance}"
+            }.stream()
+        } else {
+            CalculateImpactedTargetsInteractor().execute(from, to).stream()
+        }
 
         return try {
-            BufferedWriter(when (val path=outputPath) {
+            BufferedWriter(when (val path = outputPath) {
                 null -> FileWriter(FileDescriptor.out)
                 else -> FileWriter(path)
             }).use { writer ->
-                impactedTargets.forEach {
-                    writer.write(it)
-                    //Should not depend on OS
+                impactedTargetsStream.forEach { line ->
+                    writer.write(line)
                     writer.write("\n")
                 }
             }

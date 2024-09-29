@@ -1,0 +1,8 @@
+//test/java/com/integration:libbazel-diff-integration-test-lib-src.jar~0~0
+//test/java/com/integration:TestStringGenerator.java~0~0
+//test/java/com/integration:bazel-diff-integration-test-lib~0~0
+//test/java/com/integration:bazel-diff-integration-tests-src.jar~2~0
+//test/java/com/integration:libbazel-diff-integration-test-lib.jar~0~0
+//test/java/com/integration:bazel-diff-integration-tests~1~0
+//test/java/com/integration:bazel-diff-integration-tests_deploy-src.jar~2~0
+//test/java/com/integration:bazel-diff-integration-tests.jar~2~0

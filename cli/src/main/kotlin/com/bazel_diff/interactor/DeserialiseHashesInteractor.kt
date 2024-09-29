@@ -46,4 +46,9 @@ class DeserialiseHashesInteractor : KoinComponent {
         val shape = object : TypeToken<Map<String, String>>() {}.type
         return gson.fromJson(FileReader(file), shape)
     }
+
+    fun deserializeDeps(file: File): Map<String, List<String>> {
+        val shape = object : TypeToken<Map<String, List<String>>>() {}.type
+        return gson.fromJson(FileReader(file), shape)
+    }
 }

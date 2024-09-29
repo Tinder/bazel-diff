@@ -4,6 +4,7 @@ import com.bazel_diff.di.loggingModule
 import com.bazel_diff.di.serialisationModule
 import com.bazel_diff.interactor.CalculateImpactedTargetsInteractor
 import com.bazel_diff.interactor.DeserialiseHashesInteractor
+import com.bazel_diff.interactor.TargetTypeFilter
 import org.koin.core.context.startKoin
 import org.koin.core.context.stopKoin
 import picocli.CommandLine
@@ -74,16 +75,22 @@ class GetImpactedTargetsCommand : Callable<Int> {
 
         validate()
         val deserialiser = DeserialiseHashesInteractor()
-        val from = deserialiser.executeTargetHash(startingHashesJSONPath, targetType)
-        val to = deserialiser.executeTargetHash(finalHashesJSONPath, targetType)
+        val from = deserialiser.executeTargetHash(startingHashesJSONPath)
+        val to = deserialiser.executeTargetHash(finalHashesJSONPath)
+
+        val typeFilter = TargetTypeFilter(targetType, to)
 
         val impactedTargetsStream = if (depsMappingJSONPath != null) {
             val depsMapping = deserialiser.deserializeDeps(depsMappingJSONPath!!)
-            CalculateImpactedTargetsInteractor().executeWithDistances(from, to, depsMapping).map { (label, metrics) ->
+            CalculateImpactedTargetsInteractor().executeWithDistances(from, to, depsMapping)
+            .filterKeys { typeFilter.accepts(it) }
+            .map { (label, metrics) ->
                 "${label}~${metrics.targetDistance}~${metrics.packageDistance}"
             }.stream()
         } else {
-            CalculateImpactedTargetsInteractor().execute(from, to).stream()
+            CalculateImpactedTargetsInteractor().execute(from, to)
+            .filter { typeFilter.accepts(it) }
+            .stream()
         }
 
         return try {

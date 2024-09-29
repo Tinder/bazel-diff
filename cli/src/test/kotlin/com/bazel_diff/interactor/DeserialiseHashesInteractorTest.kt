@@ -41,19 +41,6 @@ class DeserialiseHashesInteractorTest : KoinTest {
     }
 
     @Test
-    fun testDeserialisatingFileWithoutType() {
-        val file = temp.newFile().apply {
-            writeText("""{"target-name":"hash#direct"}""")
-        }
-
-        assertThat { interactor.executeTargetHash(file, setOf("Whatever"))}
-            .isFailure().apply {
-                messageContains("please re-generate the JSON with --includeTypeTarget!")
-                hasClass(IllegalStateException::class)
-            }
-    }
-
-    @Test
     fun testDeserialisationWithType() {
         val file = temp.newFile().apply {
             writeText("""{
@@ -63,18 +50,9 @@ class DeserialiseHashesInteractorTest : KoinTest {
                 |}""".trimMargin())
         }
 
-        assertThat(interactor.executeTargetHash(file, null)).isEqualTo(mapOf(
+        assertThat(interactor.executeTargetHash(file)).isEqualTo(mapOf(
             "target-1" to TargetHash("GeneratedFile", "hash1", "direct1"),
             "target-2" to TargetHash("Rule", "hash2", "direct2"),
-            "target-3" to TargetHash("SourceFile", "hash3", "direct3")
-        ))
-        assertThat(interactor.executeTargetHash(file, setOf("GeneratedFile"))).isEqualTo(mapOf(
-            "target-1" to TargetHash("GeneratedFile", "hash1", "direct1")
-        ))
-        assertThat(interactor.executeTargetHash(file, setOf("Rule"))).isEqualTo(mapOf(
-            "target-2" to TargetHash("Rule", "hash2", "direct2")
-        ))
-        assertThat(interactor.executeTargetHash(file, setOf("SourceFile"))).isEqualTo(mapOf(
             "target-3" to TargetHash("SourceFile", "hash3", "direct3")
         ))
     }

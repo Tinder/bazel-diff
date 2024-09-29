@@ -75,6 +75,12 @@ class E2ETest {
     }
 
     @Test
+    fun testE2EWithTargetTypeAndDistance() {
+        testE2E(listOf("--includeTargetType"), listOf("-tt", "Rule,SourceFile"), "/fixture/impacted_targets_distances-1-2-rule-sourcefile.txt", computeDistances = true)
+    }
+
+
+    @Test
     fun testFineGrainedHashExternalRepo() {
         // The difference between these two snapshots is simply upgrading the Guava version.
         // Following is the diff.

@@ -8,11 +8,11 @@ data class TargetDigest(
     val deps: List<String>? = null,
 ) {
     fun clone(newDeps: List<String>? = null): TargetDigest {
-        var newDeps = newDeps
+        var toUse = newDeps
         if (newDeps == null) {
-            newDeps = deps
+            toUse = deps
         }
-        return TargetDigest(overallDigest.clone(), directDigest.clone(), newDeps)
+        return TargetDigest(overallDigest.clone(), directDigest.clone(), toUse)
     }
 }
 

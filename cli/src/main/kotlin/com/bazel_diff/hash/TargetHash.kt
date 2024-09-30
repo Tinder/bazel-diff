@@ -7,11 +7,11 @@ data class TargetHash(
     val deps: List<String>? = null
 ) {
     val hashWithType by lazy {
-        "${type}#${hash}#${directHash}"
+        "${type}#${hash}~${directHash}"
     }
 
     val totalHash by lazy {
-        "${hash}#${directHash}"
+        "${hash}~${directHash}"
     }
 
     fun toJson(includeTargetType: Boolean): String {
@@ -30,9 +30,15 @@ data class TargetHash(
         fun fromJson(json: String): TargetHash {
             val parts = json.split("#")
             return when (parts.size) {
-                2 -> TargetHash("", parts[0], parts[1])
-                3 -> TargetHash(parts[0], parts[1], parts[2])
-                else -> throw IllegalArgumentException("Invalid JSON format")
+                1 -> Pair("", parts[0])
+                2 -> Pair(parts[0], parts[1])
+                else -> throw IllegalArgumentException("Invalid targetHash format: $json")
+            }.let { (type, hash) ->
+                val hashes = hash.split("~")
+                when (hashes.size) {
+                    2 -> TargetHash(type, hashes[0], hashes[1])
+                    else -> throw IllegalArgumentException("Invalid targetHash format: $json")
+                }
             }
         }
     }

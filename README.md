@@ -91,12 +91,14 @@ bazel-diff generate-hashes --depsFile deps.json [...]
 bazel-diff get-impacted-targets --depsFile deps.json [...]
 ```
 
-This will produce an impacted targets list with target label, target distance, and package distance delimited by `~` characters:
+This will produce an impacted targets json list with target label, target distance, and package distance:
 
 ```text
-//foo:bar~0~0
-//foo:baz~1~0
-//bar:qux~1~1
+[
+  {"label": "//foo:bar", "targetDistance": 0, "packageDistance": 0},
+  {"label": "//foo:baz", "targetDistance": 1, "packageDistance": 0},
+  {"label": "//bar:qux", "targetDistance": 1, "packageDistance": 1}
+]
 ```
 
 ## CLI Interface

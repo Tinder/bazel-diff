@@ -40,7 +40,7 @@ class GetImpactedTargetsCommand : Callable<Int> {
     lateinit var finalHashesJSONPath: File
 
     @CommandLine.Option(
-        names = ["-d", "--depsFile"],
+        names = ["-d", "--depEdgesFile"],
         description = ["Path to the file where dependency edges are. If specified, build graph distance metrics will be computed from the given hash data."],
         scope = CommandLine.ScopeType.INHERIT,
         defaultValue = CommandLine.Parameters.NULL_VALUE
@@ -58,7 +58,7 @@ class GetImpactedTargetsCommand : Callable<Int> {
     @CommandLine.Option(
         names = ["-o", "--output"],
         scope = CommandLine.ScopeType.LOCAL,
-        description = ["Filepath to write the impacted Bazel targets to, newline separated. If not specified, the targets will be written to STDOUT."],
+        description = ["Filepath to write the impacted Bazel targets to. If using depEdgesFile: formatted in json, otherwise: newline separated. If not specified, the output will be written to STDOUT."],
     )
     var outputPath: File? = null
 
@@ -78,30 +78,17 @@ class GetImpactedTargetsCommand : Callable<Int> {
         val from = deserialiser.executeTargetHash(startingHashesJSONPath)
         val to = deserialiser.executeTargetHash(finalHashesJSONPath)
 
-        val typeFilter = TargetTypeFilter(targetType, to)
-
-        val impactedTargetsStream = if (depsMappingJSONPath != null) {
-            val depsMapping = deserialiser.deserializeDeps(depsMappingJSONPath!!)
-            CalculateImpactedTargetsInteractor().executeWithDistances(from, to, depsMapping)
-            .filterKeys { typeFilter.accepts(it) }
-            .map { (label, metrics) ->
-                "${label}~${metrics.targetDistance}~${metrics.packageDistance}"
-            }.stream()
-        } else {
-            CalculateImpactedTargetsInteractor().execute(from, to)
-            .filter { typeFilter.accepts(it) }
-            .stream()
-        }
-
-        return try {
-            BufferedWriter(when (val path = outputPath) {
+        val outputWriter = BufferedWriter(when (val path = outputPath) {
                 null -> FileWriter(FileDescriptor.out)
                 else -> FileWriter(path)
-            }).use { writer ->
-                impactedTargetsStream.forEach { line ->
-                    writer.write(line)
-                    writer.write("\n")
-                }
+        })
+
+        return try {
+            if (depsMappingJSONPath != null) {
+                val depsMapping = deserialiser.deserializeDeps(depsMappingJSONPath!!)
+                CalculateImpactedTargetsInteractor().executeWithDistances(from, to, depsMapping, outputWriter, targetType)
+            } else {
+                CalculateImpactedTargetsInteractor().execute(from, to, outputWriter, targetType)
             }
             CommandLine.ExitCode.OK
         } catch (e: IOException) {
@@ -120,6 +107,12 @@ class GetImpactedTargetsCommand : Callable<Int> {
             throw CommandLine.ParameterException(
                 spec.commandLine(),
                 "Incorrect final hashes: file doesn't exist or can't be read."
+            )
+        }
+        if (depsFile != null && !depsFile.canRead()) {
+            throw CommandLine.ParameterException(
+                spec.commandLine(),
+                "Incorrect dep edges file: file doesn't exist or can't be read."
             )
         }
     }

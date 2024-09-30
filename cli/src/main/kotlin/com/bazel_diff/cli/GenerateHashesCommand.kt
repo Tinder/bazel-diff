@@ -137,8 +137,8 @@ class GenerateHashesCommand : Callable<Int> {
     var ignoredRuleHashingAttributes: Set<String> = emptySet()
 
     @CommandLine.Option(
-        names = ["-d", "--depsFile"],
-        description = ["Path to the file where dependency edges are written to. If not specified, the dependency edges will not be written to a file."],
+        names = ["-d", "--depEdgesFile"],
+        description = ["Path to the file where dependency edges are written to. If not specified, the dependency edges will not be written to a file. Needed for computing build graph distance metrics. See bazel-diff docs for more details about build graph distance metrics."],
         scope = CommandLine.ScopeType.INHERIT,
         defaultValue = CommandLine.Parameters.NULL_VALUE
     )

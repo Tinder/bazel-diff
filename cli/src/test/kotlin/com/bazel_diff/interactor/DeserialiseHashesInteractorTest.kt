@@ -31,7 +31,7 @@ class DeserialiseHashesInteractorTest : KoinTest {
     @Test
     fun testDeserialisation() {
         val file = temp.newFile().apply {
-            writeText("""{"target-name":"hash#direct"}""")
+            writeText("""{"target-name":"hash~direct"}""")
         }
 
         val actual = interactor.executeTargetHash(file)
@@ -44,9 +44,9 @@ class DeserialiseHashesInteractorTest : KoinTest {
     fun testDeserialisationWithType() {
         val file = temp.newFile().apply {
             writeText("""{
-                |  "target-1":"GeneratedFile#hash1#direct1", 
-                |  "target-2":"Rule#hash2#direct2",
-                |  "target-3":"SourceFile#hash3#direct3"
+                |  "target-1":"GeneratedFile#hash1~direct1", 
+                |  "target-2":"Rule#hash2~direct2",
+                |  "target-3":"SourceFile#hash3~direct3"
                 |}""".trimMargin())
         }
 

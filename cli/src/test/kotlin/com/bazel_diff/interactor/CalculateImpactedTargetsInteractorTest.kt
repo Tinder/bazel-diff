@@ -34,7 +34,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         end["3"] = "d"
         val endHashes = end.mapValues { TargetHash("", it.value, it.value) }
 
-        val impacted = interactor.execute(startHashes, endHashes)
+        val impacted = interactor.computeSimpleImpactedTargets(startHashes, endHashes)
         assertThat(impacted).containsExactlyInAnyOrder(
             "1", "3"
         )
@@ -53,7 +53,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         makeIndirectlyChanged(endHashes, "//:3")
 
         val interactor = CalculateImpactedTargetsInteractor()
-        val impacted = interactor.executeWithDistances(startHashes, endHashes, depEdges)
+        val impacted = interactor.computeAllDistances(startHashes, endHashes, depEdges)
 
         assertThat(impacted).containsOnly(
             "//:1" to TargetDistanceMetrics(0, 0),
@@ -72,7 +72,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         )
 
         val interactor = CalculateImpactedTargetsInteractor()
-        val impacted = interactor.executeWithDistances(startHashes, endHashes, mapOf())
+        val impacted = interactor.computeAllDistances(startHashes, endHashes, mapOf())
 
         assertThat(impacted).containsOnly(
             "//:1" to TargetDistanceMetrics(0, 0),
@@ -91,7 +91,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         makeIndirectlyChanged(endHashes, "//:2", "//:3")
         
         val interactor = CalculateImpactedTargetsInteractor()
-        val impacted = interactor.executeWithDistances(startHashes, endHashes, depEdges)
+        val impacted = interactor.computeAllDistances(startHashes, endHashes, depEdges)
 
         assertThat(impacted).containsOnly(
             "//:1" to TargetDistanceMetrics(0,0),
@@ -111,7 +111,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         makeIndirectlyChanged(endHashes, "//A:2", "//B:3", "//B:4", "//C:5")
 
         val interactor = CalculateImpactedTargetsInteractor()
-        val impacted = interactor.executeWithDistances(startHashes, endHashes, depEdges)
+        val impacted = interactor.computeAllDistances(startHashes, endHashes, depEdges)
 
         assertThat(impacted).containsOnly(
             "//A:1" to TargetDistanceMetrics(0,0),
@@ -139,7 +139,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         makeIndirectlyChanged(endHashes, "//A:target_1", "//A:target_2", "//A:target_3", "//A:target_4", "//B:target", "//C:target", "//D:target", "//final:final")
 
         val interactor = CalculateImpactedTargetsInteractor()
-        val impacted = interactor.executeWithDistances(startHashes, endHashes, depEdges)
+        val impacted = interactor.computeAllDistances(startHashes, endHashes, depEdges)
 
         assertThat(impacted["//final:final"]).isEqualTo(TargetDistanceMetrics(4,2))
     }
@@ -161,7 +161,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         makeIndirectlyChanged(endHashes, "//:2", "//:3")
         
         val interactor = CalculateImpactedTargetsInteractor()
-        val impacted = interactor.executeWithDistances(startHashes, endHashes, depEdges)
+        val impacted = interactor.computeAllDistances(startHashes, endHashes, depEdges)
 
         assertThat(impacted).containsOnly(
             "//:1" to TargetDistanceMetrics(0,0),
@@ -181,12 +181,12 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
 
         val interactor = CalculateImpactedTargetsInteractor()
         assertThat {
-            interactor.executeWithDistances(startHashes, endHashes, depEdges)
+            interactor.computeAllDistances(startHashes, endHashes, depEdges)
         }.isFailure().message().isEqualTo("//:2 was indirectly impacted, but has no impacted dependencies.")
 
         assertThat {
             // empty dep edges
-            interactor.executeWithDistances(startHashes, endHashes, mapOf())
+            interactor.computeAllDistances(startHashes, endHashes, mapOf())
         }.isFailure().message().isEqualTo("//:2 was indirectly impacted, but has no dependencies.")
 
     }

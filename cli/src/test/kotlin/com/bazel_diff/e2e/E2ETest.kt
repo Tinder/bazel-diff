@@ -3,6 +3,8 @@ package com.bazel_diff.e2e
 import assertk.assertThat
 import assertk.assertions.isEqualTo
 import com.bazel_diff.cli.BazelDiff
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import org.junit.Ignore
 import org.junit.Rule
 import org.junit.Test
@@ -46,11 +48,23 @@ class E2ETest {
                 listOf("get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath) + extraGetImpactedTargetsArgs + if (computeDistances) listOf("-d", depsFile.absolutePath) else emptyList()
         )
 
-        val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
-        val expected: Set<String> =
-                javaClass.getResourceAsStream(expectedResultFile).use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+        if (!computeDistances) {
+                val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+                val expected: Set<String> =
+                        javaClass.getResourceAsStream(expectedResultFile).use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
-        assertThat(actual).isEqualTo(expected)
+                assertThat(actual).isEqualTo(expected)
+        } else {
+                // When computing target distances, the output format is json. Read the files and assert the sorted contents.
+                val gson = Gson()
+                val shape = object : TypeToken<List<Map<String, Any>>>() {}.type
+                val actual = gson.fromJson<List<Map<String, Any>>>(impactedTargetsOutput.readText(), shape).sortedBy { it["label"] as String }
+                val expected = javaClass.getResourceAsStream(expectedResultFile).use {
+                        gson.fromJson<List<Map<String, Any>>>(it.bufferedReader().readText(), shape).sortedBy { it["label"] as String }
+                }
+
+                assertThat(actual).isEqualTo(expected)
+        }
     }
 
     @Test

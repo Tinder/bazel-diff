@@ -48,7 +48,11 @@ class SourceFileHasher : KoinComponent {
                 val filenameSubstring = name.substring(2)
                 Paths.get(filenameSubstring.removePrefix(":").replace(':', '/'))
             } else if (name.startsWith("@")) {
-                val parts = name.substring(1).split("//")
+                val parts = if (name.startsWith("@@")) {
+                    name.substring(2).split("//")
+                } else {
+                    name.substring(1).split("//")
+                }
                 if (parts.size != 2) {
                     logger.w { "Invalid source label $name" }
                     return@sha256

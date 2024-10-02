@@ -45,7 +45,7 @@ class BazelQueryService(
         val targets = outputFile.inputStream().buffered().use { proto ->
             if (useCquery) {
                 val cqueryResult = AnalysisProtosV2.CqueryResult.parseFrom(proto)
-                cqueryResult.resultsList.filter { it.target.rule.name in compatibleTargetSet }.map { it.target }
+                cqueryResult.resultsList.filter { inCompatibleTargetSet(it, compatibleTargetSet) }.map { it.target }
             } else {
                 mutableListOf<Build.Target>().apply {
                     while (true) {
@@ -58,6 +58,15 @@ class BazelQueryService(
         }
 
         return targets
+    }
+
+    private fun inCompatibleTargetSet(
+        target: AnalysisProtosV2.ConfiguredTarget,
+        compatibleTargetSet: Set<String>
+    ): Boolean {
+        val name = target.target.rule.name
+        return name in compatibleTargetSet ||
+                name.startsWith("@") && !name.startsWith("@@") && "@${name}" in compatibleTargetSet
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)

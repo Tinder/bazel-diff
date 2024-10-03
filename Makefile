@@ -6,4 +6,4 @@ release_source_archive:
 		--exclude=bazel-* \
 		--exclude=.github \
 		--exclude=archives \
-		-zcf "archives/bazel_diff_$version.tar.gz" .
+		-zcf "archives/bazel_diff_$(version).tar.gz" .

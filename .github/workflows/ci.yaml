@@ -11,55 +11,55 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Java JDK
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '11'
       - name: Setup Go environment
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
           go-version: ^1.17
         id: go
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Run bazel-diff tests
         run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=true
   test-jre11:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Java JDK
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '11'
       - name: Setup Go environment
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
           go-version: ^1.17
         id: go
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Run bazel-diff tests
         run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=false
   test-jre11-run-example:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Java JDK
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '11'
         id: java
       - name: Setup Go environment
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
           go-version: ^1.17
         id: go
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Run bazel-diff example script
@@ -72,23 +72,30 @@ jobs:
         java: [ '11' ]
     steps:
       - name: Setup Java JDK
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: ${{ matrix.java }}
         id: java
       - name: Setup Go environment
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
           go-version: ^1.17
         id: go
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Build deployable JAR
         run: ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: bazel-diff_deploy.jar
           path: bazel-bin/cli/bazel-diff_deploy.jar
+          if-no-files-found: error
+      - name: Build release source archive
+        run: make release_source_archive
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release_source_archive
+          path: archives/
           if-no-files-found: error

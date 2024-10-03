@@ -27,3 +27,4 @@ user.bazelrc
 !bazel-diff-example.sh
 .DS_Store
 !.bazelversion
+archives/

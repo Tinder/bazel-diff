@@ -92,10 +92,8 @@ jobs:
           name: bazel-diff_deploy.jar
           path: bazel-bin/cli/bazel-diff_deploy.jar
           if-no-files-found: error
-      - name: Set env
-        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
       - name: Build release source archive
-        run: make release_source_archive version=${{ env.RELEASE_VERSION }}
+        run: make release_source_archive
       - uses: actions/upload-artifact@v4
         with:
           name: release_source_archive

@@ -1,9 +1,8 @@
-###############################################################################
-# Bazel now uses Bzlmod by default to manage external dependencies.
-# Please consider migrating your external dependencies from WORKSPACE to MODULE.bazel.
-#
-# For more details, please check https://github.com/bazelbuild/bazel/issues/18958
-###############################################################################
+module(
+    name = "bazel-diff",
+    version = "7.2.5",
+    compatibility_level = 0,
+)
 
 bazel_dep(name = "bazel_skylib", version = "1.5.0")
 bazel_dep(name = "rules_proto", version = "6.0.0-rc2")

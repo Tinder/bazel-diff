@@ -10,12 +10,8 @@ config_setting(
 
 genrule(
     name = "version_file",
-    srcs = [],
     outs = ["version"],
-    cmd_bash = """
-        version_tag=$$(grep ^STABLE_GIT_TAG bazel-out/stable-status.txt | cut -d' ' -f2); \
-        printf '%s' $$version_tag > $@;
-    """,
+    cmd = "echo '{version}' > $@".format(version = module_version() if module_version() else "unknown"),
     stamp = 1,
 )
 

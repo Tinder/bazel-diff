@@ -37,11 +37,11 @@ class BazelRule(private val rule: Build.Rule) {
     val name: String = rule.name
 
     private fun transformRuleInput(fineGrainedHashExternalRepos: Set<String>, ruleInput: String): String {
-        if (ruleInput.startsWith("@") && fineGrainedHashExternalRepos.none { ruleInput.startsWith("@$it") }) {
+        if (ruleInput.startsWith("@") && fineGrainedHashExternalRepos.none { ruleInput.startsWith("@$it") || ruleInput.startsWith("@@${it}") }) {
             val splitRule = ruleInput.split("//".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
             if (splitRule.size == 2) {
                 var externalRule = splitRule[0]
-                externalRule = externalRule.replaceFirst("@".toRegex(), "")
+                externalRule = externalRule.replaceFirst("@+".toRegex(), "")
                 return String.format("//external:%s", externalRule)
             }
         }

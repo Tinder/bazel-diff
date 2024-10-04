@@ -1,18 +1,17 @@
-###############################################################################
-# Bazel now uses Bzlmod by default to manage external dependencies.
-# Please consider migrating your external dependencies from WORKSPACE to MODULE.bazel.
-#
-# For more details, please check https://github.com/bazelbuild/bazel/issues/18958
-###############################################################################
+module(
+    name = "bazel-diff",
+    version = "7.2.12",
+    compatibility_level = 0,
+)
 
-bazel_dep(name = "bazel_skylib", version = "1.5.0")
+bazel_dep(name = "bazel_skylib", version = "1.6.1")
 bazel_dep(name = "rules_proto", version = "6.0.0-rc2")
-bazel_dep(name = "rules_java", version = "7.5.0")
+bazel_dep(name = "rules_java", version = "7.6.5")
 bazel_dep(name = "rules_kotlin", version = "1.9.1")
 bazel_dep(name = "rules_jvm_external", version = "6.0")
 
-maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
-maven.install(
+bazel_diff_maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+bazel_diff_maven.install(
     artifacts = [
         "com.google.code.gson:gson:jar:2.9.0",
         "com.google.guava:guava:31.1-jre",
@@ -23,11 +22,11 @@ maven.install(
         "junit:junit:4.13.2",
         "org.apache.commons:commons-pool2:2.11.1",
         "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.5.2",
-        "org.mockito.kotlin:mockito-kotlin:4.0.0",
+        "org.mockito.kotlin:mockito-kotlin:5.4.0",
     ],
     lock_file = "//:maven_install.json",
 )
 use_repo(
-    maven,
+    bazel_diff_maven,
     bazel_diff_maven = "maven",
 )

@@ -11,7 +11,7 @@ config_setting(
 genrule(
     name = "version_file",
     outs = ["version"],
-    cmd = "echo '%s' > $@" % module_version() if module_version() else "unknown",
+    cmd = "echo '{version}' > $@".format(version = module_version() if module_version() else "unknown"),
     stamp = 1,
 )
 

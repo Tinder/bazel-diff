@@ -96,6 +96,6 @@ jobs:
         run: make release_source_archive
       - uses: actions/upload-artifact@v4
         with:
-          name: release_source_archive
+          name: release.tar.gz
           path: archives/
           if-no-files-found: error

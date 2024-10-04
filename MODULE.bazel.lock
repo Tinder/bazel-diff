@@ -127,7 +127,7 @@
     "@@rules_jvm_external~//:extensions.bzl%maven": {
       "general": {
         "bzlTransitiveDigest": "aME0tyUxYd+PGhICmzT9zEnIgZNf05hZhsfDD5v0JXM=",
-        "usagesDigest": "AkZduefFr6Ydap5ccPDieRcZ7XCBlsl1d5R2hstogZc=",
+        "usagesDigest": "i+5vGBPOvWqTehoIhu5pNEQG7td5sMSSpgEuuv85hsc=",
         "recordedFileInputs": {
           "@@rules_jvm_external~//rules_jvm_external_deps_install.json": "cafb5d2d8119391eb2b322ce3840d3352ea82d496bdb8cbd4b6779ec4d044dda",
           "@@//maven_install.json": "8ab3e635bbd52fcff5900e530933fbdc41c45d1d5b2a2aef8af1becf7a7d0784"
@@ -682,8 +682,8 @@
                 "{ \"group\": \"com.willowtreeapps.assertk\", \"artifact\": \"assertk-jvm\", \"version\": \"0.25\" }",
                 "{ \"group\": \"info.picocli\", \"artifact\": \"picocli\", \"version\": \"4.6.3\", \"packaging\": \"jar\" }",
                 "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-core-jvm\", \"version\": \"3.1.6\" }",
-                "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-test-junit4\", \"version\": \"3.1.6\" }",
-                "{ \"group\": \"junit\", \"artifact\": \"junit\", \"version\": \"4.13.2\" }",
+                "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-test-junit4\", \"version\": \"4.0.0\" }",
+                "{ \"group\": \"junit\", \"artifact\": \"junit\", \"version\": \"5.11.2\" }",
                 "{ \"group\": \"org.apache.commons\", \"artifact\": \"commons-pool2\", \"version\": \"2.11.1\" }",
                 "{ \"group\": \"org.jetbrains.kotlinx\", \"artifact\": \"kotlinx-coroutines-core\", \"version\": \"1.5.2\" }",
                 "{ \"group\": \"org.mockito.kotlin\", \"artifact\": \"mockito-kotlin\", \"version\": \"5.4.0\" }",
@@ -1416,8 +1416,8 @@
                 "{ \"group\": \"com.willowtreeapps.assertk\", \"artifact\": \"assertk-jvm\", \"version\": \"0.25\" }",
                 "{ \"group\": \"info.picocli\", \"artifact\": \"picocli\", \"version\": \"4.6.3\", \"packaging\": \"jar\" }",
                 "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-core-jvm\", \"version\": \"3.1.6\" }",
-                "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-test-junit4\", \"version\": \"3.1.6\" }",
-                "{ \"group\": \"junit\", \"artifact\": \"junit\", \"version\": \"4.13.2\" }",
+                "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-test-junit4\", \"version\": \"4.0.0\" }",
+                "{ \"group\": \"junit\", \"artifact\": \"junit\", \"version\": \"5.11.2\" }",
                 "{ \"group\": \"org.apache.commons\", \"artifact\": \"commons-pool2\", \"version\": \"2.11.1\" }",
                 "{ \"group\": \"org.jetbrains.kotlinx\", \"artifact\": \"kotlinx-coroutines-core\", \"version\": \"1.5.2\" }",
                 "{ \"group\": \"org.mockito.kotlin\", \"artifact\": \"mockito-kotlin\", \"version\": \"5.4.0\" }",

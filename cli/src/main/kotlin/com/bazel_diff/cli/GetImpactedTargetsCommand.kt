@@ -109,7 +109,7 @@ class GetImpactedTargetsCommand : Callable<Int> {
                 "Incorrect final hashes: file doesn't exist or can't be read."
             )
         }
-        if (depsFile != null && !depsFile.canRead()) {
+        if (depsMappingJSONPath != null && !depsMappingJSONPath!!.canRead()) {
             throw CommandLine.ParameterException(
                 spec.commandLine(),
                 "Incorrect dep edges file: file doesn't exist or can't be read."

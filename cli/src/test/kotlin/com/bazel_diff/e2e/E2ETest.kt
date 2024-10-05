@@ -210,8 +210,8 @@ class E2ETest {
         //     }),
         //     visibility = ["//visibility:public"],
         //     deps = select({
-        //         "//:android_system": ["@bazel_diff_maven_android//:com_google_guava_guava"],
-        //         "//:jre_system": ["@bazel_diff_maven//:com_google_guava_guava"],
+        //         "//:android_system": ["@maven_android//:com_google_guava_guava"],
+        //         "//:jre_system": ["@maven//:com_google_guava_guava"],
         //     }),
         // )
 
@@ -313,8 +313,8 @@ class E2ETest {
         //     }),
         //     visibility = ["//visibility:public"],
         //     deps = select({
-        //         "//:android_system": ["@bazel_diff_maven_android//:com_google_guava_guava"],
-        //         "//:jre_system": ["@bazel_diff_maven//:com_google_guava_guava"],
+        //         "//:android_system": ["@maven_android//:com_google_guava_guava"],
+        //         "//:jre_system": ["@maven//:com_google_guava_guava"],
         //     }),
         // )
 

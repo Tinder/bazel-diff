@@ -31,14 +31,14 @@ kt_jvm_library(
     srcs = glob(["src/main/kotlin/**/*.kt"]),
     resources = [":version_file"],
     deps = [
-        "@bazel_diff_maven//:com_google_code_gson_gson",
-        "@bazel_diff_maven//:com_google_guava_guava",
-        "@bazel_diff_maven//:info_picocli_picocli",
-        "@bazel_diff_maven//:io_insert_koin_koin_core_jvm",
-        "@bazel_diff_maven//:org_apache_commons_commons_pool2",
-        "@bazel_diff_maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core_jvm",
         "@bazel_tools//src/main/protobuf:analysis_v2_java_proto",
         "@bazel_tools//src/main/protobuf:build_java_proto",
+        "@maven//:com_google_code_gson_gson",
+        "@maven//:com_google_guava_guava",
+        "@maven//:info_picocli_picocli",
+        "@maven//:io_insert_koin_koin_core_jvm",
+        "@maven//:org_apache_commons_commons_pool2",
+        "@maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core_jvm",
     ],
 )
 
@@ -123,10 +123,10 @@ kt_jvm_library(
     resources = glob(["src/test/resources/**/*"]),
     deps = [
         ":cli-lib",
-        "@bazel_diff_maven//:com_willowtreeapps_assertk_assertk_jvm",
-        "@bazel_diff_maven//:io_insert_koin_koin_test_junit4",
-        "@bazel_diff_maven//:io_insert_koin_koin_test_jvm",
-        "@bazel_diff_maven//:junit_junit",
-        "@bazel_diff_maven//:org_mockito_kotlin_mockito_kotlin",
+        "@maven//:com_willowtreeapps_assertk_assertk_jvm",
+        "@maven//:io_insert_koin_koin_test_junit4",
+        "@maven//:io_insert_koin_koin_test_jvm",
+        "@maven//:junit_junit",
+        "@maven//:org_mockito_kotlin_mockito_kotlin",
     ],
 )

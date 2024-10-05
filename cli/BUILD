@@ -143,6 +143,7 @@ kt_jvm_test(
     }),
     test_class = "com.bazel_diff.e2e.E2ETest",
     runtime_deps = [":cli-test-lib"],
+    data = [":workspaces"],
 )
 
 kt_jvm_test(
@@ -173,5 +174,12 @@ kt_jvm_library(
         "@bazel_diff_maven//:io_insert_koin_koin_test_jvm",
         "@bazel_diff_maven//:junit_junit",
         "@bazel_diff_maven//:org_mockito_kotlin_mockito_kotlin",
+    ],
+)
+
+filegroup(
+    name = "workspaces",
+    srcs = [
+        "src/test/resources/workspaces",
     ],
 )

@@ -43,8 +43,8 @@ load("@rules_jvm_external//:setup.bzl", "rules_jvm_external_setup")
 rules_jvm_external_setup()
 
 load("@rules_jvm_external//:defs.bzl", "maven_install")
-load("//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
 load("@rules_kotlin//kotlin:repositories.bzl", "kotlin_repositories")
+load("//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
 
 kotlin_repositories()
 
@@ -55,7 +55,12 @@ kt_register_toolchains()
 maven_install(
     name = "bazel_diff_maven",
     artifacts = BAZEL_DIFF_MAVEN_ARTIFACTS,
+    maven_install_json = "//:maven_install.json",
     repositories = [
         "https://repo1.maven.org/maven2/",
     ],
 )
+
+load("@bazel_diff_maven//:defs.bzl", "pinned_maven_install")
+
+pinned_maven_install()

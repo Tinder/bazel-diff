@@ -177,9 +177,6 @@ class E2ETest {
         // the only impacted targets.
         val projectA = extractFixtureProject("/fixture/fine-grained-hash-bzlmod-test-1.zip")
         val projectB = extractFixtureProject("/fixture/fine-grained-hash-bzlmod-test-2.zip")
-        println("----------------")
-        println("Testing in workspace: $projectA")
-        println("----------------")
 
         val workingDirectoryA = projectA
         val workingDirectoryB = projectB
@@ -210,11 +207,9 @@ class E2ETest {
         assertThat(actual).isEqualTo(expected)
     }
 
-//     @Ignore("foo")
     @Test
     fun testTargetDistanceMetrics() {
         val workspace = copyTestWorkspace("distance_metrics")
-        println("Testing in workspace: $workspace")
 
         val outputDir = temp.newFolder()
         val from = File(outputDir, "starting_hashes.json")
@@ -239,7 +234,6 @@ class E2ETest {
                 "-o", impactedTargetsOutput.absolutePath, 
         )
 
-        // When computing target distances, the output format is json. Read the files and assert the sorted contents.
         val gson = Gson()
         val shape = object : TypeToken<List<Map<String, Any>>>() {}.type
         val actual = gson.fromJson<List<Map<String, Any>>>(impactedTargetsOutput.readText(), shape).sortedBy { it["label"] as String }
@@ -472,7 +466,6 @@ class E2ETest {
         val testProject = temp.newFolder()
 
         // Copy all of the files in path into a new folder
-        // print the pwd
         val filepath = File("cli/src/test/resources/workspaces", path)
         filepath.walkTopDown().forEach { file ->
             val destFile = File(testProject, file.relativeTo(filepath).path)

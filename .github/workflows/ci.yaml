@@ -7,14 +7,14 @@ on:
     branches: [ master ]
 
 jobs:
-  test-jre11-bzlmod:
+  test-jre21-bzlmod:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '11'
+          java-version: '21'
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
@@ -25,14 +25,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run bazel-diff tests
         run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=true
-  test-jre11:
+  test-jre21:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '11'
+          java-version: '21'
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
@@ -65,7 +65,7 @@ jobs:
       - name: Run bazel-diff example script
         run: ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   deploy:
-    needs: [test-jre11]
+    needs: [test-jre21]
     runs-on: ubuntu-latest
     strategy:
       matrix:

@@ -1,0 +1,15 @@
+{
+    "homepage": "https://github.com/Tinder/bazel-diff",
+    "maintainers": [
+        {
+            "name": "Maxwell Elliott",
+            "email": "elliott.432@buckeyemail.osu.edu",
+            "github": "maxwellE"
+        }
+    ],
+    "repository": [
+        "github:Tinder/bazel-diff"
+    ],
+    "versions": [],
+    "yanked_versions": {}
+}

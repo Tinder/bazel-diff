@@ -1,0 +1,13 @@
+@@//src/main/java/com/integration:guava-user
+@@rules_jvm_external~~maven~com_google_errorprone_error_prone_annotations_2_18_0//file:file
+@@rules_jvm_external~~maven~com_google_guava_guava_32_0_0_jre//file:file
+@@rules_jvm_external~~maven~com_google_j2objc_j2objc_annotations_2_8//file:file
+@@rules_jvm_external~~maven~maven//:com_google_errorprone_error_prone_annotations
+@@rules_jvm_external~~maven~maven//:com_google_errorprone_error_prone_annotations_2_18_0_extension
+@@rules_jvm_external~~maven~maven//:com_google_guava_guava
+@@rules_jvm_external~~maven~maven//:com_google_guava_guava_32_0_0_jre_extension
+@@rules_jvm_external~~maven~maven//:com_google_j2objc_j2objc_annotations
+@@rules_jvm_external~~maven~maven//:com_google_j2objc_j2objc_annotations_2_8_extension
+@@rules_jvm_external~~maven~maven//:org_checkerframework_checker_qual
+@@rules_jvm_external~~maven~maven//:org_checkerframework_checker_qual_3_33_0_extension
+@@rules_jvm_external~~maven~org_checkerframework_checker_qual_3_33_0//file:file

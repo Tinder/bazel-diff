@@ -9,7 +9,7 @@ import org.koin.core.component.inject
 import java.util.concurrent.ConcurrentMap
 import java.nio.file.Path
 
-class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
+class RuleHasher(private val useCquery: Boolean, private val trackDepLabels: Boolean, private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
     private val logger: Logger by inject()
     private val sourceFileHasher: SourceFileHasher by inject()
 
@@ -28,13 +28,13 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
     fun digest(
         rule: BazelRule,
         allRulesMap: Map<String, BazelRule>,
-        ruleHashes: ConcurrentMap<String, ByteArray>,
+        ruleHashes: ConcurrentMap<String, TargetDigest>,
         sourceDigests: ConcurrentMap<String, ByteArray>,
         seedHash: ByteArray?,
         depPath: LinkedHashSet<String>?,
         ignoredAttrs: Set<String>,
         modifiedFilepaths: Set<Path>
-    ): ByteArray {
+    ): TargetDigest {
         val depPathClone = if (depPath != null) LinkedHashSet(depPath) else LinkedHashSet()
         if (depPathClone.contains(rule.name)) {
             throw raiseCircularDependency(depPathClone, rule.name)
@@ -42,17 +42,17 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
         depPathClone.add(rule.name)
         ruleHashes[rule.name]?.let { return it }
 
-        val finalHashValue = sha256 {
-            safePutBytes(rule.digest(ignoredAttrs))
-            safePutBytes(seedHash)
+        val finalHashValue = targetSha256(trackDepLabels) {
+            putDirectBytes(rule.digest(ignoredAttrs))
+            putDirectBytes(seedHash)
 
             for (ruleInput in rule.ruleInputList(useCquery, fineGrainedHashExternalRepos)) {
-                safePutBytes(ruleInput.toByteArray())
+                putDirectBytes(ruleInput.toByteArray())
 
                 val inputRule = allRulesMap[ruleInput]
                 when {
                     inputRule == null && sourceDigests.containsKey(ruleInput) -> {
-                        safePutBytes(sourceDigests[ruleInput])
+                        putDirectBytes(sourceDigests[ruleInput])
                     }
 
                     inputRule?.name != null && inputRule.name != rule.name -> {
@@ -66,7 +66,7 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
                             ignoredAttrs,
                             modifiedFilepaths
                         )
-                        safePutBytes(ruleInputHash)
+                        putTransitiveBytes(ruleInput, ruleInputHash.overallDigest)
                     }
 
                     else -> {
@@ -75,7 +75,7 @@ class RuleHasher(private val useCquery: Boolean, private val fineGrainedHashExte
                             heuristicDigest != null -> {
                                 logger.i { "Source file $ruleInput picked up as an input for rule ${rule.name}" }
                                 sourceDigests[ruleInput] = heuristicDigest
-                                safePutBytes(heuristicDigest)
+                                putDirectBytes(heuristicDigest)
                             }
 
                             else -> logger.w { "Unable to calculate digest for input $ruleInput for rule ${rule.name}" }

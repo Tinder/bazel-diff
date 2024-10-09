@@ -9,7 +9,12 @@ import org.koin.core.qualifier.named
 import java.nio.file.Path
 import java.nio.file.Paths
 
-class SourceFileHasher : KoinComponent {
+interface SourceFileHasher {
+    fun digest(sourceFileTarget: BazelSourceFileTarget, modifiedFilepaths: Set<Path> = emptySet()): ByteArray
+    fun softDigest(sourceFileTarget: BazelSourceFileTarget, modifiedFilepaths: Set<Path> = emptySet()): ByteArray?
+}
+
+class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
     private val workingDirectory: Path
     private val logger: Logger
     private val relativeFilenameToContentHash: Map<String, String>?
@@ -38,9 +43,9 @@ class SourceFileHasher : KoinComponent {
         this.externalRepoResolver = externalRepoResolver
     }
 
-    fun digest(
+    override fun digest(
         sourceFileTarget: BazelSourceFileTarget,
-        modifiedFilepaths: Set<Path> = emptySet()
+        modifiedFilepaths: Set<Path>
     ): ByteArray {
         return sha256 {
             val name = sourceFileTarget.name
@@ -94,7 +99,7 @@ class SourceFileHasher : KoinComponent {
         }
     }
 
-    fun softDigest(sourceFileTarget: BazelSourceFileTarget, modifiedFilepaths: Set<Path> = emptySet()): ByteArray? {
+    override fun softDigest(sourceFileTarget: BazelSourceFileTarget, modifiedFilepaths: Set<Path>): ByteArray? {
         val name = sourceFileTarget.name
         val index = isMainRepo(name)
         if (index == -1) return null

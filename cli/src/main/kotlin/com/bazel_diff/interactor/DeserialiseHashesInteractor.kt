@@ -6,6 +6,7 @@ import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import java.io.File
 import java.io.FileReader
+import com.bazel_diff.hash.TargetHash
 
 class DeserialiseHashesInteractor : KoinComponent {
     private val gson: Gson by inject()
@@ -14,20 +15,28 @@ class DeserialiseHashesInteractor : KoinComponent {
      * @param file path to file that has been pre-validated
      * @param targetTypes the target types to filter. If null, all targets will be returned
      */
-    fun execute(file: File, targetTypes: Set<String>? = null): Map<String, String> {
+    fun executeTargetHash(file: File): Map<String, TargetHash> {
         val shape = object : TypeToken<Map<String, String>>() {}.type
         val result: Map<String, String> = gson.fromJson(FileReader(file), shape)
-        if (targetTypes == null) {
-            return result.mapValues { it.value.substringAfter("#") }
-        } else {
-            val prefixes = targetTypes.map { "${it}#" }.toSet()
-            return result.filter { entry ->
-                if (entry.value.contains("#")) {
-                    prefixes.any { entry.value.startsWith(it) }
-                } else {
-                    throw IllegalStateException("No type info found in ${file}, please re-generate the JSON with --includeTypeTarget!")
-                }
-            }.mapValues { it.value.substringAfter("#") }
-        }
+        return result.mapValues { TargetHash.fromJson(it.value) }
+    }
+
+    /**
+     * Deserializes hashes from the given file.
+     * 
+     * Used for deserializing the content hashes of files, which are represented as
+     * a map of file paths to their content hashes.
+     *
+     * @param file The path to the file that has been pre-validated.
+     * @return A map containing the deserialized hashes.
+     */
+    fun executeSimple(file: File): Map<String, String> {
+        val shape = object : TypeToken<Map<String, String>>() {}.type
+        return gson.fromJson(FileReader(file), shape)
+    }
+
+    fun deserializeDeps(file: File): Map<String, List<String>> {
+        val shape = object : TypeToken<Map<String, List<String>>>() {}.type
+        return gson.fromJson(FileReader(file), shape)
     }
 }

@@ -61,6 +61,46 @@ Open `bazel-diff-example.sh` to see how this is implemented. This is purely an e
 
 * We run `bazel-diff` on the starting and final JSON hash filepaths to get our impacted set of targets. This impacted set of targets is written to a file.
 
+## Build Graph Distance Metrics
+
+`bazel-diff` can optionally compute build graph distance metrics between two revisions. This is
+useful for understanding the impact of a change on the build graph. Directly impacted targets are
+targets that have had their rule attributes or source file dependencies changed. Indirectly impacted
+targets are that are impacted only due to a change in one of their target dependencies.
+
+For each target, the following metrics are computed:
+
+* `target_distance`: The number of dependency hops that it takes to get from an impacted target to a directly impacted target.
+* `package_distance`: The number of dependency hops that cross a package boundary to get from an impacted target to a directly impacted target.
+
+Build graph distance metrics can be used by downstream tools to power features such as:
+
+* Only running sanitizers on impacted tests that are in the same package as a directly impacted target.
+* Only running large-sized tests that are within a few package hops of a directly impacted target.
+* Only running computationally expensive jobs when an impacted target is within a certain distance of a directly impacted target.
+
+To enable this feature, you must generate a dependency mapping on your final revision when computing hashes, then pass it into the `get-impacted-targets` command.
+
+```bash
+git checkout BASE_REV
+bazel-diff generate-hashes [...]
+
+git checkout FINAL_REV
+bazel-diff generate-hashes --depsFile deps.json [...]
+
+bazel-diff get-impacted-targets --depsFile deps.json [...]
+```
+
+This will produce an impacted targets json list with target label, target distance, and package distance:
+
+```text
+[
+  {"label": "//foo:bar", "targetDistance": 0, "packageDistance": 0},
+  {"label": "//foo:baz", "targetDistance": 1, "packageDistance": 0},
+  {"label": "//bar:qux", "targetDistance": 1, "packageDistance": 1}
+]
+```
+
 ## CLI Interface
 
 `bazel-diff` Command
@@ -354,6 +394,13 @@ Now you can simply run `bazel-diff` from your project:
 ```terminal
 bazel run @bazel_diff//:bazel-diff -- bazel-diff -h
 ```
+
+## Learn More
+
+Take a look at the following bazelcon talks to learn more about `bazel-diff`:
+
+* [BazelCon 2023: Improving CI efficiency with Bazel querying and bazel-diff](https://www.youtube.com/watch?v=QYAbmE_1fSo)
+* BazelCon 2024: Not Going the Distance: Filtering Tests by Build Graph Distance: Coming Soon
 
 ## Running the tests
 

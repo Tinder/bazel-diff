@@ -9,6 +9,6 @@ class ContentHashProvider(file: File?) {
 
     private fun readJson(file: File): Map<String, String> {
         val deserialiser = DeserialiseHashesInteractor()
-        return deserialiser.execute(file)
+        return deserialiser.executeSimple(file)
     }
 }

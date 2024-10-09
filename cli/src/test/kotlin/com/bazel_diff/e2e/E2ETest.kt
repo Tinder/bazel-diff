@@ -123,8 +123,7 @@ class E2ETest {
         assertThat(actual).isEqualTo(expected)
     }
 
-    @Test
-    fun testFineGrainedHashBzlMod() {
+    private fun testFineGrainedHashBzlMod(extraGenerateHashesArgs: List<String>, fineGrainedHashExternalRepo: String, expectedResultFile: String) {
         // The difference between these two snapshots is simply upgrading the Guava version.
         // Following is the diff. (The diff on maven_install.json is omitted)
         //
@@ -161,11 +160,11 @@ class E2ETest {
         val cli = CommandLine(BazelDiff())
         //From
         cli.execute(
-                "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", "bazel_diff_maven", from.absolutePath
+                listOf("generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", fineGrainedHashExternalRepo, from.absolutePath) + extraGenerateHashesArgs
         )
         //To
         cli.execute(
-                "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", "bazel_diff_maven", to.absolutePath
+                listOf("generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", fineGrainedHashExternalRepo, to.absolutePath) + extraGenerateHashesArgs
         )
         //Impacted targets
         cli.execute(
@@ -174,9 +173,19 @@ class E2ETest {
 
         val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
         val expected: Set<String> =
-                javaClass.getResourceAsStream("/fixture/fine-grained-hash-bzlmod-test-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+                javaClass.getResourceAsStream(expectedResultFile).use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
         assertThat(actual).isEqualTo(expected)
+    }
+
+    @Test
+    fun testFineGrainedHashBzlMod() {
+        testFineGrainedHashBzlMod(emptyList(), "bazel_diff_maven", "/fixture/fine-grained-hash-bzlmod-test-impacted-targets.txt")
+    }
+
+    @Test
+    fun testFineGrainedHashBzlModCquery() {
+        testFineGrainedHashBzlMod(listOf("--useCquery"), "@rules_jvm_external~~maven~maven", "/fixture/fine-grained-hash-bzlmod-cquery-test-impacted-targets.txt")
     }
 
     // TODO: re-enable the test after https://github.com/bazelbuild/bazel/issues/21010 is fixed

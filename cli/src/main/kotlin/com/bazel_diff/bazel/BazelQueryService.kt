@@ -45,7 +45,7 @@ class BazelQueryService(
         val targets = outputFile.inputStream().buffered().use { proto ->
             if (useCquery) {
                 val cqueryResult = AnalysisProtosV2.CqueryResult.parseFrom(proto)
-                cqueryResult.resultsList.filter { inCompatibleTargetSet(it, compatibleTargetSet) }.map { it.target }
+                cqueryResult.resultsList.filter { it.target.rule.name in compatibleTargetSet }.map { it.target }
             } else {
                 mutableListOf<Build.Target>().apply {
                     while (true) {
@@ -58,15 +58,6 @@ class BazelQueryService(
         }
 
         return targets
-    }
-
-    private fun inCompatibleTargetSet(
-        target: AnalysisProtosV2.ConfiguredTarget,
-        compatibleTargetSet: Set<String>
-    ): Boolean {
-        val name = target.target.rule.name
-        return name in compatibleTargetSet ||
-                name.startsWith("@") && !name.startsWith("@@") && "@${name}" in compatibleTargetSet
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -111,13 +102,7 @@ class BazelQueryService(
                             # printed
                             return ""
                         if "IncompatiblePlatformProvider" not in providers(target):
-                            label = str(target.label)
-                            # normalize label to be consistent with content inside proto
-                            if label.startswith("@//"):
-                                return label[1:]
-                            if label.startswith("@@//"):
-                                return label[2:]
-                            return label
+                            return str(target.label)
                         return ""
                     """.trimIndent())
                     add(cqueryOutputFile.toString())
@@ -137,6 +122,7 @@ class BazelQueryService(
             }
             if (useCquery) {
                 addAll(cqueryOptions)
+                add("--consistent_labels")
             } else {
                 addAll(commandOptions)
             }

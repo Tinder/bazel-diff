@@ -1,2 +1,3 @@
-//src/main/java/com/integration:android
-//src/main/java/com/integration:guava-user
+@@//src/main/java/com/integration:android
+@@//src/main/java/com/integration:android_deployjars_internal_rule
+@@//src/main/java/com/integration:guava-user

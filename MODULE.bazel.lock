@@ -127,7 +127,7 @@
     "@@rules_jvm_external~//:extensions.bzl%maven": {
       "general": {
         "bzlTransitiveDigest": "aME0tyUxYd+PGhICmzT9zEnIgZNf05hZhsfDD5v0JXM=",
-        "usagesDigest": "9DpRpGlkE5wF48B17Rhh+lgvGgC8Bwo86a4lBTR4UWg=",
+        "usagesDigest": "RiESu1RzypJ/tRsAUBEwT8uAvAL02bjB08j6rSK2pT8=",
         "recordedFileInputs": {
           "@@rules_jvm_external~//rules_jvm_external_deps_install.json": "cafb5d2d8119391eb2b322ce3840d3352ea82d496bdb8cbd4b6779ec4d044dda",
           "@@//maven_install.json": "8ab3e635bbd52fcff5900e530933fbdc41c45d1d5b2a2aef8af1becf7a7d0784"
@@ -668,54 +668,6 @@
               "downloaded_file_path": "v1/software/amazon/awssdk/aws-xml-protocol/2.20.128/aws-xml-protocol-2.20.128.jar"
             }
           },
-          "unpinned_maven": {
-            "bzlFile": "@@rules_jvm_external~//:coursier.bzl",
-            "ruleClassName": "coursier_fetch",
-            "attributes": {
-              "user_provided_name": "maven",
-              "repositories": [
-                "{ \"repo_url\": \"https://repo1.maven.org/maven2\" }"
-              ],
-              "artifacts": [
-                "{ \"group\": \"com.google.code.gson\", \"artifact\": \"gson\", \"version\": \"2.9.0\", \"packaging\": \"jar\" }",
-                "{ \"group\": \"com.google.guava\", \"artifact\": \"guava\", \"version\": \"31.1-jre\" }",
-                "{ \"group\": \"com.willowtreeapps.assertk\", \"artifact\": \"assertk-jvm\", \"version\": \"0.25\" }",
-                "{ \"group\": \"info.picocli\", \"artifact\": \"picocli\", \"version\": \"4.6.3\", \"packaging\": \"jar\" }",
-                "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-core-jvm\", \"version\": \"3.1.6\" }",
-                "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-test-junit4\", \"version\": \"4.0.0\" }",
-                "{ \"group\": \"junit\", \"artifact\": \"junit\", \"version\": \"5.11.2\" }",
-                "{ \"group\": \"org.apache.commons\", \"artifact\": \"commons-pool2\", \"version\": \"2.11.1\" }",
-                "{ \"group\": \"org.jetbrains.kotlinx\", \"artifact\": \"kotlinx-coroutines-core\", \"version\": \"1.5.2\" }",
-                "{ \"group\": \"org.mockito.kotlin\", \"artifact\": \"mockito-kotlin\", \"version\": \"5.4.0\" }",
-                "{ \"group\": \"com.google.code.findbugs\", \"artifact\": \"jsr305\", \"version\": \"3.0.2\" }",
-                "{ \"group\": \"com.google.code.gson\", \"artifact\": \"gson\", \"version\": \"2.8.9\" }",
-                "{ \"group\": \"com.google.errorprone\", \"artifact\": \"error_prone_annotations\", \"version\": \"2.3.2\" }",
-                "{ \"group\": \"com.google.j2objc\", \"artifact\": \"j2objc-annotations\", \"version\": \"1.3\" }",
-                "{ \"group\": \"com.google.guava\", \"artifact\": \"guava\", \"version\": \"31.1-jre\" }",
-                "{ \"group\": \"com.google.guava\", \"artifact\": \"guava-testlib\", \"version\": \"31.1-jre\" }",
-                "{ \"group\": \"com.google.truth\", \"artifact\": \"truth\", \"version\": \"1.1.2\" }",
-                "{ \"group\": \"junit\", \"artifact\": \"junit\", \"version\": \"4.13.2\" }",
-                "{ \"group\": \"org.mockito\", \"artifact\": \"mockito-core\", \"version\": \"4.3.1\" }"
-              ],
-              "fail_on_missing_checksum": true,
-              "fetch_sources": false,
-              "fetch_javadoc": false,
-              "excluded_artifacts": [],
-              "generate_compat_repositories": false,
-              "version_conflict_policy": "default",
-              "override_targets": {},
-              "strict_visibility": false,
-              "strict_visibility_value": [
-                "@@//visibility:private"
-              ],
-              "maven_install_json": "@@//:maven_install.json",
-              "resolve_timeout": 600,
-              "use_starlark_android_rules": false,
-              "aar_import_bzl_label": "@build_bazel_rules_android//android:rules.bzl",
-              "duplicate_version_warning": "warn",
-              "ignore_empty_files": false
-            }
-          },
           "software_amazon_awssdk_s3_2_20_128": {
             "bzlFile": "@@bazel_tools//tools/build_defs/repo:http.bzl",
             "ruleClassName": "http_file",
@@ -1156,6 +1108,44 @@
               "downloaded_file_path": "v1/org/jetbrains/annotations/13.0/annotations-13.0.jar"
             }
           },
+          "bazel_diff_maven": {
+            "bzlFile": "@@rules_jvm_external~//:coursier.bzl",
+            "ruleClassName": "pinned_coursier_fetch",
+            "attributes": {
+              "user_provided_name": "bazel_diff_maven",
+              "repositories": [
+                "{ \"repo_url\": \"https://repo1.maven.org/maven2\" }"
+              ],
+              "artifacts": [
+                "{ \"group\": \"com.google.code.gson\", \"artifact\": \"gson\", \"version\": \"2.9.0\", \"packaging\": \"jar\" }",
+                "{ \"group\": \"com.google.guava\", \"artifact\": \"guava\", \"version\": \"31.1-jre\" }",
+                "{ \"group\": \"com.willowtreeapps.assertk\", \"artifact\": \"assertk-jvm\", \"version\": \"0.25\" }",
+                "{ \"group\": \"info.picocli\", \"artifact\": \"picocli\", \"version\": \"4.6.3\", \"packaging\": \"jar\" }",
+                "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-core-jvm\", \"version\": \"3.1.6\" }",
+                "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-test-junit4\", \"version\": \"4.0.0\" }",
+                "{ \"group\": \"junit\", \"artifact\": \"junit\", \"version\": \"5.11.2\" }",
+                "{ \"group\": \"org.apache.commons\", \"artifact\": \"commons-pool2\", \"version\": \"2.11.1\" }",
+                "{ \"group\": \"org.jetbrains.kotlinx\", \"artifact\": \"kotlinx-coroutines-core\", \"version\": \"1.5.2\" }",
+                "{ \"group\": \"org.mockito.kotlin\", \"artifact\": \"mockito-kotlin\", \"version\": \"5.4.0\" }"
+              ],
+              "fetch_sources": false,
+              "fetch_javadoc": false,
+              "generate_compat_repositories": false,
+              "maven_install_json": "@@//:maven_install.json",
+              "override_targets": {},
+              "strict_visibility": false,
+              "strict_visibility_value": [
+                "@@//visibility:private"
+              ],
+              "additional_netrc_lines": [],
+              "fail_if_repin_required": false,
+              "use_starlark_android_rules": false,
+              "aar_import_bzl_label": "@build_bazel_rules_android//android:rules.bzl",
+              "duplicate_version_warning": "warn",
+              "excluded_artifacts": [],
+              "repin_instructions": ""
+            }
+          },
           "commons_logging_commons_logging_1_2": {
             "bzlFile": "@@bazel_tools//tools/build_defs/repo:http.bzl",
             "ruleClassName": "http_file",
@@ -1165,6 +1155,45 @@
                 "https://repo1.maven.org/maven2/commons-logging/commons-logging/1.2/commons-logging-1.2.jar"
               ],
               "downloaded_file_path": "v1/commons-logging/commons-logging/1.2/commons-logging-1.2.jar"
+            }
+          },
+          "unpinned_bazel_diff_maven": {
+            "bzlFile": "@@rules_jvm_external~//:coursier.bzl",
+            "ruleClassName": "coursier_fetch",
+            "attributes": {
+              "user_provided_name": "bazel_diff_maven",
+              "repositories": [
+                "{ \"repo_url\": \"https://repo1.maven.org/maven2\" }"
+              ],
+              "artifacts": [
+                "{ \"group\": \"com.google.code.gson\", \"artifact\": \"gson\", \"version\": \"2.9.0\", \"packaging\": \"jar\" }",
+                "{ \"group\": \"com.google.guava\", \"artifact\": \"guava\", \"version\": \"31.1-jre\" }",
+                "{ \"group\": \"com.willowtreeapps.assertk\", \"artifact\": \"assertk-jvm\", \"version\": \"0.25\" }",
+                "{ \"group\": \"info.picocli\", \"artifact\": \"picocli\", \"version\": \"4.6.3\", \"packaging\": \"jar\" }",
+                "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-core-jvm\", \"version\": \"3.1.6\" }",
+                "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-test-junit4\", \"version\": \"4.0.0\" }",
+                "{ \"group\": \"junit\", \"artifact\": \"junit\", \"version\": \"5.11.2\" }",
+                "{ \"group\": \"org.apache.commons\", \"artifact\": \"commons-pool2\", \"version\": \"2.11.1\" }",
+                "{ \"group\": \"org.jetbrains.kotlinx\", \"artifact\": \"kotlinx-coroutines-core\", \"version\": \"1.5.2\" }",
+                "{ \"group\": \"org.mockito.kotlin\", \"artifact\": \"mockito-kotlin\", \"version\": \"5.4.0\" }"
+              ],
+              "fail_on_missing_checksum": true,
+              "fetch_sources": false,
+              "fetch_javadoc": false,
+              "excluded_artifacts": [],
+              "generate_compat_repositories": false,
+              "version_conflict_policy": "default",
+              "override_targets": {},
+              "strict_visibility": false,
+              "strict_visibility_value": [
+                "@@//visibility:private"
+              ],
+              "maven_install_json": "@@//:maven_install.json",
+              "resolve_timeout": 600,
+              "use_starlark_android_rules": false,
+              "aar_import_bzl_label": "@build_bazel_rules_android//android:rules.bzl",
+              "duplicate_version_warning": "warn",
+              "ignore_empty_files": false
             }
           },
           "com_willowtreeapps_opentest4k_opentest4k_jvm_1_2_2": {
@@ -1404,23 +1433,13 @@
           },
           "maven": {
             "bzlFile": "@@rules_jvm_external~//:coursier.bzl",
-            "ruleClassName": "pinned_coursier_fetch",
+            "ruleClassName": "coursier_fetch",
             "attributes": {
               "user_provided_name": "maven",
               "repositories": [
                 "{ \"repo_url\": \"https://repo1.maven.org/maven2\" }"
               ],
               "artifacts": [
-                "{ \"group\": \"com.google.code.gson\", \"artifact\": \"gson\", \"version\": \"2.9.0\", \"packaging\": \"jar\" }",
-                "{ \"group\": \"com.google.guava\", \"artifact\": \"guava\", \"version\": \"31.1-jre\" }",
-                "{ \"group\": \"com.willowtreeapps.assertk\", \"artifact\": \"assertk-jvm\", \"version\": \"0.25\" }",
-                "{ \"group\": \"info.picocli\", \"artifact\": \"picocli\", \"version\": \"4.6.3\", \"packaging\": \"jar\" }",
-                "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-core-jvm\", \"version\": \"3.1.6\" }",
-                "{ \"group\": \"io.insert-koin\", \"artifact\": \"koin-test-junit4\", \"version\": \"4.0.0\" }",
-                "{ \"group\": \"junit\", \"artifact\": \"junit\", \"version\": \"5.11.2\" }",
-                "{ \"group\": \"org.apache.commons\", \"artifact\": \"commons-pool2\", \"version\": \"2.11.1\" }",
-                "{ \"group\": \"org.jetbrains.kotlinx\", \"artifact\": \"kotlinx-coroutines-core\", \"version\": \"1.5.2\" }",
-                "{ \"group\": \"org.mockito.kotlin\", \"artifact\": \"mockito-kotlin\", \"version\": \"5.4.0\" }",
                 "{ \"group\": \"com.google.code.findbugs\", \"artifact\": \"jsr305\", \"version\": \"3.0.2\" }",
                 "{ \"group\": \"com.google.code.gson\", \"artifact\": \"gson\", \"version\": \"2.8.9\" }",
                 "{ \"group\": \"com.google.errorprone\", \"artifact\": \"error_prone_annotations\", \"version\": \"2.3.2\" }",
@@ -1431,22 +1450,22 @@
                 "{ \"group\": \"junit\", \"artifact\": \"junit\", \"version\": \"4.13.2\" }",
                 "{ \"group\": \"org.mockito\", \"artifact\": \"mockito-core\", \"version\": \"4.3.1\" }"
               ],
+              "fail_on_missing_checksum": true,
               "fetch_sources": false,
               "fetch_javadoc": false,
+              "excluded_artifacts": [],
               "generate_compat_repositories": false,
-              "maven_install_json": "@@//:maven_install.json",
+              "version_conflict_policy": "default",
               "override_targets": {},
               "strict_visibility": false,
               "strict_visibility_value": [
                 "@@//visibility:private"
               ],
-              "additional_netrc_lines": [],
-              "fail_if_repin_required": false,
+              "resolve_timeout": 600,
               "use_starlark_android_rules": false,
               "aar_import_bzl_label": "@build_bazel_rules_android//android:rules.bzl",
               "duplicate_version_warning": "warn",
-              "excluded_artifacts": [],
-              "repin_instructions": ""
+              "ignore_empty_files": false
             }
           },
           "com_google_cloud_google_cloud_core_2_22_0": {

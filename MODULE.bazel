@@ -1,6 +1,6 @@
 module(
     name = "bazel-diff",
-    version = "7.2.13",
+    version = "7.3.0",
     compatibility_level = 0,
 )
 
@@ -10,8 +10,9 @@ bazel_dep(name = "rules_java", version = "7.6.5")
 bazel_dep(name = "rules_kotlin", version = "1.9.1")
 bazel_dep(name = "rules_jvm_external", version = "6.0")
 
-bazel_diff_maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
-bazel_diff_maven.install(
+maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+maven.install(
+    name = "bazel_diff_maven",
     artifacts = [
         "com.google.code.gson:gson:jar:2.9.0",
         "com.google.guava:guava:31.1-jre",
@@ -27,6 +28,6 @@ bazel_diff_maven.install(
     lock_file = "//:maven_install.json",
 )
 use_repo(
-    bazel_diff_maven,
-    bazel_diff_maven = "maven",
+    maven,
+    bazel_diff_maven = "bazel_diff_maven",
 )

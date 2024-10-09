@@ -1,0 +1,32 @@
+matrix:
+  platform:
+  - debian10
+  - ubuntu2004
+  - macos
+  - macos_arm64
+  - windows
+  bazel:
+  - 7.x
+tasks:
+  verify_targets:
+    name: Verify build targets
+    platform: ${{ platform }}
+    bazel: ${{ bazel }}
+    build_targets:
+    - '@bazel-diff//:bazel-diff'
+bcr_test_module:
+  module_path: ""
+  matrix:
+    platform:
+    - ubuntu2004
+    - macos
+    - macos_arm64
+    bazel:
+    - 7.x
+  tasks:
+    run_tests:
+      name: Run test
+      platform: ${{ platform }}
+      bazel: ${{ bazel }}
+      test_targets:
+      - '//cli/...'

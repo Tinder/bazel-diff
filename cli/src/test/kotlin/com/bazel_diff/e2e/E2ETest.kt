@@ -151,8 +151,7 @@ class E2ETest {
         assertThat(actual).isEqualTo(expected)
     }
 
-    @Test
-    fun testFineGrainedHashBzlMod() {
+    private fun testFineGrainedHashBzlMod(extraGenerateHashesArgs: List<String>, fineGrainedHashExternalRepo: String, expectedResultFile: String) {
         // The difference between these two snapshots is simply upgrading the Guava version.
         // Following is the diff. (The diff on maven_install.json is omitted)
         //
@@ -189,11 +188,11 @@ class E2ETest {
         val cli = CommandLine(BazelDiff())
         //From
         cli.execute(
-                "generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", "bazel_diff_maven", from.absolutePath
+                listOf("generate-hashes", "-w", workingDirectoryA.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", fineGrainedHashExternalRepo, from.absolutePath) + extraGenerateHashesArgs
         )
         //To
         cli.execute(
-                "generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", "bazel_diff_maven", to.absolutePath
+                listOf("generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, "--fineGrainedHashExternalRepos", fineGrainedHashExternalRepo, to.absolutePath) + extraGenerateHashesArgs
         )
         //Impacted targets
         cli.execute(
@@ -202,56 +201,19 @@ class E2ETest {
 
         val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
         val expected: Set<String> =
-                javaClass.getResourceAsStream("/fixture/fine-grained-hash-bzlmod-test-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+                javaClass.getResourceAsStream(expectedResultFile).use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
         assertThat(actual).isEqualTo(expected)
     }
 
     @Test
-    fun testTargetDistanceMetrics() {
-        val workspace = copyTestWorkspace("distance_metrics")
+    fun testFineGrainedHashBzlMod() {
+        testFineGrainedHashBzlMod(emptyList(), "bazel_diff_maven", "/fixture/fine-grained-hash-bzlmod-test-impacted-targets.txt")
+    }
 
-        val outputDir = temp.newFolder()
-        val from = File(outputDir, "starting_hashes.json")
-        val to = File(outputDir, "final_hashes.json")
-        val depsFile = File(outputDir, "depEdges.json")
-        val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
-
-        val cli = CommandLine(BazelDiff())
-
-        cli.execute("generate-hashes", "--includeTargetType", "-w", workspace.absolutePath, "-b", "bazel", from.absolutePath)
-        // Modify the workspace
-        File(workspace, "A/one.sh").appendText("foo")
-        cli.execute("generate-hashes", "--includeTargetType", "-w", workspace.absolutePath, "-d", depsFile.absolutePath, "-b", "bazel", to.absolutePath)
-
-        //Impacted targets
-        cli.execute(
-                "get-impacted-targets", 
-                "-sh", from.absolutePath, 
-                "-fh", to.absolutePath, 
-                "-d", depsFile.absolutePath,
-                "-tt", "Rule,GeneratedFile",
-                "-o", impactedTargetsOutput.absolutePath, 
-        )
-
-        val gson = Gson()
-        val shape = object : TypeToken<List<Map<String, Any>>>() {}.type
-        val actual = gson.fromJson<List<Map<String, Any>>>(impactedTargetsOutput.readText(), shape).sortedBy { it["label"] as String }
-        val expected: List<Map<String, Any>> = listOf(
-                mapOf("label" to "//A:one", "targetDistance" to 0.0, "packageDistance" to 0.0),
-                mapOf("label" to "//A:gen_two", "targetDistance" to 1.0, "packageDistance" to 0.0),
-                mapOf("label" to "//A:two.sh", "targetDistance" to 2.0, "packageDistance" to 0.0),
-                mapOf("label" to "//A:two", "targetDistance" to 3.0, "packageDistance" to 0.0),
-                mapOf("label" to "//A:three", "targetDistance" to 4.0, "packageDistance" to 0.0),
-                mapOf("label" to "//:lib", "targetDistance" to 5.0, "packageDistance" to 1.0)
-        )
-
-        assertThat(actual.size).isEqualTo(expected.size)
-
-        expected.forEach { expectedMap ->
-            val actualMap = actual.find { it["label"] == expectedMap["label"] }
-            assertThat(actualMap).isEqualTo(expectedMap)
-        }
+    @Test
+    fun testFineGrainedHashBzlModCquery() {
+        testFineGrainedHashBzlMod(listOf("--useCquery"), "@rules_jvm_external~~maven~maven", "/fixture/fine-grained-hash-bzlmod-cquery-test-impacted-targets.txt")
     }
 
     // TODO: re-enable the test after https://github.com/bazelbuild/bazel/issues/21010 is fixed
@@ -461,6 +423,54 @@ class E2ETest {
 
         assertThat(actual).isEqualTo(expected)
     }
+
+    @Test
+    fun testTargetDistanceMetrics() {
+        val workspace = copyTestWorkspace("distance_metrics")
+
+        val outputDir = temp.newFolder()
+        val from = File(outputDir, "starting_hashes.json")
+        val to = File(outputDir, "final_hashes.json")
+        val depsFile = File(outputDir, "depEdges.json")
+        val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+        val cli = CommandLine(BazelDiff())
+
+        cli.execute("generate-hashes", "--includeTargetType", "-w", workspace.absolutePath, "-b", "bazel", from.absolutePath)
+        // Modify the workspace
+        File(workspace, "A/one.sh").appendText("foo")
+        cli.execute("generate-hashes", "--includeTargetType", "-w", workspace.absolutePath, "-d", depsFile.absolutePath, "-b", "bazel", to.absolutePath)
+
+        //Impacted targets
+        cli.execute(
+                "get-impacted-targets", 
+                "-sh", from.absolutePath, 
+                "-fh", to.absolutePath, 
+                "-d", depsFile.absolutePath,
+                "-tt", "Rule,GeneratedFile",
+                "-o", impactedTargetsOutput.absolutePath, 
+        )
+
+        val gson = Gson()
+        val shape = object : TypeToken<List<Map<String, Any>>>() {}.type
+        val actual = gson.fromJson<List<Map<String, Any>>>(impactedTargetsOutput.readText(), shape).sortedBy { it["label"] as String }
+        val expected: List<Map<String, Any>> = listOf(
+                mapOf("label" to "//A:one", "targetDistance" to 0.0, "packageDistance" to 0.0),
+                mapOf("label" to "//A:gen_two", "targetDistance" to 1.0, "packageDistance" to 0.0),
+                mapOf("label" to "//A:two.sh", "targetDistance" to 2.0, "packageDistance" to 0.0),
+                mapOf("label" to "//A:two", "targetDistance" to 3.0, "packageDistance" to 0.0),
+                mapOf("label" to "//A:three", "targetDistance" to 4.0, "packageDistance" to 0.0),
+                mapOf("label" to "//:lib", "targetDistance" to 5.0, "packageDistance" to 1.0)
+        )
+
+        assertThat(actual.size).isEqualTo(expected.size)
+
+        expected.forEach { expectedMap ->
+            val actualMap = actual.find { it["label"] == expectedMap["label"] }
+            assertThat(actualMap).isEqualTo(expectedMap)
+        }
+    }
+
 
     private fun copyTestWorkspace(path: String): File {
         val testProject = temp.newFolder()

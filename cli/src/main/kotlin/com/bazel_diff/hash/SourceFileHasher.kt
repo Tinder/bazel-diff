@@ -49,8 +49,9 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
     ): ByteArray {
         return sha256 {
             val name = sourceFileTarget.name
-            val filenamePath = if (name.startsWith("//")) {
-                val filenameSubstring = name.substring(2)
+            val index = isMainRepo(name);
+            val filenamePath = if (index != -1) {
+                val filenameSubstring = name.substring(index)
                 Paths.get(filenameSubstring.removePrefix(":").replace(':', '/'))
             } else if (name.startsWith("@")) {
                 val parts = if (name.startsWith("@@")) {
@@ -100,14 +101,28 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
 
     override fun softDigest(sourceFileTarget: BazelSourceFileTarget, modifiedFilepaths: Set<Path>): ByteArray? {
         val name = sourceFileTarget.name
-        if (!name.startsWith("//")) return null
+        val index = isMainRepo(name)
+        if (index == -1) return null
 
-        val filenameSubstring = name.substring(2)
+        val filenameSubstring = name.substring(index)
         val filenamePath = filenameSubstring.replaceFirst(":".toRegex(), "/")
         val absoluteFilePath = Paths.get(workingDirectory.toString(), filenamePath)
         val file = absoluteFilePath.toFile()
         if (!file.exists() || !file.isFile) return null
 
         return digest(sourceFileTarget, modifiedFilepaths)
+    }
+
+    private fun isMainRepo(name: String): Int {
+        if (name.startsWith("//")) {
+            return 2;
+        }
+        if (name.startsWith("@//")) {
+            return 3;
+        }
+        if (name.startsWith("@@//")) {
+            return 4;
+        }
+        return -1;
     }
 }

@@ -1,5 +1,0 @@
-[
-{"label": "//test/java/com/integration:bazel-diff-integration-test-lib", "targetDistance": 0, "packageDistance": 0},
-{"label": "//test/java/com/integration:bazel-diff-integration-tests", "targetDistance": 1, "packageDistance": 0},
-{"label": "//test/java/com/integration:TestStringGenerator.java", "targetDistance": 0, "packageDistance": 0}
-]

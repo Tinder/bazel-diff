@@ -22,7 +22,7 @@ class E2ETest {
 
     private fun CommandLine.execute(args: List<String>) = execute(*args.toTypedArray())
 
-    private fun testE2E(extraGenerateHashesArgs: List<String>, extraGetImpactedTargetsArgs: List<String>, expectedResultFile: String, computeDistances: Boolean = false) {
+    private fun testE2E(extraGenerateHashesArgs: List<String>, extraGetImpactedTargetsArgs: List<String>, expectedResultFile: String) {
         val projectA = extractFixtureProject("/fixture/integration-test-1.zip")
         val projectB = extractFixtureProject("/fixture/integration-test-2.zip")
 
@@ -32,7 +32,6 @@ class E2ETest {
         val outputDir = temp.newFolder()
         val from = File(outputDir, "starting_hashes.json")
         val to = File(outputDir, "final_hashes.json")
-        val depsFile = File(outputDir, "deps.json")
         val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
 
         val cli = CommandLine(BazelDiff())
@@ -42,42 +41,24 @@ class E2ETest {
         )
         //To
         cli.execute(
-                listOf("generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, to.absolutePath) + extraGenerateHashesArgs + if (computeDistances) listOf("-d", depsFile.absolutePath) else emptyList()
+                listOf("generate-hashes", "-w", workingDirectoryB.absolutePath, "-b", bazelPath, to.absolutePath) + extraGenerateHashesArgs
         )
         //Impacted targets
         cli.execute(
-                listOf("get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath) + extraGetImpactedTargetsArgs + if (computeDistances) listOf("-d", depsFile.absolutePath) else emptyList()
+                listOf("get-impacted-targets", "-sh", from.absolutePath, "-fh", to.absolutePath, "-o", impactedTargetsOutput.absolutePath) + extraGetImpactedTargetsArgs
         )
 
-        if (!computeDistances) {
-                val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
-                val expected: Set<String> =
-                        javaClass.getResourceAsStream(expectedResultFile).use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+        val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+        val expected: Set<String> =
+                javaClass.getResourceAsStream(expectedResultFile).use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
-                assertThat(actual).isEqualTo(expected)
-        } else {
-                // When computing target distances, the output format is json. Read the files and assert the sorted contents.
-                val gson = Gson()
-                val shape = object : TypeToken<List<Map<String, Any>>>() {}.type
-                val actual = gson.fromJson<List<Map<String, Any>>>(impactedTargetsOutput.readText(), shape).sortedBy { it["label"] as String }
-                val expected = javaClass.getResourceAsStream(expectedResultFile).use {
-                        gson.fromJson<List<Map<String, Any>>>(it.bufferedReader().readText(), shape).sortedBy { it["label"] as String }
-                }
-
-                assertThat(actual).isEqualTo(expected)
-        }
+        assertThat(actual).isEqualTo(expected)
     }
 
     @Test
     fun testE2E() {
         testE2E(emptyList(), emptyList(), "/fixture/impacted_targets-1-2.txt")
     }
-
-    @Test
-    fun testE2EDistances() {
-        testE2E(emptyList(), emptyList(), "/fixture/impacted_targets_distances-1-2.txt", computeDistances = true)
-    }
-
 
     @Test
     fun testE2EIncludingTargetType() {
@@ -88,12 +69,6 @@ class E2ETest {
     fun testE2EWithTargetType() {
         testE2E(listOf("--includeTargetType"), listOf("-tt", "Rule,SourceFile"), "/fixture/impacted_targets-1-2-rule-sourcefile.txt")
     }
-
-    @Test
-    fun testE2EWithTargetTypeAndDistance() {
-        testE2E(listOf("--includeTargetType"), listOf("-tt", "Rule,SourceFile"), "/fixture/impacted_targets_distances-1-2-rule-sourcefile.txt", computeDistances = true)
-    }
-
 
     @Test
     fun testFineGrainedHashExternalRepo() {

@@ -53,10 +53,7 @@ kt_jvm_test(
 
 kt_jvm_test(
     name = "TargetHashTest",
-    jvm_flags = select({
-        ":macos": ["-Djava.security.manager=allow"],
-        "//conditions:default": [],
-    }),
+    jvm_flags = ["-Djava.security.manager=allow"],
     test_class = "com.bazel_diff.hash.TargetHashTest",
     runtime_deps = [":cli-test-lib"],
 )

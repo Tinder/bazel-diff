@@ -6,7 +6,6 @@ import assertk.assertions.containsExactlyInAnyOrder
 import com.bazel_diff.cli.BazelDiff
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import org.junit.Ignore
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -191,8 +190,6 @@ class E2ETest {
         testFineGrainedHashBzlMod(listOf("--useCquery"), "@rules_jvm_external~~maven~maven", "/fixture/fine-grained-hash-bzlmod-cquery-test-impacted-targets.txt")
     }
 
-    // TODO: re-enable the test after https://github.com/bazelbuild/bazel/issues/21010 is fixed
-    @Ignore("cquery mode is broken with Bazel 7 because --transition=lite is crashes due to https://github.com/bazelbuild/bazel/issues/21010")
     @Test
     fun testUseCqueryWithExternalDependencyChange() {
         // The difference between these two snapshots is simply upgrading the Guava version for Android platform.
@@ -295,8 +292,6 @@ class E2ETest {
         assertThat(actual).isEqualTo(expected)
     }
 
-    // TODO: re-enable the test after https://github.com/bazelbuild/bazel/issues/21010 is fixed
-    @Ignore("cquery mode is broken with Bazel 7 because --transition=lite is crashes due to https://github.com/bazelbuild/bazel/issues/21010")
     @Test
     fun testUseCqueryWithAndroidCodeChange() {
         // The difference between these two snapshots is simply making a code change to Android-only source code.

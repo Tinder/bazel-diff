@@ -2,7 +2,10 @@ package com.bazel_diff.e2e
 
 import assertk.assertThat
 import assertk.assertions.isEqualTo
+import assertk.assertions.containsExactlyInAnyOrder
 import com.bazel_diff.cli.BazelDiff
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -389,6 +392,71 @@ class E2ETest {
         expected = javaClass.getResourceAsStream("/fixture/cquery-test-android-code-change-jre-impacted-targets.txt").use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
         assertThat(actual).isEqualTo(expected)
+    }
+
+    @Test
+    fun testTargetDistanceMetrics() {
+        val workspace = copyTestWorkspace("distance_metrics")
+
+        val outputDir = temp.newFolder()
+        val from = File(outputDir, "starting_hashes.json")
+        val to = File(outputDir, "final_hashes.json")
+        val depsFile = File(outputDir, "depEdges.json")
+        val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+        val cli = CommandLine(BazelDiff())
+
+        cli.execute("generate-hashes", "--includeTargetType", "-w", workspace.absolutePath, "-b", "bazel", from.absolutePath)
+        // Modify the workspace
+        File(workspace, "A/one.sh").appendText("foo")
+        cli.execute("generate-hashes", "--includeTargetType", "-w", workspace.absolutePath, "-d", depsFile.absolutePath, "-b", "bazel", to.absolutePath)
+
+        //Impacted targets
+        cli.execute(
+                "get-impacted-targets", 
+                "-sh", from.absolutePath, 
+                "-fh", to.absolutePath, 
+                "-d", depsFile.absolutePath,
+                "-tt", "Rule,GeneratedFile",
+                "-o", impactedTargetsOutput.absolutePath, 
+        )
+
+        val gson = Gson()
+        val shape = object : TypeToken<List<Map<String, Any>>>() {}.type
+        val actual = gson.fromJson<List<Map<String, Any>>>(impactedTargetsOutput.readText(), shape).sortedBy { it["label"] as String }
+        val expected: List<Map<String, Any>> = listOf(
+                mapOf("label" to "//A:one", "targetDistance" to 0.0, "packageDistance" to 0.0),
+                mapOf("label" to "//A:gen_two", "targetDistance" to 1.0, "packageDistance" to 0.0),
+                mapOf("label" to "//A:two.sh", "targetDistance" to 2.0, "packageDistance" to 0.0),
+                mapOf("label" to "//A:two", "targetDistance" to 3.0, "packageDistance" to 0.0),
+                mapOf("label" to "//A:three", "targetDistance" to 4.0, "packageDistance" to 0.0),
+                mapOf("label" to "//:lib", "targetDistance" to 5.0, "packageDistance" to 1.0)
+        )
+
+        assertThat(actual.size).isEqualTo(expected.size)
+
+        expected.forEach { expectedMap ->
+            val actualMap = actual.find { it["label"] == expectedMap["label"] }
+            assertThat(actualMap).isEqualTo(expectedMap)
+        }
+    }
+
+
+    private fun copyTestWorkspace(path: String): File {
+        val testProject = temp.newFolder()
+
+        // Copy all of the files in path into a new folder
+        val filepath = File("cli/src/test/resources/workspaces", path)
+        filepath.walkTopDown().forEach { file ->
+            val destFile = File(testProject, file.relativeTo(filepath).path)
+            if (file.isDirectory) {
+                destFile.mkdirs()
+            } else {
+                file.copyTo(destFile)
+            }
+        }
+        return testProject
+
     }
 
     private fun extractFixtureProject(path: String): File {

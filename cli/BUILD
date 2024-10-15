@@ -52,6 +52,14 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "TargetHashTest",
+    jvm_flags = ["-Djava.security.manager=allow"],
+    test_class = "com.bazel_diff.hash.TargetHashTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+
+kt_jvm_test(
     name = "SourceFileHasherTest",
     data = [
         ":src/test/kotlin/com/bazel_diff/hash/fixture/foo.ts",
@@ -101,6 +109,7 @@ kt_jvm_test(
     jvm_flags = ["-Djava.security.manager=allow"],
     test_class = "com.bazel_diff.e2e.E2ETest",
     runtime_deps = [":cli-test-lib"],
+    data = [":workspaces"],
 )
 
 kt_jvm_test(
@@ -128,5 +137,12 @@ kt_jvm_library(
         "@bazel_diff_maven//:io_insert_koin_koin_test_jvm",
         "@bazel_diff_maven//:junit_junit",
         "@bazel_diff_maven//:org_mockito_kotlin_mockito_kotlin",
+    ],
+)
+
+filegroup(
+    name = "workspaces",
+    srcs = [
+        "src/test/resources/workspaces",
     ],
 )

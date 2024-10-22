@@ -122,6 +122,7 @@ Commands:
 
 ```terminal
 Usage: bazel-diff generate-hashes [-hkvV] [--[no-]useCquery] [-b=<bazelPath>]
+                                  [--[no-]excludeExternalTargets]
                                   [--[no-]includeTargetType]
                                   [--contentHashPath=<contentHashPath>]
                                   [-s=<seedFilepaths>] -w=<workspacePath>
@@ -151,7 +152,11 @@ workspace.
                                   "//cli:bazel-diff_deploy.jar": "GeneratedFile#4ae310f8ad2bc728934e3509b6102ca658e828b9cd668f79990e95c6663f9633",
                                   ...
                                 }
-      ----[no-]includeTargetType
+      --[no-]excludeExternalTargets
+                          If true, exclude external targets. This must be
+                            switched on when using `--noenable_workspace` Bazel
+                            command line option. Defaults to `false`.
+      --[no-]includeTargetType
                           Whether include target type in the generated JSON or not.
                             If false, the generate JSON schema is: {"<target>": "<sha256>"}
                             If true, the generate JSON schema is: {"<target>": "<type>#<sha256>"

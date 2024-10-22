@@ -150,6 +150,14 @@ class GenerateHashesCommand : Callable<Int> {
     )
     var modifiedFilepaths: File? = null
 
+    @CommandLine.Option(
+        names = ["--excludeExternalTargets"],
+        negatable = true,
+        description = ["If true, exclude external targets. This must be switched on when using `--noenable_workspace` Bazel command line option. Defaults to `false`."],
+        scope = CommandLine.ScopeType.INHERIT
+    )
+    var excludeExternalTargets = false
+
     @CommandLine.Spec
     lateinit var spec: CommandLine.Model.CommandSpec
 
@@ -169,6 +177,7 @@ class GenerateHashesCommand : Callable<Int> {
                     keepGoing,
                     depsMappingJSONPath != null,
                     fineGrainedHashExternalRepos,
+                    excludeExternalTargets,
                 ),
                 loggingModule(parent.verbose),
                 serialisationModule(),

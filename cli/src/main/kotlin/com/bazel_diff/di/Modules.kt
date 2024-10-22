@@ -30,6 +30,7 @@ fun hasherModule(
         keepGoing: Boolean,
         trackDeps: Boolean,
         fineGrainedHashExternalRepos: Set<String>,
+        excludeExternalTargets: Boolean,
 ): Module = module {
     val cmd: MutableList<String> = ArrayList<String>().apply {
             add(bazelPath.toString())
@@ -59,7 +60,7 @@ fun hasherModule(
                 debug
         )
     }
-    single { BazelClient(useCquery, fineGrainedHashExternalRepos) }
+    single { BazelClient(useCquery, fineGrainedHashExternalRepos, excludeExternalTargets) }
     single { BuildGraphHasher(get()) }
     single { TargetHasher() }
     single { RuleHasher(useCquery, trackDeps, fineGrainedHashExternalRepos) }

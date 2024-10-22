@@ -6,14 +6,18 @@ import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import java.util.Calendar
 
-class BazelClient(private val useCquery: Boolean, private val fineGrainedHashExternalRepos: Set<String>) : KoinComponent {
+class BazelClient(
+        private val useCquery: Boolean,
+        private val fineGrainedHashExternalRepos: Set<String>,
+        private val excludeExternalTargets: Boolean
+) : KoinComponent {
     private val logger: Logger by inject()
     private val queryService: BazelQueryService by inject()
 
     suspend fun queryAllTargets(): List<BazelTarget> {
         val queryEpoch = Calendar.getInstance().getTimeInMillis()
 
-        val repoTargetsQuery = listOf("//external:all-targets")
+        val repoTargetsQuery = if (excludeExternalTargets) emptyList() else listOf("//external:all-targets")
         val targets = if (useCquery) {
             // Explicitly listing external repos here sometimes causes issues mentioned at
             // https://bazel.build/query/cquery#recursive-target-patterns. Hence, we query all dependencies with `deps`

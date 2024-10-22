@@ -64,3 +64,17 @@ maven_install(
 load("@bazel_diff_maven//:defs.bzl", "pinned_maven_install")
 
 pinned_maven_install()
+
+load("@aspect_bazel_lib//lib:repositories.bzl", "aspect_bazel_lib_dependencies")
+
+aspect_bazel_lib_dependencies()
+
+load(
+    "@aspect_rules_lint//format:repositories.bzl",
+    "fetch_ktfmt",
+    "rules_lint_dependencies",
+)
+
+rules_lint_dependencies()
+
+fetch_ktfmt()

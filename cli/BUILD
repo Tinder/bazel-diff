@@ -1,3 +1,4 @@
+load("@aspect_rules_lint//format:defs.bzl", "format_multirun")
 load("@rules_java//java:defs.bzl", "java_binary")
 load("@rules_kotlin//kotlin:jvm.bzl", "kt_jvm_library", "kt_jvm_test")
 
@@ -58,7 +59,6 @@ kt_jvm_test(
     runtime_deps = [":cli-test-lib"],
 )
 
-
 kt_jvm_test(
     name = "SourceFileHasherTest",
     data = [
@@ -106,10 +106,10 @@ kt_jvm_test(
 
 kt_jvm_test(
     name = "E2ETest",
+    data = [":workspaces"],
     jvm_flags = ["-Djava.security.manager=allow"],
     test_class = "com.bazel_diff.e2e.E2ETest",
     runtime_deps = [":cli-test-lib"],
-    data = [":workspaces"],
 )
 
 kt_jvm_test(
@@ -145,4 +145,16 @@ filegroup(
     srcs = [
         "src/test/resources/workspaces",
     ],
+)
+
+java_binary(
+    name = "ktfmt",
+    main_class = "com.facebook.ktfmt.cli.Main",
+    runtime_deps = ["@ktfmt//jar"],
+)
+
+format_multirun(
+    name = "format",
+    kotlin = ":ktfmt",
+    visibility = ["//visibility:public"],
 )

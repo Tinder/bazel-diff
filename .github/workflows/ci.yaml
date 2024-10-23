@@ -23,8 +23,12 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
+      - name: Write BuildBuddy config
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: echo "build:bb --remote_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY" > /tmp/bb.bazelrc
       - name: Run bazel-diff tests
-        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=true
+        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=true --config=bb
   test-jre21:
     runs-on: ubuntu-latest
     steps:
@@ -41,8 +45,12 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
+      - name: Write BuildBuddy config
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: echo "build:bb --remote_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY" > /tmp/bb.bazelrc
       - name: Run bazel-diff tests
-        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=false
+        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=false --config=bb
   test-jre11-run-example:
     runs-on: ubuntu-latest
     steps:
@@ -85,8 +93,12 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
+      - name: Write BuildBuddy config
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: echo "build:bb --remote_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY" > /tmp/bb.bazelrc
       - name: Build deployable JAR
-        run: ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar
+        run: ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar --config=bb
       - uses: actions/upload-artifact@v4
         with:
           name: bazel-diff_deploy.jar

@@ -3,6 +3,7 @@ build:bb --bes_backend=grpcs://remote.buildbuddy.io
 build:bb --remote_cache=grpcs://remote.buildbuddy.io
 build:bb --remote_timeout=3600
 build:bb --experimental_remote_cache_compression
+build:bb --experimental_remote_cache_compression_threshold=100
 build:bb --workspace_status_command=$(pwd)/workspace_status.sh
 
 run -c opt --show_loading_progress=false --show_progress=false --ui_event_filters=error

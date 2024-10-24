@@ -1,3 +1,11 @@
+@@//src/main/java/com/integration:GuavaUserAndroid.java
 @@//src/main/java/com/integration:android
+@@//src/main/java/com/integration:android-src.jar
+@@//src/main/java/com/integration:android.jar
+@@//src/main/java/com/integration:android_deploy-src.jar
+@@//src/main/java/com/integration:android_deploy.jar
+@@//src/main/java/com/integration:android_deploy.jar.unstripped
 @@//src/main/java/com/integration:android_deployjars_internal_rule
 @@//src/main/java/com/integration:guava-user
+@@//src/main/java/com/integration:libguava-user-src.jar
+@@//src/main/java/com/integration:libguava-user.jar

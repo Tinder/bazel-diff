@@ -24,7 +24,7 @@ class BazelQueryService(
 ) : KoinComponent {
   private val logger: Logger by inject()
 
-  suspend fun query(query: String, useCquery: Boolean = false): List<Build.Target> {
+  suspend fun query(query: String, useCquery: Boolean = false): List<BazelTarget> {
     // Unfortunately, there is still no direct way to tell if a target is compatible or not with the
     // proto output
     // by itself. So we do an extra cquery with the trick at
@@ -46,16 +46,18 @@ class BazelQueryService(
           if (useCquery) {
             val cqueryResult = AnalysisProtosV2.CqueryResult.parseFrom(proto)
             cqueryResult.resultsList
-                .filter { it.target.rule.name in compatibleTargetSet }
-                .map { it.target }
+                .mapNotNull { toBazelTarget(it.target) }
+                .filter { it.name in compatibleTargetSet }
           } else {
-            mutableListOf<Build.Target>().apply {
-              while (true) {
-                val target = Build.Target.parseDelimitedFrom(proto) ?: break
-                // EOF
-                add(target)
-              }
-            }
+            mutableListOf<Build.Target>()
+                .apply {
+                  while (true) {
+                    val target = Build.Target.parseDelimitedFrom(proto) ?: break
+                    // EOF
+                    add(target)
+                  }
+                }
+                .mapNotNull { toBazelTarget(it) }
           }
         }
 
@@ -102,8 +104,6 @@ class BazelQueryService(
                   """
                     def format(target):
                         if providers(target) == None:
-                            # skip printing non-target results. That is, source files and generated files won't be
-                            # printed
                             return ""
                         if "IncompatiblePlatformProvider" not in providers(target):
                             return str(target.label)
@@ -151,5 +151,17 @@ class BazelQueryService(
     if (result.resultCode != 0)
         throw RuntimeException("Bazel query failed, exit code ${result.resultCode}")
     return outputFile
+  }
+
+  private fun toBazelTarget(target: Build.Target): BazelTarget? {
+    return when (target.type) {
+      Build.Target.Discriminator.RULE -> BazelTarget.Rule(target)
+      Build.Target.Discriminator.SOURCE_FILE -> BazelTarget.SourceFile(target)
+      Build.Target.Discriminator.GENERATED_FILE -> BazelTarget.GeneratedFile(target)
+      else -> {
+        logger.w { "Unsupported target type in the build graph: ${target.type.name}" }
+        null
+      }
+    }
   }
 }

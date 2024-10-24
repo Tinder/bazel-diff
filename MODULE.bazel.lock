@@ -121,7 +121,7 @@
     "//:extensions.bzl%non_module_repositories": {
       "general": {
         "bzlTransitiveDigest": "9kscpNTrmoEECh40kS6bqcncGbg5lZ8bpWLxD8wpc2Q=",
-        "usagesDigest": "ejjWPqMitcgyuDICIqqUvoCye7p0Q38k82XOu8kAoAQ=",
+        "usagesDigest": "DDFd+LlZwLVs1afOYeXN3SocjEs4laj7J7cU6ge7638=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
@@ -839,7 +839,7 @@
     "@@rules_jvm_external~//:extensions.bzl%maven": {
       "general": {
         "bzlTransitiveDigest": "aME0tyUxYd+PGhICmzT9zEnIgZNf05hZhsfDD5v0JXM=",
-        "usagesDigest": "geYwYc8WoHCKRf1SyKGOPa0WlCCzxl3cSi/qy3CJRB8=",
+        "usagesDigest": "va4wz9/+kBRMD8ybggV5KVZ07lxkkrptBxSSzHeX3/4=",
         "recordedFileInputs": {
           "@@rules_jvm_external~//rules_jvm_external_deps_install.json": "cafb5d2d8119391eb2b322ce3840d3352ea82d496bdb8cbd4b6779ec4d044dda",
           "@@//maven_install.json": "8ab3e635bbd52fcff5900e530933fbdc41c45d1d5b2a2aef8af1becf7a7d0784"

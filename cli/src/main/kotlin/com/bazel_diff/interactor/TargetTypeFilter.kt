@@ -14,7 +14,7 @@ class TargetTypeFilter(
     val targetHash = targets[label]!!
     if (!targetHash.hasType()) {
       throw IllegalStateException(
-          "No target type info found, please re-generate the target hashes JSON with --includeTypeTarget!")
+          "No target type info found, please re-generate the target hashes JSON with --includeTargetType!")
     }
     return targetTypes.contains(targetHash.type)
   }

@@ -1,9 +1,9 @@
 package com.bazel_diff.bazel
 
 import com.bazel_diff.log.Logger
-import java.util.Calendar
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
+import java.util.Calendar
 
 class BazelClient(
     private val useCquery: Boolean,
@@ -35,10 +35,6 @@ class BazelClient(
           // In addition, we must include all source dependencies in this query in order for them to
           // show up in
           // `configuredRuleInput`. Hence, one must not filter them out with `kind(rule, deps(..))`.
-          // However, these
-          // source targets are omitted inside BazelQueryService with the custom starlark function
-          // used to print
-          // labels.
           (queryService.query("deps(//...:all-targets)", useCquery = true) +
                   queryService.query(repoTargetsQuery.joinToString(" + ") { "'$it'" }))
               .distinctBy { it.name }

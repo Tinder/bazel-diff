@@ -86,9 +86,9 @@ git checkout BASE_REV
 bazel-diff generate-hashes [...]
 
 git checkout FINAL_REV
-bazel-diff generate-hashes --depsFile deps.json [...]
+bazel-diff generate-hashes --depEdgesFile deps.json [...]
 
-bazel-diff get-impacted-targets --depsFile deps.json [...]
+bazel-diff get-impacted-targets --depEdgesFile deps.json [...]
 ```
 
 This will produce an impacted targets json list with target label, target distance, and package distance:

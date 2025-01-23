@@ -1,6 +1,6 @@
 module(
     name = "bazel-diff",
-    version = "8.1.4",
+    version = "8.1.6",
     compatibility_level = 0,
 )
 

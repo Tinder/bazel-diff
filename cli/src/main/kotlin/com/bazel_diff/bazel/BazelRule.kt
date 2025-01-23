@@ -37,9 +37,7 @@ class BazelRule(private val rule: Build.Rule) {
               .filter { it.startsWith("//external:") }
               .distinct()
     } else {
-      rule.ruleInputList.map { ruleInput: String ->
-        transformRuleInput(fineGrainedHashExternalRepos, ruleInput)
-      }
+      rule.ruleInputList
     }
   }
 

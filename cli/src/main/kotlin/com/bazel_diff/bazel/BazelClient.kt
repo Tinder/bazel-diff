@@ -1,9 +1,9 @@
 package com.bazel_diff.bazel
 
 import com.bazel_diff.log.Logger
+import java.util.Calendar
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
-import java.util.Calendar
 
 class BazelClient(
     private val useCquery: Boolean,

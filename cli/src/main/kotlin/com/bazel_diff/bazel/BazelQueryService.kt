@@ -106,6 +106,9 @@ class BazelQueryService(
                         if providers(target) == None:
                             return ""
                         if "IncompatiblePlatformProvider" not in providers(target):
+                            target_repr = repr(target)
+                            if "<alias target" in target_repr:
+                                return target_repr.split(" ")[2]
                             return str(target.label)
                         return ""
                     """

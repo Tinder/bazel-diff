@@ -185,13 +185,15 @@ workspace.
                             By default, external repos are treated as an opaque
                             blob. If an external repo is specified here,
                             bazel-diff instead computes the hash for individual
-                            targets. For example, one wants to specify `maven`
-                            here if they user rules_jvm_external so that
+                            targets. For example, one wants to specify `@maven`
+                            here if they use rules_jvm_external so that
                             individual third party dependency change won't
                             invalidate all targets in the mono repo. Note that
-                            when `--useCquery` is used, the canonical repo name
-                            must be provided but with single `@`, e.g.
-                            `@rules_jvm_external~~maven~maven`
+                            if `--useCquery` is true; or `--useCquery` is false but
+                            `--bazelCommandOptions=--consistent_labels` is provided,
+                            the canonical repo name must be provided,
+                            e.g. `@@maven` or `@@rules_jvm_external~~maven~maven` (bzlmod)
+                            instead of apparent name `@maven`
   -h, --help              Show this help message and exit.
       --ignoredRuleHashingAttributes=<ignoredRuleHashingAttributes>
                           Attributes that should be ignored when hashing rule

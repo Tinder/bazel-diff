@@ -25,7 +25,7 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
   private val workingDirectory: Path
   private val logger: Logger
   private val relativeFilenameToContentHash: Map<String, String>?
-  private val fineGrainedHashExternalRepos: Set<String>
+  private val fineGrainedHashExternalRepoNames: Set<String>
   private val externalRepoResolver: ExternalRepoResolver
 
   init {
@@ -38,7 +38,8 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
     this.workingDirectory = workingDirectory
     val contentHashProvider: ContentHashProvider by inject()
     relativeFilenameToContentHash = contentHashProvider.filenameToHash
-    this.fineGrainedHashExternalRepos = fineGrainedHashExternalRepos
+    this.fineGrainedHashExternalRepoNames =
+        fineGrainedHashExternalRepos.map { it.replaceFirst("@+".toRegex(), "") }.toSet()
     val externalRepoResolver: ExternalRepoResolver by inject()
     this.externalRepoResolver = externalRepoResolver
   }
@@ -51,7 +52,8 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
   ) {
     this.workingDirectory = workingDirectory
     this.relativeFilenameToContentHash = relativeFilenameToContentHash
-    this.fineGrainedHashExternalRepos = fineGrainedHashExternalRepos
+    this.fineGrainedHashExternalRepoNames =
+        fineGrainedHashExternalRepos.map { it.replaceFirst("@+".toRegex(), "") }.toSet()
     this.externalRepoResolver = externalRepoResolver
   }
 
@@ -67,18 +69,13 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
             val filenameSubstring = name.substring(index)
             Paths.get(filenameSubstring.removePrefix(":").replace(':', '/'))
           } else if (name.startsWith("@")) {
-            val parts =
-                if (name.startsWith("@@")) {
-                  name.substring(2).split("//")
-                } else {
-                  name.substring(1).split("//")
-                }
+            val parts = name.replaceFirst("@+".toRegex(), "").split("//")
             if (parts.size != 2) {
               logger.w { "Invalid source label $name" }
               return@sha256
             }
             val repoName = parts[0]
-            if (repoName !in fineGrainedHashExternalRepos) {
+            if (repoName !in fineGrainedHashExternalRepoNames) {
               return@sha256
             }
             val relativePath = Paths.get(parts[1].removePrefix(":").replace(':', '/'))

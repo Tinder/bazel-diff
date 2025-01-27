@@ -26,8 +26,9 @@ jobs:
           repository: tinder-maxwellelliott/bazel-diff-repro-1
           ref: master
           fetch-depth: 0
+      - name: Set bazel version
+        run: echo "USE_BAZEL_VERSION=7.3.1" > "~/.bazeliskrc"
       - name: Run External Target Impact test
         run: ./bazel-diff.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
       - name: Validate Impacted Targets
         run: grep -q "//:yo" /tmp/impacted_targets.txt
-

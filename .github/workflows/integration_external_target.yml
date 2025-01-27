@@ -27,7 +27,7 @@ jobs:
           ref: master
           fetch-depth: 0
       - name: Set bazel version
-        run: echo "USE_BAZEL_VERSION=7.3.1" > "~/.bazeliskrc"
+        run: echo "USE_BAZEL_VERSION=7.3.1" > "$HOME/.bazeliskrc"
       - name: Run External Target Impact test
         run: ./bazel-diff.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
       - name: Validate Impacted Targets

@@ -41,7 +41,7 @@ class BazelClient(
         } else {
           val buildTargetsQuery =
               listOf("//...:all-targets") +
-                  fineGrainedHashExternalRepos.map { "@$it//...:all-targets" }
+                  fineGrainedHashExternalRepos.map { "$it//...:all-targets" }
           queryService.query((repoTargetsQuery + buildTargetsQuery).joinToString(" + ") { "'$it'" })
         }
     val queryDuration = Calendar.getInstance().getTimeInMillis() - queryEpoch

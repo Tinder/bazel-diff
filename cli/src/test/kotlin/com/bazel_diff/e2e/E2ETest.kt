@@ -138,7 +138,7 @@ class E2ETest {
         "-b",
         bazelPath,
         "--fineGrainedHashExternalRepos",
-        "bazel_diff_maven",
+        "@bazel_diff_maven",
         from.absolutePath)
     // To
     cli.execute(
@@ -148,7 +148,7 @@ class E2ETest {
         "-b",
         bazelPath,
         "--fineGrainedHashExternalRepos",
-        "bazel_diff_maven",
+        "@bazel_diff_maven",
         to.absolutePath)
     // Impacted targets
     cli.execute(
@@ -254,7 +254,7 @@ class E2ETest {
   fun testFineGrainedHashBzlMod() {
     testFineGrainedHashBzlMod(
         emptyList(),
-        "bazel_diff_maven",
+        "@bazel_diff_maven",
         "/fixture/fine-grained-hash-bzlmod-test-impacted-targets.txt")
   }
 
@@ -262,7 +262,7 @@ class E2ETest {
   fun testFineGrainedHashBzlModCquery() {
     testFineGrainedHashBzlMod(
         listOf("--useCquery"),
-        "@rules_jvm_external~~maven~maven",
+        "@@rules_jvm_external~~maven~maven",
         "/fixture/fine-grained-hash-bzlmod-cquery-test-impacted-targets.txt")
   }
 
@@ -345,7 +345,7 @@ class E2ETest {
         "--cqueryCommandOptions",
         "--platforms=//:android",
         "--fineGrainedHashExternalRepos",
-        "bazel_diff_maven,bazel_diff_maven_android",
+        "@@bazel_diff_maven,@@bazel_diff_maven_android",
         from.absolutePath)
     // To
     cli.execute(
@@ -358,7 +358,7 @@ class E2ETest {
         "--cqueryCommandOptions",
         "--platforms=//:android",
         "--fineGrainedHashExternalRepos",
-        "bazel_diff_maven,bazel_diff_maven_android",
+        "@@bazel_diff_maven,@@bazel_diff_maven_android",
         to.absolutePath)
     // Impacted targets
     cli.execute(
@@ -391,7 +391,7 @@ class E2ETest {
         "--cqueryCommandOptions",
         "--platforms=//:jre",
         "--fineGrainedHashExternalRepos",
-        "bazel_diff_maven,bazel_diff_maven_android",
+        "@@bazel_diff_maven,@@bazel_diff_maven_android",
         from.absolutePath)
     // To
     cli.execute(
@@ -404,7 +404,7 @@ class E2ETest {
         "--cqueryCommandOptions",
         "--platforms=//:jre",
         "--fineGrainedHashExternalRepos",
-        "bazel_diff_maven,bazel_diff_maven_android",
+        "@@bazel_diff_maven,@@bazel_diff_maven_android",
         to.absolutePath)
     // Impacted targets
     cli.execute(
@@ -505,7 +505,7 @@ class E2ETest {
         "--cqueryCommandOptions",
         "--platforms=//:android",
         "--fineGrainedHashExternalRepos",
-        "bazel_diff_maven,bazel_diff_maven_android",
+        "@@bazel_diff_maven,@@bazel_diff_maven_android",
         from.absolutePath)
     // To
     cli.execute(
@@ -518,7 +518,7 @@ class E2ETest {
         "--cqueryCommandOptions",
         "--platforms=//:android",
         "--fineGrainedHashExternalRepos",
-        "bazel_diff_maven,bazel_diff_maven_android",
+        "@@bazel_diff_maven,@@bazel_diff_maven_android",
         to.absolutePath)
     // Impacted targets
     cli.execute(
@@ -552,7 +552,7 @@ class E2ETest {
         "--cqueryCommandOptions",
         "--platforms=//:jre",
         "--fineGrainedHashExternalRepos",
-        "bazel_diff_maven,bazel_diff_maven_android",
+        "@@bazel_diff_maven,@@bazel_diff_maven_android",
         from.absolutePath)
     // To
     cli.execute(
@@ -565,7 +565,7 @@ class E2ETest {
         "--cqueryCommandOptions",
         "--platforms=//:jre",
         "--fineGrainedHashExternalRepos",
-        "bazel_diff_maven,bazel_diff_maven_android",
+        "@@bazel_diff_maven,@@bazel_diff_maven_android",
         to.absolutePath)
     // Impacted targets
     cli.execute(

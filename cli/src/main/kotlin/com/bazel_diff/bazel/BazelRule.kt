@@ -49,9 +49,7 @@ class BazelRule(private val rule: Build.Rule) {
   ): String {
     if (isNotMainRepo(ruleInput) &&
         ruleInput.startsWith("@") &&
-        fineGrainedHashExternalRepos.none {
-          ruleInput.startsWith("@$it") || ruleInput.startsWith("@@${it}")
-        }) {
+        fineGrainedHashExternalRepos.none { ruleInput.startsWith(it) }) {
       val splitRule = ruleInput.split("//".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
       if (splitRule.size == 2) {
         var externalRule = splitRule[0]

@@ -3,13 +3,15 @@ Methods to assist in loading dependencies for bazel-diff in WORKSPACE files
 """
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-load("//:constants.bzl", "RULES_JVM_EXTERNAL_SHA", "RULES_JVM_EXTERNAL_TAG", "RULES_KOTLIN_SHA", "RULES_KOTLIN_VERSION")
+load("//:constants.bzl", "RULES_JAVA_INTEGRITY", "RULES_JAVA_VERSION", "RULES_JVM_EXTERNAL_SHA", "RULES_JVM_EXTERNAL_TAG", "RULES_KOTLIN_SHA", "RULES_KOTLIN_VERSION")
 
 def _maybe(repo_rule, name, **kwargs):
     if not native.existing_rule(name):
         repo_rule(name = name, **kwargs)
 
 def bazel_diff_dependencies(
+        rules_java_version = RULES_JAVA_VERSION,
+        rules_java_integrity = RULES_JAVA_INTEGRITY,
         rules_jvm_external_tag = RULES_JVM_EXTERNAL_TAG,
         rules_jvm_external_sha = RULES_JVM_EXTERNAL_SHA,
         rules_kotlin_version = RULES_KOTLIN_VERSION,
@@ -64,9 +66,9 @@ def bazel_diff_dependencies(
         http_archive,
         name = "rules_java",
         urls = [
-            "https://github.com/bazelbuild/rules_java/releases/download/7.5.0/rules_java-7.5.0.tar.gz",
+            "https://github.com/bazelbuild/rules_java/releases/download/%s/rules_java-%s.tar.gz" % (rules_java_version, rules_java_version),
         ],
-        sha256 = "4da3761f6855ad916568e2bfe86213ba6d2637f56b8360538a7fb6125abf6518",
+        integrity = rules_java_integrity,
     )
 
     _maybe(
@@ -98,4 +100,14 @@ def bazel_diff_dependencies(
         sha256 = "7d5feef9ad85f0ba78cc5757a9478f8fa99c58a8cabc1660d610b291dc242e9b",
         strip_prefix = "rules_lint-1.0.2",
         url = "https://github.com/aspect-build/rules_lint/releases/download/v1.0.2/rules_lint-v1.0.2.tar.gz",
+    )
+
+    _maybe(
+        http_archive,
+        name = "rules_license",
+        urls = [
+            "https://mirror.bazel.build/github.com/bazelbuild/rules_license/releases/download/1.0.0/rules_license-1.0.0.tar.gz",
+            "https://github.com/bazelbuild/rules_license/releases/download/1.0.0/rules_license-1.0.0.tar.gz",
+        ],
+        sha256 = "26d4021f6898e23b82ef953078389dd49ac2b5618ac564ade4ef87cced147b38",
     )

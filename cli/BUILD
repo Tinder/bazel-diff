@@ -45,7 +45,7 @@ kt_jvm_library(
 
 kt_jvm_test(
     name = "BuildGraphHasherTest",
-    jvm_flags = ["-Djava.security.manager=allow"] + [
+    jvm_flags = [
         "-Dnet.bytebuddy.experimental=true",
     ],
     test_class = "com.bazel_diff.hash.BuildGraphHasherTest",
@@ -54,7 +54,6 @@ kt_jvm_test(
 
 kt_jvm_test(
     name = "TargetHashTest",
-    jvm_flags = ["-Djava.security.manager=allow"],
     test_class = "com.bazel_diff.hash.TargetHashTest",
     runtime_deps = [":cli-test-lib"],
 )
@@ -64,42 +63,36 @@ kt_jvm_test(
     data = [
         ":src/test/kotlin/com/bazel_diff/hash/fixture/foo.ts",
     ],
-    jvm_flags = ["-Djava.security.manager=allow"],
     test_class = "com.bazel_diff.hash.SourceFileHasherTest",
     runtime_deps = [":cli-test-lib"],
 )
 
 kt_jvm_test(
     name = "CalculateImpactedTargetsInteractorTest",
-    jvm_flags = ["-Djava.security.manager=allow"],
     test_class = "com.bazel_diff.interactor.CalculateImpactedTargetsInteractorTest",
     runtime_deps = [":cli-test-lib"],
 )
 
 kt_jvm_test(
     name = "NormalisingPathConverterTest",
-    jvm_flags = ["-Djava.security.manager=allow"],
     test_class = "com.bazel_diff.cli.converter.NormalisingPathConverterTest",
     runtime_deps = [":cli-test-lib"],
 )
 
 kt_jvm_test(
     name = "OptionsConverterTest",
-    jvm_flags = ["-Djava.security.manager=allow"],
     test_class = "com.bazel_diff.cli.converter.OptionsConverterTest",
     runtime_deps = [":cli-test-lib"],
 )
 
 kt_jvm_test(
     name = "DeserialiseHashesInteractorTest",
-    jvm_flags = ["-Djava.security.manager=allow"],
     test_class = "com.bazel_diff.interactor.DeserialiseHashesInteractorTest",
     runtime_deps = [":cli-test-lib"],
 )
 
 kt_jvm_test(
     name = "BazelRuleTest",
-    jvm_flags = ["-Djava.security.manager=allow"],
     test_class = "com.bazel_diff.bazel.BazelRuleTest",
     runtime_deps = [":cli-test-lib"],
 )
@@ -107,7 +100,6 @@ kt_jvm_test(
 kt_jvm_test(
     name = "E2ETest",
     data = [":workspaces"],
-    jvm_flags = ["-Djava.security.manager=allow"],
     test_class = "com.bazel_diff.e2e.E2ETest",
     runtime_deps = [":cli-test-lib"],
 )
@@ -118,7 +110,6 @@ kt_jvm_test(
         ":src/test/kotlin/com/bazel_diff/io/fixture/correct.json",
         ":src/test/kotlin/com/bazel_diff/io/fixture/wrong.json",
     ],
-    jvm_flags = ["-Djava.security.manager=allow"],
     test_class = "com.bazel_diff.io.ContentHashProviderTest",
     runtime_deps = [
         ":cli-test-lib",

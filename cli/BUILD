@@ -45,6 +45,9 @@ kt_jvm_library(
 
 kt_jvm_test(
     name = "BuildGraphHasherTest",
+    jvm_flags = [
+        "-Dnet.bytebuddy.experimental=true",
+    ],
     test_class = "com.bazel_diff.hash.BuildGraphHasherTest",
     runtime_deps = [":cli-test-lib"],
 )

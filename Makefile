@@ -6,3 +6,10 @@ release_source_archive:
 		--exclude=.github \
 		--exclude=archives \
 		-zcf "archives/release.tar.gz" .
+
+.PHONY: release_deploy_jar
+release_deploy_jar:
+	bazelisk \
+		build \
+		//cli:bazel-diff_deploy.jar \
+		-c opt

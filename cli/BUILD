@@ -99,6 +99,7 @@ kt_jvm_test(
 
 kt_jvm_test(
     name = "E2ETest",
+    timeout = "long",
     data = [":workspaces"],
     test_class = "com.bazel_diff.e2e.E2ETest",
     runtime_deps = [":cli-test-lib"],

@@ -267,31 +267,16 @@ Command-line utility to analyze the state of the bazel build graph
 
 First, add the following snippet to your project:
 
-#### WORKSPACE Snippet
+#### Bzlmod snippet
 
 ```bazel
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
-
-http_jar(
-    name = "bazel_diff",
-    urls = [
-        "https://github.com/Tinder/bazel-diff/releases/download/6.1.0/bazel-diff_deploy.jar",
-    ],
-    sha256 = "5d90de4561afd1e711bc62956560a9dfcbb4454bd6b209d6e68272b65c3cb50a",
-)
+bazel_dep(name = "bazel-diff", version = "9.0.3")
 ```
 
-#### MODULE.bazel Snippet (if you are using Bzlmod)
+You can now run the tool with:
 
-```bazel
-http_jar = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
-http_jar(
-    name = "bazel_diff",
-    urls = [
-        "https://github.com/Tinder/bazel-diff/releases/download/7.0.0/bazel-diff_deploy.jar"
-    ],
-    sha256 = "0b9e32f9c20e570846b083743fe967ae54d13e2a1f7364983e0a7792979442be",
-)
+```terminal
+bazel run @bazel-diff//cli:bazel-diff
 ```
 
 #### WORKSPACE snippet
@@ -299,16 +284,12 @@ http_jar(
 ```bazel
 http_jar = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
 http_jar(
-    name = "bazel_diff",
+    name = "bazel-diff",
     urls = [
         "https://github.com/Tinder/bazel-diff/releases/download/7.0.0/bazel-diff_deploy.jar"
     ],
     sha256 = "0b9e32f9c20e570846b083743fe967ae54d13e2a1f7364983e0a7792979442be",
 )
-
-load("//@bazel_diff:repositories.bzl", "bazel_diff_dependencies")
-
-bazel_diff_dependencies()
 ```
 
 Second, add in your root `BUILD.bazel` file:
@@ -319,7 +300,7 @@ load("@rules_java//java:defs.bzl", "java_binary")
 java_binary(
     name = "bazel-diff",
     main_class = "com.bazel_diff.Main",
-    runtime_deps = ["@bazel_diff//jar"],
+    runtime_deps = ["@bazel-diff//cli:bazel-diff"],
 )
 ```
 
@@ -371,7 +352,7 @@ Add the following to your `WORKSPACE` file to add the external repositories, rep
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 http_archive(
-  name = "bazel_diff",
+  name = "bazel-diff",
   urls = [
         "RELEASE_ARCHIVE_URL",
     ],
@@ -379,12 +360,12 @@ http_archive(
     strip_prefix = "UPDATE_ME"
 )
 
-load("@bazel_diff//:repositories.bzl", "bazel_diff_dependencies")
+load("@bazel-diff//:repositories.bzl", "bazel_diff_dependencies")
 
 bazel_diff_dependencies()
 
 load("@rules_jvm_external//:defs.bzl", "maven_install")
-load("@bazel_diff//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
+load("@bazel-diff//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
 
 maven_install(
     name = "bazel_diff_maven",
@@ -399,7 +380,7 @@ maven_install(
 Now you can simply run `bazel-diff` from your project:
 
 ```terminal
-bazel run @bazel_diff//:bazel-diff -- bazel-diff -h
+bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
 ```
 
 ## Learn More

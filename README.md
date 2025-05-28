@@ -40,7 +40,6 @@ cd bazel-diff
 Here is a breakdown of those arguments:
 
 * `WORKSPACE_PATH`: Path to directory containing your `WORKSPACE` file in your Bazel project.
-  * Note: Your project must use Git for `bazel-diff` to work!
 * `BAZEL_PATH`: Path to your Bazel executable
 * `START_GIT_REVISION`: Starting Git Branch or SHA for your desired commit range
 * `END_GIT_REVISION`: Final Git Branch or SHA for your desired commit range

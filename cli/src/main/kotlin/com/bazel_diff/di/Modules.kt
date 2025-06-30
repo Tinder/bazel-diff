@@ -30,8 +30,15 @@ fun hasherModule(
     keepGoing: Boolean,
     trackDeps: Boolean,
     fineGrainedHashExternalRepos: Set<String>,
+    fineGrainedHashExternalReposFile: File?,
     excludeExternalTargets: Boolean,
 ): Module = module {
+  val updatedFineGrainedHashExternalRepos = fineGrainedHashExternalReposFile?.let { file ->
+    file.readLines()
+        .filter { it.isNotBlank() }
+        .toSet()
+  } ?: fineGrainedHashExternalRepos
+
   val cmd: MutableList<String> =
       ArrayList<String>().apply {
         add(bazelPath.toString())
@@ -60,11 +67,11 @@ fun hasherModule(
         keepGoing,
         debug)
   }
-  single { BazelClient(useCquery, fineGrainedHashExternalRepos, excludeExternalTargets) }
+  single { BazelClient(useCquery, updatedFineGrainedHashExternalRepos, excludeExternalTargets) }
   single { BuildGraphHasher(get()) }
   single { TargetHasher() }
-  single { RuleHasher(useCquery, trackDeps, fineGrainedHashExternalRepos) }
-  single<SourceFileHasher> { SourceFileHasherImpl(fineGrainedHashExternalRepos) }
+  single { RuleHasher(useCquery, trackDeps, updatedFineGrainedHashExternalRepos) }
+  single<SourceFileHasher> { SourceFileHasherImpl(updatedFineGrainedHashExternalRepos) }
   single { ExternalRepoResolver(workingDirectory, bazelPath, outputPath) }
   single(named("working-directory")) { workingDirectory }
   single(named("output-base")) { outputPath }

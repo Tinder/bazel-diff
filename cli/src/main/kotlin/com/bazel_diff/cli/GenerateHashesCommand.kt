@@ -79,6 +79,13 @@ class GenerateHashesCommand : Callable<Int> {
   var fineGrainedHashExternalRepos: Set<String> = emptySet()
 
   @CommandLine.Option(
+        names = ["--fineGrainedHashExternalReposFile"],
+        description =
+            [
+                "A text file containing a newline separated list of external repos. Similar to --fineGrainedHashExternalRepos but helps you avoid exceeding max arg length. Using this option supersedes the --fineGrainedHashExternalRepos flag."])
+  var fineGrainedHashExternalReposFile: File? = null
+
+  @CommandLine.Option(
       names = ["--useCquery"],
       negatable = true,
       description =
@@ -192,6 +199,7 @@ class GenerateHashesCommand : Callable<Int> {
               keepGoing,
               depsMappingJSONPath != null,
               fineGrainedHashExternalRepos,
+              fineGrainedHashExternalReposFile,
               excludeExternalTargets,
           ),
           loggingModule(parent.verbose),

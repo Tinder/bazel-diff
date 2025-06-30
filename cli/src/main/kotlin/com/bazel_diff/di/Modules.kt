@@ -33,6 +33,10 @@ fun hasherModule(
     fineGrainedHashExternalReposFile: File?,
     excludeExternalTargets: Boolean,
 ): Module = module {
+  if (fineGrainedHashExternalReposFile != null && fineGrainedHashExternalRepos.isNotEmpty()) {
+    System.err.println("Error: fineGrainedHashExternalReposFile and fineGrainedHashExternalRepos are mutually exclusive - please provide only one of them")
+    System.exit(1)
+  }
   val updatedFineGrainedHashExternalRepos = fineGrainedHashExternalReposFile?.let { file ->
     file.readLines()
         .filter { it.isNotBlank() }

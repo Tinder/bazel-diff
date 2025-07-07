@@ -2,3 +2,10 @@ run -c opt --show_loading_progress=false --show_progress=false --ui_event_filter
 run:verbose -c dbg --show_loading_progress=true --show_progress=true --ui_event_filters=info,error,debug
 # https://github.com/mockito/mockito/issues/1879
 test --sandbox_tmpfs_path=/tmp
+
+# Use a hermetic JDK for tests.
+common --java_runtime_version=remotejdk_21
+
+# Avoid cache thrashing, but allow integration tests to find "bazel" on the PATH.
+common --incompatible_strict_action_env
+common --test_env=PATH

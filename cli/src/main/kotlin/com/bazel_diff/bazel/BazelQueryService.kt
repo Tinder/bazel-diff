@@ -1,6 +1,7 @@
 package com.bazel_diff.bazel
 
 import com.bazel_diff.log.Logger
+import com.bazel_diff.process.ProcessService
 import com.bazel_diff.process.Redirect
 import com.bazel_diff.process.process
 import com.google.devtools.build.lib.analysis.AnalysisProtosV2
@@ -130,6 +131,8 @@ class BazelQueryService(
 
     queryFile.writeText(query)
 
+    val allowedExitCodes = mutableListOf(0)
+
     val cmd: MutableList<String> =
         ArrayList<String>().apply {
           add(bazelPath.toString())
@@ -179,6 +182,7 @@ class BazelQueryService(
           }
           if (keepGoing) {
             add("--keep_going")
+            allowedExitCodes.add(3)
           }
           if (useCquery) {
             addAll(cqueryOptions)
@@ -204,8 +208,9 @@ class BazelQueryService(
           destroyForcibly = true,
       )
 
-    if (result.resultCode != 0)
-        throw RuntimeException("Bazel query failed, exit code ${result.resultCode}")
+    if (result.resultCode !in allowedExitCodes)
+        logger.w { "Bazel query failed, output: ${result.output.joinToString("\n")}" }
+        throw RuntimeException("Bazel query failed, exit code ${result.resultCode}, allowed exit codes: ${allowedExitCodes.joinToString()}")
     return outputFile
   }
 

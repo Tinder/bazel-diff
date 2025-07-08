@@ -13,6 +13,10 @@ import kotlinx.coroutines.runBlocking
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
+private val versionComparator = compareBy<Triple<Int, Int, Int>> { it.first }
+    .thenBy { it.second }
+    .thenBy { it.third }
+
 class BazelQueryService(
     private val workingDirectory: Path,
     private val bazelPath: Path,
@@ -23,6 +27,44 @@ class BazelQueryService(
     private val noBazelrc: Boolean,
 ) : KoinComponent {
   private val logger: Logger by inject()
+  private val version: Triple<Int, Int, Int> by lazy {
+    runBlocking { determineBazelVersion() }
+  }
+
+  @OptIn(ExperimentalCoroutinesApi::class)
+  private suspend fun determineBazelVersion(): Triple<Int, Int, Int> {
+    val cmd = arrayOf(bazelPath.toString(), "--version")
+    logger.i { "Executing Bazel version command: ${cmd.joinToString()}" }
+    val result = process(
+        *cmd,
+        stdout = Redirect.CAPTURE,
+        workingDirectory = workingDirectory.toFile(),
+        stderr = Redirect.PRINT,
+        destroyForcibly = true,
+    )
+
+    if (result.resultCode != 0) {
+      throw RuntimeException("Bazel version command failed, exit code ${result.resultCode}")
+    }
+
+    if (result.output.size != 1 || !result.output.first().startsWith("bazel "))  {
+      throw RuntimeException("Bazel version command returned unexpected output: ${result.output}")
+    }
+    // Trim off any prerelease suffixes.
+    val versionString = result.output.first().removePrefix("bazel ").trim().split('-')[0]
+    val version = versionString.split('.').map { it.toInt() }.toTypedArray()
+    return Triple(version[0], version[1], version[2])
+  }
+
+  // Use streamed_proto output for cquery if available. This is more efficient than the proto output.
+  // https://github.com/bazelbuild/bazel/commit/607d0f7335f95aa0ee236ba3c18ce2a232370cdb
+  private val canUseStreamedProtoWithCquery
+    get() = versionComparator.compare(version, Triple(7, 0, 0)) >= 0
+
+  // Use an output file for (c)query if supported. This avoids excessively large stdout, which is sent out on the BES.
+  // https://github.com/bazelbuild/bazel/commit/514e9052f2c603c53126fbd9436bdd3ad3a1b0c7
+  private val canUseOutputFile
+    get() = versionComparator.compare(version, Triple(8, 2, 0)) >= 0
 
   suspend fun query(query: String, useCquery: Boolean = false): List<BazelTarget> {
     // Unfortunately, there is still no direct way to tell if a target is compatible or not with the
@@ -44,10 +86,21 @@ class BazelQueryService(
     val targets =
         outputFile.inputStream().buffered().use { proto ->
           if (useCquery) {
-            val cqueryResult = AnalysisProtosV2.CqueryResult.parseFrom(proto)
-            cqueryResult.resultsList
-                .mapNotNull { toBazelTarget(it.target) }
-                .filter { it.name in compatibleTargetSet }
+            if (canUseStreamedProtoWithCquery) {
+              mutableListOf<AnalysisProtosV2.CqueryResult>()
+                .apply {
+                  while (true) {
+                    val result = AnalysisProtosV2.CqueryResult.parseDelimitedFrom(proto) ?: break
+                    // EOF
+                    add(result)
+                  }
+                }
+                .flatMap { it.resultsList }
+            } else {
+              AnalysisProtosV2.CqueryResult.parseFrom(proto).resultsList
+            }
+              .mapNotNull { toBazelTarget(it.target) }
+              .filter { it.name in compatibleTargetSet }
           } else {
             mutableListOf<Build.Target>()
                 .apply {
@@ -98,9 +151,9 @@ class BazelQueryService(
             if (outputCompatibleTargets) {
               add("starlark")
               add("--starlark:file")
-              val cqueryOutputFile = Files.createTempFile(null, ".cquery").toFile()
-              cqueryOutputFile.deleteOnExit()
-              cqueryOutputFile.writeText(
+              val cqueryStarlarkFile = Files.createTempFile(null, ".cquery").toFile()
+              cqueryStarlarkFile.deleteOnExit()
+              cqueryStarlarkFile.writeText(
                   """
                     def format(target):
                         if providers(target) == None:
@@ -112,13 +165,11 @@ class BazelQueryService(
                             return str(target.label)
                         return ""
                     """
-                      .trimIndent())
-              add(cqueryOutputFile.toString())
+                  .trimIndent()
+              )
+              add(cqueryStarlarkFile.toString())
             } else {
-              // Unfortunately, cquery does not support streamed_proto yet.
-              // See https://github.com/bazelbuild/bazel/issues/17743. This poses an issue for large
-              // monorepos.
-              add("proto")
+              add(if (canUseStreamedProtoWithCquery) "streamed_proto" else "proto")
             }
           } else {
             add("streamed_proto")
@@ -137,19 +188,21 @@ class BazelQueryService(
           }
           add("--query_file")
           add(queryFile.toString())
+          if (canUseOutputFile) {
+            add("--output_file")
+            add(outputFile.toString())
+          }
         }
 
     logger.i { "Executing Query: $query" }
     logger.i { "Command: ${cmd.toTypedArray().joinToString()}" }
-    val result = runBlocking {
-      process(
+    val result = process(
           *cmd.toTypedArray(),
-          stdout = Redirect.ToFile(outputFile),
+          stdout = if (canUseOutputFile) Redirect.SILENT else Redirect.ToFile(outputFile),
           workingDirectory = workingDirectory.toFile(),
           stderr = Redirect.PRINT,
           destroyForcibly = true,
       )
-    }
 
     if (result.resultCode != 0)
         throw RuntimeException("Bazel query failed, exit code ${result.resultCode}")

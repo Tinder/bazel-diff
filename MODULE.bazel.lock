@@ -169,7 +169,7 @@
     "//:extensions.bzl%non_module_repositories": {
       "general": {
         "bzlTransitiveDigest": "9kscpNTrmoEECh40kS6bqcncGbg5lZ8bpWLxD8wpc2Q=",
-        "usagesDigest": "DilXwPms6Ze5Xc1kL93pbCa4d2cDauqM1x2SEheyzRQ=",
+        "usagesDigest": "B/ulmGDgTJJ7blCuwEJsJ0wV1kMPVgF36azpv5dXn58=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},

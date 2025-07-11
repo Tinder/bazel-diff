@@ -207,9 +207,10 @@ class BazelQueryService(
           destroyForcibly = true,
       )
 
-    if (result.resultCode !in allowedExitCodes)
+    if (!allowedExitCodes.contains(result.resultCode)) {
         logger.w { "Bazel query failed, output: ${result.output.joinToString("\n")}" }
         throw RuntimeException("Bazel query failed, exit code ${result.resultCode}, allowed exit codes: ${allowedExitCodes.joinToString()}")
+    }
     return outputFile
   }
 

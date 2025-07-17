@@ -35,9 +35,13 @@ class BazelClient(
           // In addition, we must include all source dependencies in this query in order for them to
           // show up in
           // `configuredRuleInput`. Hence, one must not filter them out with `kind(rule, deps(..))`.
-          (queryService.query("deps(//...:all-targets)", useCquery = true) +
-                  queryService.query(repoTargetsQuery.joinToString(" + ") { "'$it'" }))
-              .distinctBy { it.name }
+          val mainTargets = queryService.query("deps(//...:all-targets)", useCquery = true)
+          val repoTargets = if (repoTargetsQuery.isNotEmpty()) {
+            queryService.query(repoTargetsQuery.joinToString(" + ") { "'$it'" })
+          } else {
+            emptyList()
+          }
+          (mainTargets + repoTargets).distinctBy { it.name }
         } else {
           val buildTargetsQuery =
               listOf("//...:all-targets") +

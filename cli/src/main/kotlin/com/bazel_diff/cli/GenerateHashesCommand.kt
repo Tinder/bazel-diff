@@ -104,7 +104,7 @@ class GenerateHashesCommand : Callable<Int> {
                   "If true, the generate JSON schema is: {\"<target>\": \"<type>#<sha256>\" }"],
       scope = CommandLine.ScopeType.INHERIT)
   var includeTargetType = false
-()
+
   @CommandLine.Option(
       names = ["-tt", "--targetType"],
       split = ",",

@@ -127,11 +127,13 @@ class GenerateHashesCommand : Callable<Int> {
   @CommandLine.Option(
       names = ["-k", "--keep_going"],
       negatable = true,
+      defaultValue = "true",
+      fallbackValue = "true",
       description =
           [
               "This flag controls if `bazel query` will be executed with the `--keep_going` flag or not. Disabling this flag allows you to catch configuration issues in your Bazel graph, but may not work for some Bazel setups. Defaults to `true`"],
       scope = CommandLine.ScopeType.INHERIT)
-  var keepGoing = true
+  var keepGoing = false
 
   @CommandLine.Option(
       names = ["-s", "--seed-filepaths"],

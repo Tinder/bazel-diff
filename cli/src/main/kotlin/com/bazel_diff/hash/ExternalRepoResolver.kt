@@ -22,10 +22,18 @@ class ExternalRepoResolver(
       CacheBuilder.newBuilder()
           .build(
               CacheLoader.from { repoName: String ->
-                val externalRepoRoot = externalRoot.resolve(repoName)
-                if (Files.exists(externalRepoRoot)) {
-                  return@from externalRepoRoot
+                externalRoot.resolve(repoName).let {
+                  if (Files.exists(it)) {
+                    return@from it
+                  }
                 }
+
+                externalRoot.resolve("$repoName+").let {
+                  if (Files.exists(it)) {
+                    return@from it
+                  }
+                }
+
                 resolveBzlModPath(repoName)
               })
 

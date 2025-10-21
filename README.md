@@ -204,8 +204,11 @@ workspace.
                             setups. Defaults to `true`
   -s, --seed-filepaths=<seedFilepaths>
                           A text file containing a newline separated list of
-                            filepaths, each of these filepaths will be read and
-                            used as a seed for all targets.
+                            filepaths. Each file in this list will be read and
+                            its content will be used as a SHA256 seed when
+                            determining affected targets in the build graph.
+                            Invalidating any of these files will effectively
+                            mark all targets as affected.
       -so, --bazelStartupOptions=<bazelStartupOptions>
                           Additional space separated Bazel client startup
                             options used when invoking Bazel

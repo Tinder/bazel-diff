@@ -2,6 +2,7 @@ package com.bazel_diff.hash
 
 import assertk.assertThat
 import assertk.assertions.isEqualTo
+import assertk.assertions.isNotEqualTo
 import assertk.assertions.isNull
 import com.bazel_diff.bazel.BazelSourceFileTarget
 import com.bazel_diff.extensions.toHexString
@@ -212,5 +213,34 @@ internal class SourceFileHasherTest : KoinTest {
             }
             .toHexString()
     assertThat(actual).isEqualTo(expected)
+  }
+
+  @Test
+  fun testHashEmptyFileVsDeletedFile() = runBlocking<Unit> {
+    // Create a temp directory for testing
+    val testDir = Files.createTempDirectory("empty_file_test")
+    val emptyFilePath = testDir.resolve("path/to/empty.txt")
+    Files.createDirectories(emptyFilePath.parent)
+    Files.createFile(emptyFilePath)
+
+    val emptyFileTarget = "//path/to:empty.txt"
+    val hasher = SourceFileHasherImpl(testDir, null, externalRepoResolver)
+
+    // Hash the empty file (file exists)
+    val emptyFileHash = hasher.digest(BazelSourceFileTarget(emptyFileTarget, seed)).toHexString()
+
+    // Delete the file
+    Files.delete(emptyFilePath)
+
+    // Hash the non-existent file
+    val deletedFileHash = hasher.digest(BazelSourceFileTarget(emptyFileTarget, seed)).toHexString()
+
+    // The hashes should be different (file exists vs file missing)
+    assertThat(emptyFileHash).isNotEqualTo(deletedFileHash)
+
+    // Clean up
+    Files.deleteIfExists(emptyFilePath.parent)
+    Files.deleteIfExists(testDir.resolve("path"))
+    Files.deleteIfExists(testDir)
   }
 }

@@ -272,7 +272,7 @@ First, add the following snippet to your project:
 #### Bzlmod snippet
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "11.0.2")
+bazel_dep(name = "bazel-diff", version = "11.0.3")
 ```
 
 You can now run the tool with:

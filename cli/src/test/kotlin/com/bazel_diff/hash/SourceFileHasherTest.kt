@@ -2,6 +2,7 @@ package com.bazel_diff.hash
 
 import assertk.assertThat
 import assertk.assertions.isEqualTo
+import assertk.assertions.isNotEqualTo
 import assertk.assertions.isNull
 import com.bazel_diff.bazel.BazelSourceFileTarget
 import com.bazel_diff.extensions.toHexString
@@ -38,6 +39,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes(fixtureFileContent)
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -53,6 +55,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes(fixtureFileContent)
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -68,6 +71,7 @@ internal class SourceFileHasherTest : KoinTest {
         hasher.digest(bazelSourceFileTarget, setOf(Paths.get("some/other/path"))).toHexString()
     val expected =
         sha256 {
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -89,6 +93,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes(externalRepoFileContent.toByteArray())
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(externalRepoFileTarget.toByteArray())
             }
@@ -104,6 +109,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes(fixtureFileContent)
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -136,6 +142,7 @@ internal class SourceFileHasherTest : KoinTest {
     val actual = hasher.digest(bazelSourceFileTarget).toHexString()
     val expected =
         sha256 {
+              putBytes(byteArrayOf(0x00))
               safePutBytes(seed)
               safePutBytes(target.toByteArray())
             }
@@ -163,6 +170,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes("foo-content-hash".toByteArray())
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -180,6 +188,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes(fixtureFileContent)
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -198,10 +207,40 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes("foo-content-hash".toByteArray())
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(targetName.toByteArray())
             }
             .toHexString()
     assertThat(actual).isEqualTo(expected)
+  }
+
+  @Test
+  fun testHashEmptyFileVsDeletedFile() = runBlocking<Unit> {
+    // Create a temp directory for testing
+    val testDir = Files.createTempDirectory("empty_file_test")
+    val emptyFilePath = testDir.resolve("path/to/empty.txt")
+    Files.createDirectories(emptyFilePath.parent)
+    Files.createFile(emptyFilePath)
+
+    val emptyFileTarget = "//path/to:empty.txt"
+    val hasher = SourceFileHasherImpl(testDir, null, externalRepoResolver)
+
+    // Hash the empty file (file exists)
+    val emptyFileHash = hasher.digest(BazelSourceFileTarget(emptyFileTarget, seed)).toHexString()
+
+    // Delete the file
+    Files.delete(emptyFilePath)
+
+    // Hash the non-existent file
+    val deletedFileHash = hasher.digest(BazelSourceFileTarget(emptyFileTarget, seed)).toHexString()
+
+    // The hashes should be different (file exists vs file missing)
+    assertThat(emptyFileHash).isNotEqualTo(deletedFileHash)
+
+    // Clean up
+    Files.deleteIfExists(emptyFilePath.parent)
+    Files.deleteIfExists(testDir.resolve("path"))
+    Files.deleteIfExists(testDir)
   }
 }

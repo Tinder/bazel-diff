@@ -88,6 +88,8 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
       if (relativeFilenameToContentHash?.contains(filenamePathString) == true) {
         val contentHash = relativeFilenameToContentHash.getValue(filenamePathString)
         safePutBytes(contentHash.toByteArray())
+        // Mark that file exists (via content hash)
+        putBytes(byteArrayOf(0x01))
       } else {
         val absoluteFilePath = workingDirectory.resolve(filenamePath)
         val file = absoluteFilePath.toFile()
@@ -98,9 +100,13 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
             } else if (modifiedFilepaths.any { workingDirectory.resolve(it) == absoluteFilePath }) {
               putFile(file)
             }
+            // Mark that file exists
+            putBytes(byteArrayOf(0x01))
           }
         } else {
           logger.w { "File $absoluteFilePath not found" }
+          // Mark that file is missing
+          putBytes(byteArrayOf(0x00))
         }
       }
       safePutBytes(sourceFileTarget.seed)

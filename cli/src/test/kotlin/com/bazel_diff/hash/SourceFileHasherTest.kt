@@ -38,6 +38,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes(fixtureFileContent)
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -53,6 +54,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes(fixtureFileContent)
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -68,6 +70,7 @@ internal class SourceFileHasherTest : KoinTest {
         hasher.digest(bazelSourceFileTarget, setOf(Paths.get("some/other/path"))).toHexString()
     val expected =
         sha256 {
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -89,6 +92,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes(externalRepoFileContent.toByteArray())
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(externalRepoFileTarget.toByteArray())
             }
@@ -104,6 +108,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes(fixtureFileContent)
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -136,6 +141,7 @@ internal class SourceFileHasherTest : KoinTest {
     val actual = hasher.digest(bazelSourceFileTarget).toHexString()
     val expected =
         sha256 {
+              putBytes(byteArrayOf(0x00))
               safePutBytes(seed)
               safePutBytes(target.toByteArray())
             }
@@ -163,6 +169,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes("foo-content-hash".toByteArray())
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -180,6 +187,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes(fixtureFileContent)
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -198,6 +206,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               safePutBytes("foo-content-hash".toByteArray())
+              putBytes(byteArrayOf(0x01))
               safePutBytes(seed)
               safePutBytes(targetName.toByteArray())
             }

@@ -13,3 +13,7 @@ release_deploy_jar:
 		build \
 		//cli:bazel-diff_deploy.jar \
 		-c opt
+
+.PHONY: format
+format:
+	bazelisk run //cli/format

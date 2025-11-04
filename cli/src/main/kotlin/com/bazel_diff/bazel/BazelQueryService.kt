@@ -13,9 +13,8 @@ import kotlinx.coroutines.runBlocking
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
-private val versionComparator = compareBy<Triple<Int, Int, Int>> { it.first }
-    .thenBy { it.second }
-    .thenBy { it.third }
+private val versionComparator =
+    compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
 
 class BazelQueryService(
     private val workingDirectory: Path,
@@ -27,27 +26,26 @@ class BazelQueryService(
     private val noBazelrc: Boolean,
 ) : KoinComponent {
   private val logger: Logger by inject()
-  private val version: Triple<Int, Int, Int> by lazy {
-    runBlocking { determineBazelVersion() }
-  }
+  private val version: Triple<Int, Int, Int> by lazy { runBlocking { determineBazelVersion() } }
 
   @OptIn(ExperimentalCoroutinesApi::class)
   private suspend fun determineBazelVersion(): Triple<Int, Int, Int> {
     val cmd = arrayOf(bazelPath.toString(), "--version")
     logger.i { "Executing Bazel version command: ${cmd.joinToString()}" }
-    val result = process(
-        *cmd,
-        stdout = Redirect.CAPTURE,
-        workingDirectory = workingDirectory.toFile(),
-        stderr = Redirect.PRINT,
-        destroyForcibly = true,
-    )
+    val result =
+        process(
+            *cmd,
+            stdout = Redirect.CAPTURE,
+            workingDirectory = workingDirectory.toFile(),
+            stderr = Redirect.PRINT,
+            destroyForcibly = true,
+        )
 
     if (result.resultCode != 0) {
       throw RuntimeException("Bazel version command failed, exit code ${result.resultCode}")
     }
 
-    if (result.output.size != 1 || !result.output.first().startsWith("bazel "))  {
+    if (result.output.size != 1 || !result.output.first().startsWith("bazel ")) {
       throw RuntimeException("Bazel version command returned unexpected output: ${result.output}")
     }
     // Trim off any prerelease suffixes.
@@ -56,12 +54,14 @@ class BazelQueryService(
     return Triple(version[0], version[1], version[2])
   }
 
-  // Use streamed_proto output for cquery if available. This is more efficient than the proto output.
+  // Use streamed_proto output for cquery if available. This is more efficient than the proto
+  // output.
   // https://github.com/bazelbuild/bazel/commit/607d0f7335f95aa0ee236ba3c18ce2a232370cdb
   private val canUseStreamedProtoWithCquery
     get() = versionComparator.compare(version, Triple(7, 0, 0)) >= 0
 
-  // Use an output file for (c)query if supported. This avoids excessively large stdout, which is sent out on the BES.
+  // Use an output file for (c)query if supported. This avoids excessively large stdout, which is
+  // sent out on the BES.
   // https://github.com/bazelbuild/bazel/commit/514e9052f2c603c53126fbd9436bdd3ad3a1b0c7
   private val canUseOutputFile
     get() = versionComparator.compare(version, Triple(8, 2, 0)) >= 0
@@ -87,20 +87,21 @@ class BazelQueryService(
         outputFile.inputStream().buffered().use { proto ->
           if (useCquery) {
             if (canUseStreamedProtoWithCquery) {
-              mutableListOf<AnalysisProtosV2.CqueryResult>()
-                .apply {
-                  while (true) {
-                    val result = AnalysisProtosV2.CqueryResult.parseDelimitedFrom(proto) ?: break
-                    // EOF
-                    add(result)
-                  }
+                  mutableListOf<AnalysisProtosV2.CqueryResult>()
+                      .apply {
+                        while (true) {
+                          val result =
+                              AnalysisProtosV2.CqueryResult.parseDelimitedFrom(proto) ?: break
+                          // EOF
+                          add(result)
+                        }
+                      }
+                      .flatMap { it.resultsList }
+                } else {
+                  AnalysisProtosV2.CqueryResult.parseFrom(proto).resultsList
                 }
-                .flatMap { it.resultsList }
-            } else {
-              AnalysisProtosV2.CqueryResult.parseFrom(proto).resultsList
-            }
-              .mapNotNull { toBazelTarget(it.target) }
-              .filter { it.name in compatibleTargetSet }
+                .mapNotNull { toBazelTarget(it.target) }
+                .filter { it.name in compatibleTargetSet }
           } else {
             mutableListOf<Build.Target>()
                 .apply {
@@ -167,8 +168,7 @@ class BazelQueryService(
                             return str(target.label)
                         return ""
                     """
-                  .trimIndent()
-              )
+                      .trimIndent())
               add(cqueryStarlarkFile.toString())
             } else {
               add(if (canUseStreamedProtoWithCquery) "streamed_proto" else "proto")
@@ -199,17 +199,19 @@ class BazelQueryService(
 
     logger.i { "Executing Query: $query" }
     logger.i { "Command: ${cmd.toTypedArray().joinToString()}" }
-    val result = process(
-          *cmd.toTypedArray(),
-          stdout = if (canUseOutputFile) Redirect.SILENT else Redirect.ToFile(outputFile),
-          workingDirectory = workingDirectory.toFile(),
-          stderr = Redirect.PRINT,
-          destroyForcibly = true,
-      )
+    val result =
+        process(
+            *cmd.toTypedArray(),
+            stdout = if (canUseOutputFile) Redirect.SILENT else Redirect.ToFile(outputFile),
+            workingDirectory = workingDirectory.toFile(),
+            stderr = Redirect.PRINT,
+            destroyForcibly = true,
+        )
 
     if (!allowedExitCodes.contains(result.resultCode)) {
-        logger.w { "Bazel query failed, output: ${result.output.joinToString("\n")}" }
-        throw RuntimeException("Bazel query failed, exit code ${result.resultCode}, allowed exit codes: ${allowedExitCodes.joinToString()}")
+      logger.w { "Bazel query failed, output: ${result.output.joinToString("\n")}" }
+      throw RuntimeException(
+          "Bazel query failed, exit code ${result.resultCode}, allowed exit codes: ${allowedExitCodes.joinToString()}")
     }
     return outputFile
   }

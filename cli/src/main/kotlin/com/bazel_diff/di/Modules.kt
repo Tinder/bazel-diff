@@ -34,14 +34,14 @@ fun hasherModule(
     excludeExternalTargets: Boolean,
 ): Module = module {
   if (fineGrainedHashExternalReposFile != null && fineGrainedHashExternalRepos.isNotEmpty()) {
-    System.err.println("Error: fineGrainedHashExternalReposFile and fineGrainedHashExternalRepos are mutually exclusive - please provide only one of them")
+    System.err.println(
+        "Error: fineGrainedHashExternalReposFile and fineGrainedHashExternalRepos are mutually exclusive - please provide only one of them")
     System.exit(1)
   }
-  val updatedFineGrainedHashExternalRepos = fineGrainedHashExternalReposFile?.let { file ->
-    file.readLines()
-        .filter { it.isNotBlank() }
-        .toSet()
-  } ?: fineGrainedHashExternalRepos
+  val updatedFineGrainedHashExternalRepos =
+      fineGrainedHashExternalReposFile?.let { file ->
+        file.readLines().filter { it.isNotBlank() }.toSet()
+      } ?: fineGrainedHashExternalRepos
 
   val cmd: MutableList<String> =
       ArrayList<String>().apply {

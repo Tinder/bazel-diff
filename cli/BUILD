@@ -1,4 +1,3 @@
-load("@aspect_rules_lint//format:defs.bzl", "format_multirun")
 load("@rules_java//java:defs.bzl", "java_binary")
 load("@rules_kotlin//kotlin:jvm.bzl", "kt_jvm_library", "kt_jvm_test")
 
@@ -143,10 +142,5 @@ java_binary(
     name = "ktfmt",
     main_class = "com.facebook.ktfmt.cli.Main",
     runtime_deps = ["@ktfmt//jar"],
-)
-
-format_multirun(
-    name = "format",
-    kotlin = ":ktfmt",
-    visibility = ["//visibility:public"],
+    visibility = ["//cli/format:__pkg__"],
 )

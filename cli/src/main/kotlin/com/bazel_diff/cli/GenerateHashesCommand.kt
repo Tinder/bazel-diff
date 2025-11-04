@@ -79,10 +79,10 @@ class GenerateHashesCommand : Callable<Int> {
   var fineGrainedHashExternalRepos: Set<String> = emptySet()
 
   @CommandLine.Option(
-        names = ["--fineGrainedHashExternalReposFile"],
-        description =
-            [
-                "A text file containing a newline separated list of external repos. Similar to --fineGrainedHashExternalRepos but helps you avoid exceeding max arg length. Mutually exclusive with --fineGrainedHashExternalRepos."])
+      names = ["--fineGrainedHashExternalReposFile"],
+      description =
+          [
+              "A text file containing a newline separated list of external repos. Similar to --fineGrainedHashExternalRepos but helps you avoid exceeding max arg length. Mutually exclusive with --fineGrainedHashExternalRepos."])
   var fineGrainedHashExternalReposFile: File? = null
 
   @CommandLine.Option(

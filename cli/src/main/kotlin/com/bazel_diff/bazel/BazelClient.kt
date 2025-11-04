@@ -36,11 +36,12 @@ class BazelClient(
           // show up in
           // `configuredRuleInput`. Hence, one must not filter them out with `kind(rule, deps(..))`.
           val mainTargets = queryService.query("deps(//...:all-targets)", useCquery = true)
-          val repoTargets = if (repoTargetsQuery.isNotEmpty()) {
-            queryService.query(repoTargetsQuery.joinToString(" + ") { "'$it'" })
-          } else {
-            emptyList()
-          }
+          val repoTargets =
+              if (repoTargetsQuery.isNotEmpty()) {
+                queryService.query(repoTargetsQuery.joinToString(" + ") { "'$it'" })
+              } else {
+                emptyList()
+              }
           (mainTargets + repoTargets).distinctBy { it.name }
         } else {
           val buildTargetsQuery =

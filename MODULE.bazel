@@ -22,7 +22,7 @@ maven.install(
         "info.picocli:picocli:jar:4.6.3",
         "io.insert-koin:koin-core-jvm:3.1.6",
         "io.insert-koin:koin-test-junit4:4.0.0",
-        "junit:junit:5.11.2",
+        "junit:junit:4.13.2",
         "org.apache.commons:commons-pool2:2.11.1",
         "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.5.2",
         "org.mockito.kotlin:mockito-kotlin:5.4.0",

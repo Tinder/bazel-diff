@@ -50,6 +50,12 @@ You can see the example shell script in action below:
 
 Open `bazel-diff-example.sh` to see how this is implemented. This is purely an example use-case, but it is a great starting point to using `bazel-diff`.
 
+## With Aspect CLI
+
+Aspect's Extension Language (AXL) allows the shell script above to be expressed in Starlark, and exposed as an `impacted` command on your terminal.
+
+See https://github.com/aspect-extensions/impacted
+
 ## How it works
 
 `bazel-diff` works as follows

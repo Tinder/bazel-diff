@@ -17,15 +17,13 @@ impacted_targets_path="/tmp/impacted_targets.txt"
 bazel_diff="/tmp/bazel_diff"
 
 # Set appropriate flags based on environment variable
-bazel_flags=""
 bazel_diff_flags=""
 if [ "${BAZEL_DIFF_DISABLE_WORKSPACE:-false}" = "true" ]; then
-  echo "Disabling workspace and enabling bzlmod (BAZEL_DIFF_DISABLE_WORKSPACE=true)"
-  bazel_flags="--enable_bzlmod --enable_workspace=false"
-  bazel_diff_flags="-so --enable_bzlmod -so --enable_workspace=false --excludeExternalTargets"
+  echo "Disabling workspace for bazel-diff commands (BAZEL_DIFF_DISABLE_WORKSPACE=true)"
+  bazel_diff_flags="-so --enable_workspace=false --excludeExternalTargets"
 fi
 
-"$bazel_path" run $bazel_flags :bazel-diff --script_path="$bazel_diff"
+"$bazel_path" run :bazel-diff --script_path="$bazel_diff"
 
 git -C "$workspace_path" checkout "$previous_revision" --quiet
 

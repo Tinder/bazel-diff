@@ -159,7 +159,7 @@ workspace.
                                 }
       --[no-]excludeExternalTargets
                           If true, exclude external targets. This must be
-                            switched on when using `--noenable_workspace` Bazel
+                            switched on when using `--enable_workspace=false` Bazel
                             command line option. Defaults to `false`.
       --[no-]includeTargetType
                           Whether include target type in the generated JSON or not.

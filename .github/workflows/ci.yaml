@@ -24,7 +24,7 @@ jobs:
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
       - name: Run bazel-diff tests
-        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=true
+        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=true --enable_workspace=false
   test-jre21:
     runs-on: ubuntu-latest
     steps:
@@ -42,7 +42,7 @@ jobs:
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
       - name: Run bazel-diff tests
-        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=false
+        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=false --enable_workspace=true
   test-jre11-run-example:
     runs-on: ubuntu-latest
     strategy:

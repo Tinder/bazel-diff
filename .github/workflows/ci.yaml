@@ -45,6 +45,9 @@ jobs:
         run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=false
   test-jre11-run-example:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        bazel: ['7.x', '8.x', '9.x']
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v4
@@ -63,6 +66,8 @@ jobs:
         with:
           fetch-depth: 0
       - name: Run bazel-diff example script
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
         run: ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   deploy:
     needs: [test-jre21]

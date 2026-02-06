@@ -14,6 +14,7 @@ jobs:
     strategy:
       matrix:
         java: [ '8', '11' ]
+        bazel: ['7.x', '8.x', '9.x']
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v3
@@ -27,6 +28,8 @@ jobs:
           ref: add_bazel_diff_impact
           fetch-depth: 0
       - name: Run No Impacted Targets Test
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
         run: cd java-tutorial && ./bazel-diff-example.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
       - name: Validate Impacted Targets
         run: |

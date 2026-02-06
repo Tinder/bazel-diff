@@ -14,6 +14,7 @@ jobs:
     strategy:
       matrix:
         java: [ '8', '11' ]
+        bazel: ['7.x', '8.x', '9.x']
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v3
@@ -26,9 +27,9 @@ jobs:
           repository: tinder-maxwellelliott/bazel-diff-repro-1
           ref: master
           fetch-depth: 0
-      - name: Set bazel version
-        run: echo "USE_BAZEL_VERSION=7.3.1" > "$HOME/.bazeliskrc"
       - name: Run External Target Impact test
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
         run: ./bazel-diff.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
       - name: Validate Impacted Targets
         run: grep -q "//:yo" /tmp/impacted_targets.txt

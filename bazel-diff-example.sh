@@ -16,17 +16,28 @@ final_hashes_json="/tmp/final_hashes.json"
 impacted_targets_path="/tmp/impacted_targets.txt"
 bazel_diff="/tmp/bazel_diff"
 
-"$bazel_path" run :bazel-diff --script_path="$bazel_diff"
+# Set appropriate flags based on environment variable
+bazel_flags=""
+bazel_diff_flags=""
+if [ "${BAZEL_DIFF_DISABLE_WORKSPACE:-false}" = "true" ]; then
+  echo "Disabling workspace (BAZEL_DIFF_DISABLE_WORKSPACE=true)"
+  bazel_flags="--noenable_workspace"
+  bazel_diff_flags="-so --noenable_workspace --excludeExternalTargets"
+fi
+
+"$bazel_path" run $bazel_flags :bazel-diff --script_path="$bazel_diff"
 
 git -C "$workspace_path" checkout "$previous_revision" --quiet
 
 echo "Generating Hashes for Revision '$previous_revision'"
-$bazel_diff generate-hashes -w "$workspace_path" -b "$bazel_path" $starting_hashes_json
+# shellcheck disable=SC2086
+$bazel_diff generate-hashes -w "$workspace_path" -b "$bazel_path" $bazel_diff_flags "$starting_hashes_json"
 
 git -C "$workspace_path" checkout "$final_revision" --quiet
 
 echo "Generating Hashes for Revision '$final_revision'"
-$bazel_diff generate-hashes -w "$workspace_path" -b "$bazel_path" $final_hashes_json
+# shellcheck disable=SC2086
+$bazel_diff generate-hashes -w "$workspace_path" -b "$bazel_path" $bazel_diff_flags "$final_hashes_json"
 
 echo "Determining Impacted Targets"
 $bazel_diff get-impacted-targets -sh $starting_hashes_json -fh $final_hashes_json -o $impacted_targets_path

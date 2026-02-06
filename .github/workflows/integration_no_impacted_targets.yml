@@ -30,6 +30,7 @@ jobs:
       - name: Run No Impacted Targets Test
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
+          BAZEL_DIFF_DISABLE_WORKSPACE: ${{ matrix.bazel == '8.x' && 'true' || 'false' }}
         run: cd java-tutorial && ./bazel-diff-example.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
       - name: Validate Impacted Targets
         run: |

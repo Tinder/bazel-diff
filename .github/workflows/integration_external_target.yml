@@ -30,6 +30,7 @@ jobs:
       - name: Run External Target Impact test
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
+          BAZEL_DIFF_DISABLE_WORKSPACE: ${{ matrix.bazel == '8.x' && 'true' || 'false' }}
         run: ./bazel-diff.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
       - name: Validate Impacted Targets
         run: grep -q "//:yo" /tmp/impacted_targets.txt

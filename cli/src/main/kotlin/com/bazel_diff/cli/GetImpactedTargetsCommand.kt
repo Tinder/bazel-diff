@@ -73,31 +73,34 @@ class GetImpactedTargetsCommand : Callable<Int> {
   override fun call(): Int {
     startKoin { modules(serialisationModule(), loggingModule(parent.verbose)) }
 
-    validate()
-    val deserialiser = DeserialiseHashesInteractor()
-    val from = deserialiser.executeTargetHash(startingHashesJSONPath)
-    val to = deserialiser.executeTargetHash(finalHashesJSONPath)
-
-    val outputWriter =
-        BufferedWriter(
-            when (val path = outputPath) {
-              null -> FileWriter(FileDescriptor.out)
-              else -> FileWriter(path)
-            })
-
     return try {
-          if (depsMappingJSONPath != null) {
-            val depsMapping = deserialiser.deserializeDeps(depsMappingJSONPath!!)
-            CalculateImpactedTargetsInteractor()
-                .executeWithDistances(from, to, depsMapping, outputWriter, targetType)
-          } else {
-            CalculateImpactedTargetsInteractor().execute(from, to, outputWriter, targetType)
-          }
-          CommandLine.ExitCode.OK
-        } catch (e: IOException) {
-          CommandLine.ExitCode.SOFTWARE
+      validate()
+      val deserialiser = DeserialiseHashesInteractor()
+      val from = deserialiser.executeTargetHash(startingHashesJSONPath)
+      val to = deserialiser.executeTargetHash(finalHashesJSONPath)
+
+      val outputWriter =
+          BufferedWriter(
+              when (val path = outputPath) {
+                null -> FileWriter(FileDescriptor.out)
+                else -> FileWriter(path)
+              })
+
+      try {
+        if (depsMappingJSONPath != null) {
+          val depsMapping = deserialiser.deserializeDeps(depsMappingJSONPath!!)
+          CalculateImpactedTargetsInteractor()
+              .executeWithDistances(from, to, depsMapping, outputWriter, targetType)
+        } else {
+          CalculateImpactedTargetsInteractor().execute(from, to, outputWriter, targetType)
         }
-        .also { stopKoin() }
+        CommandLine.ExitCode.OK
+      } catch (e: IOException) {
+        CommandLine.ExitCode.SOFTWARE
+      }
+    } finally {
+      stopKoin()
+    }
   }
 
   private fun validate() {

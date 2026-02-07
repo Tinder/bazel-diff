@@ -20,7 +20,7 @@ bazel_diff="/tmp/bazel_diff"
 bazel_diff_flags=""
 if [ "${BAZEL_DIFF_DISABLE_WORKSPACE:-false}" = "true" ]; then
   echo "Disabling workspace for bazel-diff commands (BAZEL_DIFF_DISABLE_WORKSPACE=true)"
-  bazel_diff_flags="-so --enable_workspace=false --excludeExternalTargets"
+  bazel_diff_flags="-co --enable_workspace=false --excludeExternalTargets"
 fi
 
 "$bazel_path" run :bazel-diff --script_path="$bazel_diff"

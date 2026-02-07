@@ -209,18 +209,22 @@ class GenerateHashesCommand : Callable<Int> {
       )
     }
 
-    return when (GenerateHashesInteractor()
-        .execute(
-            seedFilepaths,
-            outputPath,
-            depsMappingJSONPath,
-            ignoredRuleHashingAttributes,
-            targetType,
-            includeTargetType,
-            modifiedFilepaths)) {
-      true -> CommandLine.ExitCode.OK
-      false -> CommandLine.ExitCode.SOFTWARE
-    }.also { stopKoin() }
+    return try {
+      when (GenerateHashesInteractor()
+          .execute(
+              seedFilepaths,
+              outputPath,
+              depsMappingJSONPath,
+              ignoredRuleHashingAttributes,
+              targetType,
+              includeTargetType,
+              modifiedFilepaths)) {
+        true -> CommandLine.ExitCode.OK
+        false -> CommandLine.ExitCode.SOFTWARE
+      }
+    } finally {
+      stopKoin()
+    }
   }
 
   private fun validate(contentHashPath: File?) {

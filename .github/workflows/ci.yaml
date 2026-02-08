@@ -51,6 +51,7 @@ jobs:
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           BAZEL_DIFF_DISABLE_WORKSPACE: ${{ matrix.bazel == '8.x' && 'true' || 'false' }}
+          BAZEL_DIFF_FORCE_CHECKOUT: true
         run: ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   deploy:
     needs: [test-jre21]

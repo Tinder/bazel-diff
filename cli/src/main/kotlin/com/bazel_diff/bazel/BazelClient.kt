@@ -16,8 +16,14 @@ class BazelClient(
   suspend fun queryAllTargets(): List<BazelTarget> {
     val queryEpoch = Calendar.getInstance().getTimeInMillis()
 
+    // Skip //external:all-targets in Bazel 8+ (where WORKSPACE is disabled by default)
+    // or when explicitly excluded via the flag
     val repoTargetsQuery =
-        if (excludeExternalTargets) emptyList() else listOf("//external:all-targets")
+        if (excludeExternalTargets || queryService.shouldSkipExternalTargets) {
+          emptyList()
+        } else {
+          listOf("//external:all-targets")
+        }
     val targets =
         if (useCquery) {
           // Explicitly listing external repos here sometimes causes issues mentioned at

@@ -28,6 +28,11 @@ class BazelQueryService(
   private val logger: Logger by inject()
   private val version: Triple<Int, Int, Int> by lazy { runBlocking { determineBazelVersion() } }
 
+  // In Bazel 8+, the //external package is not available when WORKSPACE is disabled (Bzlmod is the default).
+  // We should skip querying //external:all-targets in Bazel 8+.
+  val shouldSkipExternalTargets: Boolean
+    get() = versionComparator.compare(version, Triple(8, 0, 0)) >= 0
+
   @OptIn(ExperimentalCoroutinesApi::class)
   private suspend fun determineBazelVersion(): Triple<Int, Int, Int> {
     val cmd = arrayOf(bazelPath.toString(), "--version")

@@ -35,3 +35,13 @@ jobs:
         run: ./bazel-diff.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
       - name: Validate Impacted Targets
         run: grep -q "//:yo" /tmp/impacted_targets.txt
+      - name: Upload bazel-diff artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-diff-artifacts-java-${{ matrix.java }}-bazel-${{ matrix.bazel }}
+          path: |
+            /tmp/impacted_targets.txt
+            /tmp/bazel-diff*.log
+            /tmp/bazel-diff*.json
+          if-no-files-found: warn

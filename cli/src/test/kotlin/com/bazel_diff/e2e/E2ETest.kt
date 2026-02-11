@@ -18,6 +18,40 @@ class E2ETest {
 
   private fun CommandLine.execute(args: List<String>) = execute(*args.toTypedArray())
 
+  private fun assertTargetsMatch(actual: Set<String>, expected: Set<String>, testContext: String = "") {
+    if (actual != expected) {
+      val missingTargets = expected - actual
+      val unexpectedTargets = actual - expected
+
+      val debugMessage = buildString {
+        appendLine("\n========================================")
+        appendLine("Target list mismatch${if (testContext.isNotEmpty()) " in $testContext" else ""}")
+        appendLine("========================================")
+
+        if (missingTargets.isNotEmpty()) {
+          appendLine("\nMISSING TARGETS (expected but not found):")
+          missingTargets.sorted().forEach { appendLine("  - $it") }
+        }
+
+        if (unexpectedTargets.isNotEmpty()) {
+          appendLine("\nUNEXPECTED TARGETS (found but not expected):")
+          unexpectedTargets.sorted().forEach { appendLine("  + $it") }
+        }
+
+        appendLine("\nEXPECTED (${expected.size} targets):")
+        expected.sorted().forEach { appendLine("  $it") }
+
+        appendLine("\nACTUAL (${actual.size} targets):")
+        actual.sorted().forEach { appendLine("  $it") }
+        appendLine("========================================")
+      }
+
+      println(debugMessage)
+    }
+
+    assertThat(actual).isEqualTo(expected)
+  }
+
   private fun testE2E(
       extraGenerateHashesArgs: List<String>,
       extraGetImpactedTargetsArgs: List<String>,
@@ -70,7 +104,7 @@ class E2ETest {
           it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()
         }
 
-    assertThat(actual).isEqualTo(expected)
+    assertTargetsMatch(actual, expected, "testE2E")
   }
 
   @Test
@@ -167,7 +201,7 @@ class E2ETest {
                 "/fixture/fine-grained-hash-external-repo-test-impacted-targets.txt")
             .use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
-    assertThat(actual).isEqualTo(expected)
+    assertTargetsMatch(actual, expected, "testFineGrainedHashExternalRepo")
   }
 
   private fun testFineGrainedHashBzlMod(
@@ -247,7 +281,7 @@ class E2ETest {
           it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()
         }
 
-    assertThat(actual).isEqualTo(expected)
+    assertTargetsMatch(actual, expected, "testFineGrainedHashBzlMod")
   }
 
   @Test
@@ -376,7 +410,7 @@ class E2ETest {
             .getResourceAsStream("/fixture/cquery-test-guava-upgrade-android-impacted-targets.txt")
             .use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
-    assertThat(actual).isEqualTo(expected)
+    assertTargetsMatch(actual, expected, "testUseCqueryWithExternalDependencyChange - Android platform")
 
     // Query JRE platform
 
@@ -422,7 +456,7 @@ class E2ETest {
             .getResourceAsStream("/fixture/cquery-test-guava-upgrade-jre-impacted-targets.txt")
             .use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
-    assertThat(actual).isEqualTo(expected)
+    assertTargetsMatch(actual, expected, "testUseCqueryWithExternalDependencyChange - JRE platform")
   }
 
   @Test
@@ -537,7 +571,7 @@ class E2ETest {
                 "/fixture/cquery-test-android-code-change-android-impacted-targets.txt")
             .use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
-    assertThat(actual).isEqualTo(expected)
+    assertTargetsMatch(actual, expected, "testUseCqueryWithAndroidCodeChange - Android platform")
 
     // Query JRE platform
 
@@ -584,7 +618,7 @@ class E2ETest {
                 "/fixture/cquery-test-android-code-change-jre-impacted-targets.txt")
             .use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
 
-    assertThat(actual).isEqualTo(expected)
+    assertTargetsMatch(actual, expected, "testUseCqueryWithAndroidCodeChange - JRE platform")
   }
 
   @Test

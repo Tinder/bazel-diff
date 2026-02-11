@@ -18,6 +18,14 @@ class E2ETest {
 
   private fun CommandLine.execute(args: List<String>) = execute(*args.toTypedArray())
 
+  private fun filterBazelDiffInternalTargets(targets: Set<String>): Set<String> {
+    return targets.filter { target ->
+      // Filter out bazel-diff's own internal test targets
+      !target.contains("bazel-diff-integration-tests") &&
+      !target.contains("bazel_diff_maven") // Filter out bazel-diff's maven dependencies
+    }.toSet()
+  }
+
   private fun assertTargetsMatch(actual: Set<String>, expected: Set<String>, testContext: String = "") {
     if (actual != expected) {
       val missingTargets = expected - actual
@@ -98,10 +106,12 @@ class E2ETest {
             "-o",
             impactedTargetsOutput.absolutePath) + extraGetImpactedTargetsArgs)
 
-    val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    val actual: Set<String> = filterBazelDiffInternalTargets(
+        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     val expected: Set<String> =
         javaClass.getResourceAsStream(expectedResultFile).use {
-          it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()
+          filterBazelDiffInternalTargets(
+              it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet())
         }
 
     assertTargetsMatch(actual, expected, "testE2E")
@@ -194,12 +204,14 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    val actual: Set<String> = filterBazelDiffInternalTargets(
+        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     val expected: Set<String> =
         javaClass
             .getResourceAsStream(
                 "/fixture/fine-grained-hash-external-repo-test-impacted-targets.txt")
-            .use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+            .use { filterBazelDiffInternalTargets(
+                it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()) }
 
     assertTargetsMatch(actual, expected, "testFineGrainedHashExternalRepo")
   }
@@ -275,10 +287,12 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    val actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    val actual: Set<String> = filterBazelDiffInternalTargets(
+        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     val expected: Set<String> =
         javaClass.getResourceAsStream(expectedResultFile).use {
-          it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()
+          filterBazelDiffInternalTargets(
+              it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet())
         }
 
     assertTargetsMatch(actual, expected, "testFineGrainedHashBzlMod")
@@ -404,11 +418,13 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    var actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    var actual: Set<String> = filterBazelDiffInternalTargets(
+        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     var expected: Set<String> =
         javaClass
             .getResourceAsStream("/fixture/cquery-test-guava-upgrade-android-impacted-targets.txt")
-            .use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+            .use { filterBazelDiffInternalTargets(
+                it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()) }
 
     assertTargetsMatch(actual, expected, "testUseCqueryWithExternalDependencyChange - Android platform")
 
@@ -450,11 +466,13 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    actual = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    actual = filterBazelDiffInternalTargets(
+        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     expected =
         javaClass
             .getResourceAsStream("/fixture/cquery-test-guava-upgrade-jre-impacted-targets.txt")
-            .use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+            .use { filterBazelDiffInternalTargets(
+                it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()) }
 
     assertTargetsMatch(actual, expected, "testUseCqueryWithExternalDependencyChange - JRE platform")
   }
@@ -564,12 +582,14 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    var actual: Set<String> = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    var actual: Set<String> = filterBazelDiffInternalTargets(
+        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     var expected: Set<String> =
         javaClass
             .getResourceAsStream(
                 "/fixture/cquery-test-android-code-change-android-impacted-targets.txt")
-            .use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+            .use { filterBazelDiffInternalTargets(
+                it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()) }
 
     assertTargetsMatch(actual, expected, "testUseCqueryWithAndroidCodeChange - Android platform")
 
@@ -611,12 +631,14 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    actual = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    actual = filterBazelDiffInternalTargets(
+        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     expected =
         javaClass
             .getResourceAsStream(
                 "/fixture/cquery-test-android-code-change-jre-impacted-targets.txt")
-            .use { it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet() }
+            .use { filterBazelDiffInternalTargets(
+                it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()) }
 
     assertTargetsMatch(actual, expected, "testUseCqueryWithAndroidCodeChange - JRE platform")
   }

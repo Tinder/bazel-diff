@@ -7,6 +7,12 @@
 @@//src/main/java/com/integration:guava-user
 @@//src/main/java/com/integration:libguava-user-src.jar
 @@//src/main/java/com/integration:libguava-user.jar
+@@//test/java/com/integration:bazel-diff-integration-tests
+@@//test/java/com/integration:bazel-diff-integration-tests-src.jar
+@@//test/java/com/integration:bazel-diff-integration-tests.jar
+@@//test/java/com/integration:bazel-diff-integration-tests_deploy-src.jar
+@@//test/java/com/integration:bazel-diff-integration-tests_deploy.jar
+@@//test/java/com/integration:bazel-diff-integration-tests_deploy.jar.unstripped
 @@rules_jvm_external++maven+android//:com_google_errorprone_error_prone_annotations
 @@rules_jvm_external++maven+android//:com_google_guava_guava
 @@rules_jvm_external++maven+android//:com_google_j2objc_j2objc_annotations

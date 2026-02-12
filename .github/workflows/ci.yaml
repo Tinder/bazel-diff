@@ -7,24 +7,6 @@ on:
     branches: [ master ]
 
 jobs:
-  test-jre21-bzlmod:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-      - name: Setup Go environment
-        uses: actions/setup-go@v5
-        with:
-          go-version: ^1.17
-        id: go
-      - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
-      - uses: actions/checkout@v4
-      - name: Run bazel-diff tests
-        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=true
   test-jre21:
     runs-on: ubuntu-latest
     steps:
@@ -42,9 +24,26 @@ jobs:
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
       - name: Run bazel-diff tests
-        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=false
+        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=true --enable_workspace=false
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report-jre21
+          path: bazel-out/_coverage/_coverage_report.dat
+          if-no-files-found: warn
+      - name: Upload test logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-logs-jre21
+          path: bazel-testlogs/
+          if-no-files-found: warn
   test-jre11-run-example:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        bazel: ['7.x', '8.x']
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v4
@@ -63,6 +62,10 @@ jobs:
         with:
           fetch-depth: 0
       - name: Run bazel-diff example script
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+          BAZEL_DIFF_DISABLE_WORKSPACE: ${{ matrix.bazel == '8.x' && 'true' || 'false' }}
+          BAZEL_DIFF_FORCE_CHECKOUT: true
         run: ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   deploy:
     needs: [test-jre21]

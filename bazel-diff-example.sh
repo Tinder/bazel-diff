@@ -16,17 +16,35 @@ final_hashes_json="/tmp/final_hashes.json"
 impacted_targets_path="/tmp/impacted_targets.txt"
 bazel_diff="/tmp/bazel_diff"
 
+# Set appropriate flags based on environment variable
+bazel_diff_flags=""
+if [ "${BAZEL_DIFF_DISABLE_WORKSPACE:-false}" = "true" ]; then
+  echo "Disabling workspace for bazel-diff commands (BAZEL_DIFF_DISABLE_WORKSPACE=true)"
+  bazel_diff_flags="-co --enable_workspace=false --excludeExternalTargets"
+fi
+
+# Set git checkout flags based on environment variable
+git_checkout_flags="--quiet"
+if [ "${BAZEL_DIFF_FORCE_CHECKOUT:-false}" = "true" ]; then
+  echo "Force checkout enabled (BAZEL_DIFF_FORCE_CHECKOUT=true) - will discard uncommitted changes"
+  git_checkout_flags="--force --quiet"
+fi
+
 "$bazel_path" run :bazel-diff --script_path="$bazel_diff"
 
-git -C "$workspace_path" checkout "$previous_revision" --quiet
+# shellcheck disable=SC2086
+git -C "$workspace_path" checkout $git_checkout_flags "$previous_revision"
 
 echo "Generating Hashes for Revision '$previous_revision'"
-$bazel_diff generate-hashes -w "$workspace_path" -b "$bazel_path" $starting_hashes_json
+# shellcheck disable=SC2086
+$bazel_diff generate-hashes -w "$workspace_path" -b "$bazel_path" $bazel_diff_flags "$starting_hashes_json"
 
-git -C "$workspace_path" checkout "$final_revision" --quiet
+# shellcheck disable=SC2086
+git -C "$workspace_path" checkout $git_checkout_flags "$final_revision"
 
 echo "Generating Hashes for Revision '$final_revision'"
-$bazel_diff generate-hashes -w "$workspace_path" -b "$bazel_path" $final_hashes_json
+# shellcheck disable=SC2086
+$bazel_diff generate-hashes -w "$workspace_path" -b "$bazel_path" $bazel_diff_flags "$final_hashes_json"
 
 echo "Determining Impacted Targets"
 $bazel_diff get-impacted-targets -sh $starting_hashes_json -fh $final_hashes_json -o $impacted_targets_path

@@ -13,7 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        java: [ '8', '11' ]
+        java: [ '11' ]
+        bazel: ['8.x']
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v3
@@ -26,9 +27,21 @@ jobs:
           repository: tinder-maxwellelliott/bazel-diff-repro-1
           ref: master
           fetch-depth: 0
-      - name: Set bazel version
-        run: echo "USE_BAZEL_VERSION=7.3.1" > "$HOME/.bazeliskrc"
       - name: Run External Target Impact test
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+          BAZEL_DIFF_DISABLE_WORKSPACE: ${{ matrix.bazel == '8.x' && 'true' || 'false' }}
+          BAZEL_DIFF_FORCE_CHECKOUT: true
         run: ./bazel-diff.sh $(pwd) bazel $(git rev-parse HEAD~1) $(git rev-parse HEAD)
       - name: Validate Impacted Targets
         run: grep -q "//:yo" /tmp/impacted_targets.txt
+      - name: Upload bazel-diff artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-diff-artifacts-java-${{ matrix.java }}-bazel-${{ matrix.bazel }}
+          path: |
+            /tmp/impacted_targets.txt
+            /tmp/bazel-diff*.log
+            /tmp/bazel-diff*.json
+          if-no-files-found: warn

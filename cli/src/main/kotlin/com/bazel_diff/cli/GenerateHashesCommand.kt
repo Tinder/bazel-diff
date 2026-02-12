@@ -179,7 +179,7 @@ class GenerateHashesCommand : Callable<Int> {
       negatable = true,
       description =
           [
-              "If true, exclude external targets. This must be switched on when using `--noenable_workspace` Bazel command line option. Defaults to `false`."],
+              "If true, exclude external targets. This must be switched on when using `--enable_workspace=false` Bazel command line option. Defaults to `false`."],
       scope = CommandLine.ScopeType.INHERIT)
   var excludeExternalTargets = false
 
@@ -209,18 +209,22 @@ class GenerateHashesCommand : Callable<Int> {
       )
     }
 
-    return when (GenerateHashesInteractor()
-        .execute(
-            seedFilepaths,
-            outputPath,
-            depsMappingJSONPath,
-            ignoredRuleHashingAttributes,
-            targetType,
-            includeTargetType,
-            modifiedFilepaths)) {
-      true -> CommandLine.ExitCode.OK
-      false -> CommandLine.ExitCode.SOFTWARE
-    }.also { stopKoin() }
+    return try {
+      when (GenerateHashesInteractor()
+          .execute(
+              seedFilepaths,
+              outputPath,
+              depsMappingJSONPath,
+              ignoredRuleHashingAttributes,
+              targetType,
+              includeTargetType,
+              modifiedFilepaths)) {
+        true -> CommandLine.ExitCode.OK
+        false -> CommandLine.ExitCode.SOFTWARE
+      }
+    } finally {
+      stopKoin()
+    }
   }
 
   private fun validate(contentHashPath: File?) {

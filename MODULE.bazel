@@ -1,12 +1,13 @@
 module(
     name = "bazel-diff",
-    version = "13.0.0",
+    version = "13.1.0",
     compatibility_level = 0,
 )
 
 bazel_dep(name = "rules_license", version = "1.0.0", dev_dependency = True)
 bazel_dep(name = "aspect_rules_lint", version = "1.0.2", dev_dependency = True)
 
+bazel_dep(name = "aspect_bazel_lib", version = "2.7.7")
 bazel_dep(name = "bazel_skylib", version = "1.7.1")
 bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "rules_java", version = "8.14.0")
@@ -17,10 +18,10 @@ maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
 maven.install(
     name = "bazel_diff_maven",
     artifacts = [
-        "com.google.code.gson:gson:jar:2.9.0",
+        "com.google.code.gson:gson:2.9.0@jar",
         "com.google.guava:guava:31.1-jre",
         "com.willowtreeapps.assertk:assertk-jvm:0.25",
-        "info.picocli:picocli:jar:4.6.3",
+        "info.picocli:picocli:4.6.3@jar",
         "io.insert-koin:koin-core-jvm:3.1.6",
         "io.insert-koin:koin-test-junit4:4.0.0",
         "junit:junit:4.13.2",

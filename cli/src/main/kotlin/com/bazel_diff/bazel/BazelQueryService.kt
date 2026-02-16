@@ -53,9 +53,9 @@ class BazelQueryService(
     if (result.output.size != 1 || !result.output.first().startsWith("bazel ")) {
       throw RuntimeException("Bazel version command returned unexpected output: ${result.output}")
     }
-    // Trim off any prerelease suffixes.
+    // Trim off any prerelease suffixes (e.g., 8.6.0-rc1 or 8.6.0rc1).
     val versionString = result.output.first().removePrefix("bazel ").trim().split('-')[0]
-    val version = versionString.split('.').map { it.toInt() }.toTypedArray()
+    val version = versionString.split('.').map { it.takeWhile { c -> c.isDigit() }.toInt() }.toTypedArray()
     return Triple(version[0], version[1], version[2])
   }
 

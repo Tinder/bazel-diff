@@ -42,8 +42,24 @@ jobs:
   test-jre11-run-example:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        bazel: ['7.x', '8.x', '8.6.0rc1']
+        include:
+          - bazel: '7.x'
+            disable_workspace: 'false'
+            extra_flags: ''
+          - bazel: '7.x'
+            disable_workspace: 'false'
+            extra_flags: '--incompatible_disable_native_repo_rules'
+          - bazel: '8.x'
+            disable_workspace: 'true'
+            extra_flags: ''
+          - bazel: '8.6.0rc1'
+            disable_workspace: 'true'
+            extra_flags: ''
+          - bazel: '8.x'
+            disable_workspace: 'true'
+            extra_flags: '--incompatible_disable_native_repo_rules'
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v4
@@ -64,8 +80,9 @@ jobs:
       - name: Run bazel-diff example script
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-          BAZEL_DIFF_DISABLE_WORKSPACE: ${{ matrix.bazel == '8.x' && 'true' || 'false' }}
+          BAZEL_DIFF_DISABLE_WORKSPACE: ${{ matrix.disable_workspace }}
           BAZEL_DIFF_FORCE_CHECKOUT: true
+          BAZEL_EXTRA_COMMAND_OPTIONS: ${{ matrix.extra_flags }}
         run: ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   deploy:
     needs: [test-jre21]

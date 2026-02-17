@@ -16,6 +16,16 @@ def bazel_diff_dependencies(
         rules_jvm_external_sha = RULES_JVM_EXTERNAL_SHA,
         rules_kotlin_version = RULES_KOTLIN_VERSION,
         rules_kotlin_sha = RULES_KOTLIN_SHA):
+    """Loads all external repositories required by bazel-diff (Skylib, rules_java, rules_jvm_external, rules_kotlin, etc.).
+
+    Args:
+      rules_java_version: Version string for rules_java.
+      rules_java_integrity: Integrity hash for rules_java archive.
+      rules_jvm_external_tag: Tag/version for rules_jvm_external.
+      rules_jvm_external_sha: SHA256 of rules_jvm_external archive.
+      rules_kotlin_version: Version string for rules_kotlin.
+      rules_kotlin_sha: SHA256 of rules_kotlin archive.
+    """
     _maybe(
         http_archive,
         name = "bazel_skylib",
@@ -89,9 +99,9 @@ def bazel_diff_dependencies(
     _maybe(
         http_archive,
         name = "aspect_bazel_lib",
-        sha256 = "6d758a8f646ecee7a3e294fbe4386daafbe0e5966723009c290d493f227c390b",
-        strip_prefix = "bazel-lib-2.7.7",
-        url = "https://github.com/aspect-build/bazel-lib/releases/download/v2.7.7/bazel-lib-v2.7.7.tar.gz",
+        sha256 = "5c42b1547cd4fab56fb90f75295aaf6d9e4aed5b51bfcb2457e44b886204a6e2",
+        strip_prefix = "bazel-lib-3.2.1",
+        url = "https://github.com/aspect-build/bazel-lib/releases/download/v3.2.1/bazel-lib-v3.2.1.tar.gz",
     )
 
     _maybe(

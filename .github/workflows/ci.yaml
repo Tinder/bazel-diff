@@ -67,6 +67,35 @@ jobs:
           BAZEL_DIFF_DISABLE_WORKSPACE: ${{ matrix.bazel == '8.x' && 'true' || 'false' }}
           BAZEL_DIFF_FORCE_CHECKOUT: true
         run: ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
+  test-example-with-incompatible-flags:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: incompatible_disable_native_repo_rules
+            extra_flags: "--incompatible_disable_native_repo_rules"
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run bazel-diff example with incompatible flags (${{ matrix.name }})
+        env:
+          USE_BAZEL_VERSION: '7.x'
+          BAZEL_DIFF_FORCE_CHECKOUT: true
+          BAZEL_EXTRA_COMMAND_OPTIONS: ${{ matrix.extra_flags }}
+        run: ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
   deploy:
     needs: [test-jre21]
     runs-on: ubuntu-latest

@@ -22,6 +22,15 @@ if [ "${BAZEL_DIFF_DISABLE_WORKSPACE:-false}" = "true" ]; then
   echo "Disabling workspace for bazel-diff commands (BAZEL_DIFF_DISABLE_WORKSPACE=true)"
   bazel_diff_flags="-co --enable_workspace=false"
 fi
+if [ -n "${BAZEL_DIFF_EXTRA_FLAGS:-}" ]; then
+  echo "Injecting extra bazel-diff flags: $BAZEL_DIFF_EXTRA_FLAGS"
+  bazel_diff_flags="$bazel_diff_flags $BAZEL_DIFF_EXTRA_FLAGS"
+fi
+# Bazel command options applied to both top-level bazel invocations and generate-hashes (via -co)
+if [ -n "${BAZEL_EXTRA_COMMAND_OPTIONS:-}" ]; then
+  echo "Applying extra Bazel command options to top-level and generate-hashes: $BAZEL_EXTRA_COMMAND_OPTIONS"
+  bazel_diff_flags="$bazel_diff_flags -co $BAZEL_EXTRA_COMMAND_OPTIONS"
+fi
 
 # Set git checkout flags based on environment variable
 git_checkout_flags="--quiet"
@@ -30,7 +39,8 @@ if [ "${BAZEL_DIFF_FORCE_CHECKOUT:-false}" = "true" ]; then
   git_checkout_flags="--force --quiet"
 fi
 
-"$bazel_path" run :bazel-diff --script_path="$bazel_diff"
+# shellcheck disable=SC2086
+"$bazel_path" run ${BAZEL_EXTRA_COMMAND_OPTIONS:-} :bazel-diff --script_path="$bazel_diff"
 
 # shellcheck disable=SC2086
 git -C "$workspace_path" checkout $git_checkout_flags "$previous_revision"

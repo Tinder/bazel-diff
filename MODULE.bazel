@@ -7,7 +7,7 @@ module(
 bazel_dep(name = "rules_license", version = "1.0.0", dev_dependency = True)
 bazel_dep(name = "aspect_rules_lint", version = "1.0.2", dev_dependency = True)
 
-bazel_dep(name = "aspect_bazel_lib", version = "2.7.7")
+bazel_dep(name = "aspect_bazel_lib", version = "2.7.7", dev_dependency = True)
 bazel_dep(name = "bazel_skylib", version = "1.7.1")
 bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "rules_java", version = "8.14.0")

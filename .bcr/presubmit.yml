@@ -27,12 +27,18 @@ tasks:
     bazel: ${{ bazel }}
     build_targets:
     - '@bazel-diff//:bazel-diff'
-  verify_targets_windows:
-    name: Verify build targets (Windows)
+  verify_targets_windows_7x:
+    name: Verify build targets (Windows, Bazel 7.x)
     platform: windows
-    bazel: ${{ bazel }}
+    bazel: "7.x"
+    build_targets:
+    - '@bazel-diff//:bazel-diff'
+  verify_targets_windows_8x:
+    name: Verify build targets (Windows, Bazel 8.x)
+    platform: windows
+    bazel: "8.x"
     build_flags:
-    - '--config=windows'
+    - '--legacy_external_runfiles'
     build_targets:
     - '@bazel-diff//:bazel-diff'
 bcr_test_module:

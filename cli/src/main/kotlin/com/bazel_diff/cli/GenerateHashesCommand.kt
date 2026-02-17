@@ -179,7 +179,7 @@ class GenerateHashesCommand : Callable<Int> {
       negatable = true,
       description =
           [
-              "If true, exclude external targets. This must be switched on when using `--enable_workspace=false` Bazel command line option. Defaults to `false`."],
+              "If true, exclude external targets (do not query //external:all-targets). When Bzlmod is enabled (detected via bazel mod graph), external targets are excluded automatically. Set this when using Bazel with --enable_workspace=false in other configurations. Defaults to false."],
       scope = CommandLine.ScopeType.INHERIT)
   var excludeExternalTargets = false
 

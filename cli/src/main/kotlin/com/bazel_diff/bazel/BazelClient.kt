@@ -8,18 +8,19 @@ import org.koin.core.component.inject
 class BazelClient(
     private val useCquery: Boolean,
     private val fineGrainedHashExternalRepos: Set<String>,
-    private val excludeExternalTargets: Boolean
+    private val excludeExternalTargets: Boolean,
 ) : KoinComponent {
   private val logger: Logger by inject()
   private val queryService: BazelQueryService by inject()
+  private val bazelModService: BazelModService by inject()
 
   suspend fun queryAllTargets(): List<BazelTarget> {
     val queryEpoch = Calendar.getInstance().getTimeInMillis()
 
-    // Skip //external:all-targets in Bazel 8+ (where WORKSPACE is disabled by default)
-    // or when explicitly excluded via the flag
+    // Skip //external:all-targets when explicitly excluded or when Bzlmod is enabled (//external not
+    // available).
     val repoTargetsQuery =
-        if (excludeExternalTargets || queryService.shouldSkipExternalTargets) {
+        if (excludeExternalTargets || bazelModService.isBzlmodEnabled) {
           emptyList()
         } else {
           listOf("//external:all-targets")

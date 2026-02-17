@@ -158,9 +158,12 @@ workspace.
                                   ...
                                 }
       --[no-]excludeExternalTargets
-                          If true, exclude external targets. This must be
-                            switched on when using `--enable_workspace=false` Bazel
-                            command line option. Defaults to `false`.
+                          If true, exclude external targets (do not query
+                            //external:all-targets). When Bzlmod is enabled
+                            (detected via bazel mod graph), external targets
+                            are excluded automatically. Set this when using
+                            Bazel with --enable_workspace=false in other
+                            configurations. Defaults to false.
       --[no-]includeTargetType
                           Whether include target type in the generated JSON or not.
                             If false, the generate JSON schema is: {"<target>": "<sha256>"}

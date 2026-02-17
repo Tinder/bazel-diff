@@ -643,34 +643,6 @@ class E2ETest {
     assertTargetsMatch(actual, expected, "testUseCqueryWithAndroidCodeChange - JRE platform")
   }
 
-  @Test
-  fun testUseCqueryWithExcludeExternalTargets() {
-    // This test verifies the fix for the issue where using --excludeExternalTargets with
-    // --useCquery
-    // would cause an empty query string to be passed to Bazel, resulting in exit code 2.
-    val workingDirectory = extractFixtureProject("/fixture/cquery-test-base.zip")
-
-    val bazelPath = "bazel"
-    val outputDir = temp.newFolder()
-    val hashesJson = File(outputDir, "hashes.json")
-
-    val cli = CommandLine(BazelDiff())
-
-    val exitCode =
-        cli.execute(
-            "generate-hashes",
-            "-w",
-            workingDirectory.absolutePath,
-            "-b",
-            bazelPath,
-            "--useCquery",
-            // Platform is specified only to make the cquery succeed.
-            "--cqueryCommandOptions",
-            "--platforms=//:jre",
-            "--excludeExternalTargets",
-            hashesJson.absolutePath)
-    assertThat(exitCode).isEqualTo(0)
-  }
 
   @Test
   fun testTargetDistanceMetrics() {

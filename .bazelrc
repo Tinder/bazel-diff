@@ -9,3 +9,7 @@ common --java_runtime_version=remotejdk_21
 # Avoid cache thrashing, but allow integration tests to find "bazel" on the PATH.
 common --incompatible_strict_action_env
 common --test_env=PATH
+
+# Workaround for rules_kotlin KotlinCompile runfiles on Windows (Rlocation / MANIFEST).
+# See: https://github.com/bazelbuild/rules_kotlin/issues/1309
+build:windows --legacy_external_runfiles

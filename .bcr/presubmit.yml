@@ -1,18 +1,44 @@
 matrix:
-  platform:
-  - debian10
-  - ubuntu2004
-  - macos
-  - macos_arm64
-  - windows
   bazel:
   - 7.x
   - 8.x
 tasks:
-  verify_targets:
-    name: Verify build targets
-    platform: ${{ platform }}
+  verify_targets_debian10:
+    name: Verify build targets (Debian 10)
+    platform: debian10
     bazel: ${{ bazel }}
+    build_targets:
+    - '@bazel-diff//:bazel-diff'
+  verify_targets_ubuntu2004:
+    name: Verify build targets (Ubuntu 20.04)
+    platform: ubuntu2004
+    bazel: ${{ bazel }}
+    build_targets:
+    - '@bazel-diff//:bazel-diff'
+  verify_targets_macos:
+    name: Verify build targets (macOS)
+    platform: macos
+    bazel: ${{ bazel }}
+    build_targets:
+    - '@bazel-diff//:bazel-diff'
+  verify_targets_macos_arm64:
+    name: Verify build targets (macOS ARM64)
+    platform: macos_arm64
+    bazel: ${{ bazel }}
+    build_targets:
+    - '@bazel-diff//:bazel-diff'
+  verify_targets_windows_7x:
+    name: Verify build targets (Windows, Bazel 7.x)
+    platform: windows
+    bazel: "7.x"
+    build_targets:
+    - '@bazel-diff//:bazel-diff'
+  verify_targets_windows_8x:
+    name: Verify build targets (Windows, Bazel 8.x)
+    platform: windows
+    bazel: "8.x"
+    build_flags:
+    - '--legacy_external_runfiles'
     build_targets:
     - '@bazel-diff//:bazel-diff'
 bcr_test_module:

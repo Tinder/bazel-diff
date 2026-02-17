@@ -1,6 +1,7 @@
 package com.bazel_diff.di
 
 import com.bazel_diff.bazel.BazelClient
+import com.bazel_diff.bazel.BazelModService
 import com.bazel_diff.bazel.BazelQueryService
 import com.bazel_diff.hash.*
 import com.bazel_diff.io.ContentHashProvider
@@ -70,6 +71,9 @@ fun hasherModule(
         cqueryOptions,
         keepGoing,
         debug)
+  }
+  single {
+    BazelModService(workingDirectory, bazelPath, startupOptions, debug)
   }
   single { BazelClient(useCquery, updatedFineGrainedHashExternalRepos, excludeExternalTargets) }
   single { BuildGraphHasher(get()) }

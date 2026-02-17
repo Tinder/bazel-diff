@@ -20,7 +20,7 @@ bazel_diff="/tmp/bazel_diff"
 bazel_diff_flags=""
 if [ "${BAZEL_DIFF_DISABLE_WORKSPACE:-false}" = "true" ]; then
   echo "Disabling workspace for bazel-diff commands (BAZEL_DIFF_DISABLE_WORKSPACE=true)"
-  bazel_diff_flags="-co --enable_workspace=false --excludeExternalTargets"
+  bazel_diff_flags="-co --enable_workspace=false"
 fi
 
 # Set git checkout flags based on environment variable

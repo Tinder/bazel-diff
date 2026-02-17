@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        bazel: ['7.x', '8.x']
+        bazel: ['7.x', '8.x', '8.6.0rc1']
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v4

@@ -16,6 +16,7 @@ bazel_dep(name = "rules_jvm_external", version = "6.10")
 
 # Add protobuf and grpc for Bazel 9 compatibility
 bazel_dep(name = "protobuf", version = "33.4")
+bazel_dep(name = "stardoc", version = "0.7.2")
 
 single_version_override(
     module_name = "grpc-java",

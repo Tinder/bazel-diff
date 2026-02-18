@@ -7,7 +7,7 @@ alias(
 
 alias(
     name = "format",
-    actual = "//cli:format",
+    actual = "//cli/format:format",
 )
 
 define_kt_toolchain(

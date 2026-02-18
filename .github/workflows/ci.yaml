@@ -60,6 +60,12 @@ jobs:
           - bazel: '8.x'
             disable_workspace: 'true'
             extra_flags: '--incompatible_disable_native_repo_rules'
+          - bazel: '9.x'
+            disable_workspace: 'true'
+            extra_flags: ''
+          - bazel: '9.x'
+            disable_workspace: 'true'
+            extra_flags: '--incompatible_disable_native_repo_rules'
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v4

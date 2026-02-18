@@ -37,8 +37,8 @@ kt_jvm_library(
         "@bazel_diff_maven//:io_insert_koin_koin_core_jvm",
         "@bazel_diff_maven//:org_apache_commons_commons_pool2",
         "@bazel_diff_maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core_jvm",
-        "@bazel_tools//src/main/protobuf:analysis_v2_java_proto",
-        "@bazel_tools//src/main/protobuf:build_java_proto",
+        "//proto:analysis_v2_java_proto",
+        "//proto:build_java_proto",
     ],
 )
 

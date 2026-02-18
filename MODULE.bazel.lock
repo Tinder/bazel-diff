@@ -310,6 +310,36 @@
   },
   "selectedYankedVersions": {},
   "moduleExtensions": {
+    "//:extensions.bzl%non_module_repositories": {
+      "general": {
+        "bzlTransitiveDigest": "+11C3Nl1PrqDZuEZBkWEY/1862q4s4Wb0bsOaKjAMhk=",
+        "usagesDigest": "IpaUhOlr0mgVktZrtxDQUACS6qc5An/t3Ps6FzSYasQ=",
+        "recordedFileInputs": {},
+        "recordedDirentsInputs": {},
+        "envVariables": {},
+        "generatedRepoSpecs": {
+          "ktfmt": {
+            "repoRuleId": "@@bazel_tools//tools/build_defs/repo:http.bzl%http_jar",
+            "attributes": {
+              "integrity": "sha256-l/x/vRlNAan6RdgUfAVSQDAD1VusSridhNe7TV4/SN4=",
+              "url": "https://repo1.maven.org/maven2/com/facebook/ktfmt/0.46/ktfmt-0.46-jar-with-dependencies.jar"
+            }
+          }
+        },
+        "recordedRepoMappingEntries": [
+          [
+            "",
+            "aspect_rules_lint",
+            "aspect_rules_lint+"
+          ],
+          [
+            "aspect_rules_lint+",
+            "bazel_tools",
+            "bazel_tools"
+          ]
+        ]
+      }
+    },
     "@@buildifier_prebuilt+//:defs.bzl%buildifier_prebuilt_deps_extension": {
       "general": {
         "bzlTransitiveDigest": "SGILosx5Y/9gqlxz+OVua6yYM6U/ZgniyPU6ecTht1o=",

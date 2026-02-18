@@ -39,3 +39,5 @@ use_repo(
 
 non_module_repositories = use_extension("//:extensions.bzl", "non_module_repositories", dev_dependency = True)
 use_repo(non_module_repositories, "ktfmt")
+
+register_toolchains("//:kotlin_toolchain")

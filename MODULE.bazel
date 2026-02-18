@@ -8,11 +8,24 @@ bazel_dep(name = "rules_license", version = "1.0.0", dev_dependency = True)
 bazel_dep(name = "aspect_rules_lint", version = "1.0.2", dev_dependency = True)
 bazel_dep(name = "aspect_bazel_lib", version = "2.22.5", dev_dependency = True)
 
-bazel_dep(name = "bazel_skylib", version = "1.8.2")
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "rules_java", version = "9.3.0")
 bazel_dep(name = "rules_kotlin", version = "2.3.0")
 bazel_dep(name = "rules_jvm_external", version = "6.10")
+
+# Add protobuf and grpc for Bazel 9 compatibility
+bazel_dep(name = "protobuf", version = "33.4")
+single_version_override(
+    module_name = "grpc-java",
+    version = "1.78.0",
+)
+bazel_dep(name = "grpc", version = "1.76.0", repo_name = "com_github_grpc_grpc")
+
+# Override transitive dependencies to Bazel 9 compatible versions
+bazel_dep(name = "rules_nodejs", version = "6.7.3")
+bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
+bazel_dep(name = "rules_python", version = "1.8.4")
 
 maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
 maven.install(

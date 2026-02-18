@@ -2,6 +2,7 @@ matrix:
   bazel:
   - 7.x
   - 8.x
+  - 9.x
 tasks:
   verify_targets_debian10:
     name: Verify build targets (Debian 10)
@@ -41,6 +42,14 @@ tasks:
     - '--legacy_external_runfiles'
     build_targets:
     - '@bazel-diff//:bazel-diff'
+  verify_targets_windows_9x:
+    name: Verify build targets (Windows, Bazel 9.x)
+    platform: windows
+    bazel: "9.x"
+    build_flags:
+    - '--legacy_external_runfiles'
+    build_targets:
+    - '@bazel-diff//:bazel-diff'
 bcr_test_module:
   module_path: ""
   matrix:
@@ -50,6 +59,7 @@ bcr_test_module:
     - macos_arm64
     bazel:
     - 8.x
+    - 9.x
   tasks:
     run_tests:
       name: Run test

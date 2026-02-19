@@ -22,6 +22,7 @@ class E2ETest {
     return targets.filter { target ->
       // Filter out bazel-diff's own internal test targets
       !target.contains("bazel-diff-integration-tests") &&
+      !target.contains("@@//:BUILD") &&
       !target.contains("bazel_diff_maven") // Filter out bazel-diff's maven dependencies
     }.toSet()
   }
@@ -695,9 +696,13 @@ class E2ETest {
     val gson = Gson()
     val shape = object : TypeToken<List<Map<String, Any>>>() {}.type
     val actual =
-        gson.fromJson<List<Map<String, Any>>>(impactedTargetsOutput.readText(), shape).sortedBy {
-          it["label"] as String
-        }
+        gson.fromJson<List<Map<String, Any>>>(impactedTargetsOutput.readText(), shape)
+            .filter { target ->
+              // Filter out Bazel convenience symlink targets (bazel-*) as they're not reliably
+              // present across all environments
+              !(target["label"] as String).contains("//bazel-")
+            }
+            .sortedBy { it["label"] as String }
     val expected: List<Map<String, Any>> =
         listOf(
             mapOf("label" to "//A:one", "targetDistance" to 0.0, "packageDistance" to 0.0),

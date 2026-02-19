@@ -696,9 +696,13 @@ class E2ETest {
     val gson = Gson()
     val shape = object : TypeToken<List<Map<String, Any>>>() {}.type
     val actual =
-        gson.fromJson<List<Map<String, Any>>>(impactedTargetsOutput.readText(), shape).sortedBy {
-          it["label"] as String
-        }
+        gson.fromJson<List<Map<String, Any>>>(impactedTargetsOutput.readText(), shape)
+            .filter { target ->
+              // Filter out Bazel convenience symlink targets (bazel-*) as they're not reliably
+              // present across all environments
+              !(target["label"] as String).contains("//bazel-")
+            }
+            .sortedBy { it["label"] as String }
     val expected: List<Map<String, Any>> =
         listOf(
             mapOf("label" to "//A:one", "targetDistance" to 0.0, "packageDistance" to 0.0),
@@ -706,8 +710,7 @@ class E2ETest {
             mapOf("label" to "//A:two.sh", "targetDistance" to 2.0, "packageDistance" to 0.0),
             mapOf("label" to "//A:two", "targetDistance" to 3.0, "packageDistance" to 0.0),
             mapOf("label" to "//A:three", "targetDistance" to 4.0, "packageDistance" to 0.0),
-            mapOf("label" to "//:lib", "targetDistance" to 5.0, "packageDistance" to 1.0),
-            mapOf("label" to "//bazel-distance_metrics:lib", "targetDistance" to 5.0, "packageDistance" to 1.0))
+            mapOf("label" to "//:lib", "targetDistance" to 5.0, "packageDistance" to 1.0))
 
     assertThat(actual.size).isEqualTo(expected.size)
 

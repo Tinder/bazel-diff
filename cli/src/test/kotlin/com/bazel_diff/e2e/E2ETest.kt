@@ -22,6 +22,7 @@ class E2ETest {
     return targets.filter { target ->
       // Filter out bazel-diff's own internal test targets
       !target.contains("bazel-diff-integration-tests") &&
+      !target.contains("@@//:BUILD") &&
       !target.contains("bazel_diff_maven") // Filter out bazel-diff's maven dependencies
     }.toSet()
   }
@@ -705,7 +706,8 @@ class E2ETest {
             mapOf("label" to "//A:two.sh", "targetDistance" to 2.0, "packageDistance" to 0.0),
             mapOf("label" to "//A:two", "targetDistance" to 3.0, "packageDistance" to 0.0),
             mapOf("label" to "//A:three", "targetDistance" to 4.0, "packageDistance" to 0.0),
-            mapOf("label" to "//:lib", "targetDistance" to 5.0, "packageDistance" to 1.0))
+            mapOf("label" to "//:lib", "targetDistance" to 5.0, "packageDistance" to 1.0),
+            mapOf("label" to "//bazel-distance_metrics:lib", "targetDistance" to 5.0, "packageDistance" to 1.0))
 
     assertThat(actual.size).isEqualTo(expected.size)
 

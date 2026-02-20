@@ -2,7 +2,7 @@
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
 
-def _non_module_repositories_impl(module_ctx):
+def _non_module_repositories_impl(_module_ctx):
     # Fetch ktfmt JAR from Maven Central
     # This replaces the removed fetch_ktfmt() from aspect_rules_lint v1.x
     http_jar(

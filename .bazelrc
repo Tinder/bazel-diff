@@ -6,9 +6,18 @@ test --sandbox_tmpfs_path=/tmp
 # Use a hermetic JDK for tests.
 common --java_runtime_version=remotejdk_21
 
+# Enable platform-specific config
+common --enable_platform_specific_config
+
 # Set C++ standard to C++17 for abseil-cpp compatibility
-build --cxxopt=-std=c++17
-build --host_cxxopt=-std=c++17
+# Use GCC/Clang syntax for Linux and macOS
+build:linux --cxxopt=-std=c++17
+build:linux --host_cxxopt=-std=c++17
+build:macos --cxxopt=-std=c++17
+build:macos --host_cxxopt=-std=c++17
+# Use MSVC syntax for Windows
+build:windows --cxxopt=/std:c++17
+build:windows --host_cxxopt=/std:c++17
 
 # Avoid cache thrashing, but allow integration tests to find "bazel" on the PATH.
 common --incompatible_strict_action_env

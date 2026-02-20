@@ -71,6 +71,8 @@ class GetImpactedTargetsCommand : Callable<Int> {
   @CommandLine.Spec lateinit var spec: CommandLine.Model.CommandSpec
 
   override fun call(): Int {
+    // Stop any existing Koin instance before starting a new one (for E2E tests)
+    org.koin.core.context.GlobalContext.stopKoin()
     startKoin { modules(serialisationModule(), loggingModule(parent.verbose)) }
 
     return try {

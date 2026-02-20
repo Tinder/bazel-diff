@@ -21,7 +21,6 @@ $TempDir = $env:TEMP
 $StartingHashesJson = Join-Path $TempDir "starting_hashes.json"
 $FinalHashesJson = Join-Path $TempDir "final_hashes.json"
 $ImpactedTargetsPath = Join-Path $TempDir "impacted_targets.txt"
-$BazelDiff = Join-Path $TempDir "bazel_diff.exe"
 
 # Set appropriate flags based on environment variables
 $BazelDiffFlags = @()
@@ -50,16 +49,25 @@ if ($env:BAZEL_DIFF_FORCE_CHECKOUT -eq "true") {
     $GitCheckoutFlags = @("--force", "--quiet")
 }
 
-# Build bazel-diff and extract script
+# Build bazel-diff first to ensure it's ready
 Write-Host "Building bazel-diff..."
 $BazelExtraOptions = @()
 if ($env:BAZEL_EXTRA_COMMAND_OPTIONS) {
     $BazelExtraOptions = $env:BAZEL_EXTRA_COMMAND_OPTIONS.Split(" ")
 }
 
-& $BazelPath run @BazelExtraOptions :bazel-diff --script_path="$BazelDiff"
+& $BazelPath build @BazelExtraOptions //:bazel-diff
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to build bazel-diff"
+}
+
+# Helper function to run bazel-diff commands
+function Run-BazelDiff {
+    param(
+        [string[]]$Arguments
+    )
+    & $BazelPath run @BazelExtraOptions //:bazel-diff -- @Arguments
+    return $LASTEXITCODE
 }
 
 # Checkout previous revision
@@ -71,8 +79,8 @@ if ($LASTEXITCODE -ne 0) {
 
 # Generate hashes for previous revision
 Write-Host "Generating Hashes for Revision '$PreviousRevision'"
-& $BazelDiff generate-hashes -w $WorkspacePath -b $BazelPath @BazelDiffFlags $StartingHashesJson
-if ($LASTEXITCODE -ne 0) {
+$exitCode = Run-BazelDiff (@("generate-hashes", "-w", $WorkspacePath, "-b", $BazelPath) + $BazelDiffFlags + @($StartingHashesJson))
+if ($exitCode -ne 0) {
     throw "Failed to generate hashes for revision $PreviousRevision"
 }
 
@@ -85,15 +93,15 @@ if ($LASTEXITCODE -ne 0) {
 
 # Generate hashes for final revision
 Write-Host "Generating Hashes for Revision '$FinalRevision'"
-& $BazelDiff generate-hashes -w $WorkspacePath -b $BazelPath @BazelDiffFlags $FinalHashesJson
-if ($LASTEXITCODE -ne 0) {
+$exitCode = Run-BazelDiff (@("generate-hashes", "-w", $WorkspacePath, "-b", $BazelPath) + $BazelDiffFlags + @($FinalHashesJson))
+if ($exitCode -ne 0) {
     throw "Failed to generate hashes for revision $FinalRevision"
 }
 
 # Determine impacted targets
 Write-Host "Determining Impacted Targets"
-& $BazelDiff get-impacted-targets -sh $StartingHashesJson -fh $FinalHashesJson -o $ImpactedTargetsPath
-if ($LASTEXITCODE -ne 0) {
+$exitCode = Run-BazelDiff @("get-impacted-targets", "-sh", $StartingHashesJson, "-fh", $FinalHashesJson, "-o", $ImpactedTargetsPath)
+if ($exitCode -ne 0) {
     throw "Failed to get impacted targets"
 }
 

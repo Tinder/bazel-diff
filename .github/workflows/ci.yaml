@@ -111,8 +111,16 @@ jobs:
         with:
           go-version: ^1.17
         id: go
-      - name: Setup Bazelisk
+      - name: Setup Bazelisk (Linux/macOS)
+        if: runner.os != 'Windows'
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+      - name: Setup Bazelisk (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          go install github.com/bazelbuild/bazelisk@latest
+          $env:PATH = "$env:PATH;$(go env GOPATH)\bin"
+          echo "$env:USERPROFILE\go\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0

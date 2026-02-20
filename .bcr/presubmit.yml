@@ -36,8 +36,8 @@ tasks:
     platform: windows
     bazel: "7.x"
     build_flags:
-    - '--cxxopt=-std=c++17'
-    - '--host_cxxopt=-std=c++17'
+    - '--cxxopt=/std:c++17'
+    - '--host_cxxopt=/std:c++17'
     build_targets:
     - '@bazel-diff//:bazel-diff'
   verify_targets_windows_8x:
@@ -46,8 +46,8 @@ tasks:
     bazel: "8.x"
     build_flags:
     - '--legacy_external_runfiles'
-    - '--cxxopt=-std=c++17'
-    - '--host_cxxopt=-std=c++17'
+    - '--cxxopt=/std:c++17'
+    - '--host_cxxopt=/std:c++17'
     build_targets:
     - '@bazel-diff//:bazel-diff'
   verify_targets_windows_9x:
@@ -56,8 +56,8 @@ tasks:
     bazel: "9.x"
     build_flags:
     - '--legacy_external_runfiles'
-    - '--cxxopt=-std=c++17'
-    - '--host_cxxopt=-std=c++17'
+    - '--cxxopt=/std:c++17'
+    - '--host_cxxopt=/std:c++17'
     build_targets:
     - '@bazel-diff//:bazel-diff'
 bcr_test_module:

@@ -100,7 +100,7 @@ if ($LASTEXITCODE -ne 0) {
 # Read and display impacted targets
 if (Test-Path $ImpactedTargetsPath) {
     $ImpactedTargets = Get-Content $ImpactedTargetsPath
-    Write-Host "Impacted Targets between $PreviousRevision and $FinalRevision:"
+    Write-Host "Impacted Targets between ${PreviousRevision} and ${FinalRevision}:"
     $ImpactedTargets | ForEach-Object { Write-Host $_ }
     Write-Host ""
 } else {

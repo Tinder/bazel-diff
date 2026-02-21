@@ -1,11 +1,11 @@
 module(
     name = "bazel-diff",
-    version = "15.0.2",
+    version = "15.0.3",
     compatibility_level = 0,
 )
 
 bazel_dep(name = "rules_license", version = "1.0.0", dev_dependency = True)
-bazel_dep(name = "aspect_rules_lint", version = "1.0.2", dev_dependency = True)
+bazel_dep(name = "aspect_rules_lint", version = "2.1.0", dev_dependency = True)
 bazel_dep(name = "aspect_bazel_lib", version = "2.22.5", dev_dependency = True)
 
 bazel_dep(name = "bazel_skylib", version = "1.9.0")

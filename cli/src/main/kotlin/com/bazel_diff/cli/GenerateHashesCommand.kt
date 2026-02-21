@@ -188,6 +188,8 @@ class GenerateHashesCommand : Callable<Int> {
   override fun call(): Int {
     validate(contentHashPath = contentHashPath)
 
+    // Stop any existing Koin instance before starting a new one (for E2E tests)
+    org.koin.core.context.GlobalContext.stopKoin()
     startKoin {
       modules(
           hasherModule(

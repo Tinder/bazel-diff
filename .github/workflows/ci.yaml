@@ -8,7 +8,19 @@ on:
 
 jobs:
   test-jre21:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bazel: '8.x'
+          - os: ubuntu-latest
+            bazel: '9.x'
+          - os: macos-latest
+            bazel: '8.x'
+          - os: macos-latest
+            bazel: '9.x'
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v4
@@ -24,48 +36,67 @@ jobs:
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
       - name: Run bazel-diff tests
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
         run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=true --enable_workspace=false
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: coverage-report-jre21
+          name: coverage-report-jre21-${{ matrix.os }}-bazel-${{ matrix.bazel }}
           path: bazel-out/_coverage/_coverage_report.dat
           if-no-files-found: warn
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-logs-jre21
+          name: test-logs-jre21-${{ matrix.os }}-bazel-${{ matrix.bazel }}
           path: bazel-testlogs/
           if-no-files-found: warn
   test-jre11-run-example:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - bazel: '7.x'
+          - os: ubuntu-latest
+            bazel: '7.x'
             disable_workspace: 'false'
             extra_flags: ''
-          - bazel: '7.x'
+          - os: ubuntu-latest
+            bazel: '7.x'
             disable_workspace: 'false'
             extra_flags: '--incompatible_disable_native_repo_rules'
-          - bazel: '8.x'
+          - os: ubuntu-latest
+            bazel: '8.x'
             disable_workspace: 'true'
             extra_flags: ''
-          - bazel: '8.6.0rc1'
+          - os: ubuntu-latest
+            bazel: '8.6.0rc1'
             disable_workspace: 'true'
             extra_flags: ''
-          - bazel: '8.x'
+          - os: ubuntu-latest
+            bazel: '8.x'
             disable_workspace: 'true'
             extra_flags: '--incompatible_disable_native_repo_rules'
-          - bazel: '9.x'
+          - os: ubuntu-latest
+            bazel: '9.x'
             disable_workspace: 'true'
             extra_flags: ''
-          - bazel: '9.x'
+          - os: ubuntu-latest
+            bazel: '9.x'
             disable_workspace: 'true'
             extra_flags: '--incompatible_disable_native_repo_rules'
+          # Skip Windows + Bazel 7.x due to protobuf compilation issues on MSVC
+          # Windows is tested with Bazel 8.x and 9.x which are more current
+          - os: windows-latest
+            bazel: '8.x'
+            disable_workspace: 'true'
+            extra_flags: ''
+          - os: windows-latest
+            bazel: '9.x'
+            disable_workspace: 'true'
+            extra_flags: ''
     steps:
       - name: Setup Java JDK
         uses: actions/setup-java@v4
@@ -78,18 +109,39 @@ jobs:
         with:
           go-version: ^1.17
         id: go
-      - name: Setup Bazelisk
+      - name: Setup Bazelisk (Linux/macOS)
+        if: runner.os != 'Windows'
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+      - name: Setup Bazelisk (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          go install github.com/bazelbuild/bazelisk@latest
+          $env:PATH = "$env:PATH;$(go env GOPATH)\bin"
+          echo "$env:USERPROFILE\go\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Run bazel-diff example script
+      - name: Run bazel-diff example script (Linux)
+        if: runner.os != 'Windows'
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           BAZEL_DIFF_DISABLE_WORKSPACE: ${{ matrix.disable_workspace }}
           BAZEL_DIFF_FORCE_CHECKOUT: true
           BAZEL_EXTRA_COMMAND_OPTIONS: ${{ matrix.extra_flags }}
         run: ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
+      - name: Run bazel-diff example script (Windows)
+        if: runner.os == 'Windows'
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+          BAZEL_DIFF_DISABLE_WORKSPACE: ${{ matrix.disable_workspace }}
+          BAZEL_DIFF_FORCE_CHECKOUT: true
+          BAZEL_EXTRA_COMMAND_OPTIONS: ${{ matrix.extra_flags }}
+        shell: pwsh
+        run: |
+          $prevRev = git rev-parse HEAD~1
+          $currRev = git rev-parse HEAD
+          .\bazel-diff-example.ps1 -WorkspacePath "$env:GITHUB_WORKSPACE" -BazelPath "$env:USERPROFILE\go\bin\bazelisk.exe" -PreviousRevision $prevRev -FinalRevision $currRev
   deploy:
     needs: [test-jre21]
     runs-on: ubuntu-latest

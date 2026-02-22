@@ -281,7 +281,7 @@ First, add the following snippet to your project:
 #### Bzlmod snippet
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "13.1.0")
+bazel_dep(name = "bazel-diff", version = "15.0.5")
 ```
 
 You can now run the tool with:

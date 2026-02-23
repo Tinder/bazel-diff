@@ -187,6 +187,13 @@ workspace.
                           Additional space separated Bazel command options used
                             when invoking `bazel cquery`. This flag is has no
                             effect if `--useCquery`is false.
+      --cqueryExpression=<cqueryExpression>
+                          Custom cquery expression to use instead of the default
+                            'deps(//...:all-targets)'. This allows you to exclude
+                            problematic targets (e.g., analysis_test targets that
+                            are designed to fail). Example: 'deps(//:target1) +
+                            deps(//:target2)'. This flag has no effect if
+                            `--useCquery` is false.
       --fineGrainedHashExternalRepos=<fineGrainedHashExternalRepos>
                           Comma separate list of external repos in which
                             fine-grained hashes are computed for the targets.
@@ -238,6 +245,37 @@ workspace.
 **Note**: `--useCquery` flag may not work with very large repos due to limitation
 of Bazel. You may want to fallback to use normal query mode in that case.
 See <https://github.com/bazelbuild/bazel/issues/17743> for more details.
+
+#### Handling Failing Analysis Targets with `--cqueryExpression`
+
+When using `--useCquery`, Bazel's `cquery` command analyzes all targets (executes their implementation functions). This can cause issues with targets that are intentionally designed to fail during analysis, such as:
+
+- `analysis_test` targets from the Bazel `rules_testing` library
+- Other validation targets that verify build failures
+
+With regular `bazel query`, these targets don't cause problems because `query` doesn't execute implementation functions. However, `cquery` will fail when it encounters these targets.
+
+**Solution**: Use the `--cqueryExpression` flag to specify a custom query expression that excludes the problematic targets:
+
+```bash
+bazel-diff generate-hashes \
+  --useCquery \
+  --cqueryExpression "deps(//:target1) + deps(//:target2)" \
+  output.json
+```
+
+**Important**: When crafting custom cquery expressions:
+
+- ❌ **Don't use**: `deps(//...:all-targets) except //:failing_target`
+  - This still analyzes the failing target during pattern expansion
+
+- ✅ **Do use**: Explicitly specify which targets or packages to include:
+  ```bash
+  --cqueryExpression "deps(//:target1) + deps(//:target2)"
+  --cqueryExpression "deps(//src/...:*) + deps(//lib/...:*)"
+  ```
+
+See [GitHub Issue #301](https://github.com/Tinder/bazel-diff/issues/301) for more details.
 
 ### What does the SHA256 value of `generate-hashes` represent?
 

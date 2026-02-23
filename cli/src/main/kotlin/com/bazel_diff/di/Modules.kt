@@ -28,6 +28,7 @@ fun hasherModule(
     commandOptions: List<String>,
     cqueryOptions: List<String>,
     useCquery: Boolean,
+    cqueryExpression: String?,
     keepGoing: Boolean,
     trackDeps: Boolean,
     fineGrainedHashExternalRepos: Set<String>,
@@ -75,7 +76,7 @@ fun hasherModule(
   single {
     BazelModService(workingDirectory, bazelPath, startupOptions, debug)
   }
-  single { BazelClient(useCquery, updatedFineGrainedHashExternalRepos, excludeExternalTargets) }
+  single { BazelClient(useCquery, cqueryExpression, updatedFineGrainedHashExternalRepos, excludeExternalTargets) }
   single { BuildGraphHasher(get()) }
   single { TargetHasher() }
   single { RuleHasher(useCquery, trackDeps, updatedFineGrainedHashExternalRepos) }

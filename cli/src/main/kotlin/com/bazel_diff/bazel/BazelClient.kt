@@ -7,6 +7,7 @@ import org.koin.core.component.inject
 
 class BazelClient(
     private val useCquery: Boolean,
+    private val cqueryExpression: String?,
     private val fineGrainedHashExternalRepos: Set<String>,
     private val excludeExternalTargets: Boolean,
 ) : KoinComponent {
@@ -42,7 +43,8 @@ class BazelClient(
           // In addition, we must include all source dependencies in this query in order for them to
           // show up in
           // `configuredRuleInput`. Hence, one must not filter them out with `kind(rule, deps(..))`.
-          val mainTargets = queryService.query("deps(//...:all-targets)", useCquery = true)
+          val expression = cqueryExpression ?: "deps(//...:all-targets)"
+          val mainTargets = queryService.query(expression, useCquery = true)
           val repoTargets =
               if (repoTargetsQuery.isNotEmpty()) {
                 queryService.query(repoTargetsQuery.joinToString(" + ") { "'$it'" })

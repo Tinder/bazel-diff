@@ -735,10 +735,9 @@ class E2ETest {
     // Expected behavior:
     // - With query: All targets are found without executing implementation functions
     // - With cquery: The failing_analysis_target causes analysis to fail
+    // - With cquery + keep_going: Partial results should be returned (only the non-failing targets)
     //
-    // This test expects the cquery to fail, demonstrating the issue.
-    // Once the issue is fixed (by allowing custom cquery expressions or error handling),
-    // this test should be updated to verify the fix works.
+    // This test verifies the current behavior and demonstrates the issue.
 
     val workspace = copyTestWorkspace("cquery_failing_target")
     val outputDir = temp.newFolder()
@@ -771,6 +770,49 @@ class E2ETest {
     // The cquery should fail because it tries to analyze the failing_analysis_target
     // which is designed to fail during analysis
     assertThat(exitCodeWithCquery).isEqualTo(1)
+
+    // Test with --keep_going enabled (default behavior)
+    // With keep_going, cquery returns partial results but still exits with code 1
+    // The current implementation allows exit codes 0 and 3, but cquery with keep_going
+    // returns exit code 1 when some targets fail analysis
+    val exitCodeWithCqueryKeepGoing = cli.execute(
+        "generate-hashes",
+        "-w",
+        workspace.absolutePath,
+        "-b",
+        "bazel",
+        "--useCquery",
+        "--keep_going",
+        from.absolutePath)
+
+    // This currently fails (exit code 1) because bazel-diff only allows exit codes 0 and 3
+    // but cquery with --keep_going returns exit code 1 when partial results are available
+    assertThat(exitCodeWithCqueryKeepGoing).isEqualTo(1)
+
+    // Test with custom cquery expression to exclude the failing target
+    // Note: We use explicit target selection instead of wildcard + except because
+    // cquery analyzes targets during pattern expansion, so "//...:all-targets except X"
+    // would still try to analyze X. The solution is to explicitly specify which targets to query.
+    val exitCodeWithCustomExpression = cli.execute(
+        "generate-hashes",
+        "-w",
+        workspace.absolutePath,
+        "-b",
+        "bazel",
+        "--useCquery",
+        "--cqueryExpression",
+        "deps(//:normal_target) + deps(//:dependent_target)",
+        from.absolutePath)
+
+    // With the custom expression that explicitly lists only the non-failing targets, this should succeed
+    assertThat(exitCodeWithCustomExpression).isEqualTo(0)
+
+    // Verify the hashes were generated successfully and contain the expected targets
+    val hashes = from.readText()
+    assertThat(hashes.contains("normal_target")).isEqualTo(true)
+    assertThat(hashes.contains("dependent_target")).isEqualTo(true)
+    // The failing target should not be in the hashes since it wasn't included in the query
+    assertThat(hashes.contains("failing_analysis_target")).isEqualTo(false)
   }
 
   private fun copyTestWorkspace(path: String): File {

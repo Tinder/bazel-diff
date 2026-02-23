@@ -1,0 +1,6 @@
+module(
+    name = "cquery_failing_target_test",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "bazel_skylib", version = "1.9.0")

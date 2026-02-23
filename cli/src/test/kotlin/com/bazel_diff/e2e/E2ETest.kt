@@ -720,6 +720,59 @@ class E2ETest {
     }
   }
 
+  @Test
+  fun testCqueryWithFailingAnalysisTargets() {
+    // Reproducer for https://github.com/Tinder/bazel-diff/issues/301
+    // This test demonstrates the issue where cquery executes implementation functions
+    // for all repository targets, causing targets designed to fail (like analysis_test
+    // from rules_testing) to fail during cquery execution.
+    //
+    // The workspace contains:
+    // - normal_target: A regular target that works fine
+    // - dependent_target: Another regular target
+    // - failing_analysis_target: A target designed to fail during analysis
+    //
+    // Expected behavior:
+    // - With query: All targets are found without executing implementation functions
+    // - With cquery: The failing_analysis_target causes analysis to fail
+    //
+    // This test expects the cquery to fail, demonstrating the issue.
+    // Once the issue is fixed (by allowing custom cquery expressions or error handling),
+    // this test should be updated to verify the fix works.
+
+    val workspace = copyTestWorkspace("cquery_failing_target")
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+
+    val cli = CommandLine(BazelDiff())
+
+    // First, verify that generate-hashes works without --useCquery
+    val exitCodeWithoutCquery = cli.execute(
+        "generate-hashes",
+        "-w",
+        workspace.absolutePath,
+        "-b",
+        "bazel",
+        from.absolutePath)
+
+    assertThat(exitCodeWithoutCquery).isEqualTo(0)
+
+    // Now, verify that generate-hashes fails with --useCquery due to the failing target
+    // This demonstrates the issue described in #301
+    val exitCodeWithCquery = cli.execute(
+        "generate-hashes",
+        "-w",
+        workspace.absolutePath,
+        "-b",
+        "bazel",
+        "--useCquery",
+        from.absolutePath)
+
+    // The cquery should fail because it tries to analyze the failing_analysis_target
+    // which is designed to fail during analysis
+    assertThat(exitCodeWithCquery).isEqualTo(1)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

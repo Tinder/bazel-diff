@@ -1,6 +1,7 @@
 package com.bazel_diff.hash
 
 import com.bazel_diff.bazel.BazelClient
+import com.bazel_diff.bazel.BazelModService
 import com.bazel_diff.bazel.BazelRule
 import com.bazel_diff.bazel.BazelSourceFileTarget
 import com.bazel_diff.bazel.BazelTarget
@@ -23,6 +24,7 @@ import org.koin.core.component.inject
 class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
   private val targetHasher: TargetHasher by inject()
   private val sourceFileHasher: SourceFileHasher by inject()
+  private val bazelModService: BazelModService by inject()
   private val logger: Logger by inject()
 
   fun hashAllBazelTargetsAndSourcefiles(
@@ -51,7 +53,8 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
 
           Pair(sourceDigestsFuture.await(), allTargets)
         }
-    val seedForFilepaths = createSeedForFilepaths(seedFilepaths)
+    val seedForFilepaths =
+        runBlocking(Dispatchers.IO) { createSeedForFilepaths(seedFilepaths) }
     return hashAllTargets(
         seedForFilepaths, sourceDigests, allTargets, ignoredAttrs, modifiedFilepaths)
   }
@@ -160,13 +163,24 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
     }
   }
 
-  private fun createSeedForFilepaths(seedFilepaths: Set<Path>): ByteArray {
-    if (seedFilepaths.isEmpty()) {
-      return ByteArray(0)
+  private suspend fun createSeedForFilepaths(seedFilepaths: Set<Path>): ByteArray {
+    // Include MODULE.bazel dependency graph in hash
+    // This ensures that module version changes (e.g., abseil-cpp 20240116.2 -> 20240722.0)
+    // are detected and cascade to all dependent targets
+    val moduleGraph = bazelModService.getModuleGraph()
+    if (moduleGraph != null) {
+      logger.i { "Including module graph in seed hash (${moduleGraph.length} bytes)" }
     }
+
     return sha256 {
+      // Include seed filepaths in hash
       for (path in seedFilepaths) {
         putBytes(path.readBytes())
+      }
+
+      // Include module graph if available
+      if (moduleGraph != null) {
+        putBytes(moduleGraph.toByteArray())
       }
     }
   }

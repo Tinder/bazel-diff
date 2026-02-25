@@ -125,6 +125,14 @@ class GenerateHashesCommand : Callable<Int> {
   var cqueryCommandOptions: List<String> = emptyList()
 
   @CommandLine.Option(
+      names = ["--cqueryExpression"],
+      description =
+          [
+              "Custom cquery expression to use instead of the default 'deps(//...:all-targets)'. This allows you to exclude problematic targets (e.g., analysis_test targets that are designed to fail). Example: 'deps(//...:all-targets) except //path/to/failing:target'. This flag has no effect if `--useCquery` is false."],
+      scope = CommandLine.ScopeType.INHERIT)
+  var cqueryExpression: String? = null
+
+  @CommandLine.Option(
       names = ["-k", "--keep_going"],
       negatable = true,
       defaultValue = "true",
@@ -200,6 +208,7 @@ class GenerateHashesCommand : Callable<Int> {
               bazelCommandOptions,
               cqueryCommandOptions,
               useCquery,
+              cqueryExpression,
               keepGoing,
               depsMappingJSONPath != null,
               fineGrainedHashExternalRepos,

@@ -13,12 +13,9 @@
 @@rules_jvm_external++maven+maven//:com/google/errorprone/error_prone_annotations/2.18.0/error_prone_annotations-2.18.0.jar
 @@rules_jvm_external++maven+maven//:com/google/guava/guava/32.0.0-jre/guava-32.0.0-jre.jar
 @@rules_jvm_external++maven+maven//:com/google/j2objc/j2objc-annotations/2.8/j2objc-annotations-2.8.jar
-@@rules_jvm_external++maven+maven//:com_google_code_findbugs_jsr305
 @@rules_jvm_external++maven+maven//:com_google_errorprone_error_prone_annotations
 @@rules_jvm_external++maven+maven//:com_google_errorprone_error_prone_annotations_2_18_0_extension
-@@rules_jvm_external++maven+maven//:com_google_guava_failureaccess
 @@rules_jvm_external++maven+maven//:com_google_guava_guava
-@@rules_jvm_external++maven+maven//:com_google_guava_listenablefuture
 @@rules_jvm_external++maven+maven//:com_google_guava_guava_32_0_0_jre_extension
 @@rules_jvm_external++maven+maven//:com_google_j2objc_j2objc_annotations
 @@rules_jvm_external++maven+maven//:com_google_j2objc_j2objc_annotations_2_8_extension
@@ -27,4 +24,3 @@
 @@rules_jvm_external++maven+maven//:org_checkerframework_checker_qual_3_33_0_extension
 @@rules_jvm_external++maven+org_checkerframework_checker_qual_3_33_0//file:file
 @@rules_jvm_external++maven+org_checkerframework_checker_qual_3_33_0//file:v1/org/checkerframework/checker-qual/3.33.0/checker-qual-3.33.0.jar
-@@rules_jvm_external+//private/tools/java/com/github/bazelbuild/rules_jvm_external/jar:AddJarManifestEntry

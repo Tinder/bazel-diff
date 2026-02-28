@@ -1,0 +1,8 @@
+//src/main/cc:libtarget-a.a
+//src/main/cc:libtarget-b.a
+//src/main/cc:target-a
+//src/main/cc:target-b
+//src/main/cc:target_a.cc
+//src/main/cc:target_a.h
+//src/main/cc:target_b.cc
+//src/main/cc:target_b.h

@@ -21,7 +21,7 @@ class E2ETest {
   private fun filterBazelDiffInternalTargets(targets: Set<String>): Set<String> {
     return targets.filter { target ->
       // Filter out bazel-diff's own internal test targets
-      !target.contains("bazel-diff-integration-tests") &&
+      !target.contains("bazel-diff-integration-test") &&
       !target.contains("@@//:BUILD") &&
       !target.contains("bazel_diff_maven") && // Filter out bazel-diff's maven dependencies
       // Filter out platform-specific Maven alias targets that may or may not appear in cquery
@@ -29,7 +29,10 @@ class E2ETest {
       !target.matches(Regex(".*rules_jvm_external\\+\\+maven\\+maven//:com_google_code_findbugs_jsr305$")) &&
       !target.matches(Regex(".*rules_jvm_external\\+\\+maven\\+maven//:com_google_guava_failureaccess$")) &&
       !target.matches(Regex(".*rules_jvm_external\\+\\+maven\\+maven//:com_google_guava_listenablefuture$")) &&
-      !target.matches(Regex(".*rules_jvm_external\\+//private/tools/java/com/github/bazelbuild/rules_jvm_external/jar:AddJarManifestEntry$"))
+      !target.matches(Regex(".*rules_jvm_external\\+//private/tools/java/com/github/bazelbuild/rules_jvm_external/jar:AddJarManifestEntry$")) &&
+      // Filter out junit and hamcrest which may appear on some platforms
+      !target.matches(Regex(".*rules_jvm_external\\+\\+maven\\+maven//:junit_junit$")) &&
+      !target.matches(Regex(".*rules_jvm_external\\+\\+maven\\+maven//:org_hamcrest_hamcrest_core$"))
     }.toSet()
   }
 

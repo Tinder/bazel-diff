@@ -145,6 +145,10 @@ jobs:
   deploy:
     needs: [test-jre21]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       matrix:
         java: [ '11' ]
@@ -177,3 +181,11 @@ jobs:
           name: release.tar.gz
           path: archives/release.tar.gz
           if-no-files-found: error
+      - name: Attest deploy JAR provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'bazel-bin/cli/bazel-diff_deploy.jar'
+      - name: Attest source archive provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'archives/release.tar.gz'

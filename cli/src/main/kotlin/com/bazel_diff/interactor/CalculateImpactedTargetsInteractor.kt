@@ -1,6 +1,8 @@
 package com.bazel_diff.interactor
 
+import com.bazel_diff.bazel.ModuleGraphParser
 import com.bazel_diff.hash.TargetHash
+import com.bazel_diff.log.Logger
 import com.google.common.annotations.VisibleForTesting
 import com.google.common.collect.Maps
 import com.google.gson.Gson
@@ -15,6 +17,8 @@ data class TargetDistanceMetrics(val targetDistance: Int, val packageDistance: I
 
 class CalculateImpactedTargetsInteractor : KoinComponent {
   private val gson: Gson by inject()
+  private val logger: Logger by inject()
+  private val moduleGraphParser = ModuleGraphParser()
 
   @VisibleForTesting class InvalidDependencyEdgesException(message: String) : Exception(message)
 
@@ -27,10 +31,15 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       from: Map<String, TargetHash>,
       to: Map<String, TargetHash>,
       outputWriter: Writer,
-      targetTypes: Set<String>?
+      targetTypes: Set<String>?,
+      fromModuleGraphJson: String? = null,
+      toModuleGraphJson: String? = null
   ) {
     /** This call might be faster if end hashes is a sorted map */
     val typeFilter = TargetTypeFilter(targetTypes, to)
+
+    // Log module changes for visibility (doesn't affect impacted targets calculation)
+    logModuleChanges(fromModuleGraphJson, toModuleGraphJson)
 
     computeSimpleImpactedTargets(from, to)
         .filter { typeFilter.accepts(it) }
@@ -59,9 +68,14 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       to: Map<String, TargetHash>,
       depEdges: Map<String, List<String>>,
       outputWriter: Writer,
-      targetTypes: Set<String>?
+      targetTypes: Set<String>?,
+      fromModuleGraphJson: String? = null,
+      toModuleGraphJson: String? = null
   ) {
     val typeFilter = TargetTypeFilter(targetTypes, to)
+
+    // Log module changes for visibility (doesn't affect impacted targets calculation)
+    logModuleChanges(fromModuleGraphJson, toModuleGraphJson)
 
     computeAllDistances(from, to, depEdges)
         .filterKeys { typeFilter.accepts(it) }
@@ -163,6 +177,45 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
 
     return TargetDistanceMetrics(targetDistance, packageDistance).also {
       impactedTargets[label] = it
+    }
+  }
+
+  /**
+   * Detects module changes by comparing module graphs and logs information.
+   *
+   * This method:
+   * 1. Parses the from and to module graphs
+   * 2. Identifies which modules changed (added, removed, or version changed)
+   * 3. Logs the changes for visibility
+   *
+   * Note: Module changes are incorporated into the hash seed in BuildGraphHasher,
+   * causing dependent targets to have different hashes. This method just provides
+   * visibility into what changed.
+   *
+   * @param fromModuleGraphJson JSON from `bazel mod graph --output=json` for starting revision
+   * @param toModuleGraphJson JSON from `bazel mod graph --output=json` for final revision
+   */
+  private fun logModuleChanges(
+      fromModuleGraphJson: String?,
+      toModuleGraphJson: String?
+  ) {
+    // If either module graph is missing, skip
+    if (fromModuleGraphJson == null || toModuleGraphJson == null) {
+      return
+    }
+
+    // Parse module graphs
+    val fromGraph = moduleGraphParser.parseModuleGraph(fromModuleGraphJson)
+    val toGraph = moduleGraphParser.parseModuleGraph(toModuleGraphJson)
+
+    // Find changed modules
+    val changedModules = moduleGraphParser.findChangedModules(fromGraph, toGraph)
+
+    if (changedModules.isEmpty()) {
+      logger.i { "No module changes detected" }
+    } else {
+      logger.i { "Detected ${changedModules.size} module changes: ${changedModules.joinToString(", ")}" }
+      // Module changes are reflected in hash differences via the seed
     }
   }
 }

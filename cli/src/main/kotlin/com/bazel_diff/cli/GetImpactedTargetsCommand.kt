@@ -78,8 +78,8 @@ class GetImpactedTargetsCommand : Callable<Int> {
     return try {
       validate()
       val deserialiser = DeserialiseHashesInteractor()
-      val from = deserialiser.executeTargetHash(startingHashesJSONPath)
-      val to = deserialiser.executeTargetHash(finalHashesJSONPath)
+      val fromData = deserialiser.executeTargetHashWithMetadata(startingHashesJSONPath)
+      val toData = deserialiser.executeTargetHashWithMetadata(finalHashesJSONPath)
 
       val outputWriter =
           BufferedWriter(
@@ -92,9 +92,23 @@ class GetImpactedTargetsCommand : Callable<Int> {
         if (depsMappingJSONPath != null) {
           val depsMapping = deserialiser.deserializeDeps(depsMappingJSONPath!!)
           CalculateImpactedTargetsInteractor()
-              .executeWithDistances(from, to, depsMapping, outputWriter, targetType)
+              .executeWithDistances(
+                  fromData.hashes,
+                  toData.hashes,
+                  depsMapping,
+                  outputWriter,
+                  targetType,
+                  fromData.moduleGraphJson,
+                  toData.moduleGraphJson)
         } else {
-          CalculateImpactedTargetsInteractor().execute(from, to, outputWriter, targetType)
+          CalculateImpactedTargetsInteractor()
+              .execute(
+                  fromData.hashes,
+                  toData.hashes,
+                  outputWriter,
+                  targetType,
+                  fromData.moduleGraphJson,
+                  toData.moduleGraphJson)
         }
         CommandLine.ExitCode.OK
       } catch (e: IOException) {

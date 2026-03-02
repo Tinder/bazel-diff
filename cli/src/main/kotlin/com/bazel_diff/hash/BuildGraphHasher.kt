@@ -164,23 +164,10 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
   }
 
   private suspend fun createSeedForFilepaths(seedFilepaths: Set<Path>): ByteArray {
-    // Include MODULE.bazel dependency graph in hash
-    // This ensures that module version changes (e.g., abseil-cpp 20240116.2 -> 20240722.0)
-    // are detected and cascade to all dependent targets
-    val moduleGraph = bazelModService.getModuleGraph()
-    if (moduleGraph != null) {
-      logger.i { "Including module graph in seed hash (${moduleGraph.length} bytes)" }
-    }
-
     return sha256 {
       // Include seed filepaths in hash
       for (path in seedFilepaths) {
         putBytes(path.readBytes())
-      }
-
-      // Include module graph if available
-      if (moduleGraph != null) {
-        putBytes(moduleGraph.toByteArray())
       }
     }
   }

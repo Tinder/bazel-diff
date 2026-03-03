@@ -255,7 +255,8 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
 
   @Test
   fun testModuleChangesWithoutWorkspace() {
-    // When module changes are detected but no workspace is provided, all targets should be impacted
+    // When module changes occur but no workspace is provided, fall back to hash comparison
+    // This correctly supports fine-grained external repo hashing where only changed external targets are marked
     val startHashes = mapOf(
         "//:target1" to TargetHash("", "hash1", "hash1"),
         "//:target2" to TargetHash("", "hash2", "hash2"),
@@ -308,8 +309,8 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
     )
 
     val output = outputWriter.toString().trim().split("\n")
-    // All targets should be marked as impacted when workspace not available
-    assertThat(output).containsExactlyInAnyOrder("//:target1", "//:target2", "@@abseil-cpp~20240722.0//:strings")
+    // Without workspace, falls back to hash comparison - only external target is impacted
+    assertThat(output).containsExactlyInAnyOrder("@@abseil-cpp~20240722.0//:strings")
   }
 
   @Test
@@ -413,8 +414,8 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
 
   @Test
   fun testModuleChangesWithDistances() {
-    // Test executeWithDistances with module changes
-    // When module changes detected without workspace, all targets marked with distance 0
+    // Test executeWithDistances with module changes but no workspace
+    // Without workspace, falls back to hash comparison
     val startHashes = mapOf(
         "//:1" to TargetHash("", "//:1", "//:1"),
         "//:2" to TargetHash("", "//:2", "//:2"),
@@ -422,7 +423,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
     )
 
     val endHashes = mapOf(
-        "//:1" to TargetHash("", "//:1", "//:1"),
+        "//:1" to TargetHash("", "//:1-changed", "//:1-changed"),
         "//:2" to TargetHash("", "//:2", "//:2"),
         "//:3" to TargetHash("", "//:3", "//:3")
     )
@@ -457,7 +458,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
     interactor.executeWithDistances(
         from = startHashes,
         to = endHashes,
-        depEdges = mapOf(), // No dep edges needed for module change test
+        depEdges = mapOf(), // No dep edges needed
         outputWriter = outputWriter,
         targetTypes = null,
         fromModuleGraphJson = fromModuleGraph,
@@ -466,10 +467,10 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
     )
 
     val output = outputWriter.toString()
-    // All targets should be marked with distance 0 when module changes without workspace
+    // Without workspace, falls back to hash comparison - only //:1 changed
     assertThat(output).contains("//:1")
-    assertThat(output).contains("//:2")
-    assertThat(output).contains("//:3")
+    assertThat(output).doesNotContain("//:2")
+    assertThat(output).doesNotContain("//:3")
     assertThat(output).contains("\"targetDistance\": 0")
     assertThat(output).contains("\"packageDistance\": 0")
   }

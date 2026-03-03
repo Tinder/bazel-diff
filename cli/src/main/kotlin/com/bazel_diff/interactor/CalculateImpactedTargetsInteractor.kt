@@ -41,26 +41,27 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
     /** This call might be faster if end hashes is a sorted map */
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
-    // Quick check: if module graph JSON is identical, skip module change detection entirely
-    val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
+    // Only engage module change detection if workspace is available for querying
+    // Without workspace, fall back to hash comparison which correctly handles fine-grained external repo hashing
+    val impactedTargets = if (canQueryWorkspace) {
+      // Quick check: if module graph JSON is identical, skip module change detection entirely
+      val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
 
-    // Detect module changes and query for impacted targets if workspace is available
-    val changedModules = if (moduleGraphChanged) {
-      detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
-    } else {
-      emptySet()
-    }
+      // Detect module changes and query for impacted targets
+      val changedModules = if (moduleGraphChanged) {
+        detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
+      } else {
+        emptySet()
+      }
 
-    val impactedTargets = if (changedModules.isNotEmpty()) {
-      if (canQueryWorkspace) {
+      if (changedModules.isNotEmpty()) {
         logger.i { "Module changes detected - querying for targets that depend on changed modules" }
         queryTargetsDependingOnModules(changedModules, to)
       } else {
-        logger.w { "Module changes detected but no workspace provided - marking all targets as impacted" }
-        logger.w { "To enable fine-grained module detection, provide -w/--workspacePath to get-impacted-targets" }
-        to.keys
+        computeSimpleImpactedTargets(from, to)
       }
     } else {
+      // Without workspace, use hash comparison (supports fine-grained external repo hashing)
       computeSimpleImpactedTargets(from, to)
     }
 
@@ -98,30 +99,30 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
   ) {
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
-    // Quick check: if module graph JSON is identical, skip module change detection entirely
-    val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
+    // Only engage module change detection if workspace is available for querying
+    // Without workspace, fall back to hash comparison which correctly handles fine-grained external repo hashing
+    val impactedTargets = if (canQueryWorkspace) {
+      // Quick check: if module graph JSON is identical, skip module change detection entirely
+      val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
 
-    // Detect module changes and query for impacted targets if workspace is available
-    val changedModules = if (moduleGraphChanged) {
-      detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
-    } else {
-      emptySet()
-    }
+      // Detect module changes and query for impacted targets
+      val changedModules = if (moduleGraphChanged) {
+        detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
+      } else {
+        emptySet()
+      }
 
-    val impactedTargets = if (changedModules.isNotEmpty()) {
-      if (canQueryWorkspace) {
+      if (changedModules.isNotEmpty()) {
         logger.i { "Module changes detected - querying for targets that depend on changed modules" }
         val moduleImpactedTargets = queryTargetsDependingOnModules(changedModules, to)
         // Mark module-impacted targets with distance 0, then compute distances from there
         val moduleImpactedHashes = from.filterKeys { !moduleImpactedTargets.contains(it) }
         computeAllDistances(moduleImpactedHashes, to, depEdges)
       } else {
-        logger.w { "Module changes detected but no workspace provided - marking all targets as impacted" }
-        logger.w { "To enable fine-grained module detection, provide -w/--workspacePath to get-impacted-targets" }
-        // When modules change without workspace, mark all targets with distance 0 (directly impacted)
-        to.keys.associateWith { TargetDistanceMetrics(0, 0) }
+        computeAllDistances(from, to, depEdges)
       }
     } else {
+      // Without workspace, use hash comparison (supports fine-grained external repo hashing)
       computeAllDistances(from, to, depEdges)
     }
 

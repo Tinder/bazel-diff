@@ -36,7 +36,7 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       targetTypes: Set<String>?,
       fromModuleGraphJson: String? = null,
       toModuleGraphJson: String? = null,
-      canQueryWorkspace: Boolean = false
+      canQueryWorkspace: Boolean = true
   ) {
     /** This call might be faster if end hashes is a sorted map */
     val typeFilter = TargetTypeFilter(targetTypes, to)
@@ -95,7 +95,7 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       targetTypes: Set<String>?,
       fromModuleGraphJson: String? = null,
       toModuleGraphJson: String? = null,
-      canQueryWorkspace: Boolean = false
+      canQueryWorkspace: Boolean = true
   ) {
     val typeFilter = TargetTypeFilter(targetTypes, to)
 

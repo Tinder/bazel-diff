@@ -164,6 +164,9 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
   }
 
   private suspend fun createSeedForFilepaths(seedFilepaths: Set<Path>): ByteArray {
+    if (seedFilepaths.isEmpty()) {
+      return ByteArray(0)
+    }
     return sha256 {
       // Include seed filepaths in hash
       for (path in seedFilepaths) {

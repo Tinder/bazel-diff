@@ -159,8 +159,7 @@ class GetImpactedTargetsCommand : Callable<Int> {
                   outputWriter,
                   targetType,
                   fromData.moduleGraphJson,
-                  toData.moduleGraphJson,
-                  canQueryWorkspace = true)
+                  toData.moduleGraphJson)
         } else {
           CalculateImpactedTargetsInteractor()
               .execute(
@@ -169,8 +168,7 @@ class GetImpactedTargetsCommand : Callable<Int> {
                   outputWriter,
                   targetType,
                   fromData.moduleGraphJson,
-                  toData.moduleGraphJson,
-                  canQueryWorkspace = true)
+                  toData.moduleGraphJson)
         }
         CommandLine.ExitCode.OK
       } catch (e: IOException) {

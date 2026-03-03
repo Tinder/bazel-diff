@@ -88,12 +88,12 @@ To enable this feature, you must generate a dependency mapping on your final rev
 
 ```bash
 git checkout BASE_REV
-bazel-diff generate-hashes [...]
+bazel-diff generate-hashes -w /path/to/workspace -b bazel starting_hashes.json
 
 git checkout FINAL_REV
-bazel-diff generate-hashes --depEdgesFile deps.json [...]
+bazel-diff generate-hashes -w /path/to/workspace -b bazel --depEdgesFile deps.json final_hashes.json
 
-bazel-diff get-impacted-targets --depEdgesFile deps.json [...]
+bazel-diff get-impacted-targets -w /path/to/workspace -b bazel -sh starting_hashes.json -fh final_hashes.json --depEdgesFile deps.json -o impacted_targets.json
 ```
 
 This will produce an impacted targets json list with target label, target distance, and package distance:
@@ -288,24 +288,46 @@ content of the file are converted into a SHA256 value.
 ### `get-impacted-targets` command
 
 ```terminal
-Usage: bazel-diff get-impacted-targets [-v] -fh=<finalHashesJSONPath>
-                                       -o=<outputPath>
-                                       -tt=<targetType>
+Usage: bazel-diff get-impacted-targets [-v] -w=<workspacePath>
+                                       -b=<bazelPath>
+                                       -fh=<finalHashesJSONPath>
                                        -sh=<startingHashesJSONPath>
+                                       [-o=<outputPath>]
+                                       [-d=<depEdgesFile>]
+                                       [-tt=<targetType>]
+                                       [-so=<bazelStartupOptions>]
+                                       [--noBazelrc]
 Command-line utility to analyze the state of the bazel build graph
+      -w, --workspacePath=<workspacePath>
+                  Path to Bazel workspace directory. Required for module
+                    change detection.
+      -b, --bazelPath=<bazelPath>
+                  Path to Bazel binary. If not specified, the Bazel binary
+                    available in PATH will be used.
       -fh, --finalHashes=<finalHashesJSONPath>
                   The path to the JSON file of target hashes for the final
                     revision. Run 'generate-hashes' to get this value.
-      -o, --output=<outputPath>
-                  Filepath to write the impacted Bazel targets to, newline
-                    separated
       -sh, --startingHashes=<startingHashesJSONPath>
                   The path to the JSON file of target hashes for the initial
                     revision. Run 'generate-hashes' to get this value.
+      -o, --output=<outputPath>
+                  Filepath to write the impacted Bazel targets to. If using
+                    depEdgesFile: formatted in json, otherwise: newline
+                    separated. If not specified, the output will be written
+                    to STDOUT.
+      -d, --depEdgesFile=<depEdgesFile>
+                  Path to the file where dependency edges are. If specified,
+                    build graph distance metrics will be computed from the
+                    given hash data.
       -tt, --targetType=<targetType>
-                  The type of targets to filter, available options are SourceFile/Rule/GeneratedFile
-                  Only works if the JSON was generated with `--includeTargetType` enabled.
-                  If not specified, all types of impacted targets will be returned.
+                  The types of targets to filter. Use comma (,) to separate
+                    multiple values, e.g. '--targetType=SourceFile,Rule,GeneratedFile'.
+                    Only works if the JSON was generated with `--includeTargetType` enabled.
+                    If not specified, all types of impacted targets will be returned.
+      -so, --bazelStartupOptions=<bazelStartupOptions>
+                  Additional space separated Bazel client startup options
+                    used when invoking Bazel
+      --noBazelrc Don't use .bazelrc
       -v, --verbose
                   Display query string, missing files and elapsed time
 ```

@@ -255,8 +255,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
 
   @Test
   fun testModuleChangesWithoutWorkspace() {
-    // When module changes occur but no workspace is provided, fall back to hash comparison
-    // This correctly supports fine-grained external repo hashing where only changed external targets are marked
+    // When module changes occur and query service is not available, all targets are marked as impacted
     val startHashes = mapOf(
         "//:target1" to TargetHash("", "hash1", "hash1"),
         "//:target2" to TargetHash("", "hash2", "hash2"),
@@ -304,13 +303,12 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         outputWriter = outputWriter,
         targetTypes = null,
         fromModuleGraphJson = fromModuleGraph,
-        toModuleGraphJson = toModuleGraph,
-        canQueryWorkspace = false
+        toModuleGraphJson = toModuleGraph
     )
 
     val output = outputWriter.toString().trim().split("\n")
-    // Without workspace, falls back to hash comparison - only external target is impacted
-    assertThat(output).containsExactlyInAnyOrder("@@abseil-cpp~20240722.0//:strings")
+    // Module changes detected but no query service available - all targets including external are impacted
+    assertThat(output).containsExactlyInAnyOrder("//:target1", "//:target2", "@@abseil-cpp~20240722.0//:strings")
   }
 
   @Test
@@ -363,8 +361,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         outputWriter = outputWriter,
         targetTypes = null,
         fromModuleGraphJson = fromModuleGraph,
-        toModuleGraphJson = toModuleGraph,
-        canQueryWorkspace = true
+        toModuleGraphJson = toModuleGraph
     )
 
     val output = outputWriter.toString().trim().split("\n")
@@ -403,8 +400,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         outputWriter = outputWriter,
         targetTypes = null,
         fromModuleGraphJson = moduleGraph,
-        toModuleGraphJson = moduleGraph,  // Same module graph
-        canQueryWorkspace = false
+        toModuleGraphJson = moduleGraph  // Same module graph
     )
 
     val output = outputWriter.toString().trim().split("\n")
@@ -414,8 +410,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
 
   @Test
   fun testModuleChangesWithDistances() {
-    // Test executeWithDistances with module changes but no workspace
-    // Without workspace, falls back to hash comparison
+    // Test executeWithDistances with module changes - when query service is not available, all targets are marked as impacted
     val startHashes = mapOf(
         "//:1" to TargetHash("", "//:1", "//:1"),
         "//:2" to TargetHash("", "//:2", "//:2"),
@@ -462,15 +457,14 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         outputWriter = outputWriter,
         targetTypes = null,
         fromModuleGraphJson = fromModuleGraph,
-        toModuleGraphJson = toModuleGraph,
-        canQueryWorkspace = false
+        toModuleGraphJson = toModuleGraph
     )
 
     val output = outputWriter.toString()
-    // Without workspace, falls back to hash comparison - only //:1 changed
+    // Module changes detected but no query service available - all targets are marked as impacted
     assertThat(output).contains("//:1")
-    assertThat(output).doesNotContain("//:2")
-    assertThat(output).doesNotContain("//:3")
+    assertThat(output).contains("//:2")
+    assertThat(output).contains("//:3")
     assertThat(output).contains("\"targetDistance\": 0")
     assertThat(output).contains("\"packageDistance\": 0")
   }
@@ -497,8 +491,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         outputWriter = outputWriter,
         targetTypes = null,
         fromModuleGraphJson = null,  // Missing module graph
-        toModuleGraphJson = null,
-        canQueryWorkspace = true
+        toModuleGraphJson = null
     )
 
     val output = outputWriter.toString().trim().split("\n")
@@ -541,8 +534,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         outputWriter = outputWriter,
         targetTypes = null,
         fromModuleGraphJson = moduleGraph,  // Identical module graphs
-        toModuleGraphJson = moduleGraph,
-        canQueryWorkspace = true
+        toModuleGraphJson = moduleGraph
     )
 
     val output = outputWriter.toString().trim().split("\n")

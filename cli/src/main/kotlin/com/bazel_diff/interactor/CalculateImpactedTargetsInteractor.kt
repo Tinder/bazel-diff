@@ -35,33 +35,25 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       outputWriter: Writer,
       targetTypes: Set<String>?,
       fromModuleGraphJson: String? = null,
-      toModuleGraphJson: String? = null,
-      canQueryWorkspace: Boolean = false
+      toModuleGraphJson: String? = null
   ) {
     /** This call might be faster if end hashes is a sorted map */
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
-    // Only engage module change detection if workspace is available for querying
-    // Without workspace, fall back to hash comparison which correctly handles fine-grained external repo hashing
-    val impactedTargets = if (canQueryWorkspace) {
-      // Quick check: if module graph JSON is identical, skip module change detection entirely
-      val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
+    // Quick check: if module graph JSON is identical, skip module change detection entirely
+    val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
 
-      // Detect module changes and query for impacted targets
-      val changedModules = if (moduleGraphChanged) {
-        detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
-      } else {
-        emptySet()
-      }
-
-      if (changedModules.isNotEmpty()) {
-        logger.i { "Module changes detected - querying for targets that depend on changed modules" }
-        queryTargetsDependingOnModules(changedModules, to)
-      } else {
-        computeSimpleImpactedTargets(from, to)
-      }
+    // Detect module changes and query for impacted targets
+    val changedModules = if (moduleGraphChanged) {
+      detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
     } else {
-      // Without workspace, use hash comparison (supports fine-grained external repo hashing)
+      emptySet()
+    }
+
+    val impactedTargets = if (changedModules.isNotEmpty()) {
+      logger.i { "Module changes detected - querying for targets that depend on changed modules" }
+      queryTargetsDependingOnModules(changedModules, to)
+    } else {
       computeSimpleImpactedTargets(from, to)
     }
 
@@ -94,35 +86,27 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       outputWriter: Writer,
       targetTypes: Set<String>?,
       fromModuleGraphJson: String? = null,
-      toModuleGraphJson: String? = null,
-      canQueryWorkspace: Boolean = false
+      toModuleGraphJson: String? = null
   ) {
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
-    // Only engage module change detection if workspace is available for querying
-    // Without workspace, fall back to hash comparison which correctly handles fine-grained external repo hashing
-    val impactedTargets = if (canQueryWorkspace) {
-      // Quick check: if module graph JSON is identical, skip module change detection entirely
-      val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
+    // Quick check: if module graph JSON is identical, skip module change detection entirely
+    val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
 
-      // Detect module changes and query for impacted targets
-      val changedModules = if (moduleGraphChanged) {
-        detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
-      } else {
-        emptySet()
-      }
-
-      if (changedModules.isNotEmpty()) {
-        logger.i { "Module changes detected - querying for targets that depend on changed modules" }
-        val moduleImpactedTargets = queryTargetsDependingOnModules(changedModules, to)
-        // Mark module-impacted targets with distance 0, then compute distances from there
-        val moduleImpactedHashes = from.filterKeys { !moduleImpactedTargets.contains(it) }
-        computeAllDistances(moduleImpactedHashes, to, depEdges)
-      } else {
-        computeAllDistances(from, to, depEdges)
-      }
+    // Detect module changes and query for impacted targets
+    val changedModules = if (moduleGraphChanged) {
+      detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
     } else {
-      // Without workspace, use hash comparison (supports fine-grained external repo hashing)
+      emptySet()
+    }
+
+    val impactedTargets = if (changedModules.isNotEmpty()) {
+      logger.i { "Module changes detected - querying for targets that depend on changed modules" }
+      val moduleImpactedTargets = queryTargetsDependingOnModules(changedModules, to)
+      // Mark module-impacted targets with distance 0, then compute distances from there
+      val moduleImpactedHashes = from.filterKeys { !moduleImpactedTargets.contains(it) }
+      computeAllDistances(moduleImpactedHashes, to, depEdges)
+    } else {
       computeAllDistances(from, to, depEdges)
     }
 

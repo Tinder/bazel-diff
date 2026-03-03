@@ -1,5 +1,6 @@
 package com.bazel_diff.interactor
 
+import com.bazel_diff.bazel.BazelQueryService
 import com.bazel_diff.bazel.ModuleGraphParser
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.log.Logger
@@ -10,6 +11,7 @@ import java.io.Writer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentMap
 import java.util.stream.Collectors
+import kotlinx.coroutines.runBlocking
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
@@ -33,18 +35,39 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       outputWriter: Writer,
       targetTypes: Set<String>?,
       fromModuleGraphJson: String? = null,
-      toModuleGraphJson: String? = null
+      toModuleGraphJson: String? = null,
+      canQueryWorkspace: Boolean = false
   ) {
     /** This call might be faster if end hashes is a sorted map */
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
-    // Log module changes for visibility (doesn't affect impacted targets calculation)
-    logModuleChanges(fromModuleGraphJson, toModuleGraphJson)
+    // Quick check: if module graph JSON is identical, skip module change detection entirely
+    val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
 
-    computeSimpleImpactedTargets(from, to)
+    // Detect module changes and query for impacted targets if workspace is available
+    val changedModules = if (moduleGraphChanged) {
+      detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
+    } else {
+      emptySet()
+    }
+
+    val impactedTargets = if (changedModules.isNotEmpty()) {
+      if (canQueryWorkspace) {
+        logger.i { "Module changes detected - querying for targets that depend on changed modules" }
+        queryTargetsDependingOnModules(changedModules, to)
+      } else {
+        logger.w { "Module changes detected but no workspace provided - marking all targets as impacted" }
+        logger.w { "To enable fine-grained module detection, provide -w/--workspacePath to get-impacted-targets" }
+        to.keys
+      }
+    } else {
+      computeSimpleImpactedTargets(from, to)
+    }
+
+    impactedTargets
         .filter { typeFilter.accepts(it) }
-        .let { impactedTargets ->
-          outputWriter.use { writer -> impactedTargets.forEach { writer.write("$it\n") } }
+        .let { filtered ->
+          outputWriter.use { writer -> filtered.forEach { writer.write("$it\n") } }
         }
   }
 
@@ -70,20 +93,45 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       outputWriter: Writer,
       targetTypes: Set<String>?,
       fromModuleGraphJson: String? = null,
-      toModuleGraphJson: String? = null
+      toModuleGraphJson: String? = null,
+      canQueryWorkspace: Boolean = false
   ) {
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
-    // Log module changes for visibility (doesn't affect impacted targets calculation)
-    logModuleChanges(fromModuleGraphJson, toModuleGraphJson)
+    // Quick check: if module graph JSON is identical, skip module change detection entirely
+    val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
 
-    computeAllDistances(from, to, depEdges)
+    // Detect module changes and query for impacted targets if workspace is available
+    val changedModules = if (moduleGraphChanged) {
+      detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
+    } else {
+      emptySet()
+    }
+
+    val impactedTargets = if (changedModules.isNotEmpty()) {
+      if (canQueryWorkspace) {
+        logger.i { "Module changes detected - querying for targets that depend on changed modules" }
+        val moduleImpactedTargets = queryTargetsDependingOnModules(changedModules, to)
+        // Mark module-impacted targets with distance 0, then compute distances from there
+        val moduleImpactedHashes = from.filterKeys { !moduleImpactedTargets.contains(it) }
+        computeAllDistances(moduleImpactedHashes, to, depEdges)
+      } else {
+        logger.w { "Module changes detected but no workspace provided - marking all targets as impacted" }
+        logger.w { "To enable fine-grained module detection, provide -w/--workspacePath to get-impacted-targets" }
+        // When modules change without workspace, mark all targets with distance 0 (directly impacted)
+        to.keys.associateWith { TargetDistanceMetrics(0, 0) }
+      }
+    } else {
+      computeAllDistances(from, to, depEdges)
+    }
+
+    impactedTargets
         .filterKeys { typeFilter.accepts(it) }
-        .let { impactedTargets ->
+        .let { filtered ->
           outputWriter.use { writer ->
             writer.write(
                 gson.toJson(
-                    impactedTargets.map {
+                    filtered.map {
                       mapOf(
                           "label" to it.key,
                           "targetDistance" to it.value.targetDistance,
@@ -181,27 +229,25 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
   }
 
   /**
-   * Detects module changes by comparing module graphs and logs information.
+   * Detects module changes by comparing module graphs and returns changed module keys.
    *
    * This method:
    * 1. Parses the from and to module graphs
    * 2. Identifies which modules changed (added, removed, or version changed)
    * 3. Logs the changes for visibility
-   *
-   * Note: Module changes are incorporated into the hash seed in BuildGraphHasher,
-   * causing dependent targets to have different hashes. This method just provides
-   * visibility into what changed.
+   * 4. Returns the set of changed module keys
    *
    * @param fromModuleGraphJson JSON from `bazel mod graph --output=json` for starting revision
    * @param toModuleGraphJson JSON from `bazel mod graph --output=json` for final revision
+   * @return Set of changed module keys, empty if no changes
    */
-  private fun logModuleChanges(
+  private fun detectChangedModules(
       fromModuleGraphJson: String?,
       toModuleGraphJson: String?
-  ) {
-    // If either module graph is missing, skip
+  ): Set<String> {
+    // If either module graph is missing, assume no changes
     if (fromModuleGraphJson == null || toModuleGraphJson == null) {
-      return
+      return emptySet()
     }
 
     // Parse module graphs
@@ -215,7 +261,93 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       logger.i { "No module changes detected" }
     } else {
       logger.i { "Detected ${changedModules.size} module changes: ${changedModules.joinToString(", ")}" }
-      // Module changes are reflected in hash differences via the seed
+    }
+
+    return changedModules
+  }
+
+  /**
+   * Queries Bazel to find all targets that depend on the changed modules.
+   *
+   * This uses an efficient module-level query approach:
+   * 1. Identifies which external repository each changed module corresponds to
+   * 2. Uses `rdeps(//..., @@module~version//...)` to find workspace targets depending on each module
+   * 3. Returns the union of all impacted targets
+   *
+   * @param changedModuleKeys Set of changed module keys (e.g., "abseil-cpp@20240722.0")
+   * @param allTargets Map of all targets from the final revision
+   * @return Set of target labels that are impacted by module changes
+   */
+  private fun queryTargetsDependingOnModules(
+      changedModuleKeys: Set<String>,
+      allTargets: Map<String, TargetHash>
+  ): Set<String> {
+    return try {
+      // Inject BazelQueryService if available
+      val queryService: BazelQueryService? = try {
+        inject<BazelQueryService>().value
+      } catch (e: Exception) {
+        null
+      }
+
+      if (queryService == null) {
+        logger.w { "BazelQueryService not available - cannot query for module dependencies" }
+        return allTargets.keys
+      }
+
+      val impactedTargets = mutableSetOf<String>()
+
+      for (moduleKey in changedModuleKeys) {
+        // Extract module name from key (e.g., "abseil-cpp" from "abseil-cpp@20240722.0")
+        val moduleName = moduleKey.substringBefore("@")
+        logger.i { "Querying targets depending on module: $moduleName (key: $moduleKey)" }
+
+        // Find the canonical repository name for this module from allTargets
+        // Bzlmod repos look like: @@abseil-cpp~20240116.2//... or @@rules_jvm_external~~maven~maven//...
+        val moduleRepos = allTargets.keys
+            .filter { it.startsWith("@@") && it.contains(moduleName) }
+            .map { it.substring(2).substringBefore("//") } // Extract repo name
+            .toSet()
+
+        if (moduleRepos.isEmpty()) {
+          logger.w { "No external repository found for module $moduleName" }
+          continue
+        }
+
+        logger.i { "Found ${moduleRepos.size} repositories for module $moduleName: ${moduleRepos.joinToString(", ")}" }
+
+        // Query workspace targets that depend on any target in the changed module repo
+        for (repoName in moduleRepos) {
+          try {
+            // Use rdeps to find all workspace targets depending on this module
+            // rdeps(universe, target_set) finds all targets in universe that depend on target_set
+            val queryExpression = "rdeps(//..., @@$repoName//...)"
+            logger.i { "Executing query: $queryExpression" }
+
+            val rdeps = runBlocking { queryService.query(queryExpression, useCquery = false) }
+            val rdepLabels = rdeps.map { it.name }.filter { !it.startsWith("@@") } // Filter to workspace targets only
+
+            logger.i { "Found ${rdepLabels.size} workspace targets depending on @@$repoName" }
+            impactedTargets.addAll(rdepLabels)
+          } catch (e: Exception) {
+            logger.w { "Failed to query rdeps for @@$repoName: ${e.message}" }
+            logger.w { "Conservatively marking all targets as impacted for this module" }
+            // On error for this module, add all workspace targets
+            impactedTargets.addAll(allTargets.keys.filter { !it.startsWith("@@") })
+          }
+        }
+      }
+
+      // Add directly changed targets from hash comparison (e.g., code changes)
+      val directlyChanged = computeSimpleImpactedTargets(emptyMap(), allTargets)
+      impactedTargets.addAll(directlyChanged)
+
+      logger.i { "Total targets impacted by module changes: ${impactedTargets.size}" }
+      impactedTargets
+    } catch (e: Exception) {
+      logger.e(e) { "Error querying targets depending on modules" }
+      // On error, conservatively mark all targets as impacted
+      allTargets.keys
     }
   }
 }

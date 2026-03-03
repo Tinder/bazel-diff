@@ -75,11 +75,11 @@ class GetImpactedTargetsCommand : Callable<Int> {
       names = ["-w", "--workspacePath"],
       description =
           [
-              "Path to Bazel workspace directory. Optional. When provided along with module changes, enables fine-grained module dependency detection."],
+              "Path to Bazel workspace directory. Required for module change detection."],
       scope = CommandLine.ScopeType.LOCAL,
-      required = false,
+      required = true,
       converter = [NormalisingPathConverter::class])
-  var workspacePath: Path? = null
+  lateinit var workspacePath: Path
 
   @CommandLine.Option(
       names = ["-b", "--bazelPath"],
@@ -111,32 +111,28 @@ class GetImpactedTargetsCommand : Callable<Int> {
     // Stop any existing Koin instance before starting a new one (for E2E tests)
     org.koin.core.context.GlobalContext.stopKoin()
 
-    // Setup modules - include hasher module if workspace is provided for module querying
-    if (workspacePath != null) {
-      val resolvedBazelPath = bazelPath ?: java.nio.file.Paths.get("bazel")
-      startKoin {
-        modules(
-          serialisationModule(),
-          loggingModule(parent.verbose),
-          com.bazel_diff.di.hasherModule(
-            workingDirectory = workspacePath!!,
-            bazelPath = resolvedBazelPath,
-            contentHashPath = null,
-            startupOptions = bazelStartupOptions,
-            commandOptions = emptyList(),
-            cqueryOptions = emptyList(),
-            useCquery = false,
-            cqueryExpression = null,
-            keepGoing = false,
-            trackDeps = false,
-            fineGrainedHashExternalRepos = emptySet(),
-            fineGrainedHashExternalReposFile = null,
-            excludeExternalTargets = false
-          )
+    // Setup modules - include hasher module for module querying
+    val resolvedBazelPath = bazelPath ?: java.nio.file.Paths.get("bazel")
+    startKoin {
+      modules(
+        serialisationModule(),
+        loggingModule(parent.verbose),
+        com.bazel_diff.di.hasherModule(
+          workingDirectory = workspacePath,
+          bazelPath = resolvedBazelPath,
+          contentHashPath = null,
+          startupOptions = bazelStartupOptions,
+          commandOptions = emptyList(),
+          cqueryOptions = emptyList(),
+          useCquery = false,
+          cqueryExpression = null,
+          keepGoing = false,
+          trackDeps = false,
+          fineGrainedHashExternalRepos = emptySet(),
+          fineGrainedHashExternalReposFile = null,
+          excludeExternalTargets = false
         )
-      }
-    } else {
-      startKoin { modules(serialisationModule(), loggingModule(parent.verbose)) }
+      )
     }
 
     return try {
@@ -164,7 +160,7 @@ class GetImpactedTargetsCommand : Callable<Int> {
                   targetType,
                   fromData.moduleGraphJson,
                   toData.moduleGraphJson,
-                  workspacePath != null)
+                  canQueryWorkspace = true)
         } else {
           CalculateImpactedTargetsInteractor()
               .execute(
@@ -174,7 +170,7 @@ class GetImpactedTargetsCommand : Callable<Int> {
                   targetType,
                   fromData.moduleGraphJson,
                   toData.moduleGraphJson,
-                  workspacePath != null)
+                  canQueryWorkspace = true)
         }
         CommandLine.ExitCode.OK
       } catch (e: IOException) {

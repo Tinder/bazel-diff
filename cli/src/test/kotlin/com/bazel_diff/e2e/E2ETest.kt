@@ -109,6 +109,10 @@ class E2ETest {
     cli.execute(
         listOf(
             "get-impacted-targets",
+            "-w",
+            workingDirectoryB.absolutePath,
+            "-b",
+            bazelPath,
             "-sh",
             from.absolutePath,
             "-fh",
@@ -207,6 +211,10 @@ class E2ETest {
     // Impacted targets
     cli.execute(
         "get-impacted-targets",
+        "-w",
+        workingDirectoryB.absolutePath,
+        "-b",
+        bazelPath,
         "-sh",
         from.absolutePath,
         "-fh",
@@ -290,6 +298,10 @@ class E2ETest {
     // Impacted targets
     cli.execute(
         "get-impacted-targets",
+        "-w",
+        workingDirectoryB.absolutePath,
+        "-b",
+        bazelPath,
         "-sh",
         from.absolutePath,
         "-fh",
@@ -379,6 +391,10 @@ class E2ETest {
     // Impacted targets
     cli.execute(
         "get-impacted-targets",
+        "-w",
+        workingDirectoryB.absolutePath,
+        "-b",
+        bazelPath,
         "-sh",
         from.absolutePath,
         "-fh",
@@ -467,6 +483,10 @@ class E2ETest {
     // Impacted targets
     cli.execute(
         "get-impacted-targets",
+        "-w",
+        workingDirectoryB.absolutePath,
+        "-b",
+        bazelPath,
         "-sh",
         from.absolutePath,
         "-fh",
@@ -558,6 +578,7 @@ class E2ETest {
 
     val workingDirectoryA = extractFixtureProject("/fixture/cquery-test-base.zip")
     val workingDirectoryB = extractFixtureProject("/fixture/cquery-test-guava-upgrade.zip")
+    val bazelPath = "bazel"
     val outputDir = temp.newFolder()
     val from = File(outputDir, "starting_hashes.json")
     val to = File(outputDir, "final_hashes.json")
@@ -595,6 +616,10 @@ class E2ETest {
     // Impacted targets
     cli.execute(
         "get-impacted-targets",
+        "-w",
+        workingDirectoryB.absolutePath,
+        "-b",
+        bazelPath,
         "-sh",
         from.absolutePath,
         "-fh",
@@ -643,6 +668,10 @@ class E2ETest {
     // Impacted targets
     cli.execute(
         "get-impacted-targets",
+        "-w",
+        workingDirectoryB.absolutePath,
+        "-b",
+        bazelPath,
         "-sh",
         from.absolutePath,
         "-fh",
@@ -722,6 +751,7 @@ class E2ETest {
 
     val workingDirectoryA = extractFixtureProject("/fixture/cquery-test-base.zip")
     val workingDirectoryB = extractFixtureProject("/fixture/cquery-test-android-code-change.zip")
+    val bazelPath = "bazel"
     val outputDir = temp.newFolder()
     val from = File(outputDir, "starting_hashes.json")
     val to = File(outputDir, "final_hashes.json")
@@ -759,6 +789,10 @@ class E2ETest {
     // Impacted targets
     cli.execute(
         "get-impacted-targets",
+        "-w",
+        workingDirectoryB.absolutePath,
+        "-b",
+        bazelPath,
         "-sh",
         from.absolutePath,
         "-fh",
@@ -808,6 +842,10 @@ class E2ETest {
     // Impacted targets
     cli.execute(
         "get-impacted-targets",
+        "-w",
+        workingDirectoryB.absolutePath,
+        "-b",
+        bazelPath,
         "-sh",
         from.absolutePath,
         "-fh",
@@ -864,6 +902,10 @@ class E2ETest {
     // Impacted targets
     cli.execute(
         "get-impacted-targets",
+        "-w",
+        workspace.absolutePath,
+        "-b",
+        "bazel",
         "-sh",
         from.absolutePath,
         "-fh",

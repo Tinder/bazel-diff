@@ -29,7 +29,16 @@ class BuildGraphHasherTest : KoinTest {
   @get:Rule
   val koinTestRule =
       KoinTestRule.create {
-        val mod = module { single<SourceFileHasher> { fakeSourceFileHasher } }
+        val mod = module {
+          single<SourceFileHasher> { fakeSourceFileHasher }
+          single<com.bazel_diff.bazel.BazelModService> {
+            mock<com.bazel_diff.bazel.BazelModService>().apply {
+              runBlocking {
+                whenever(getModuleGraph()).thenReturn(null)
+              }
+            }
+          }
+        }
         modules(testModule(), mod)
       }
 
@@ -74,14 +83,14 @@ class BuildGraphHasherTest : KoinTest {
             "rule1" to
                 TargetHash(
                     "Rule",
-                    "7b3149cbd2219ca05bc80a557a701ddee18bd3bbe9afa8e851df64b999155c5e",
-                    "2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775",
+                    "443e5e8ca6f5f1afdebfb8650a1fc37ad10964fca5a270ef97b37ea2425c57ee",
+                    "e34f24077b917a720bc1ce4b1383c7df3c01ff26e492dea43d45780871b30382",
                     emptyList()),
             "rule2" to
                 TargetHash(
                     "Rule",
-                    "24f12d22ab247c5af32f954ca46dd4f6323ab2eef28455411b912aaf44a7c322",
-                    "bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9",
+                    "72697540fd5f7d4fd23832a046915630cb2658f8cd0e67bc9c98353131bebfbc",
+                    "9cfe592887d063932fa455fe985e96d8ec07079bc20fc2a955e8e8d520c59282",
                     emptyList()),
         )
   }
@@ -215,26 +224,26 @@ class BuildGraphHasherTest : KoinTest {
             "rule1" to
                 TargetHash(
                     "Rule",
-                    "7b3149cbd2219ca05bc80a557a701ddee18bd3bbe9afa8e851df64b999155c5e",
-                    "2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775",
+                    "443e5e8ca6f5f1afdebfb8650a1fc37ad10964fca5a270ef97b37ea2425c57ee",
+                    "e34f24077b917a720bc1ce4b1383c7df3c01ff26e492dea43d45780871b30382",
                     emptyList()),
             "rule2" to
                 TargetHash(
                     "Rule",
-                    "24f12d22ab247c5af32f954ca46dd4f6323ab2eef28455411b912aaf44a7c322",
-                    "bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9",
+                    "72697540fd5f7d4fd23832a046915630cb2658f8cd0e67bc9c98353131bebfbc",
+                    "9cfe592887d063932fa455fe985e96d8ec07079bc20fc2a955e8e8d520c59282",
                     emptyList()),
             "rule3" to
                 TargetHash(
                     "Rule",
-                    "c7018bbfed16f4f6f0ef1f258024a50c56ba916b3b9ed4f00972a233d5d11b42",
-                    "4aeafed087a9c78a4efa11b6f7831c38d775ddb244a9fabbf21d78c1666a2ea9",
+                    "504431ed5d613c0a165e0be7f492d82f03b9f48cc58fc284303967fc1946f9f5",
+                    "a572cd448866842478ead3689e13849a6069e07e50c79dc9b2be0bd282812eba",
                     listOf("rule1")),
             "rule4" to
                 TargetHash(
                     "Rule",
-                    "020720dfbb969ef9629e51a624a616f015fe07c7b779a5b4f82a8b36c9d3cbe9",
-                    "82b46404c8a1ec402a60de72d42a14f6a080e938e5ebaf26203c5ef480558767",
+                    "7ce78e40ee07a1fa9f2cbcfc3ecf65295e0455b0dcee03b66fd1a21822e39c94",
+                    "c2743eef104170464c7bb67d7c399070e0d68ae3efb5564da796cc50218a4a48",
                     listOf("rule1")),
         )
   }
@@ -254,26 +263,26 @@ class BuildGraphHasherTest : KoinTest {
             "rule1" to
                 TargetHash(
                     "Rule",
-                    "7b3149cbd2219ca05bc80a557a701ddee18bd3bbe9afa8e851df64b999155c5e",
-                    "2c963f7c06bc1cead7e3b4759e1472383d4469fc3238dc42f8848190887b4775",
+                    "443e5e8ca6f5f1afdebfb8650a1fc37ad10964fca5a270ef97b37ea2425c57ee",
+                    "e34f24077b917a720bc1ce4b1383c7df3c01ff26e492dea43d45780871b30382",
                     emptyList()),
             "rule2" to
                 TargetHash(
                     "Rule",
-                    "24f12d22ab247c5af32f954ca46dd4f6323ab2eef28455411b912aaf44a7c322",
-                    "bdc1abd0a07103cea34199a9c0d1020619136ff90fb88dcc3a8f873c811c1fe9",
+                    "72697540fd5f7d4fd23832a046915630cb2658f8cd0e67bc9c98353131bebfbc",
+                    "9cfe592887d063932fa455fe985e96d8ec07079bc20fc2a955e8e8d520c59282",
                     emptyList()),
             "rule3" to
                 TargetHash(
                     "Rule",
-                    "be17f1e1884037b970e6b7c86bb6533b253a12d967029adc711e50d4662237e8",
-                    "91ea3015d4424bb8c1ecf381c30166c386c161d31b70967f3a021c1dc43c7774",
+                    "2c424742eaeedfecd438042735f97922e87d73aaabfa28bb2e7a97665f3cb4df",
+                    "a34330110423a54360c53c8dfa6181fa7ff484b55795a41aa471c77e472d8895",
                     listOf("rule1", "rule4")),
             "rule4" to
                 TargetHash(
                     "Rule",
-                    "f3e5675e30fe25ff9b61a0c7f64c423964f886799407a9438e692fd803ecd47c",
-                    "bce09e1689cc7a8172653981582fea70954f8acd58985c92026582e4b75ec8d2",
+                    "55af9fde90871f0af4bc588cab392d89c2e58220b3e1fc2c74a55857a3842b89",
+                    "8ab85c9e6eb4c2320396c682106bf712535ac7e4c7204b7bcda2dacad7167d3b",
                     listOf("rule1")),
         )
   }

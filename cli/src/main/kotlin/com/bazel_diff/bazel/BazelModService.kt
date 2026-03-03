@@ -24,6 +24,88 @@ class BazelModService(
   /** True if Bzlmod is enabled (e.g. `bazel mod graph` succeeds). When true, //external is not available. */
   val isBzlmodEnabled: Boolean by lazy { runBlocking { checkBzlmodEnabled() } }
 
+  /**
+   * Returns the module dependency graph as a string for hashing purposes.
+   * This captures all module dependencies and their versions, allowing bazel-diff to detect
+   * when MODULE.bazel changes (e.g., when a module version is updated).
+   *
+   * @return The output of `bazel mod graph` if bzlmod is enabled, or null if disabled/error.
+   */
+  @OptIn(ExperimentalCoroutinesApi::class)
+  suspend fun getModuleGraph(): String? {
+    if (!isBzlmodEnabled) {
+      return null
+    }
+
+    val cmd =
+        mutableListOf<String>().apply {
+          add(bazelPath.toString())
+          if (noBazelrc) {
+            add("--bazelrc=/dev/null")
+          }
+          addAll(startupOptions)
+          add("mod")
+          add("graph")
+        }
+    logger.i { "Executing Bazel mod graph for hashing: ${cmd.joinToString()}" }
+    val result =
+        process(
+            *cmd.toTypedArray(),
+            stdout = Redirect.CAPTURE,
+            stderr = Redirect.CAPTURE,
+            workingDirectory = workingDirectory.toFile(),
+            destroyForcibly = true,
+        )
+
+    return if (result.resultCode == 0) {
+      result.output.joinToString("\n").trim()
+    } else {
+      logger.w { "Failed to get module graph" }
+      null
+    }
+  }
+
+  /**
+   * Returns the module dependency graph in JSON format for precise change detection.
+   *
+   * @return The JSON output of `bazel mod graph --output=json` if bzlmod is enabled,
+   *         or null if disabled/error.
+   */
+  @OptIn(ExperimentalCoroutinesApi::class)
+  suspend fun getModuleGraphJson(): String? {
+    if (!isBzlmodEnabled) {
+      return null
+    }
+
+    val cmd =
+        mutableListOf<String>().apply {
+          add(bazelPath.toString())
+          if (noBazelrc) {
+            add("--bazelrc=/dev/null")
+          }
+          addAll(startupOptions)
+          add("mod")
+          add("graph")
+          add("--output=json")
+        }
+    logger.i { "Executing Bazel mod graph JSON: ${cmd.joinToString()}" }
+    val result =
+        process(
+            *cmd.toTypedArray(),
+            stdout = Redirect.CAPTURE,
+            stderr = Redirect.CAPTURE,
+            workingDirectory = workingDirectory.toFile(),
+            destroyForcibly = true,
+        )
+
+    return if (result.resultCode == 0) {
+      result.output.joinToString("\n").trim()
+    } else {
+      logger.w { "Failed to get module graph JSON" }
+      null
+    }
+  }
+
   @OptIn(ExperimentalCoroutinesApi::class)
   private suspend fun checkBzlmodEnabled(): Boolean {
     val cmd =

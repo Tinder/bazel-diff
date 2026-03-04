@@ -10,7 +10,7 @@ config_setting(
 
 genrule(
     name = "version_file",
-    outs = ["version"],
+    outs = ["src/main/resources/cli/version"],
     cmd = "echo '{version}' > $@".format(version = module_version() if module_version() else "unknown"),
     stamp = 1,
 )

@@ -1,6 +1,7 @@
 package com.bazel_diff
 
 import com.bazel_diff.bazel.BazelClient
+import com.bazel_diff.bazel.BazelModService
 import com.bazel_diff.hash.*
 import com.bazel_diff.io.ContentHashProvider
 import com.bazel_diff.log.Logger
@@ -13,12 +14,13 @@ import org.koin.dsl.module
 fun testModule(): Module = module {
   val outputBase = Paths.get("output-base")
   val workingDirectory = Paths.get("working-directory")
+  val bazelPath = Paths.get("bazel")
   single<Logger> { SilentLogger }
   single { BazelClient(false, null, emptySet(), false) }
   single { BuildGraphHasher(get()) }
   single { TargetHasher() }
   single { RuleHasher(false, true, emptySet()) }
-  single { ExternalRepoResolver(workingDirectory, Paths.get("bazel"), outputBase) }
+  single { ExternalRepoResolver(workingDirectory, bazelPath, outputBase) }
   single<SourceFileHasher> { SourceFileHasherImpl() }
   single { GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create() }
   single(named("working-directory")) { workingDirectory }

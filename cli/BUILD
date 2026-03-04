@@ -103,6 +103,12 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "ModuleGraphParserTest",
+    test_class = "com.bazel_diff.bazel.ModuleGraphParserTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "E2ETest",
     timeout = "long",
     data = [":workspaces"],

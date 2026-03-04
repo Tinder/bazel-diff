@@ -100,7 +100,7 @@ if ($exitCode -ne 0) {
 
 # Determine impacted targets
 Write-Host "Determining Impacted Targets"
-$exitCode = Run-BazelDiff @("get-impacted-targets", "-sh", $StartingHashesJson, "-fh", $FinalHashesJson, "-o", $ImpactedTargetsPath)
+$exitCode = Run-BazelDiff @("get-impacted-targets", "-w", $WorkspacePath, "-b", $BazelPath, "-sh", $StartingHashesJson, "-fh", $FinalHashesJson, "-o", $ImpactedTargetsPath)
 if ($exitCode -ne 0) {
     throw "Failed to get impacted targets"
 }

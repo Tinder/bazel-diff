@@ -6,6 +6,7 @@ import com.google.common.cache.CacheLoader
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.util.concurrent.TimeUnit
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
@@ -70,11 +71,28 @@ class ExternalRepoResolver(
   }
 
   private fun runProcessAndCaptureFirstLine(vararg command: String): String? {
-    val process = ProcessBuilder(*command).directory(workingDirectory.toFile()).start()
-    process.inputStream.bufferedReader().use {
-      // read the first line and close the stream so that Bazel doesn't need to continue
-      // output all the query result.
-      return it.readLine()
+    val process =
+        ProcessBuilder(*command)
+            .directory(workingDirectory.toFile())
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
+            .start()
+    process.outputStream.close()
+    try {
+      process.inputStream.bufferedReader().use {
+        return it.readLine()
+      }
+    } finally {
+      if (process.isAlive) {
+        terminateProcess(process)
+      }
+    }
+  }
+
+  private fun terminateProcess(process: Process) {
+    process.destroy()
+    if (!process.waitFor(1, TimeUnit.SECONDS)) {
+      process.destroyForcibly()
+      process.waitFor(1, TimeUnit.SECONDS)
     }
   }
 }

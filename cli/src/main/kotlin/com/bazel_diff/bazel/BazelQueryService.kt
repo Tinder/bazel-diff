@@ -30,7 +30,7 @@ class BazelQueryService(
 
   @OptIn(ExperimentalCoroutinesApi::class)
   private suspend fun determineBazelVersion(): Triple<Int, Int, Int> {
-    val cmd = arrayOf(bazelPath.toString(), "--version")
+    val cmd = arrayOf(bazelPath.toString(), "version")
     logger.i { "Executing Bazel version command: ${cmd.joinToString()}" }
     val result =
         process(
@@ -45,12 +45,19 @@ class BazelQueryService(
       throw RuntimeException("Bazel version command failed, exit code ${result.resultCode}")
     }
 
-    if (result.output.size != 1 || !result.output.first().startsWith("bazel ")) {
-      throw RuntimeException("Bazel version command returned unexpected output: ${result.output}")
-    }
+    // "bazel version" outputs "Build label: X.Y.Z" on one of the lines; accept that or legacy "bazel X.Y.Z".
+    val versionString =
+        result.output
+            .firstOrNull { it.startsWith("Build label: ") }
+            ?.removePrefix("Build label: ")?.trim()
+            ?: result.output
+                .firstOrNull { it.startsWith("bazel ") }
+                ?.removePrefix("bazel ")?.trim()
+            ?: throw RuntimeException(
+                "Bazel version command returned unexpected output: ${result.output}")
     // Trim off any prerelease suffixes (e.g., 8.6.0-rc1 or 8.6.0rc1).
-    val versionString = result.output.first().removePrefix("bazel ").trim().split('-')[0]
-    val version = versionString.split('.').map { it.takeWhile { c -> c.isDigit() }.toInt() }.toTypedArray()
+    val version =
+        versionString.split('-')[0].split('.').map { it.takeWhile { c -> c.isDigit() }.toInt() }.toTypedArray()
     return Triple(version[0], version[1], version[2])
   }
 

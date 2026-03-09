@@ -5,7 +5,6 @@ release_source_archive:
 		--exclude=bazel-* \
 		--exclude=.github \
 		--exclude=archives \
-		--exclude=cli/src/test \
 		-zcf "archives/release.tar.gz" .
 
 .PHONY: release_deploy_jar

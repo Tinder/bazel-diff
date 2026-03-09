@@ -137,6 +137,37 @@ class E2ETest {
   }
 
   @Test
+  fun testDetermineBazelVersion() {
+    // E2E coverage for BazelQueryService.determineBazelVersion(): version is resolved lazily
+    // when the first query runs. Running generate-hashes to completion validates that
+    // "bazel version" is executed and parsed successfully (e.g. "Build label: X.Y.Z").
+    val projectA = extractFixtureProject("/fixture/integration-test-1.zip")
+    val workingDirectory = File(projectA, "integration")
+    val outputDir = temp.newFolder()
+    val outputPath = File(outputDir, "hashes.json")
+
+    val cli = CommandLine(BazelDiff())
+    val exitCode = cli.execute(
+        "generate-hashes",
+        "-w",
+        workingDirectory.absolutePath,
+        "-b",
+        "bazel",
+        outputPath.absolutePath)
+
+    assertThat(exitCode).isEqualTo(0)
+    assertThat(outputPath.readText().isNotEmpty()).isEqualTo(true)
+  }
+
+  @Test
+  fun testE2EWithNoKeepGoing() {
+    testE2E(
+        listOf("--no-keep_going"),
+        emptyList(),
+        "/fixture/impacted_targets-1-2.txt")
+  }
+
+  @Test
   fun testE2EIncludingTargetType() {
     testE2E(
         listOf("-tt", "Rule,SourceFile"),
@@ -995,6 +1026,19 @@ class E2ETest {
     // The cquery should fail because it tries to analyze the failing_analysis_target
     // which is designed to fail during analysis
     assertThat(exitCodeWithCquery).isEqualTo(1)
+
+    // Test with --no-keep_going: cquery should fail (no partial results, immediate failure)
+    val outputNoKeepGoing = File(outputDir, "hashes_no_keep_going.json")
+    val exitCodeWithNoKeepGoing = cli.execute(
+        "generate-hashes",
+        "-w",
+        workspace.absolutePath,
+        "-b",
+        "bazel",
+        "--useCquery",
+        "--no-keep_going",
+        outputNoKeepGoing.absolutePath)
+    assertThat(exitCodeWithNoKeepGoing).isEqualTo(1)
 
     // Test with --keep_going enabled (default behavior)
     // With keep_going, cquery returns partial results but still exits with code 1

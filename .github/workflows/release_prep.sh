@@ -11,7 +11,6 @@ tar --exclude-vcs \
   --exclude=bazel-* \
   --exclude=.github \
   --exclude=archives \
-  --exclude=cli/src/test \
   -zcf "archives/release.tar.gz" .
 
 SHA=$(shasum -a 256 archives/release.tar.gz | awk '{print $1}')

@@ -17,3 +17,7 @@ release_deploy_jar:
 .PHONY: format
 format:
 	bazelisk run //cli/format
+
+.PHONY: generate-readme
+generate-readme:
+	bazelisk run //tools:generate-readme

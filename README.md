@@ -106,6 +106,7 @@ This will produce an impacted targets json list with target label, target distan
 ]
 ```
 
+<!-- BEGIN_SECTION: cli-help -->
 ## CLI Interface
 
 `bazel-diff` Command
@@ -126,53 +127,32 @@ Commands:
 ### `generate-hashes` command
 
 ```terminal
-Usage: bazel-diff generate-hashes [-hkvV] [--[no-]useCquery] [-b=<bazelPath>]
-                                  [--[no-]excludeExternalTargets]
-                                  [--[no-]includeTargetType]
+Usage: bazel-diff generate-hashes [-hkvV] [--[no-]excludeExternalTargets] [--
+                                  [no-]includeTargetType] [--[no-]useCquery]
+                                  [-b=<bazelPath>]
                                   [--contentHashPath=<contentHashPath>]
-                                  [-s=<seedFilepaths>] -w=<workspacePath>
+                                  [--cqueryExpression=<cqueryExpression>]
+                                  [-d=<depsMappingJSONPath>]
+                                  [--fineGrainedHashExternalReposFile=<fineGrain
+                                  edHashExternalReposFile>]
+                                  [-m=<modifiedFilepaths>] [-s=<seedFilepaths>]
+                                  -w=<workspacePath>
                                   [-co=<bazelCommandOptions>]...
                                   [--cqueryCommandOptions=<cqueryCommandOptions>
                                   ]...
                                   [--fineGrainedHashExternalRepos=<fineGrainedHa
                                   shExternalRepos>]...
-                                  [-so=<bazelStartupOptions>]... <outputPath>
+                                  [--ignoredRuleHashingAttributes=<ignoredRuleHa
+                                  shingAttributes>]...
+                                  [-so=<bazelStartupOptions>]...
+                                  [-tt=<targetType>[,<targetType>...]]...
+                                  <outputPath>
 Writes to a file the SHA256 hashes for each Bazel Target in the provided
 workspace.
-      <outputPath>        The filepath to write the resulting JSON to.
-                            If not specified, the JSON will be written to STDOUT.
-
-                            By default the JSON schema is a dictionary of target => SHA-256 values.
-                            Example:
-                                 {
-                                    "//cli:bazel-diff_deploy.jar":  "4ae310f8ad2bc728934e3509b6102ca658e828b9cd668f79990e95c6663f9633"
-                                    ...
-                                 }
-
-                            If --includeTargetType is specified, the JSON schema will include the target type (SourceFile/Rule/GeneratedFile)
-                            Example:
-                                {
-                                  "//cli:src/test/resources/fixture/integration-test-1.zip": "SourceFile#c259eba8539f4c14e4536c61975457c2990e090067893f4a2981e7bb5f4ef4cf",
-                                  "//external:android_gmaven_r8": "Rule#795f583449a40814c05e1cc5d833002afed8d12bce5b835579c7f139c2462d61",
-                                  "//cli:bazel-diff_deploy.jar": "GeneratedFile#4ae310f8ad2bc728934e3509b6102ca658e828b9cd668f79990e95c6663f9633",
-                                  ...
-                                }
-      --[no-]excludeExternalTargets
-                          If true, exclude external targets (do not query
-                            //external:all-targets). When Bzlmod is enabled
-                            (detected via bazel mod graph), external targets
-                            are excluded automatically. Set this when using
-                            Bazel with --enable_workspace=false in other
-                            configurations. Defaults to false.
-      --[no-]includeTargetType
-                          Whether include target type in the generated JSON or not.
-                            If false, the generate JSON schema is: {"<target>": "<sha256>"}
-                            If true, the generate JSON schema is: {"<target>": "<type>#<sha256>"
-      -tt, --targetType=<targetType>
-                          The type of targets to filter, available options are SourceFile/Rule/GeneratedFile
-                          Only works if the JSON was generated with `--includeTargetType` enabled.
-                          If not specified, all types of impacted targets will be returned.
-      -b, --bazelPath=<bazelPath>
+      <outputPath>        The filepath to write the resulting JSON of
+                            dictionary target => SHA-256 values. If not
+                            specified, the JSON will be written to STDOUT.
+  -b, --bazelPath=<bazelPath>
                           Path to Bazel binary. If not specified, the Bazel
                             binary available in PATH will be used.
       -co, --bazelCommandOptions=<bazelCommandOptions>
@@ -188,36 +168,65 @@ workspace.
                             when invoking `bazel cquery`. This flag is has no
                             effect if `--useCquery`is false.
       --cqueryExpression=<cqueryExpression>
-                          Custom cquery expression to use instead of the default
-                            'deps(//...:all-targets)'. This allows you to exclude
-                            problematic targets (e.g., analysis_test targets that
-                            are designed to fail). Example: 'deps(//:target1) +
-                            deps(//:target2)'. This flag has no effect if
-                            `--useCquery` is false.
+                          Custom cquery expression to use instead of the
+                            default 'deps(//...:all-targets)'. This allows you
+                            to exclude problematic targets (e.g., analysis_test
+                            targets that are designed to fail). Example: 'deps
+                            (//...:all-targets) except //path/to/failing:
+                            target'. This flag has no effect if `--useCquery`
+                            is false.
+  -d, --depEdgesFile=<depsMappingJSONPath>
+                          Path to the file where dependency edges are written
+                            to. If not specified, the dependency edges will not
+                            be written to a file. Needed for computing build
+                            graph distance metrics. See bazel-diff docs for
+                            more details about build graph distance metrics.
+      --[no-]excludeExternalTargets
+                          If true, exclude external targets (do not query
+                            //external:all-targets). When Bzlmod is enabled
+                            (detected via bazel mod graph), external targets
+                            are excluded automatically. Set this when using
+                            Bazel with --enable_workspace=false in other
+                            configurations. Defaults to false.
       --fineGrainedHashExternalRepos=<fineGrainedHashExternalRepos>
                           Comma separate list of external repos in which
                             fine-grained hashes are computed for the targets.
                             By default, external repos are treated as an opaque
                             blob. If an external repo is specified here,
                             bazel-diff instead computes the hash for individual
-                            targets. For example, one wants to specify `@maven`
-                            here if they use rules_jvm_external so that
+                            targets. For example, one wants to specify `maven`
+                            here if they user rules_jvm_external so that
                             individual third party dependency change won't
-                            invalidate all targets in the mono repo. Note that
-                            if `--useCquery` is true; or `--useCquery` is false but
-                            `--bazelCommandOptions=--consistent_labels` is provided,
-                            the canonical repo name must be provided,
-                            e.g. `@@maven` or `@@rules_jvm_external~~maven~maven` (bzlmod)
-                            instead of apparent name `@maven`
+                            invalidate all targets in the mono repo.
+      --fineGrainedHashExternalReposFile=<fineGrainedHashExternalReposFile>
+                          A text file containing a newline separated list of
+                            external repos. Similar to
+                            --fineGrainedHashExternalRepos but helps you avoid
+                            exceeding max arg length. Mutually exclusive with
+                            --fineGrainedHashExternalRepos.
   -h, --help              Show this help message and exit.
       --ignoredRuleHashingAttributes=<ignoredRuleHashingAttributes>
                           Attributes that should be ignored when hashing rule
                             targets.
+      --[no-]includeTargetType
+                          Whether include target type in the generated JSON or
+                            not.
+                          If false, the generate JSON schema is: {"<target>":
+                            "<sha256>"}
+                          If true, the generate JSON schema is: {"<target>":
+                            "<type>#<sha256>" }
   -k, --[no-]keep_going   This flag controls if `bazel query` will be executed
                             with the `--keep_going` flag or not. Disabling this
                             flag allows you to catch configuration issues in
                             your Bazel graph, but may not work for some Bazel
                             setups. Defaults to `true`
+  -m, --modified-filepaths=<modifiedFilepaths>
+                          Experimental: A text file containing a newline
+                            separated list of filepaths (relative to the
+                            workspace) these filepaths should represent the
+                            modified files between the specified revisions and
+                            will be used to scope what files are hashed during
+                            hash generation.
   -s, --seed-filepaths=<seedFilepaths>
                           A text file containing a newline separated list of
                             filepaths. Each file in this list will be read and
@@ -228,6 +237,10 @@ workspace.
       -so, --bazelStartupOptions=<bazelStartupOptions>
                           Additional space separated Bazel client startup
                             options used when invoking Bazel
+      -tt, --targetType=<targetType>[,<targetType>...]
+                          The types of targets to filter. Use comma (,) to
+                            separate multiple values, e.g.
+                            '--targetType=SourceFile,Rule,GeneratedFile'.
       --[no-]useCquery    If true, use cquery instead of query when generating
                             dependency graphs. Using cquery would yield more
                             accurate build graph at the cost of slower query
@@ -242,40 +255,53 @@ workspace.
                           Path to Bazel workspace directory.
 ```
 
-**Note**: `--useCquery` flag may not work with very large repos due to limitation
-of Bazel. You may want to fallback to use normal query mode in that case.
-See <https://github.com/bazelbuild/bazel/issues/17743> for more details.
+### `get-impacted-targets` command
 
-#### Handling Failing Analysis Targets with `--cqueryExpression`
-
-When using `--useCquery`, Bazel's `cquery` command analyzes all targets (executes their implementation functions). This can cause issues with targets that are intentionally designed to fail during analysis, such as:
-
-- `analysis_test` targets from the Bazel `rules_testing` library
-- Other validation targets that verify build failures
-
-With regular `bazel query`, these targets don't cause problems because `query` doesn't execute implementation functions. However, `cquery` will fail when it encounters these targets.
-
-**Solution**: Use the `--cqueryExpression` flag to specify a custom query expression that excludes the problematic targets:
-
-```bash
-bazel-diff generate-hashes \
-  --useCquery \
-  --cqueryExpression "deps(//:target1) + deps(//:target2)" \
-  output.json
+```terminal
+Missing required options: '--startingHashes=<startingHashesJSONPath>', '--finalHashes=<finalHashesJSONPath>', '--workspacePath=<workspacePath>'
+Usage: bazel-diff get-impacted-targets [-v] [--[no-]noBazelrc] [-b=<bazelPath>]
+                                       [-d=<depsMappingJSONPath>]
+                                       -fh=<finalHashesJSONPath>
+                                       [-o=<outputPath>]
+                                       -sh=<startingHashesJSONPath>
+                                       -w=<workspacePath>
+                                       [-so=<bazelStartupOptions>]...
+                                       [-tt=<targetType>[,<targetType>...]]...
+Command-line utility to analyze the state of the bazel build graph
+  -b, --bazelPath=<bazelPath>
+                         Path to Bazel binary. If not specified, the Bazel
+                           binary available in PATH will be used.
+  -d, --depEdgesFile=<depsMappingJSONPath>
+                         Path to the file where dependency edges are. If
+                           specified, build graph distance metrics will be
+                           computed from the given hash data.
+      -fh, --finalHashes=<finalHashesJSONPath>
+                         The path to the JSON file of target hashes for the
+                           final revision. Run 'generate-hashes' to get this
+                           value.
+      --[no-]noBazelrc   Don't use .bazelrc
+  -o, --output=<outputPath>
+                         Filepath to write the impacted Bazel targets to. If
+                           using depEdgesFile: formatted in json, otherwise:
+                           newline separated. If not specified, the output will
+                           be written to STDOUT.
+      -sh, --startingHashes=<startingHashesJSONPath>
+                         The path to the JSON file of target hashes for the
+                           initial revision. Run 'generate-hashes' to get this
+                           value.
+      -so, --bazelStartupOptions=<bazelStartupOptions>
+                         Additional space separated Bazel client startup
+                           options used when invoking Bazel
+      -tt, --targetType=<targetType>[,<targetType>...]
+                         The types of targets to filter. Use comma (,) to
+                           separate multiple values, e.g.
+                           '--targetType=SourceFile,Rule,GeneratedFile'.
+  -v, --verbose          Display query string, missing files and elapsed time
+  -w, --workspacePath=<workspacePath>
+                         Path to Bazel workspace directory. Required for module
+                           change detection.
 ```
-
-**Important**: When crafting custom cquery expressions:
-
-- ❌ **Don't use**: `deps(//...:all-targets) except //:failing_target`
-  - This still analyzes the failing target during pattern expansion
-
-- ✅ **Do use**: Explicitly specify which targets or packages to include:
-  ```bash
-  --cqueryExpression "deps(//:target1) + deps(//:target2)"
-  --cqueryExpression "deps(//src/...:*) + deps(//lib/...:*)"
-  ```
-
-See [GitHub Issue #301](https://github.com/Tinder/bazel-diff/issues/301) for more details.
+<!-- END_SECTION: cli-help -->
 
 ### What does the SHA256 value of `generate-hashes` represent?
 
@@ -284,53 +310,6 @@ are the summation of the rule implementation hash, the SHA256 value
 for every attribute of the rule and then the summation of the SHA256 value for
 all `rule_inputs` using the same exact algorithm. For source_file inputs the
 content of the file are converted into a SHA256 value.
-
-### `get-impacted-targets` command
-
-```terminal
-Usage: bazel-diff get-impacted-targets [-v] -w=<workspacePath>
-                                       -b=<bazelPath>
-                                       -fh=<finalHashesJSONPath>
-                                       -sh=<startingHashesJSONPath>
-                                       [-o=<outputPath>]
-                                       [-d=<depEdgesFile>]
-                                       [-tt=<targetType>]
-                                       [-so=<bazelStartupOptions>]
-                                       [--noBazelrc]
-Command-line utility to analyze the state of the bazel build graph
-      -w, --workspacePath=<workspacePath>
-                  Path to Bazel workspace directory. Required for module
-                    change detection.
-      -b, --bazelPath=<bazelPath>
-                  Path to Bazel binary. If not specified, the Bazel binary
-                    available in PATH will be used.
-      -fh, --finalHashes=<finalHashesJSONPath>
-                  The path to the JSON file of target hashes for the final
-                    revision. Run 'generate-hashes' to get this value.
-      -sh, --startingHashes=<startingHashesJSONPath>
-                  The path to the JSON file of target hashes for the initial
-                    revision. Run 'generate-hashes' to get this value.
-      -o, --output=<outputPath>
-                  Filepath to write the impacted Bazel targets to. If using
-                    depEdgesFile: formatted in json, otherwise: newline
-                    separated. If not specified, the output will be written
-                    to STDOUT.
-      -d, --depEdgesFile=<depEdgesFile>
-                  Path to the file where dependency edges are. If specified,
-                    build graph distance metrics will be computed from the
-                    given hash data.
-      -tt, --targetType=<targetType>
-                  The types of targets to filter. Use comma (,) to separate
-                    multiple values, e.g. '--targetType=SourceFile,Rule,GeneratedFile'.
-                    Only works if the JSON was generated with `--includeTargetType` enabled.
-                    If not specified, all types of impacted targets will be returned.
-      -so, --bazelStartupOptions=<bazelStartupOptions>
-                  Additional space separated Bazel client startup options
-                    used when invoking Bazel
-      --noBazelrc Don't use .bazelrc
-      -v, --verbose
-                  Display query string, missing files and elapsed time
-```
 
 ## Installing
 
@@ -454,12 +433,64 @@ Now you can simply run `bazel-diff` from your project:
 bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
 ```
 
+## Contributors
+
+<!-- BEGIN_SECTION: contributors -->
+| | Name | Commits |
+| --- | --- | --- |
+| [![Maxwell Elliott](https://avatars.githubusercontent.com/u/56700854?s=40)](https://github.com/tinder-maxwellelliott) | [Maxwell Elliott](https://github.com/tinder-maxwellelliott) | 279 |
+| [![Honnix](https://avatars.githubusercontent.com/u/158892?s=40)](https://github.com/honnix) | [Honnix](https://github.com/honnix) | 14 |
+| [![eric wang](https://avatars.githubusercontent.com/u/10626756?s=40)](https://github.com/fa93hws) | [eric wang](https://github.com/fa93hws) | 12 |
+| [![Eric Wang](https://avatars.githubusercontent.com/u/10626756?s=40)](https://github.com/fa93hws) | [Eric Wang](https://github.com/fa93hws) | 10 |
+| [![Tianyu Geng](https://avatars.githubusercontent.com/u/29584386?s=40)](https://github.com/tgeng) | [Tianyu Geng](https://github.com/tgeng) | 8 |
+| [![Patrick Balestra](https://avatars.githubusercontent.com/u/3658887?s=40)](https://github.com/BalestraPatrick) | [Patrick Balestra](https://github.com/BalestraPatrick) | 5 |
+| [![Daniel P. Purkhus](https://avatars.githubusercontent.com/u/5622403?s=40)](https://github.com/purkhusid) | [Daniel P. Purkhus](https://github.com/purkhusid) | 5 |
+| [![Alex Eagle](https://avatars.githubusercontent.com/u/47395?s=40)](https://github.com/alexeagle) | [Alex Eagle](https://github.com/alexeagle) | 4 |
+| [![Anton Malinskiy](https://avatars.githubusercontent.com/u/2089114?s=40)](https://github.com/Malinskiy) | [Anton Malinskiy](https://github.com/Malinskiy) | 4 |
+| [![Sharmila](https://avatars.githubusercontent.com/u/257629015?s=40)](https://github.com/sharmila-oai) | [Sharmila](https://github.com/sharmila-oai) | 2 |
+| [![Dmitrii Kostyrev](https://avatars.githubusercontent.com/u/183590?s=40)](https://github.com/dkostyrev) | [Dmitrii Kostyrev](https://github.com/dkostyrev) | 2 |
+| [![Jérémy Mathevet](https://avatars.githubusercontent.com/u/1737199?s=40)](https://github.com/jmthvt) | [Jérémy Mathevet](https://github.com/jmthvt) | 2 |
+| [![Nikhil Birmiwal](https://avatars.githubusercontent.com/u/65141192?s=40)](https://github.com/nikhilbirmiwal) | [Nikhil Birmiwal](https://github.com/nikhilbirmiwal) | 2 |
+| [![Sergei Morozov](https://avatars.githubusercontent.com/u/59683?s=40)](https://github.com/morozov) | [Sergei Morozov](https://github.com/morozov) | 2 |
+| [![Fahrzin Hemmati](https://avatars.githubusercontent.com/u/306100?s=40)](https://github.com/fahhem) | [Fahrzin Hemmati](https://github.com/fahhem) | 2 |
+| [![Jaime Lennox](https://avatars.githubusercontent.com/u/1424638?s=40)](https://github.com/JaimeLennox) | [Jaime Lennox](https://github.com/JaimeLennox) | 2 |
+| [![Lucas Teixeira](https://avatars.githubusercontent.com/u/116316841?s=40)](https://github.com/lucasteixeira-cb) | [Lucas Teixeira](https://github.com/lucasteixeira-cb) | 1 |
+| [![Guillaume Van Wassenhove](https://avatars.githubusercontent.com/u/53425033?s=40)](https://github.com/GuillaumeVW) | [Guillaume Van Wassenhove](https://github.com/GuillaumeVW) | 1 |
+| [![Fabian Meumertzheim](https://avatars.githubusercontent.com/u/4312191?s=40)](https://github.com/fmeum) | [Fabian Meumertzheim](https://github.com/fmeum) | 1 |
+| [![Jonathan Block](https://avatars.githubusercontent.com/u/117850895?s=40)](https://github.com/blockjon-dd) | [Jonathan Block](https://github.com/blockjon-dd) | 1 |
+| [![Alex Torok](https://avatars.githubusercontent.com/u/8749956?s=40)](https://github.com/alex-torok) | [Alex Torok](https://github.com/alex-torok) | 1 |
+| [![Naveen Narayanan](https://avatars.githubusercontent.com/u/3528131?s=40)](https://github.com/naveenOnarayanan) | [Naveen Narayanan](https://github.com/naveenOnarayanan) | 1 |
+| [![Mathieu Sabourin](https://avatars.githubusercontent.com/u/385657?s=40)](https://github.com/OniOni) | [Mathieu Sabourin](https://github.com/OniOni) | 1 |
+| [![André](https://avatars.githubusercontent.com/u/7773955?s=40)](https://github.com/andre-alves) | [André](https://github.com/andre-alves) | 1 |
+| [![Boris](https://avatars.githubusercontent.com/u/125319243?s=40)](https://github.com/bz-canva) | [Boris](https://github.com/bz-canva) | 1 |
+| [![Rui Chen](https://avatars.githubusercontent.com/u/1580956?s=40)](https://github.com/chenrui333) | [Rui Chen](https://github.com/chenrui333) | 1 |
+| [![Sanju Naik](https://avatars.githubusercontent.com/u/66404008?s=40)](https://github.com/sanju-naik) | [Sanju Naik](https://github.com/sanju-naik) | 1 |
+| [![Ted Kaplan](https://avatars.githubusercontent.com/u/123678?s=40)](https://github.com/thirtyseven) | [Ted Kaplan](https://github.com/thirtyseven) | 1 |
+| [![Laurenz](https://avatars.githubusercontent.com/u/11611719?s=40)](https://github.com/lalten) | [Laurenz](https://github.com/lalten) | 1 |
+| [![mla](https://avatars.githubusercontent.com/u/1433210?s=40)](https://github.com/molar) | [mla](https://github.com/molar) | 1 |
+| [![tinder-yukisawa](https://avatars.githubusercontent.com/u/54122444?s=40)](https://github.com/tinder-yukisawa) | [tinder-yukisawa](https://github.com/tinder-yukisawa) | 1 |
+| [![Kevin Jiao](https://avatars.githubusercontent.com/u/9851473?s=40)](https://github.com/KevinJiao) | [Kevin Jiao](https://github.com/KevinJiao) | 1 |
+| [![Vincent Case](https://avatars.githubusercontent.com/u/10698795?s=40)](https://github.com/vcase) | [Vincent Case](https://github.com/vcase) | 1 |
+| [![Walt Panfil](https://avatars.githubusercontent.com/u/262680997?s=40)](https://github.com/fh-wpanfil) | [Walt Panfil](https://github.com/fh-wpanfil) | 1 |
+| [![Mehran Poursadeghi](https://avatars.githubusercontent.com/u/22454054?s=40)](https://github.com/mehran-prs) | [Mehran Poursadeghi](https://github.com/mehran-prs) | 1 |
+<!-- END_SECTION: contributors -->
+
 ## Learn More
 
 Take a look at the following bazelcon talks to learn more about `bazel-diff`:
 
 * [BazelCon 2023: Improving CI efficiency with Bazel querying and bazel-diff](https://www.youtube.com/watch?v=QYAbmE_1fSo)
 * [BazelCon 2024: Not Going the Distance: Filtering Tests by Build Graph Distance](https://youtu.be/Or0o0Q7Zc1w?si=nIIkTH6TP-pcPoRx)
+
+## Star History
+
+<a href="https://star-history.com/#Tinder/bazel-diff&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Tinder/bazel-diff&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Tinder/bazel-diff&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Tinder/bazel-diff&type=Date" />
+  </picture>
+</a>
 
 ## Running the tests
 

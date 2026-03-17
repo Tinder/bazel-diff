@@ -436,43 +436,55 @@ bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
 ## Contributors
 
 <!-- BEGIN_SECTION: contributors -->
-| | Name | Commits |
-| --- | --- | --- |
-| [![Maxwell Elliott](https://avatars.githubusercontent.com/u/56700854?s=40)](https://github.com/tinder-maxwellelliott) | [Maxwell Elliott](https://github.com/tinder-maxwellelliott) | 279 |
-| [![Honnix](https://avatars.githubusercontent.com/u/158892?s=40)](https://github.com/honnix) | [Honnix](https://github.com/honnix) | 14 |
-| [![eric wang](https://avatars.githubusercontent.com/u/10626756?s=40)](https://github.com/fa93hws) | [eric wang](https://github.com/fa93hws) | 12 |
-| [![Eric Wang](https://avatars.githubusercontent.com/u/10626756?s=40)](https://github.com/fa93hws) | [Eric Wang](https://github.com/fa93hws) | 10 |
-| [![Tianyu Geng](https://avatars.githubusercontent.com/u/29584386?s=40)](https://github.com/tgeng) | [Tianyu Geng](https://github.com/tgeng) | 8 |
-| [![Patrick Balestra](https://avatars.githubusercontent.com/u/3658887?s=40)](https://github.com/BalestraPatrick) | [Patrick Balestra](https://github.com/BalestraPatrick) | 5 |
-| [![Daniel P. Purkhus](https://avatars.githubusercontent.com/u/5622403?s=40)](https://github.com/purkhusid) | [Daniel P. Purkhus](https://github.com/purkhusid) | 5 |
-| [![Alex Eagle](https://avatars.githubusercontent.com/u/47395?s=40)](https://github.com/alexeagle) | [Alex Eagle](https://github.com/alexeagle) | 4 |
-| [![Anton Malinskiy](https://avatars.githubusercontent.com/u/2089114?s=40)](https://github.com/Malinskiy) | [Anton Malinskiy](https://github.com/Malinskiy) | 4 |
-| [![Sharmila](https://avatars.githubusercontent.com/u/257629015?s=40)](https://github.com/sharmila-oai) | [Sharmila](https://github.com/sharmila-oai) | 2 |
-| [![Dmitrii Kostyrev](https://avatars.githubusercontent.com/u/183590?s=40)](https://github.com/dkostyrev) | [Dmitrii Kostyrev](https://github.com/dkostyrev) | 2 |
-| [![Jérémy Mathevet](https://avatars.githubusercontent.com/u/1737199?s=40)](https://github.com/jmthvt) | [Jérémy Mathevet](https://github.com/jmthvt) | 2 |
-| [![Nikhil Birmiwal](https://avatars.githubusercontent.com/u/65141192?s=40)](https://github.com/nikhilbirmiwal) | [Nikhil Birmiwal](https://github.com/nikhilbirmiwal) | 2 |
-| [![Sergei Morozov](https://avatars.githubusercontent.com/u/59683?s=40)](https://github.com/morozov) | [Sergei Morozov](https://github.com/morozov) | 2 |
-| [![Fahrzin Hemmati](https://avatars.githubusercontent.com/u/306100?s=40)](https://github.com/fahhem) | [Fahrzin Hemmati](https://github.com/fahhem) | 2 |
-| [![Jaime Lennox](https://avatars.githubusercontent.com/u/1424638?s=40)](https://github.com/JaimeLennox) | [Jaime Lennox](https://github.com/JaimeLennox) | 2 |
-| [![Lucas Teixeira](https://avatars.githubusercontent.com/u/116316841?s=40)](https://github.com/lucasteixeira-cb) | [Lucas Teixeira](https://github.com/lucasteixeira-cb) | 1 |
-| [![Guillaume Van Wassenhove](https://avatars.githubusercontent.com/u/53425033?s=40)](https://github.com/GuillaumeVW) | [Guillaume Van Wassenhove](https://github.com/GuillaumeVW) | 1 |
-| [![Fabian Meumertzheim](https://avatars.githubusercontent.com/u/4312191?s=40)](https://github.com/fmeum) | [Fabian Meumertzheim](https://github.com/fmeum) | 1 |
-| [![Jonathan Block](https://avatars.githubusercontent.com/u/117850895?s=40)](https://github.com/blockjon-dd) | [Jonathan Block](https://github.com/blockjon-dd) | 1 |
-| [![Alex Torok](https://avatars.githubusercontent.com/u/8749956?s=40)](https://github.com/alex-torok) | [Alex Torok](https://github.com/alex-torok) | 1 |
-| [![Naveen Narayanan](https://avatars.githubusercontent.com/u/3528131?s=40)](https://github.com/naveenOnarayanan) | [Naveen Narayanan](https://github.com/naveenOnarayanan) | 1 |
-| [![Mathieu Sabourin](https://avatars.githubusercontent.com/u/385657?s=40)](https://github.com/OniOni) | [Mathieu Sabourin](https://github.com/OniOni) | 1 |
-| [![André](https://avatars.githubusercontent.com/u/7773955?s=40)](https://github.com/andre-alves) | [André](https://github.com/andre-alves) | 1 |
-| [![Boris](https://avatars.githubusercontent.com/u/125319243?s=40)](https://github.com/bz-canva) | [Boris](https://github.com/bz-canva) | 1 |
-| [![Rui Chen](https://avatars.githubusercontent.com/u/1580956?s=40)](https://github.com/chenrui333) | [Rui Chen](https://github.com/chenrui333) | 1 |
-| [![Sanju Naik](https://avatars.githubusercontent.com/u/66404008?s=40)](https://github.com/sanju-naik) | [Sanju Naik](https://github.com/sanju-naik) | 1 |
-| [![Ted Kaplan](https://avatars.githubusercontent.com/u/123678?s=40)](https://github.com/thirtyseven) | [Ted Kaplan](https://github.com/thirtyseven) | 1 |
-| [![Laurenz](https://avatars.githubusercontent.com/u/11611719?s=40)](https://github.com/lalten) | [Laurenz](https://github.com/lalten) | 1 |
-| [![mla](https://avatars.githubusercontent.com/u/1433210?s=40)](https://github.com/molar) | [mla](https://github.com/molar) | 1 |
-| [![tinder-yukisawa](https://avatars.githubusercontent.com/u/54122444?s=40)](https://github.com/tinder-yukisawa) | [tinder-yukisawa](https://github.com/tinder-yukisawa) | 1 |
-| [![Kevin Jiao](https://avatars.githubusercontent.com/u/9851473?s=40)](https://github.com/KevinJiao) | [Kevin Jiao](https://github.com/KevinJiao) | 1 |
-| [![Vincent Case](https://avatars.githubusercontent.com/u/10698795?s=40)](https://github.com/vcase) | [Vincent Case](https://github.com/vcase) | 1 |
-| [![Walt Panfil](https://avatars.githubusercontent.com/u/262680997?s=40)](https://github.com/fh-wpanfil) | [Walt Panfil](https://github.com/fh-wpanfil) | 1 |
-| [![Mehran Poursadeghi](https://avatars.githubusercontent.com/u/22454054?s=40)](https://github.com/mehran-prs) | [Mehran Poursadeghi](https://github.com/mehran-prs) | 1 |
+<table>
+  <tr>
+    <td align="center"><a href="https://github.com/tinder-maxwellelliott"><img src="https://avatars.githubusercontent.com/u/56700854?s=64" width="64" alt="Maxwell Elliott"/><br/><sub><b>Maxwell Elliott</b></sub></a></td>
+    <td align="center"><a href="https://github.com/honnix"><img src="https://avatars.githubusercontent.com/u/158892?s=64" width="64" alt="Honnix"/><br/><sub><b>Honnix</b></sub></a></td>
+    <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="eric wang"/><br/><sub><b>eric wang</b></sub></a></td>
+    <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="Eric Wang"/><br/><sub><b>Eric Wang</b></sub></a></td>
+    <td align="center"><a href="https://github.com/tgeng"><img src="https://avatars.githubusercontent.com/u/29584386?s=64" width="64" alt="Tianyu Geng"/><br/><sub><b>Tianyu Geng</b></sub></a></td>
+    <td align="center"><a href="https://github.com/BalestraPatrick"><img src="https://avatars.githubusercontent.com/u/3658887?s=64" width="64" alt="Patrick Balestra"/><br/><sub><b>Patrick Balestra</b></sub></a></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="https://github.com/purkhusid"><img src="https://avatars.githubusercontent.com/u/5622403?s=64" width="64" alt="Daniel P. Purkhus"/><br/><sub><b>Daniel P. Purkhus</b></sub></a></td>
+    <td align="center"><a href="https://github.com/alexeagle"><img src="https://avatars.githubusercontent.com/u/47395?s=64" width="64" alt="Alex Eagle"/><br/><sub><b>Alex Eagle</b></sub></a></td>
+    <td align="center"><a href="https://github.com/Malinskiy"><img src="https://avatars.githubusercontent.com/u/2089114?s=64" width="64" alt="Anton Malinskiy"/><br/><sub><b>Anton Malinskiy</b></sub></a></td>
+    <td align="center"><a href="https://github.com/sharmila-oai"><img src="https://avatars.githubusercontent.com/u/257629015?s=64" width="64" alt="Sharmila"/><br/><sub><b>Sharmila</b></sub></a></td>
+    <td align="center"><a href="https://github.com/dkostyrev"><img src="https://avatars.githubusercontent.com/u/183590?s=64" width="64" alt="Dmitrii Kostyrev"/><br/><sub><b>Dmitrii Kostyrev</b></sub></a></td>
+    <td align="center"><a href="https://github.com/jmthvt"><img src="https://avatars.githubusercontent.com/u/1737199?s=64" width="64" alt="Jérémy Mathevet"/><br/><sub><b>Jérémy Mathevet</b></sub></a></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="https://github.com/nikhilbirmiwal"><img src="https://avatars.githubusercontent.com/u/65141192?s=64" width="64" alt="Nikhil Birmiwal"/><br/><sub><b>Nikhil Birmiwal</b></sub></a></td>
+    <td align="center"><a href="https://github.com/morozov"><img src="https://avatars.githubusercontent.com/u/59683?s=64" width="64" alt="Sergei Morozov"/><br/><sub><b>Sergei Morozov</b></sub></a></td>
+    <td align="center"><a href="https://github.com/fahhem"><img src="https://avatars.githubusercontent.com/u/306100?s=64" width="64" alt="Fahrzin Hemmati"/><br/><sub><b>Fahrzin Hemmati</b></sub></a></td>
+    <td align="center"><a href="https://github.com/JaimeLennox"><img src="https://avatars.githubusercontent.com/u/1424638?s=64" width="64" alt="Jaime Lennox"/><br/><sub><b>Jaime Lennox</b></sub></a></td>
+    <td align="center"><a href="https://github.com/lucasteixeira-cb"><img src="https://avatars.githubusercontent.com/u/116316841?s=64" width="64" alt="Lucas Teixeira"/><br/><sub><b>Lucas Teixeira</b></sub></a></td>
+    <td align="center"><a href="https://github.com/GuillaumeVW"><img src="https://avatars.githubusercontent.com/u/53425033?s=64" width="64" alt="Guillaume Van Wassenhove"/><br/><sub><b>Guillaume Van Wassenhove</b></sub></a></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="https://github.com/fmeum"><img src="https://avatars.githubusercontent.com/u/4312191?s=64" width="64" alt="Fabian Meumertzheim"/><br/><sub><b>Fabian Meumertzheim</b></sub></a></td>
+    <td align="center"><a href="https://github.com/blockjon-dd"><img src="https://avatars.githubusercontent.com/u/117850895?s=64" width="64" alt="Jonathan Block"/><br/><sub><b>Jonathan Block</b></sub></a></td>
+    <td align="center"><a href="https://github.com/alex-torok"><img src="https://avatars.githubusercontent.com/u/8749956?s=64" width="64" alt="Alex Torok"/><br/><sub><b>Alex Torok</b></sub></a></td>
+    <td align="center"><a href="https://github.com/naveenOnarayanan"><img src="https://avatars.githubusercontent.com/u/3528131?s=64" width="64" alt="Naveen Narayanan"/><br/><sub><b>Naveen Narayanan</b></sub></a></td>
+    <td align="center"><a href="https://github.com/OniOni"><img src="https://avatars.githubusercontent.com/u/385657?s=64" width="64" alt="Mathieu Sabourin"/><br/><sub><b>Mathieu Sabourin</b></sub></a></td>
+    <td align="center"><a href="https://github.com/andre-alves"><img src="https://avatars.githubusercontent.com/u/7773955?s=64" width="64" alt="André"/><br/><sub><b>André</b></sub></a></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="https://github.com/bz-canva"><img src="https://avatars.githubusercontent.com/u/125319243?s=64" width="64" alt="Boris"/><br/><sub><b>Boris</b></sub></a></td>
+    <td align="center"><a href="https://github.com/chenrui333"><img src="https://avatars.githubusercontent.com/u/1580956?s=64" width="64" alt="Rui Chen"/><br/><sub><b>Rui Chen</b></sub></a></td>
+    <td align="center"><a href="https://github.com/sanju-naik"><img src="https://avatars.githubusercontent.com/u/66404008?s=64" width="64" alt="Sanju Naik"/><br/><sub><b>Sanju Naik</b></sub></a></td>
+    <td align="center"><a href="https://github.com/thirtyseven"><img src="https://avatars.githubusercontent.com/u/123678?s=64" width="64" alt="Ted Kaplan"/><br/><sub><b>Ted Kaplan</b></sub></a></td>
+    <td align="center"><a href="https://github.com/lalten"><img src="https://avatars.githubusercontent.com/u/11611719?s=64" width="64" alt="Laurenz"/><br/><sub><b>Laurenz</b></sub></a></td>
+    <td align="center"><a href="https://github.com/molar"><img src="https://avatars.githubusercontent.com/u/1433210?s=64" width="64" alt="mla"/><br/><sub><b>mla</b></sub></a></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="https://github.com/tinder-yukisawa"><img src="https://avatars.githubusercontent.com/u/54122444?s=64" width="64" alt="tinder-yukisawa"/><br/><sub><b>tinder-yukisawa</b></sub></a></td>
+    <td align="center"><a href="https://github.com/KevinJiao"><img src="https://avatars.githubusercontent.com/u/9851473?s=64" width="64" alt="Kevin Jiao"/><br/><sub><b>Kevin Jiao</b></sub></a></td>
+    <td align="center"><a href="https://github.com/vcase"><img src="https://avatars.githubusercontent.com/u/10698795?s=64" width="64" alt="Vincent Case"/><br/><sub><b>Vincent Case</b></sub></a></td>
+    <td align="center"><a href="https://github.com/fh-wpanfil"><img src="https://avatars.githubusercontent.com/u/262680997?s=64" width="64" alt="Walt Panfil"/><br/><sub><b>Walt Panfil</b></sub></a></td>
+    <td align="center"><a href="https://github.com/mehran-prs"><img src="https://avatars.githubusercontent.com/u/22454054?s=64" width="64" alt="Mehran Poursadeghi"/><br/><sub><b>Mehran Poursadeghi</b></sub></a></td>
+  </tr>
+</table>
 <!-- END_SECTION: contributors -->
 
 ## Learn More

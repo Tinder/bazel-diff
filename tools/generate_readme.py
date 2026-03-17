@@ -182,8 +182,10 @@ def build_contributors_section(workspace_dir: Path, email_map: dict[str, dict]) 
     # Sort by total commit count descending.
     sorted_authors = sorted(name_totals.items(), key=lambda x: x[1], reverse=True)
 
-    rows = ["| | Name | Commits |", "| --- | --- | --- |"]
-    for name, total in sorted_authors:
+    COLUMNS = 6
+
+    cells = []
+    for name, _total in sorted_authors:
         email = name_best_email[name]
         user = email_map.get(email)
 
@@ -199,13 +201,29 @@ def build_contributors_section(workspace_dir: Path, email_map: dict[str, dict]) 
         if user:
             login = user["login"]
             base_avatar = user["avatar_url"].split("?")[0]
-            avatar = base_avatar + "?s=40"
+            avatar = base_avatar + "?s=64"
             profile = f"https://github.com/{login}"
-            rows.append(
-                f"| [![{name}]({avatar})]({profile}) | [{name}]({profile}) | {total} |"
+            cells.append(
+                f'<td align="center">'
+                f'<a href="{profile}">'
+                f'<img src="{avatar}" width="64" alt="{name}"/><br/>'
+                f'<sub><b>{name}</b></sub>'
+                f'</a></td>'
             )
         else:
-            rows.append(f"| | {name} | {total} |")
+            cells.append(
+                f'<td align="center">'
+                f'<sub><b>{name}</b></sub>'
+                f'</td>'
+            )
+
+    rows = ["<table>"]
+    for i in range(0, len(cells), COLUMNS):
+        rows.append("  <tr>")
+        for cell in cells[i : i + COLUMNS]:
+            rows.append(f"    {cell}")
+        rows.append("  </tr>")
+    rows.append("</table>")
 
     return "\n".join(rows)
 

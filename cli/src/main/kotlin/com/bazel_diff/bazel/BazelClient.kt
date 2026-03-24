@@ -26,6 +26,19 @@ class BazelClient(
         } else {
           listOf("//external:all-targets")
         }
+
+    // When Bzlmod is enabled and Bazel 8.6.0+ is available, query bzlmod-managed external repo
+    // definitions via `bazel mod show_repo --output=streamed_proto`. This creates synthetic
+    // //external:* targets from Build.Repository protos, enabling fine-grained hashing of
+    // bzlmod dependencies.
+    val bzlmodRepoTargets =
+        if (bazelModService.isBzlmodEnabled && queryService.canUseBzlmodShowRepo) {
+          logger.i { "Querying bzlmod-managed external repos via mod show_repo" }
+          queryService.queryBzlmodRepos()
+        } else {
+          emptyList()
+        }
+
     val targets =
         if (useCquery) {
           // Explicitly listing external repos here sometimes causes issues mentioned at
@@ -58,8 +71,9 @@ class BazelClient(
                   fineGrainedHashExternalRepos.map { "$it//...:all-targets" }
           queryService.query((repoTargetsQuery + buildTargetsQuery).joinToString(" + ") { "'$it'" })
         }
+    val allTargets = (targets + bzlmodRepoTargets).distinctBy { it.name }
     val queryDuration = Calendar.getInstance().getTimeInMillis() - queryEpoch
     logger.i { "All targets queried in $queryDuration" }
-    return targets
+    return allTargets
   }
 }

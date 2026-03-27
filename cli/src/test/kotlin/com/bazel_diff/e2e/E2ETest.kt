@@ -460,6 +460,93 @@ class E2ETest {
         "/fixture/bzlmod-transitive-test-cquery-impacted-targets.txt")
   }
 
+  @Test
+  fun testModuleExtensionChangeDetection() {
+    // This test validates that targets are marked impacted when a moduleExtension's
+    // generatedRepoSpecs change in MODULE.bazel.lock, without any module version change.
+    //
+    // The fixtures share identical MODULE.bazel (guava:31.1-jre) and maven_install.json.
+    // Only MODULE.bazel.lock's moduleExtensions section differs:
+    //   - Fixture 1: generatedRepoSpecs has com_google_guava_guava_31_1_jre pointing to 31.1-jre
+    //                and maven aggregate spec with artifacts=[guava:31.1-jre]
+    //   - Fixture 2: generatedRepoSpecs has com_google_guava_guava_32_0_0_jre pointing to 32.0.0-jre
+    //                and maven aggregate spec with artifacts=[guava:32.0.0-jre]
+    //
+    // This simulates an extension that re-ran (e.g. bzl implementation changed) and resolved
+    // a different guava version, without the workspace's MODULE.bazel or maven_install.json
+    // being updated. The fine-grained hash of maven_install.json is unchanged, so current
+    // bazel-diff detects zero changes and misses impacted targets.
+    //
+    // Expected fix: parse MODULE.bazel.lock, diff generatedRepoSpecs between revisions,
+    // extract canonical repo names (the `name` attribute in each spec), then walk rdeps
+    // from changed repos to find impacted workspace targets. Only repos that actually changed
+    // should trigger invalidation — not all repos managed by an extension whose
+    // bzlTransitiveDigest changed.
+    //
+    // Changed repos in this test:
+    //   - "maven" aggregate repo (rules_jvm_external~6.3~maven~maven): artifacts list changed
+    //   - "com_google_guava_guava_31_1_jre" removed, "com_google_guava_guava_32_0_0_jre" added
+    //
+    // Expected impacted targets: target-a and target-b (and derived .jar targets), since
+    // target-b depends on @bazel_diff_maven//:com_google_guava_guava (the maven aggregate repo)
+    // and target-a transitively depends on target-b.
+    //
+    // Actual behavior (current bug): zero targets reported as impacted.
+    val projectA = extractFixtureProject("/fixture/bzlmod-module-extension-test-1.zip")
+    val projectB = extractFixtureProject("/fixture/bzlmod-module-extension-test-2.zip")
+    val bazelPath = "bazel"
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+    cli.execute(
+        listOf(
+            "generate-hashes",
+            "-w",
+            projectA.absolutePath,
+            "-b",
+            bazelPath,
+            "--fineGrainedHashExternalRepos",
+            "@bazel_diff_maven",
+            from.absolutePath))
+    cli.execute(
+        listOf(
+            "generate-hashes",
+            "-w",
+            projectB.absolutePath,
+            "-b",
+            bazelPath,
+            "--fineGrainedHashExternalRepos",
+            "@bazel_diff_maven",
+            to.absolutePath))
+    cli.execute(
+        "get-impacted-targets",
+        "-w",
+        projectB.absolutePath,
+        "-b",
+        bazelPath,
+        "-sh",
+        from.absolutePath,
+        "-fh",
+        to.absolutePath,
+        "-o",
+        impactedTargetsOutput.absolutePath)
+
+    val actual: Set<String> =
+        filterBazelDiffInternalTargets(
+            impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
+    val expected: Set<String> =
+        javaClass.getResourceAsStream("/fixture/bzlmod-module-extension-test-impacted-targets.txt")
+            .use {
+              filterBazelDiffInternalTargets(
+                  it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet())
+            }
+
+    assertTargetsMatch(actual, expected, "testModuleExtensionChangeDetection")
+  }
+
   private fun testBzlmodCCTransitiveDeps(
       extraGenerateHashesArgs: List<String>,
       expectedResultFile: String

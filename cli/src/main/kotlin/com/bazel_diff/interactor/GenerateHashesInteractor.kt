@@ -14,12 +14,14 @@ import java.util.Calendar
 import kotlinx.coroutines.runBlocking
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
+import org.koin.core.qualifier.named
 
 class GenerateHashesInteractor : KoinComponent {
   private val buildGraphHasher: BuildGraphHasher by inject()
   private val bazelModService: BazelModService by inject()
   private val logger: Logger by inject()
   private val gson: Gson by inject()
+  private val workingDirectory: Path by inject(named("working-directory"))
 
   fun execute(
       seedFilepaths: File?,
@@ -32,6 +34,13 @@ class GenerateHashesInteractor : KoinComponent {
   ): Boolean {
     return try {
       val epoch = Calendar.getInstance().getTimeInMillis()
+
+      // Read MODULE.bazel.lock BEFORE running any Bazel commands, since Bazel may update
+      // the lock file during execution (e.g. when running `bazel mod graph`).
+      // We need to capture the lock file state at the start of the revision being hashed.
+      val moduleLockFileJson: String? = workingDirectory.resolve("MODULE.bazel.lock").toFile()
+          .takeIf { it.exists() }?.readText()
+
       val seedFilepathsSet: Set<Path> =
           when {
             seedFilepaths != null -> {
@@ -69,11 +78,14 @@ class GenerateHashesInteractor : KoinComponent {
         null -> FileWriter(FileDescriptor.out)
         else -> FileWriter(outputPath)
       }.use { fileWriter ->
-        val hashOutput = if (moduleGraphJson != null) {
-          // New format with metadata
+        val hashOutput = if (moduleGraphJson != null || moduleLockFileJson != null) {
+          // New format with metadata (bzlmod workspace)
           mapOf(
             "hashes" to hashes.mapValues { it.value.toJson(includeTargetType) },
-            "metadata" to mapOf("moduleGraphJson" to moduleGraphJson)
+            "metadata" to mapOf(
+              "moduleGraphJson" to moduleGraphJson,
+              "moduleLockFileJson" to moduleLockFileJson
+            )
           )
         } else {
           // Legacy format for non-bzlmod workspaces

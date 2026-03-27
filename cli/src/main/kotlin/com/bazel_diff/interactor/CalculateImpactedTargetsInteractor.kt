@@ -2,6 +2,7 @@ package com.bazel_diff.interactor
 
 import com.bazel_diff.bazel.BazelQueryService
 import com.bazel_diff.bazel.ModuleGraphParser
+import com.bazel_diff.bazel.ModuleLockFileParser
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.log.Logger
 import com.google.common.annotations.VisibleForTesting
@@ -21,6 +22,7 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
   private val gson: Gson by inject()
   private val logger: Logger by inject()
   private val moduleGraphParser = ModuleGraphParser()
+  private val moduleLockFileParser = ModuleLockFileParser()
 
   @VisibleForTesting class InvalidDependencyEdgesException(message: String) : Exception(message)
 
@@ -35,27 +37,17 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       outputWriter: Writer,
       targetTypes: Set<String>?,
       fromModuleGraphJson: String? = null,
-      toModuleGraphJson: String? = null
+      toModuleGraphJson: String? = null,
+      fromModuleLockFileJson: String? = null,
+      toModuleLockFileJson: String? = null
   ) {
     /** This call might be faster if end hashes is a sorted map */
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
-    // Quick check: if module graph JSON is identical, skip module change detection entirely
-    val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
-
-    // Detect module changes and query for impacted targets
-    val changedModules = if (moduleGraphChanged) {
-      detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
-    } else {
-      emptySet()
-    }
-
-    val impactedTargets = if (changedModules.isNotEmpty()) {
-      logger.i { "Module changes detected - querying for targets that depend on changed modules" }
-      queryTargetsDependingOnModules(changedModules, to)
-    } else {
-      computeSimpleImpactedTargets(from, to)
-    }
+    val impactedTargets = detectExternallyImpactedTargets(
+        from, to, fromModuleGraphJson, toModuleGraphJson,
+        fromModuleLockFileJson, toModuleLockFileJson)
+        ?: computeSimpleImpactedTargets(from, to)
 
     impactedTargets
         .filter { typeFilter.accepts(it) }
@@ -86,26 +78,21 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       outputWriter: Writer,
       targetTypes: Set<String>?,
       fromModuleGraphJson: String? = null,
-      toModuleGraphJson: String? = null
+      toModuleGraphJson: String? = null,
+      fromModuleLockFileJson: String? = null,
+      toModuleLockFileJson: String? = null
   ) {
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
-    // Quick check: if module graph JSON is identical, skip module change detection entirely
-    val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
+    val externallyImpactedTargets = detectExternallyImpactedTargets(
+        from, to, fromModuleGraphJson, toModuleGraphJson,
+        fromModuleLockFileJson, toModuleLockFileJson)
 
-    // Detect module changes and query for impacted targets
-    val changedModules = if (moduleGraphChanged) {
-      detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
-    } else {
-      emptySet()
-    }
-
-    val impactedTargets = if (changedModules.isNotEmpty()) {
-      logger.i { "Module changes detected - querying for targets that depend on changed modules" }
-      val moduleImpactedTargets = queryTargetsDependingOnModules(changedModules, to)
-      // Mark module-impacted targets with distance 0, then compute distances from there
-      val moduleImpactedHashes = from.filterKeys { !moduleImpactedTargets.contains(it) }
-      computeAllDistances(moduleImpactedHashes, to, depEdges)
+    val impactedTargets = if (externallyImpactedTargets != null) {
+      // Module/extension change path: mark externally-impacted targets as if removed from `from`
+      // so computeAllDistances sees them as changed and computes distance 0
+      val reducedFrom = from.filterKeys { !externallyImpactedTargets.contains(it) }
+      computeAllDistances(reducedFrom, to, depEdges)
     } else {
       computeAllDistances(from, to, depEdges)
     }
@@ -323,15 +310,108 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
         }
       }
 
-      // Add directly changed targets from hash comparison (e.g., code changes)
-      val directlyChanged = computeSimpleImpactedTargets(emptyMap(), allTargets)
-      impactedTargets.addAll(directlyChanged)
-
       logger.i { "Total targets impacted by module changes: ${impactedTargets.size}" }
       impactedTargets
     } catch (e: Exception) {
       logger.e(e) { "Error querying targets depending on modules" }
       // On error, conservatively mark all targets as impacted
+      allTargets.keys
+    }
+  }
+
+  /**
+   * Detects impacted targets from module graph or lock file changes.
+   *
+   * Returns null if no external changes were detected (caller should fall back to hash diffing).
+   * Returns a Set<String> of impacted target labels if module graph or generatedRepoSpecs changed.
+   */
+  private fun detectExternallyImpactedTargets(
+      from: Map<String, TargetHash>,
+      to: Map<String, TargetHash>,
+      fromModuleGraphJson: String?,
+      toModuleGraphJson: String?,
+      fromModuleLockFileJson: String?,
+      toModuleLockFileJson: String?
+  ): Set<String>? {
+    val changedModules = if (fromModuleGraphJson != toModuleGraphJson) {
+      detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
+    } else {
+      emptySet()
+    }
+
+    if (changedModules.isNotEmpty()) {
+      logger.i { "Module changes detected - querying for targets that depend on changed modules" }
+      val rdepTargets = queryTargetsDependingOnModules(changedModules, to)
+      return rdepTargets + computeSimpleImpactedTargets(from, to)
+    }
+
+    val changedRepos = if (fromModuleLockFileJson != toModuleLockFileJson) {
+      detectChangedRepos(fromModuleLockFileJson, toModuleLockFileJson)
+    } else {
+      emptySet()
+    }
+
+    if (changedRepos.isNotEmpty()) {
+      logger.i { "Module extension repo changes detected - querying for targets that depend on changed repos" }
+      val rdepTargets = queryTargetsDependingOnRepos(changedRepos, to)
+      return rdepTargets + computeSimpleImpactedTargets(from, to)
+    }
+
+    return null
+  }
+
+  private fun detectChangedRepos(fromLockJson: String?, toLockJson: String?): Set<String> {
+    if (fromLockJson == null || toLockJson == null) {
+      logger.i { "MODULE.bazel.lock missing for one or both revisions — skipping lock file diff" }
+      return emptySet()
+    }
+    val oldSpecs = moduleLockFileParser.parseGeneratedRepoSpecs(fromLockJson)
+    val newSpecs = moduleLockFileParser.parseGeneratedRepoSpecs(toLockJson)
+    val changed = moduleLockFileParser.findChangedRepos(oldSpecs, newSpecs)
+    if (changed.isEmpty()) {
+      logger.i { "No module extension repo changes detected" }
+    } else {
+      logger.i { "Detected ${changed.size} changed extension repos: ${changed.joinToString(", ")}" }
+    }
+    return changed
+  }
+
+  private fun queryTargetsDependingOnRepos(
+      changedCanonicalRepoNames: Set<String>,
+      allTargets: Map<String, TargetHash>
+  ): Set<String> {
+    return try {
+      val queryService: BazelQueryService? = try {
+        inject<BazelQueryService>().value
+      } catch (e: Exception) {
+        null
+      }
+
+      if (queryService == null) {
+        logger.w { "BazelQueryService not available - cannot query for repo dependencies" }
+        return allTargets.keys
+      }
+
+      val impactedTargets = mutableSetOf<String>()
+
+      for (repoName in changedCanonicalRepoNames) {
+        try {
+          val queryExpression = "rdeps(//..., @@$repoName//...)"
+          logger.i { "Executing query: $queryExpression" }
+          val rdeps = runBlocking { queryService.query(queryExpression, useCquery = false) }
+          val rdepLabels = rdeps.map { it.name }.filter { !it.startsWith("@@") }
+          logger.i { "Found ${rdepLabels.size} workspace targets depending on @@$repoName" }
+          impactedTargets.addAll(rdepLabels)
+        } catch (e: Exception) {
+          logger.w { "Failed to query rdeps for @@$repoName: ${e.message}" }
+          impactedTargets.addAll(allTargets.keys.filter { !it.startsWith("@@") })
+        }
+      }
+
+      logger.i { "Total targets impacted by extension repo changes: ${impactedTargets.size}" }
+      impactedTargets
+    } catch (e: Exception) {
+      logger.e(e) { "Error querying targets depending on repos" }
       allTargets.keys
     }
   }

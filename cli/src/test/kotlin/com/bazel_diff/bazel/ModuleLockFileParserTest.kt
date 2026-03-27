@@ -161,4 +161,81 @@ class ModuleLockFileParserTest {
             "rules_jvm_external~6.3~maven~com_google_guava_guava_31_1_jre"
         )
     }
+
+    @Test
+    fun parseGeneratedRepoSpecs_withOsSpecificSections_extractsAllSections() {
+        // Extensions like toolchain downloaders use "os:linux", "os:macos" etc. instead of "general"
+        val lockWithOsSpecificExtension = """
+            {
+              "lockFileVersion": 10,
+              "moduleExtensions": {
+                "@@rules_go~//:extensions.bzl%go_sdk": {
+                  "os:linux": {
+                    "bzlTransitiveDigest": "abc==",
+                    "generatedRepoSpecs": {
+                      "go_sdk_linux": {
+                        "bzlFile": "@@rules_go//go:def.bzl",
+                        "ruleClassName": "go_sdk",
+                        "attributes": {
+                          "name": "rules_go~~go_sdk~go_sdk_linux",
+                          "version": "1.21.0"
+                        }
+                      }
+                    }
+                  },
+                  "os:macos": {
+                    "bzlTransitiveDigest": "abc==",
+                    "generatedRepoSpecs": {
+                      "go_sdk_macos": {
+                        "bzlFile": "@@rules_go//go:def.bzl",
+                        "ruleClassName": "go_sdk",
+                        "attributes": {
+                          "name": "rules_go~~go_sdk~go_sdk_macos",
+                          "version": "1.21.0"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        val result = parser.parseGeneratedRepoSpecs(lockWithOsSpecificExtension)
+
+        assertThat(result).hasSize(1)
+        val extKey = "@@rules_go~//:extensions.bzl%go_sdk"
+        assertThat(result.containsKey(extKey)).isEqualTo(true)
+        assertThat(result[extKey]!!.keys).containsExactlyInAnyOrder("go_sdk_linux", "go_sdk_macos")
+    }
+
+    @Test
+    fun findChangedRepos_withOsSpecificSectionChanged_returnsCanonicalName() {
+        val lockV1 = """
+            {
+              "lockFileVersion": 10,
+              "moduleExtensions": {
+                "@@rules_go~//:extensions.bzl%go_sdk": {
+                  "os:linux": {
+                    "bzlTransitiveDigest": "abc==",
+                    "generatedRepoSpecs": {
+                      "go_sdk_linux": {
+                        "bzlFile": "@@rules_go//go:def.bzl",
+                        "ruleClassName": "go_sdk",
+                        "attributes": { "name": "rules_go~~go_sdk~go_sdk_linux", "version": "1.21.0" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+        val lockV2 = lockV1.replace("\"version\": \"1.21.0\"", "\"version\": \"1.22.0\"")
+
+        val oldSpecs = parser.parseGeneratedRepoSpecs(lockV1)
+        val newSpecs = parser.parseGeneratedRepoSpecs(lockV2)
+
+        assertThat(parser.findChangedRepos(oldSpecs, newSpecs))
+            .containsExactlyInAnyOrder("rules_go~~go_sdk~go_sdk_linux")
+    }
 }

@@ -22,11 +22,19 @@ class ModuleLockFileParser {
             val root = JsonParser.parseString(lockJson).asJsonObject
             val result = mutableMapOf<String, Map<String, JsonObject>>()
             root.getAsJsonObject("moduleExtensions")?.entrySet()?.forEach { (extKey, extValue) ->
-                val specs = extValue?.asJsonObject
-                    ?.getAsJsonObject("general")
-                    ?.getAsJsonObject("generatedRepoSpecs")
-                    ?: return@forEach
-                result[extKey] = specs.entrySet().associate { (k, v) -> k to v.asJsonObject }
+                val extObj = extValue?.asJsonObject ?: return@forEach
+                // An extension entry contains one or more platform sections: "general",
+                // "os:linux", "os:macos", "arch:x86_64", "os:linux,arch:x86_64", etc.
+                // Collect generatedRepoSpecs from all sections — platform-specific extensions
+                // (e.g. toolchain downloaders) never have a "general" key.
+                val merged = mutableMapOf<String, JsonObject>()
+                extObj.entrySet().forEach { (sectionKey, sectionValue) ->
+                    sectionValue?.asJsonObject
+                        ?.getAsJsonObject("generatedRepoSpecs")
+                        ?.entrySet()
+                        ?.forEach { (k, v) -> merged[k] = v.asJsonObject }
+                }
+                if (merged.isNotEmpty()) result[extKey] = merged
             }
             result
         } catch (e: Exception) {

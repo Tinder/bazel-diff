@@ -500,6 +500,85 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
   }
 
   @Test
+  fun testNoLockFile_fallsBackToHashDiff() {
+    // When neither revision has a lock file, hash diff is used normally
+    val startHashes = mapOf(
+        "//:target1" to TargetHash("", "hash1", "hash1"),
+        "//:target2" to TargetHash("", "hash2", "hash2")
+    )
+    val endHashes = mapOf(
+        "//:target1" to TargetHash("", "hash1-changed", "hash1-changed"),
+        "//:target2" to TargetHash("", "hash2", "hash2")
+    )
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor().execute(
+        from = startHashes,
+        to = endHashes,
+        outputWriter = outputWriter,
+        targetTypes = null,
+        fromModuleLockFileJson = null,
+        toModuleLockFileJson = null
+    )
+    assertThat(outputWriter.toString().trim().split("\n")).containsExactly("//:target1")
+  }
+
+  @Test
+  fun testLockFileOnlyInTo_fallsBackToHashDiff() {
+    // When only the `to` revision has a lock file (user just adopted lock files),
+    // we cannot diff generatedRepoSpecs and must fall back to hash diff
+    val startHashes = mapOf("//:target1" to TargetHash("", "hash1", "hash1"))
+    val endHashes = mapOf("//:target1" to TargetHash("", "hash1-changed", "hash1-changed"))
+    val lockJson = """{"lockFileVersion": 10, "moduleExtensions": {}}"""
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor().execute(
+        from = startHashes,
+        to = endHashes,
+        outputWriter = outputWriter,
+        targetTypes = null,
+        fromModuleLockFileJson = null,
+        toModuleLockFileJson = lockJson
+    )
+    assertThat(outputWriter.toString().trim().split("\n")).containsExactly("//:target1")
+  }
+
+  @Test
+  fun testLockFileOnlyInFrom_fallsBackToHashDiff() {
+    // When only the `from` revision has a lock file (user stopped using lock files),
+    // we cannot diff generatedRepoSpecs and must fall back to hash diff
+    val startHashes = mapOf("//:target1" to TargetHash("", "hash1", "hash1"))
+    val endHashes = mapOf("//:target1" to TargetHash("", "hash1-changed", "hash1-changed"))
+    val lockJson = """{"lockFileVersion": 10, "moduleExtensions": {}}"""
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor().execute(
+        from = startHashes,
+        to = endHashes,
+        outputWriter = outputWriter,
+        targetTypes = null,
+        fromModuleLockFileJson = lockJson,
+        toModuleLockFileJson = null
+    )
+    assertThat(outputWriter.toString().trim().split("\n")).containsExactly("//:target1")
+  }
+
+  @Test
+  fun testIdenticalLockFiles_fallsBackToHashDiff() {
+    // When lock files are identical, no repo changes and hash diff is used
+    val startHashes = mapOf("//:target1" to TargetHash("", "hash1", "hash1"))
+    val endHashes = mapOf("//:target1" to TargetHash("", "hash1-changed", "hash1-changed"))
+    val lockJson = """{"lockFileVersion": 10, "moduleExtensions": {}}"""
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor().execute(
+        from = startHashes,
+        to = endHashes,
+        outputWriter = outputWriter,
+        targetTypes = null,
+        fromModuleLockFileJson = lockJson,
+        toModuleLockFileJson = lockJson
+    )
+    assertThat(outputWriter.toString().trim().split("\n")).containsExactly("//:target1")
+  }
+
+  @Test
   fun testIdenticalModuleGraphsSkipsParsing() {
     // When module graphs are identical, should skip parsing and use normal hash comparison
     // This is an optimization to avoid expensive JSON parsing when modules haven't changed

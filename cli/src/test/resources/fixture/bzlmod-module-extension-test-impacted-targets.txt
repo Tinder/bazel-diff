@@ -1,0 +1,10 @@
+//:BUILD
+//src/main/java/com/transitive:BUILD
+//src/main/java/com/transitive:TargetA.java
+//src/main/java/com/transitive:TargetB.java
+//src/main/java/com/transitive:libtarget-a-src.jar
+//src/main/java/com/transitive:libtarget-a.jar
+//src/main/java/com/transitive:libtarget-b-src.jar
+//src/main/java/com/transitive:libtarget-b.jar
+//src/main/java/com/transitive:target-a
+//src/main/java/com/transitive:target-b

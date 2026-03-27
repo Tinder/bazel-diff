@@ -11,7 +11,8 @@ import org.koin.core.component.inject
 
 data class HashFileData(
     val hashes: Map<String, TargetHash>,
-    val moduleGraphJson: String?
+    val moduleGraphJson: String?,
+    val moduleLockFileJson: String?
 )
 
 class DeserialiseHashesInteractor : KoinComponent {
@@ -32,17 +33,17 @@ class DeserialiseHashesInteractor : KoinComponent {
       val hashesMap: Map<String, String> = gson.fromJson(jsonObject.get("hashes"), hashesShape)
       val hashes = hashesMap.mapValues { TargetHash.fromJson(it.value) }
 
-      val moduleGraphJson = jsonObject.getAsJsonObject("metadata")
-          ?.get("moduleGraphJson")
-          ?.asString
+      val metadata = jsonObject.getAsJsonObject("metadata")
+      val moduleGraphJson = metadata?.get("moduleGraphJson")?.asString
+      val moduleLockFileJson = metadata?.get("moduleLockFileJson")?.asString
 
-      return HashFileData(hashes, moduleGraphJson)
+      return HashFileData(hashes, moduleGraphJson, moduleLockFileJson)
     } else {
       // Legacy format - just a flat map of hashes
       val shape = object : TypeToken<Map<String, String>>() {}.type
       val result: Map<String, String> = gson.fromJson(jsonObject, shape)
       val hashes = result.mapValues { TargetHash.fromJson(it.value) }
-      return HashFileData(hashes, null)
+      return HashFileData(hashes, null, null)
     }
   }
 

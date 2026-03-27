@@ -159,7 +159,9 @@ class GetImpactedTargetsCommand : Callable<Int> {
                   outputWriter,
                   targetType,
                   fromData.moduleGraphJson,
-                  toData.moduleGraphJson)
+                  toData.moduleGraphJson,
+                  fromData.moduleLockFileJson,
+                  toData.moduleLockFileJson)
         } else {
           CalculateImpactedTargetsInteractor()
               .execute(
@@ -168,7 +170,9 @@ class GetImpactedTargetsCommand : Callable<Int> {
                   outputWriter,
                   targetType,
                   fromData.moduleGraphJson,
-                  toData.moduleGraphJson)
+                  toData.moduleGraphJson,
+                  fromData.moduleLockFileJson,
+                  toData.moduleLockFileJson)
         }
         CommandLine.ExitCode.OK
       } catch (e: IOException) {

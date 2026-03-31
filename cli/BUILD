@@ -97,6 +97,12 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "BazelClientTest",
+    test_class = "com.bazel_diff.bazel.BazelClientTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "BazelModServiceTest",
     test_class = "com.bazel_diff.bazel.BazelModServiceTest",
     runtime_deps = [":cli-test-lib"],

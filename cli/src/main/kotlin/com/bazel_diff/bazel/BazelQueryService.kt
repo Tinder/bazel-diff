@@ -73,6 +73,15 @@ class BazelQueryService(
   private val canUseOutputFile
     get() = versionComparator.compare(version, Triple(8, 2, 0)) >= 0
 
+  // Bazel 8.6.0+ / 9.0.1+ supports `bazel mod show_repo --output=streamed_proto`, which
+  // outputs Build.Repository protos for bzlmod-managed external repos.
+  // https://github.com/bazelbuild/bazel/pull/28010
+  val canUseBzlmodShowRepo
+    get() =
+        versionComparator.compare(version, Triple(8, 6, 0)) >= 0 &&
+            // 9.0.0 does not have the feature; it landed in 9.0.1.
+            version != Triple(9, 0, 0)
+
   suspend fun query(query: String, useCquery: Boolean = false): List<BazelTarget> {
     // Unfortunately, there is still no direct way to tell if a target is compatible or not with the
     // proto output
@@ -221,6 +230,182 @@ class BazelQueryService(
           "Bazel query failed, exit code ${result.resultCode}, allowed exit codes: ${allowedExitCodes.joinToString()}")
     }
     return outputFile
+  }
+
+  /**
+   * Queries bzlmod-managed external repo definitions using `bazel mod show_repo`.
+   * Requires Bazel 8.6.0+ or 9.0.1+ which supports `--output=streamed_proto` for this command.
+   *
+   * The approach:
+   * 1. Run `bazel mod dump_repo_mapping ""` to discover the root module's apparent→canonical
+   *    repo name mapping (e.g., "bazel_diff_maven" → "rules_jvm_external++maven+maven").
+   * 2. Run `bazel mod show_repo @@<canonical>... --output=streamed_proto` to get Repository
+   *    proto definitions for each repo (works for both module repos and extension-generated repos).
+   * 3. Create synthetic `//external:<apparent_name>` targets for each repo. This matches how
+   *    `transformRuleInput` in BazelRule.kt collapses `@apparent_name//...` deps to
+   *    `//external:apparent_name`, so the hashing pipeline can detect changes.
+   */
+  @OptIn(ExperimentalCoroutinesApi::class)
+  suspend fun queryBzlmodRepos(): List<BazelTarget> {
+    check(canUseBzlmodShowRepo) { "queryBzlmodRepos requires Bazel 8.6.0+ or 9.0.1+" }
+
+    // Step 1: Get the root module's apparent → canonical repo mapping.
+    val repoMapping = discoverRepoMapping()
+    if (repoMapping.isEmpty()) {
+      logger.w { "No repo mappings discovered, skipping mod show_repo" }
+      return emptyList()
+    }
+    logger.i { "Discovered ${repoMapping.size} repo mappings" }
+
+    // Build reverse map: canonical → list of apparent names
+    val canonicalToApparent = mutableMapOf<String, MutableList<String>>()
+    for ((apparent, canonical) in repoMapping) {
+      canonicalToApparent.getOrPut(canonical) { mutableListOf() }.add(apparent)
+    }
+
+    // Step 2: Fetch repo definitions via `mod show_repo @@<canonical>... --output=streamed_proto`.
+    val canonicalNames = canonicalToApparent.keys.map { "@@$it" }
+    val outputFile = Files.createTempFile(null, ".bin").toFile()
+    outputFile.deleteOnExit()
+
+    val cmd: MutableList<String> =
+        ArrayList<String>().apply {
+          add(bazelPath.toString())
+          if (noBazelrc) {
+            add("--bazelrc=/dev/null")
+          }
+          addAll(startupOptions)
+          add("mod")
+          add("show_repo")
+          addAll(canonicalNames)
+          add("--output=streamed_proto")
+        }
+
+    logger.i { "Querying bzlmod repos: ${cmd.joinToString()}" }
+    val result =
+        process(
+            *cmd.toTypedArray(),
+            stdout = Redirect.ToFile(outputFile),
+            workingDirectory = workingDirectory.toFile(),
+            stderr = Redirect.PRINT,
+            destroyForcibly = true,
+        )
+
+    if (result.resultCode != 0) {
+      logger.w { "bazel mod show_repo failed (exit code ${result.resultCode}), skipping bzlmod repos" }
+      return emptyList()
+    }
+
+    // Step 3: Parse Build.Repository messages and create synthetic targets for each apparent name.
+    val repos =
+        outputFile.inputStream().buffered().use { proto ->
+          mutableListOf<Build.Repository>().apply {
+            while (true) {
+              val repo = Build.Repository.parseDelimitedFrom(proto) ?: break
+              add(repo)
+            }
+          }
+        }
+
+    val targets = mutableListOf<BazelTarget.Rule>()
+    for (repo in repos) {
+      val apparentNames = canonicalToApparent[repo.canonicalName]
+      if (apparentNames != null) {
+        for (apparentName in apparentNames) {
+          targets.add(repositoryToTarget(repo, apparentName))
+        }
+      } else {
+        // Fallback: use canonical name if no apparent name mapping exists
+        targets.add(repositoryToTarget(repo, repo.canonicalName))
+      }
+    }
+
+    logger.i { "Parsed ${repos.size} bzlmod repos → ${targets.size} synthetic targets" }
+    return targets
+  }
+
+  /**
+   * Converts a Build.Repository proto into a synthetic BazelTarget.Rule named
+   * `//external:<targetName>`. This mirrors how WORKSPACE repos appear as `//external:*`
+   * targets, and matches the names produced by `transformRuleInput` in BazelRule.kt.
+   */
+  private fun repositoryToTarget(repo: Build.Repository, targetName: String): BazelTarget.Rule {
+    val ruleClass = repo.repoRuleName.ifEmpty { "bzlmod_repo" }
+
+    val target =
+        Build.Target.newBuilder()
+            .setType(Build.Target.Discriminator.RULE)
+            .setRule(
+                Build.Rule.newBuilder()
+                    .setName("//external:$targetName")
+                    .setRuleClass(ruleClass)
+                    .addAllAttribute(repo.attributeList))
+            .build()
+    return BazelTarget.Rule(target)
+  }
+
+  /**
+   * Discovers the root module's apparent→canonical repo name mapping by running
+   * `bazel mod dump_repo_mapping ""`. Returns a map of apparent name → canonical name.
+   * Filters out internal repos (bazel_tools, _builtins, local_config_*) that aren't
+   * relevant for dependency hashing.
+   */
+  @OptIn(ExperimentalCoroutinesApi::class)
+  private suspend fun discoverRepoMapping(): Map<String, String> {
+    val cmd: MutableList<String> =
+        ArrayList<String>().apply {
+          add(bazelPath.toString())
+          if (noBazelrc) {
+            add("--bazelrc=/dev/null")
+          }
+          addAll(startupOptions)
+          add("mod")
+          add("dump_repo_mapping")
+          // Empty string = root module's repo mapping
+          add("")
+        }
+
+    logger.i { "Discovering repo mapping: ${cmd.joinToString()}" }
+    val result =
+        process(
+            *cmd.toTypedArray(),
+            stdout = Redirect.CAPTURE,
+            workingDirectory = workingDirectory.toFile(),
+            stderr = Redirect.PRINT,
+            destroyForcibly = true,
+        )
+
+    if (result.resultCode != 0) {
+      logger.w { "bazel mod dump_repo_mapping failed (exit code ${result.resultCode})" }
+      return emptyMap()
+    }
+
+    return try {
+      val mapping = mutableMapOf<String, String>()
+      for (line in result.output) {
+        val trimmed = line.trim()
+        if (trimmed.isEmpty()) continue
+        val json = com.google.gson.JsonParser.parseString(trimmed).asJsonObject
+        for ((apparent, canonicalElem) in json.entrySet()) {
+          val canonical = canonicalElem.asString
+          // Skip internal/infrastructure repos not relevant for dependency hashing.
+          if (apparent.isEmpty() ||
+              canonical.isEmpty() ||
+              canonical.startsWith("bazel_tools") ||
+              canonical.startsWith("_builtins") ||
+              canonical.startsWith("local_config_") ||
+              canonical.startsWith("rules_java_builtin") ||
+              apparent == "bazel_tools" ||
+              apparent == "local_config_platform")
+              continue
+          mapping[apparent] = canonical
+        }
+      }
+      mapping
+    } catch (e: Exception) {
+      logger.w { "Failed to parse dump_repo_mapping output: ${e.message}" }
+      emptyMap()
+    }
   }
 
   private fun toBazelTarget(target: Build.Target): BazelTarget? {

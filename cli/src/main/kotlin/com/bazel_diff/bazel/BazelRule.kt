@@ -37,7 +37,16 @@ class BazelRule(private val rule: Build.Rule) {
               .filter { it.startsWith("//external:") }
               .distinct()
     } else {
-      rule.ruleInputList
+      // Include raw rule inputs plus transformed //external:* inputs so that targets depending
+      // on external repos pick up hash changes from //external:* synthetic targets (e.g. from
+      // bzlmod mod show_repo or WORKSPACE //external:all-targets).
+      rule.ruleInputList +
+          rule.ruleInputList
+              .map { ruleInput: String ->
+                transformRuleInput(fineGrainedHashExternalRepos, ruleInput)
+              }
+              .filter { it.startsWith("//external:") }
+              .distinct()
     }
   }
 

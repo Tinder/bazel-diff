@@ -1084,6 +1084,105 @@ class E2ETest {
     assertThat(hashes.contains("failing_analysis_target")).isEqualTo(false)
   }
 
+  /**
+   * Returns the Bazel version triple by running `bazel version`, or null if it cannot be determined.
+   */
+  private fun getBazelVersion(): Triple<Int, Int, Int>? {
+    return try {
+      val process = ProcessBuilder("bazel", "version")
+          .redirectErrorStream(true)
+          .start()
+      val output = process.inputStream.bufferedReader().readText()
+      process.waitFor()
+      val versionLine = output.lines().firstOrNull { it.startsWith("Build label: ") }
+          ?.removePrefix("Build label: ")?.trim() ?: return null
+      val parts = versionLine.split('-')[0].split('.').map { it.takeWhile { c -> c.isDigit() }.toInt() }
+      Triple(parts[0], parts[1], parts[2])
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  @Test
+  fun testBzlmodShowRepoDetectsModuleBazelChanges() {
+    // Validates the fix for https://github.com/Tinder/bazel-diff/issues/255
+    //
+    // When MODULE.bazel changes a dependency version (e.g. guava 31.1-jre -> 32.0.0-jre),
+    // bazel-diff should detect the change via `bazel mod show_repo --output=streamed_proto`
+    // and report only the affected targets — WITHOUT requiring --fineGrainedHashExternalRepos.
+    //
+    // This test requires Bazel 8.6.0+ (or 9.0.1+) which supports the `mod show_repo`
+    // streamed_proto output. It is skipped on older Bazel versions.
+    val version = getBazelVersion()
+    org.junit.Assume.assumeNotNull(version)
+    val v = version!!
+    val comparator = compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+    val hasModShowRepo = comparator.compare(v, Triple(8, 6, 0)) >= 0 && v != Triple(9, 0, 0)
+    org.junit.Assume.assumeTrue(
+        "Requires Bazel 8.6.0+ or 9.0.1+ (current: ${v.first}.${v.second}.${v.third})",
+        hasModShowRepo)
+
+    val projectA = extractFixtureProject("/fixture/bzlmod-show-repo-test-1.zip")
+    val projectB = extractFixtureProject("/fixture/bzlmod-show-repo-test-2.zip")
+
+    val bazelPath = "bazel"
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+
+    // Generate hashes for both snapshots WITHOUT --fineGrainedHashExternalRepos.
+    // The mod show_repo integration should still detect the MODULE.bazel change.
+    val exitFrom = cli.execute(
+        "generate-hashes",
+        "-w", projectA.absolutePath,
+        "-b", bazelPath,
+        from.absolutePath)
+    assertThat(exitFrom).isEqualTo(0)
+
+    val exitTo = cli.execute(
+        "generate-hashes",
+        "-w", projectB.absolutePath,
+        "-b", bazelPath,
+        to.absolutePath)
+    assertThat(exitTo).isEqualTo(0)
+
+    // Get impacted targets
+    cli.execute(
+        "get-impacted-targets",
+        "-w", projectB.absolutePath,
+        "-b", bazelPath,
+        "-sh", from.absolutePath,
+        "-fh", to.absolutePath,
+        "-o", impactedTargetsOutput.absolutePath)
+
+    val impactedTargets = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+
+    // guava-user depends on an external maven artifact (guava), so it must be impacted
+    // when the guava version changes in MODULE.bazel.
+    val guavaUserImpacted = impactedTargets.any { it.contains("guava-user") }
+    assertThat(guavaUserImpacted)
+        .transform("guava-user should be in impacted targets: $impactedTargets") { it }
+        .isEqualTo(true)
+
+    // bazel-diff-integration-lib depends only on local targets (Submodule), NOT on any
+    // external maven artifact. It should NOT be impacted by the guava version change.
+    val integrationLibImpacted = impactedTargets.any {
+      it.contains("bazel-diff-integration-lib") && !it.contains("libbazel-diff-integration-lib")
+    }
+    assertThat(integrationLibImpacted)
+        .transform("bazel-diff-integration-lib should NOT be in impacted targets: $impactedTargets") { it }
+        .isEqualTo(false)
+
+    // Submodule has no external deps at all - it should not be impacted.
+    val submoduleImpacted = impactedTargets.any { it.contains("submodule") }
+    assertThat(submoduleImpacted)
+        .transform("Submodule should NOT be in impacted targets: $impactedTargets") { it }
+        .isEqualTo(false)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

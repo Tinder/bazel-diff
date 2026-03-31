@@ -232,6 +232,16 @@ def build_contributors_section(workspace_dir: Path, email_map: dict[str, dict]) 
 # Main
 # ---------------------------------------------------------------------------
 
+def read_module_version(workspace_dir: Path) -> str:
+    """Extract the version string from MODULE.bazel."""
+    module_bazel = workspace_dir / "MODULE.bazel"
+    text = module_bazel.read_text()
+    match = re.search(r'module\([^)]*version\s*=\s*"([^"]+)"', text, re.DOTALL)
+    if not match:
+        raise ValueError("Could not find version in MODULE.bazel")
+    return match.group(1)
+
+
 def main() -> None:
     workspace_dir = Path(os.environ["BUILD_WORKSPACE_DIRECTORY"])
     output_path = workspace_dir / "README.md"
@@ -240,6 +250,9 @@ def main() -> None:
     help_root = runfile("tools/help_root.txt").read_text()
     help_gen = runfile("tools/help_generate_hashes.txt").read_text()
     help_get = runfile("tools/help_get_impacted_targets.txt").read_text()
+
+    version = read_module_version(workspace_dir)
+    template = template.replace("{{BAZEL_DIFF_VERSION}}", version)
 
     print("Fetching GitHub user data...")
     email_map = fetch_github_email_map(REPO)

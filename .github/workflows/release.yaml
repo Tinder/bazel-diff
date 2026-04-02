@@ -23,7 +23,14 @@ jobs:
       prerelease: false
       tag_name: ${{ inputs.tag_name || github.ref_name }}
     permissions:
-      id-token: write        # Needed to attest provenance
-      attestations: write    # Needed to attest provenance
-      contents: write       # Needed to upload release files
+      id-token: write # Needed to attest provenance
+      attestations: write # Needed to attest provenance
+      contents: write # Needed to upload release files
     secrets: {}
+  publish:
+    needs: release
+    uses: ./.github/workflows/publish.yaml
+    with:
+      tag_name: ${{ inputs.tag_name || github.ref_name }}
+    secrets:
+      BCR_PUBLISH_TOKEN: ${{ secrets.BCR_PUBLISH_TOKEN }}

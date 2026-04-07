@@ -43,5 +43,5 @@ jobs:
     steps:
       - run: gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
         env:
-          TAG: ${{ inputs.tag_name }}
+          TAG: ${{ inputs.tag_name || github.ref_name }}
           GH_TOKEN: ${{ github.token }}

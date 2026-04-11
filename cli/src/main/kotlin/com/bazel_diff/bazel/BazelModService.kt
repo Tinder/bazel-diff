@@ -52,7 +52,7 @@ class BazelModService(
         process(
             *cmd.toTypedArray(),
             stdout = Redirect.CAPTURE,
-            stderr = Redirect.CAPTURE,
+            stderr = Redirect.SILENT,
             workingDirectory = workingDirectory.toFile(),
             destroyForcibly = true,
         )
@@ -93,7 +93,7 @@ class BazelModService(
         process(
             *cmd.toTypedArray(),
             stdout = Redirect.CAPTURE,
-            stderr = Redirect.CAPTURE,
+            stderr = Redirect.SILENT,
             workingDirectory = workingDirectory.toFile(),
             destroyForcibly = true,
         )

@@ -13,7 +13,7 @@ tar --exclude-vcs \
   --exclude=archives \
   -zcf "archives/release.tar.gz" .
 
-make release_deploy_jar
+make release_deploy_jar &> /dev/null
 
 cp bazel-bin/cli/bazel-diff_deploy.jar archives/bazel-diff_deploy.jar
 

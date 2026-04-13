@@ -13,6 +13,10 @@ tar --exclude-vcs \
   --exclude=archives \
   -zcf "archives/release.tar.gz" .
 
+make release_deploy_jar
+
+cp bazel-bin/cli/bazel-diff_deploy.jar archives/bazel-diff_deploy.jar
+
 SHA=$(shasum -a 256 archives/release.tar.gz | awk '{print $1}')
 
 cat << EOF

@@ -320,7 +320,7 @@ First, add the following snippet to your project:
 #### Bzlmod snippet
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "18.0.5")
+bazel_dep(name = "bazel-diff", version = "18.1.0")
 ```
 
 You can now run the tool with:
@@ -447,7 +447,7 @@ bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
   </tr>
   <tr>
     <td align="center"><a href="https://github.com/purkhusid"><img src="https://avatars.githubusercontent.com/u/5622403?s=64" width="64" alt="Daniel P. Purkhus"/><br/><sub><b>Daniel P. Purkhus</b></sub></a></td>
-    <td align="center"><sub><b>Alex Eagle</b></sub></td>
+    <td align="center"><a href="https://github.com/alexeagle"><img src="https://avatars.githubusercontent.com/u/47395?s=64" width="64" alt="Alex Eagle"/><br/><sub><b>Alex Eagle</b></sub></a></td>
     <td align="center"><a href="https://github.com/Malinskiy"><img src="https://avatars.githubusercontent.com/u/2089114?s=64" width="64" alt="Anton Malinskiy"/><br/><sub><b>Anton Malinskiy</b></sub></a></td>
     <td align="center"><a href="https://github.com/sharmila-oai"><img src="https://avatars.githubusercontent.com/u/257629015?s=64" width="64" alt="Sharmila"/><br/><sub><b>Sharmila</b></sub></a></td>
     <td align="center"><a href="https://github.com/dkostyrev"><img src="https://avatars.githubusercontent.com/u/183590?s=64" width="64" alt="Dmitrii Kostyrev"/><br/><sub><b>Dmitrii Kostyrev</b></sub></a></td>

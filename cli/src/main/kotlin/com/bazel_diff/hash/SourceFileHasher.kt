@@ -3,8 +3,10 @@ package com.bazel_diff.hash
 import com.bazel_diff.bazel.BazelSourceFileTarget
 import com.bazel_diff.io.ContentHashProvider
 import com.bazel_diff.log.Logger
+import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.attribute.PosixFilePermission
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import org.koin.core.qualifier.named
@@ -88,8 +90,19 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
       if (relativeFilenameToContentHash?.contains(filenamePathString) == true) {
         val contentHash = relativeFilenameToContentHash.getValue(filenamePathString)
         safePutBytes(contentHash.toByteArray())
-        // Mark that file exists (via content hash)
         putBytes(byteArrayOf(0x01))
+        val absoluteFilePath = workingDirectory.resolve(filenamePath)
+        val isExecutable =
+            try {
+              Files.getPosixFilePermissions(absoluteFilePath).let { perms ->
+                perms.contains(PosixFilePermission.OWNER_EXECUTE) ||
+                    perms.contains(PosixFilePermission.GROUP_EXECUTE) ||
+                    perms.contains(PosixFilePermission.OTHERS_EXECUTE)
+              }
+            } catch (_: Exception) {
+              absoluteFilePath.toFile().canExecute()
+            }
+        putBytes(byteArrayOf(if (isExecutable) 0x01 else 0x00))
       } else {
         val absoluteFilePath = workingDirectory.resolve(filenamePath)
         val file = absoluteFilePath.toFile()
@@ -102,6 +115,17 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
             }
             // Mark that file exists
             putBytes(byteArrayOf(0x01))
+            val isExecutable =
+                try {
+                  Files.getPosixFilePermissions(absoluteFilePath).let { perms ->
+                    perms.contains(PosixFilePermission.OWNER_EXECUTE) ||
+                        perms.contains(PosixFilePermission.GROUP_EXECUTE) ||
+                        perms.contains(PosixFilePermission.OTHERS_EXECUTE)
+                  }
+                } catch (_: Exception) {
+                  file.canExecute()
+                }
+            putBytes(byteArrayOf(if (isExecutable) 0x01 else 0x00))
           }
         } else {
           logger.w { "File $absoluteFilePath not found" }

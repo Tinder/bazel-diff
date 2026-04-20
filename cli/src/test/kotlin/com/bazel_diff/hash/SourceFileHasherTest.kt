@@ -9,6 +9,7 @@ import com.bazel_diff.extensions.toHexString
 import com.bazel_diff.testModule
 import java.nio.file.Files
 import java.nio.file.Paths
+import java.nio.file.attribute.PosixFilePermission
 import kotlinx.coroutines.runBlocking
 import org.junit.Rule
 import org.junit.Test
@@ -40,6 +41,7 @@ internal class SourceFileHasherTest : KoinTest {
         sha256 {
               safePutBytes(fixtureFileContent)
               putBytes(byteArrayOf(0x01))
+              putBytes(byteArrayOf(0x00)) // foo.ts is not executable
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -56,6 +58,7 @@ internal class SourceFileHasherTest : KoinTest {
         sha256 {
               safePutBytes(fixtureFileContent)
               putBytes(byteArrayOf(0x01))
+              putBytes(byteArrayOf(0x00)) // foo.ts is not executable
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -72,6 +75,7 @@ internal class SourceFileHasherTest : KoinTest {
     val expected =
         sha256 {
               putBytes(byteArrayOf(0x01))
+              putBytes(byteArrayOf(0x00)) // foo.ts is not executable
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -94,6 +98,7 @@ internal class SourceFileHasherTest : KoinTest {
         sha256 {
               safePutBytes(externalRepoFileContent.toByteArray())
               putBytes(byteArrayOf(0x01))
+              putBytes(byteArrayOf(0x00)) // writeText creates a non-executable file
               safePutBytes(seed)
               safePutBytes(externalRepoFileTarget.toByteArray())
             }
@@ -110,6 +115,7 @@ internal class SourceFileHasherTest : KoinTest {
         sha256 {
               safePutBytes(fixtureFileContent)
               putBytes(byteArrayOf(0x01))
+              putBytes(byteArrayOf(0x00)) // foo.ts is not executable
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -171,6 +177,7 @@ internal class SourceFileHasherTest : KoinTest {
         sha256 {
               safePutBytes("foo-content-hash".toByteArray())
               putBytes(byteArrayOf(0x01))
+              putBytes(byteArrayOf(0x00)) // foo.ts is not executable
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -189,6 +196,7 @@ internal class SourceFileHasherTest : KoinTest {
         sha256 {
               safePutBytes(fixtureFileContent)
               putBytes(byteArrayOf(0x01))
+              putBytes(byteArrayOf(0x00)) // foo.ts is not executable
               safePutBytes(seed)
               safePutBytes(fixtureFileTarget.toByteArray())
             }
@@ -208,12 +216,41 @@ internal class SourceFileHasherTest : KoinTest {
         sha256 {
               safePutBytes("foo-content-hash".toByteArray())
               putBytes(byteArrayOf(0x01))
+              putBytes(byteArrayOf(0x00)) // bar.ts does not exist, canExecute() returns false
               safePutBytes(seed)
               safePutBytes(targetName.toByteArray())
             }
             .toHexString()
     assertThat(actual).isEqualTo(expected)
   }
+
+  // Reproducer for https://github.com/Tinder/bazel-diff/issues/325
+  @Test
+  fun testHashExecutableBitChange() =
+      runBlocking<Unit> {
+        val testDir = Files.createTempDirectory("executable_bit_test")
+        val filePath = testDir.resolve("path/to/script.sh")
+        Files.createDirectories(filePath.parent)
+        Files.createFile(filePath)
+        filePath.toFile().writeText("#!/bin/bash\necho hello")
+
+        val target = "//path/to:script.sh"
+        val hasher = SourceFileHasherImpl(testDir, null, externalRepoResolver)
+
+        val permsWithoutExec =
+            Files.getPosixFilePermissions(filePath) - PosixFilePermission.OWNER_EXECUTE
+        Files.setPosixFilePermissions(filePath, permsWithoutExec)
+        val nonExecutableHash =
+            hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
+
+        val permsWithExec = permsWithoutExec + PosixFilePermission.OWNER_EXECUTE
+        Files.setPosixFilePermissions(filePath, permsWithExec)
+        val executableHash =
+            hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
+
+        // Hashes must differ when executable bit changes — currently fails (issue #325)
+        assertThat(nonExecutableHash).isNotEqualTo(executableHash)
+      }
 
   @Test
   fun testHashEmptyFileVsDeletedFile() =

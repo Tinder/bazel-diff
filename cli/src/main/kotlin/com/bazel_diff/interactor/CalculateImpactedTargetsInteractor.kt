@@ -59,6 +59,7 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
 
     impactedTargets
         .filter { typeFilter.accepts(it) }
+        .sortedWith(impactedTargetOrdering(to, from))
         .let { filtered ->
           outputWriter.use { writer -> filtered.forEach { writer.write("$it\n") } }
         }
@@ -110,8 +111,10 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       computeAllDistances(from, to, depEdges)
     }
 
+    val ordering = impactedTargetOrdering(to, from)
     impactedTargets
         .filterKeys { typeFilter.accepts(it) }
+        .toSortedMap(ordering)
         .let { filtered ->
           outputWriter.use { writer ->
             writer.write(
@@ -124,6 +127,24 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
                     }))
           }
         }
+  }
+
+  private fun impactedTargetOrdering(
+      to: Map<String, TargetHash>,
+      from: Map<String, TargetHash>
+  ): Comparator<String> {
+    fun kindRank(label: String): Int {
+      val type = to[label]?.type?.takeIf { it.isNotEmpty() }
+          ?: from[label]?.type?.takeIf { it.isNotEmpty() }
+      return when (type) {
+        "SourceFile" -> 0
+        "GeneratedFile" -> 1
+        "Rule" -> 2
+        null -> 4
+        else -> 3
+      }
+    }
+    return compareBy<String>({ kindRank(it) }, { it })
   }
 
   fun computeAllDistances(

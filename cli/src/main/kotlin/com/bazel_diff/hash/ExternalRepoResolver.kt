@@ -66,7 +66,7 @@ class ExternalRepoResolver(
       return externalRoot.resolve(repoName)
     }
     val path = Paths.get(queryResultLine.split(": ", limit = 2)[0])
-    val bzlModRelativePath = path.relativize(externalRoot).first()
+    val bzlModRelativePath = externalRoot.relativize(path).first()
     return externalRoot.resolve(bzlModRelativePath)
   }
 

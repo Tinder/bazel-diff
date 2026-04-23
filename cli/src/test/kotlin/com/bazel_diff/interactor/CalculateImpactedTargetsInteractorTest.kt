@@ -35,6 +35,40 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
   }
 
   @Test
+  fun testExecuteSortsByKindThenLabel() {
+    val startHashes =
+        mapOf(
+            "//pkg:rule_a" to TargetHash("Rule", "r_a", "r_a"),
+            "//pkg:rule_b" to TargetHash("Rule", "r_b", "r_b"),
+            "//pkg:gen_a" to TargetHash("GeneratedFile", "g_a", "g_a"),
+            "//pkg:gen_b" to TargetHash("GeneratedFile", "g_b", "g_b"),
+            "//pkg:src_a" to TargetHash("SourceFile", "s_a", "s_a"),
+            "//pkg:src_b" to TargetHash("SourceFile", "s_b", "s_b"),
+        )
+    val endHashes = startHashes.mapValues { (_, v) -> v.copy(hash = v.hash + "-changed") }
+
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = startHashes,
+            to = endHashes,
+            outputWriter = outputWriter,
+            targetTypes = null,
+        )
+
+    val lines = outputWriter.toString().trimEnd('\n').split("\n")
+    assertThat(lines)
+        .containsExactly(
+            "//pkg:src_a",
+            "//pkg:src_b",
+            "//pkg:gen_a",
+            "//pkg:gen_b",
+            "//pkg:rule_a",
+            "//pkg:rule_b",
+        )
+  }
+
+  @Test
   fun testOmitsUnchangedTargets() {
     val (depEdges, startHashes) =
         createTargetHashes(

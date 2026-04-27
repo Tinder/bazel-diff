@@ -184,6 +184,33 @@ class E2ETest {
   }
 
   @Test
+  fun testGenerateHashesWithCqueryStreamedProto() {
+    // Validates the --useCquery code path that consumes Bazel's `--output=streamed_proto`
+    // cquery output (https://github.com/Tinder/bazel-diff/issues/219). On Bazel 7.0.0+ this
+    // exercises the AnalysisProtosV2.CqueryResult.parseDelimitedFrom loop in
+    // BazelQueryService.query(); on older Bazel it falls back to single-message proto parsing.
+    // Uses the `distance_metrics` shell-only workspace so cquery analysis works without a
+    // sandboxed JDK / coursier fetch.
+    val workspace = copyTestWorkspace("distance_metrics")
+    val outputDir = temp.newFolder()
+    val output = File(outputDir, "hashes.json")
+
+    val cli = CommandLine(BazelDiff())
+    val exitCode = cli.execute(
+        "generate-hashes",
+        "-w", workspace.absolutePath,
+        "-b", "bazel",
+        "--useCquery",
+        output.absolutePath)
+
+    assertThat(exitCode).isEqualTo(0)
+
+    val hashes: Map<String, Any> =
+        Gson().fromJson(output.readText(), object : TypeToken<Map<String, Any>>() {}.type)
+    assertThat(hashes.isNotEmpty()).isEqualTo(true)
+  }
+
+  @Test
   fun testFineGrainedHashExternalRepo() {
     // The difference between these two snapshots is simply upgrading the Guava version.
     // Following is the diff.

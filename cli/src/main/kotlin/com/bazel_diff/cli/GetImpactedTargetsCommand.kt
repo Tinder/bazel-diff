@@ -105,6 +105,22 @@ class GetImpactedTargetsCommand : Callable<Int> {
       scope = CommandLine.ScopeType.LOCAL)
   var noBazelrc = false
 
+  @CommandLine.Option(
+      names = ["--excludeExternalTargets"],
+      negatable = true,
+      description =
+          [
+              "If true, drop labels starting with '//external:' from the impacted-targets output. " +
+                  "These synthetic labels are produced for bzlmod-managed external repos so " +
+                  "generate-hashes can detect dep changes, but they are not buildable in " +
+                  "bzlmod-only mode (Bazel 8.6.0+ with --enable_workspace=false) and will fail " +
+                  "downstream `bazel build`. See https://github.com/Tinder/bazel-diff/issues/326. " +
+                  "When unset, defaults to true if Bzlmod is detected (via `bazel mod graph`), " +
+                  "false otherwise."],
+      scope = CommandLine.ScopeType.LOCAL,
+      defaultValue = CommandLine.Parameters.NULL_VALUE)
+  var excludeExternalTargets: Boolean? = null
+
   @CommandLine.Spec lateinit var spec: CommandLine.Model.CommandSpec
 
   override fun call(): Int {
@@ -141,6 +157,15 @@ class GetImpactedTargetsCommand : Callable<Int> {
       val fromData = deserialiser.executeTargetHashWithMetadata(startingHashesJSONPath)
       val toData = deserialiser.executeTargetHashWithMetadata(finalHashesJSONPath)
 
+      // If the user did not pass --[no-]excludeExternalTargets, default to true when bzlmod is
+      // enabled (synthetic //external:* labels are not buildable in bzlmod-only mode — #326),
+      // otherwise false to preserve WORKSPACE-mode behavior.
+      val resolvedExcludeExternalTargets =
+          excludeExternalTargets
+              ?: org.koin.java.KoinJavaComponent.get<com.bazel_diff.bazel.BazelModService>(
+                      com.bazel_diff.bazel.BazelModService::class.java)
+                  .isBzlmodEnabled
+
       val outputWriter =
           BufferedWriter(
               when (val path = outputPath) {
@@ -159,7 +184,8 @@ class GetImpactedTargetsCommand : Callable<Int> {
                   outputWriter,
                   targetType,
                   fromData.moduleGraphJson,
-                  toData.moduleGraphJson)
+                  toData.moduleGraphJson,
+                  resolvedExcludeExternalTargets)
         } else {
           CalculateImpactedTargetsInteractor()
               .execute(
@@ -168,7 +194,8 @@ class GetImpactedTargetsCommand : Callable<Int> {
                   outputWriter,
                   targetType,
                   fromData.moduleGraphJson,
-                  toData.moduleGraphJson)
+                  toData.moduleGraphJson,
+                  resolvedExcludeExternalTargets)
         }
         CommandLine.ExitCode.OK
       } catch (e: IOException) {

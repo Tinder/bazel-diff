@@ -1210,6 +1210,96 @@ class E2ETest {
         .isEqualTo(false)
   }
 
+  @Test
+  fun testExcludeExternalTargetsFiltersBzlmodSyntheticLabels() {
+    // Validates the fix for https://github.com/Tinder/bazel-diff/issues/326.
+    //
+    // On Bazel 8.6.0+ with bzlmod, BazelClient queries `bazel mod show_repo` to produce synthetic
+    // //external:<apparent_name> targets so generate-hashes can detect bzlmod dep changes. Those
+    // labels are unbuildable in bzlmod-only mode (no //external package), so users hit
+    // "no such package 'external'" when feeding the impacted-targets file to `bazel build`.
+    //
+    // Expected behavior:
+    //   - get-impacted-targets defaults --excludeExternalTargets to TRUE when bzlmod is detected
+    //     => no //external:* lines in the output.
+    //   - --no-excludeExternalTargets opts back into the legacy behavior so the synthetic labels
+    //     reappear (proving they're really in the hash maps and the filter is what removes them).
+    val version = getBazelVersion()
+    org.junit.Assume.assumeNotNull(version)
+    val v = version!!
+    val comparator = compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+    val hasModShowRepo = comparator.compare(v, Triple(8, 6, 0)) >= 0 && v != Triple(9, 0, 0)
+    org.junit.Assume.assumeTrue(
+        "Requires Bazel 8.6.0+ or 9.0.1+ (current: ${v.first}.${v.second}.${v.third})",
+        hasModShowRepo)
+
+    val projectA = extractFixtureProject("/fixture/bzlmod-show-repo-test-1.zip")
+    val projectB = extractFixtureProject("/fixture/bzlmod-show-repo-test-2.zip")
+
+    val bazelPath = "bazel"
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val defaultOutput = File(outputDir, "impacted_default.txt")
+    val optOutOutput = File(outputDir, "impacted_optout.txt")
+
+    val cli = CommandLine(BazelDiff())
+
+    assertThat(
+        cli.execute(
+            "generate-hashes",
+            "-w", projectA.absolutePath,
+            "-b", bazelPath,
+            from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+        cli.execute(
+            "generate-hashes",
+            "-w", projectB.absolutePath,
+            "-b", bazelPath,
+            to.absolutePath))
+        .isEqualTo(0)
+
+    // Default invocation: bzlmod is detected, so --excludeExternalTargets auto-defaults to true.
+    assertThat(
+        cli.execute(
+            "get-impacted-targets",
+            "-w", projectB.absolutePath,
+            "-b", bazelPath,
+            "-sh", from.absolutePath,
+            "-fh", to.absolutePath,
+            "-o", defaultOutput.absolutePath))
+        .isEqualTo(0)
+
+    val defaultLines = defaultOutput.readLines().filter { it.isNotBlank() }
+    val leakedExternal = defaultLines.filter { it.startsWith("//external:") }
+    assertThat(leakedExternal.isEmpty())
+        .transform(
+            "default impacted-targets output should not contain //external:* labels, but found: $leakedExternal") { it }
+        .isEqualTo(true)
+
+    // Opt-out: --no-excludeExternalTargets reproduces the pre-#326 behavior so the synthetic
+    // labels show up. This proves the labels really exist in the hashes (so the filter is doing
+    // real work) and gives users an escape hatch.
+    assertThat(
+        cli.execute(
+            "get-impacted-targets",
+            "-w", projectB.absolutePath,
+            "-b", bazelPath,
+            "-sh", from.absolutePath,
+            "-fh", to.absolutePath,
+            "--no-excludeExternalTargets",
+            "-o", optOutOutput.absolutePath))
+        .isEqualTo(0)
+
+    val optOutLines = optOutOutput.readLines().filter { it.isNotBlank() }
+    val externalsWithOptOut = optOutLines.filter { it.startsWith("//external:") }
+    assertThat(externalsWithOptOut.isNotEmpty())
+        .transform(
+            "with --no-excludeExternalTargets, the impacted-targets output should expose synthetic //external:* labels (none found in: $optOutLines)") { it }
+        .isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

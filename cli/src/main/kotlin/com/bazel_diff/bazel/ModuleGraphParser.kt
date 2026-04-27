@@ -24,6 +24,10 @@ class ModuleGraphParser {
   /**
    * Parses the JSON output from `bazel mod graph --output=json`.
    *
+   * Tolerates a non-JSON prefix (e.g. leaked stderr from bazel-diff
+   * 17.0.1..18.0.5, which captured stderr into moduleGraphJson via
+   * Process.kt's captureAll -> ProcessBuilder.redirectErrorStream(true)).
+   *
    * @param json The JSON string from bazel mod graph
    * @return A map of module keys to Module objects
    */
@@ -31,7 +35,13 @@ class ModuleGraphParser {
     val modules = mutableMapOf<String, Module>()
 
     try {
-      val root = JsonParser.parseString(json).asJsonObject
+      val root = try {
+        JsonParser.parseString(json).asJsonObject
+      } catch (_: Exception) {
+        val start = json.indexOf('{')
+        if (start < 0) return emptyMap()
+        JsonParser.parseString(json.substring(start)).asJsonObject
+      }
       extractModules(root, modules)
     } catch (e: Exception) {
       // If parsing fails, return empty map

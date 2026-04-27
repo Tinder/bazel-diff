@@ -534,6 +534,70 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
   }
 
   @Test
+  fun testExecuteFiltersExternalLabelsWhenExcludeFlagSet() {
+    // Unit-level guard for https://github.com/Tinder/bazel-diff/issues/326. The synthetic
+    // //external:<apparent_name> labels produced for bzlmod repos must drop out of the
+    // impacted-targets output when --excludeExternalTargets is set, while real workspace
+    // labels (//foo:bar) and canonical bzlmod labels (@@repo//pkg:tgt) remain.
+    val from =
+        mapOf(
+            "//foo:bar" to TargetHash("Rule", "h1", "h1"),
+            "//external:boost.assert" to TargetHash("Rule", "h2", "h2"),
+            "//external:guava" to TargetHash("Rule", "h3", "h3"),
+            "@@some_repo//pkg:tgt" to TargetHash("Rule", "h4", "h4"),
+        )
+    val to = from.mapValues { (_, v) -> v.copy(hash = v.hash + "-changed") }
+
+    val filteredWriter = StringWriter()
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = from,
+            to = to,
+            outputWriter = filteredWriter,
+            targetTypes = null,
+            excludeExternalTargets = true)
+    val filteredLines = filteredWriter.toString().trimEnd('\n').split("\n").toSet()
+    assertThat(filteredLines).containsOnly("//foo:bar", "@@some_repo//pkg:tgt")
+
+    val unfilteredWriter = StringWriter()
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = from,
+            to = to,
+            outputWriter = unfilteredWriter,
+            targetTypes = null,
+            excludeExternalTargets = false)
+    val unfilteredLines = unfilteredWriter.toString().trimEnd('\n').split("\n").toSet()
+    assertThat(unfilteredLines)
+        .containsOnly(
+            "//foo:bar", "//external:boost.assert", "//external:guava", "@@some_repo//pkg:tgt")
+  }
+
+  @Test
+  fun testExecuteWithDistancesFiltersExternalLabelsWhenExcludeFlagSet() {
+    // Same guarantee for the distance-metrics output path used when --depEdgesFile is provided.
+    val from =
+        mapOf(
+            "//foo:bar" to TargetHash("Rule", "h1", "h1"),
+            "//external:boost.assert" to TargetHash("Rule", "h2", "h2"),
+        )
+    val to = from.mapValues { (_, v) -> v.copy(hash = v.hash + "-changed", directHash = v.directHash + "-changed") }
+
+    val filteredWriter = StringWriter()
+    CalculateImpactedTargetsInteractor()
+        .executeWithDistances(
+            from = from,
+            to = to,
+            depEdges = mapOf(),
+            outputWriter = filteredWriter,
+            targetTypes = null,
+            excludeExternalTargets = true)
+    val filteredJson = filteredWriter.toString()
+    assertThat(filteredJson).contains("//foo:bar")
+    assertThat(filteredJson).doesNotContain("//external:boost.assert")
+  }
+
+  @Test
   fun testIdenticalModuleGraphsSkipsParsing() {
     // When module graphs are identical, should skip parsing and use normal hash comparison
     // This is an optimization to avoid expensive JSON parsing when modules haven't changed

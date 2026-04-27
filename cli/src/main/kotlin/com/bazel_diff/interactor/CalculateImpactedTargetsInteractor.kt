@@ -35,7 +35,8 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       outputWriter: Writer,
       targetTypes: Set<String>?,
       fromModuleGraphJson: String? = null,
-      toModuleGraphJson: String? = null
+      toModuleGraphJson: String? = null,
+      excludeExternalTargets: Boolean = false,
   ) {
     /** This call might be faster if end hashes is a sorted map */
     val typeFilter = TargetTypeFilter(targetTypes, to)
@@ -59,6 +60,7 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
 
     impactedTargets
         .filter { typeFilter.accepts(it) }
+        .filter { !excludeExternalTargets || !it.startsWith("//external:") }
         .sortedWith(impactedTargetOrdering(to, from))
         .let { filtered ->
           outputWriter.use { writer -> filtered.forEach { writer.write("$it\n") } }
@@ -87,7 +89,8 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       outputWriter: Writer,
       targetTypes: Set<String>?,
       fromModuleGraphJson: String? = null,
-      toModuleGraphJson: String? = null
+      toModuleGraphJson: String? = null,
+      excludeExternalTargets: Boolean = false,
   ) {
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
@@ -114,6 +117,7 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
     val ordering = impactedTargetOrdering(to, from)
     impactedTargets
         .filterKeys { typeFilter.accepts(it) }
+        .filterKeys { !excludeExternalTargets || !it.startsWith("//external:") }
         .toSortedMap(ordering)
         .let { filtered ->
           outputWriter.use { writer ->

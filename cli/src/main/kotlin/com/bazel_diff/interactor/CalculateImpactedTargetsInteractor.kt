@@ -374,7 +374,17 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
         } catch (e: Exception) {
           logger.w { "Failed to query rdeps for @@$repoName: ${e.message}" }
           logger.w { "Conservatively marking all targets as impacted for this module" }
-          impactedTargets.addAll(allTargets.keys.filter { !it.startsWith("@@") })
+          // Emit the buildable workspace subset when it exists; otherwise
+          // (bzlmod-only shape) fall through to every hashed label so the
+          // downstream `excludeExternalTargets` strip does not reduce the
+          // fallback to empty.
+          val buildableWorkspaceTargets = allTargets.keys.filter {
+            !it.startsWith("@@") && !it.startsWith("//external:")
+          }
+          impactedTargets.addAll(
+              if (buildableWorkspaceTargets.isEmpty()) allTargets.keys
+              else buildableWorkspaceTargets
+          )
         }
       }
 

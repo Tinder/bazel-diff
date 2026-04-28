@@ -73,6 +73,12 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "CalculateImpactedTargetsInteractorModuleQueryTest",
+    test_class = "com.bazel_diff.interactor.CalculateImpactedTargetsInteractorModuleQueryTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "NormalisingPathConverterTest",
     test_class = "com.bazel_diff.cli.converter.NormalisingPathConverterTest",
     runtime_deps = [":cli-test-lib"],

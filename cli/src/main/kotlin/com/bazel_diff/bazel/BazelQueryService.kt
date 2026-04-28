@@ -349,9 +349,13 @@ class BazelQueryService(
    * `bazel mod dump_repo_mapping ""`. Returns a map of apparent name → canonical name.
    * Filters out internal repos (bazel_tools, _builtins, local_config_*) that aren't
    * relevant for dependency hashing.
+   *
+   * Used by both `queryBzlmodRepos` (for synthetic //external:* target generation) and
+   * `CalculateImpactedTargetsInteractor.queryTargetsDependingOnModules` (to resolve a
+   * changed module's canonical repo prefix without substring matching `allTargets.keys`).
    */
   @OptIn(ExperimentalCoroutinesApi::class)
-  private suspend fun discoverRepoMapping(): Map<String, String> {
+  suspend fun discoverRepoMapping(): Map<String, String> {
     val cmd: MutableList<String> =
         ArrayList<String>().apply {
           add(bazelPath.toString())

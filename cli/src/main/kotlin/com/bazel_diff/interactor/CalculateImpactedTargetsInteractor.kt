@@ -277,12 +277,11 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
   }
 
   /**
-   * Queries Bazel to find all targets that depend on the changed modules.
+   * Queries Bazel to find all workspace targets that depend on any changed module.
    *
-   * This uses an efficient module-level query approach:
-   * 1. Identifies which external repository each changed module corresponds to
-   * 2. Uses `rdeps(//..., @@module~version//...)` to find workspace targets depending on each module
-   * 3. Returns the union of all impacted targets
+   * Maps every changed module to its matching bzlmod canonical repos, then issues a
+   * single `rdeps(//..., @@a//... + @@b//... + ...)` query. Bazel executes the union
+   * in one analysis pass, avoiding per-repo subprocess fan-out.
    *
    * @param changedModuleKeys Set of changed module keys (e.g., "abseil-cpp@20240722.0")
    * @param allTargets Map of all targets from the final revision
@@ -292,72 +291,59 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       changedModuleKeys: Set<String>,
       allTargets: Map<String, TargetHash>
   ): Set<String> {
-    return try {
-      // Inject BazelQueryService if available
-      val queryService: BazelQueryService? = try {
-        inject<BazelQueryService>().value
-      } catch (e: Exception) {
-        null
-      }
-
-      if (queryService == null) {
-        logger.w { "BazelQueryService not available - cannot query for module dependencies" }
-        return allTargets.keys
-      }
-
-      val impactedTargets = mutableSetOf<String>()
-
-      for (moduleKey in changedModuleKeys) {
-        // Extract module name from key (e.g., "abseil-cpp" from "abseil-cpp@20240722.0")
-        val moduleName = moduleKey.substringBefore("@")
-        logger.i { "Querying targets depending on module: $moduleName (key: $moduleKey)" }
-
-        // Find the canonical repository name for this module from allTargets
-        // Bzlmod repos look like: @@abseil-cpp~20240116.2//... or @@rules_jvm_external~~maven~maven//...
-        val moduleRepos = allTargets.keys
-            .filter { it.startsWith("@@") && it.contains(moduleName) }
-            .map { it.substring(2).substringBefore("//") } // Extract repo name
-            .toSet()
-
-        if (moduleRepos.isEmpty()) {
-          logger.w { "No external repository found for module $moduleName" }
-          continue
-        }
-
-        logger.i { "Found ${moduleRepos.size} repositories for module $moduleName: ${moduleRepos.joinToString(", ")}" }
-
-        // Query workspace targets that depend on any target in the changed module repo
-        for (repoName in moduleRepos) {
-          try {
-            // Use rdeps to find all workspace targets depending on this module
-            // rdeps(universe, target_set) finds all targets in universe that depend on target_set
-            val queryExpression = "rdeps(//..., @@$repoName//...)"
-            logger.i { "Executing query: $queryExpression" }
-
-            val rdeps = runBlocking { queryService.query(queryExpression, useCquery = false) }
-            val rdepLabels = rdeps.map { it.name }.filter { !it.startsWith("@@") } // Filter to workspace targets only
-
-            logger.i { "Found ${rdepLabels.size} workspace targets depending on @@$repoName" }
-            impactedTargets.addAll(rdepLabels)
-          } catch (e: Exception) {
-            logger.w { "Failed to query rdeps for @@$repoName: ${e.message}" }
-            logger.w { "Conservatively marking all targets as impacted for this module" }
-            // On error for this module, add all workspace targets
-            impactedTargets.addAll(allTargets.keys.filter { !it.startsWith("@@") })
-          }
-        }
-      }
-
-      // Add directly changed targets from hash comparison (e.g., code changes)
-      val directlyChanged = computeSimpleImpactedTargets(emptyMap(), allTargets)
-      impactedTargets.addAll(directlyChanged)
-
-      logger.i { "Total targets impacted by module changes: ${impactedTargets.size}" }
-      impactedTargets
+    val queryService: BazelQueryService? = try {
+      inject<BazelQueryService>().value
     } catch (e: Exception) {
-      logger.e(e) { "Error querying targets depending on modules" }
-      // On error, conservatively mark all targets as impacted
-      allTargets.keys
+      null
     }
+
+    if (queryService == null) {
+      logger.w { "BazelQueryService not available - cannot query for module dependencies" }
+      return allTargets.keys
+    }
+
+    // Map every changed module to its matching bzlmod canonical repos. A single module
+    // name can match multiple canonical repos (e.g. rules_jvm_external matches
+    // rules_jvm_external~~maven~maven, rules_jvm_external~~toolchains~...). Log per
+    // module so an operator can attribute a pathologically large impacted set back to
+    // a specific module bump.
+    val moduleRepos = mutableSetOf<String>()
+    for (moduleKey in changedModuleKeys) {
+      val moduleName = moduleKey.substringBefore("@")
+      val matched = allTargets.keys
+          .filter { it.startsWith("@@") && it.contains(moduleName) }
+          .map { it.substring(2).substringBefore("//") }
+      if (matched.isEmpty()) {
+        logger.w { "No external repository matched module $moduleKey" }
+      } else {
+        logger.i { "Module $moduleKey matched ${matched.size} repos: ${matched.joinToString(", ")}" }
+        moduleRepos.addAll(matched)
+      }
+    }
+
+    if (moduleRepos.isEmpty()) {
+      logger.i { "No external repositories matched any changed module" }
+      return computeSimpleImpactedTargets(emptyMap(), allTargets)
+    }
+
+    logger.i { "Querying rdeps for ${moduleRepos.size} repositories across ${changedModuleKeys.size} changed modules" }
+
+    val impactedTargets = mutableSetOf<String>()
+    try {
+      // Single unioned rdeps query: bazel executes the union in one analysis pass.
+      val queryExpression = "rdeps(//..., ${moduleRepos.joinToString(" + ") { "@@$it//..." }})"
+      val rdeps = runBlocking { queryService.query(queryExpression, useCquery = false) }
+      val rdepLabels = rdeps.map { it.name }.filter { !it.startsWith("@@") }
+      logger.i { "Found ${rdepLabels.size} workspace targets depending on changed modules" }
+      impactedTargets.addAll(rdepLabels)
+    } catch (e: Exception) {
+      logger.e(e) { "Unioned rdeps query failed - conservatively marking all workspace targets impacted" }
+      impactedTargets.addAll(allTargets.keys.filter { !it.startsWith("@@") })
+    }
+
+    impactedTargets.addAll(computeSimpleImpactedTargets(emptyMap(), allTargets))
+
+    logger.i { "Total targets impacted by module changes: ${impactedTargets.size}" }
+    return impactedTargets
   }
 }

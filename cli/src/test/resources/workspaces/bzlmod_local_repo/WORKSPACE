@@ -1,0 +1,1 @@
+workspace(name = "bzlmod_local_repo_test")

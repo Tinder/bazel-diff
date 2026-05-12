@@ -1300,6 +1300,60 @@ class E2ETest {
         .isEqualTo(true)
   }
 
+  // ------------------------------------------------------------------------
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/196
+  // ------------------------------------------------------------------------
+  // The original 2023 report was that bazel-diff failed to query a bzlmod workspace whose
+  // dependencies were all wired through local repositories (no BCR fetches). honnix narrowed
+  // it down to cquery returning labels with apparent vs canonical repo names that did not
+  // match the compatible target set; PR #224 fixed that handling.
+  //
+  // This is a passing regression-protection test (NOT @Ignore). It exercises a minimal
+  // bzlmod workspace where the only dependency uses `local_path_override`, runs
+  // generate-hashes in both query and cquery modes, and asserts both produce a non-empty
+  // hash JSON that covers the local-repo target. If a future change reintroduces the
+  // canonical-name mismatch or breaks local_path_override resolution, this test fails.
+  @Test
+  fun testBzlmodLocalPathOverrideWorks_regressionForIssue196() {
+    val workspace = copyTestWorkspace("bzlmod_local_repo")
+    val outputDir = temp.newFolder()
+    val queryOutput = File(outputDir, "query.json")
+    val cqueryOutput = File(outputDir, "cquery.json")
+
+    val cli = CommandLine(BazelDiff())
+
+    // Query mode: must succeed and include //:consume + the synthetic //external entry.
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspace.absolutePath,
+                "-b", "bazel",
+                queryOutput.absolutePath))
+        .isEqualTo(0)
+    val queryJson = queryOutput.readText()
+    assertThat(queryJson.contains("//:consume"))
+        .transform("query-mode hashes should include //:consume; got: $queryJson") { it }
+        .isEqualTo(true)
+
+    // cquery mode: must succeed and include the canonical @@dep_repo+ label for the
+    // local-overridden repo (the exact shape that PR #224 made work).
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspace.absolutePath,
+                "-b", "bazel",
+                "--useCquery",
+                cqueryOutput.absolutePath))
+        .isEqualTo(0)
+    val cqueryJson = cqueryOutput.readText()
+    assertThat(cqueryJson.contains("@@//:consume") || cqueryJson.contains("//:consume"))
+        .transform("cquery-mode hashes should include the consumer target; got: $cqueryJson") { it }
+        .isEqualTo(true)
+    assertThat(cqueryJson.contains("dep_repo"))
+        .transform("cquery-mode hashes should reference dep_repo (local_path_override target); got: $cqueryJson") { it }
+        .isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

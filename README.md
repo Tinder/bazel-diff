@@ -259,7 +259,8 @@ workspace.
 
 ```terminal
 Missing required options: '--startingHashes=<startingHashesJSONPath>', '--finalHashes=<finalHashesJSONPath>', '--workspacePath=<workspacePath>'
-Usage: bazel-diff get-impacted-targets [-v] [--[no-]noBazelrc] [-b=<bazelPath>]
+Usage: bazel-diff get-impacted-targets [-v] [--[no-]excludeExternalTargets] [--
+                                       [no-]noBazelrc] [-b=<bazelPath>]
                                        [-d=<depsMappingJSONPath>]
                                        -fh=<finalHashesJSONPath>
                                        [-o=<outputPath>]
@@ -275,6 +276,17 @@ Command-line utility to analyze the state of the bazel build graph
                          Path to the file where dependency edges are. If
                            specified, build graph distance metrics will be
                            computed from the given hash data.
+      --[no-]excludeExternalTargets
+                         If true, drop labels starting with '//external:' from
+                           the impacted-targets output. These synthetic labels
+                           are produced for bzlmod-managed external repos so
+                           generate-hashes can detect dep changes, but they are
+                           not buildable in bzlmod-only mode (Bazel 8.6.0+ with
+                           --enable_workspace=false) and will fail downstream
+                           `bazel build`. See https://github.
+                           com/Tinder/bazel-diff/issues/326. When unset,
+                           defaults to true if Bzlmod is detected (via `bazel
+                           mod graph`), false otherwise.
       -fh, --finalHashes=<finalHashesJSONPath>
                          The path to the JSON file of target hashes for the
                            final revision. Run 'generate-hashes' to get this
@@ -320,7 +332,7 @@ First, add the following snippet to your project:
 #### Bzlmod snippet
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "19.0.1")
+bazel_dep(name = "bazel-diff", version = "20.0.0")
 ```
 
 You can now run the tool with:

@@ -55,8 +55,22 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
         }
     val seedForFilepaths =
         runBlocking(Dispatchers.IO) { createSeedForFilepaths(seedFilepaths) }
+    val seedForBzlFiles = createSeedForBzlFiles(allTargets, modifiedFilepaths)
+    // Only mix the bzl-files seed when at least one main-repo `.bzl` was actually hashed.
+    // This keeps the seed (and therefore every target's hash) byte-for-byte stable for
+    // workspaces that don't load any tracked .bzl files, preserving cached hashes from
+    // before this change.
+    val combinedSeed =
+        if (seedForBzlFiles != null) {
+          sha256 {
+            safePutBytes(seedForFilepaths)
+            safePutBytes(seedForBzlFiles)
+          }
+        } else {
+          seedForFilepaths
+        }
     return hashAllTargets(
-        seedForFilepaths, sourceDigests, allTargets, ignoredAttrs, modifiedFilepaths)
+        combinedSeed, sourceDigests, allTargets, ignoredAttrs, modifiedFilepaths)
   }
 
   private fun hashSourcefiles(
@@ -168,6 +182,55 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
       // Include seed filepaths in hash
       for (path in seedFilepaths) {
         putBytes(path.readBytes())
+      }
+    }
+  }
+
+  /**
+   * Builds a seed-hash contribution from the contents of every `.bzl` (and `.scl`) file the
+   * workspace's BUILD files load.
+   *
+   * Background: Bazel pre-7 populated [Build.Rule.skylark_environment_hash_code] in the query
+   * proto, so any change to a `.bzl` file loaded by a rule's BUILD file naturally bubbled into
+   * that rule's hash. Bazel 7+ leaves that field empty, which is the root cause of issues
+   * [#259](https://github.com/Tinder/bazel-diff/issues/259) and
+   * [#227](https://github.com/Tinder/bazel-diff/issues/227): editing a macro body (e.g. adding
+   * `print()`) no longer invalidated any caller because the emitted rule attrs were identical.
+   *
+   * Fix: walk every queried SourceFile target's `subincludeList` (the `Build.SourceFile.subinclude`
+   * proto field, which already lists every `.bzl` the BUILD file loaded), softDigest each main-repo
+   * `.bzl`, and roll the union of digests into the workspace-wide seed. This is intentionally
+   * conservative -- a single `.bzl` edit re-hashes every target -- because `.bzl` edits are rare
+   * and missing them silently is the worse failure mode. Per-package precision would require
+   * mapping each rule to its package's BUILD file, which isn't a direct dep relationship in the
+   * query proto.
+   *
+   * External-repo `.bzl` files (`@repo//...`, `@@canonical//...`) are skipped because
+   * [SourceFileHasher.softDigest] returns null for non-main-repo labels, which keeps the seed
+   * stable across BCR fetches that don't actually change repo contents.
+   */
+  private fun createSeedForBzlFiles(
+      allTargets: List<BazelTarget>,
+      modifiedFilepaths: Set<Path>
+  ): ByteArray? {
+    val subincludes =
+        allTargets
+            .asSequence()
+            .filterIsInstance<BazelTarget.SourceFile>()
+            .flatMap { it.subincludeList.asSequence() }
+            .toSortedSet()
+    val tracked = mutableListOf<Pair<String, ByteArray>>()
+    for (label in subincludes) {
+      val digest =
+          sourceFileHasher.softDigest(
+              BazelSourceFileTarget(label, ByteArray(0)), modifiedFilepaths)
+      if (digest != null) tracked += label to digest
+    }
+    if (tracked.isEmpty()) return null
+    return sha256 {
+      for ((label, digest) in tracked) {
+        safePutBytes(label.toByteArray())
+        safePutBytes(digest)
       }
     }
   }

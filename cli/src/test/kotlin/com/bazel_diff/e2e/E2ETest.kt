@@ -1446,6 +1446,84 @@ class E2ETest {
         .isEqualTo(true)
   }
 
+  // ------------------------------------------------------------------------
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/259 and #227.
+  // ------------------------------------------------------------------------
+  // Both issues describe the same underlying gap: when a BUILD file `load()`s a .bzl
+  // macro, editing the .bzl macro body in a way that does not change the generated rule's
+  // attrs is not reflected in `bazel-diff get-impacted-targets`. The user in #259
+  // noticed this regression after upgrading to Bazel 7 -- Bazel pre-7 populated
+  // `Rule.skylark_environment_hash_code` in the query proto so .bzl-content changes
+  // bubbled in naturally; Bazel 7+ leaves that field empty, so bazel-diff missed the change.
+  //
+  // The fix in BuildGraphHasher.hashAllBazelTargetsAndSourcefiles walks every BUILD
+  // source file's `subincludeList` (the `subinclude` proto field, which lists every .bzl
+  // loaded by that BUILD), softDigests each main-repo .bzl file, and mixes the union of
+  // digests into the seed hash. This restores the pre-Bazel-7 behaviour: a `.bzl`-only
+  // edit invalidates the targets that depend on it.
+  //
+  // The reproducer workspace `macro_invalidation` has:
+  //   - `miniature.bzl` defines a `miniature(name, src)` macro that wraps `native.genrule`.
+  //   - `BUILD` does `load(":miniature.bzl", "miniature")` and calls `miniature(...)` to
+  //     produce `//:logo_miniature`.
+  //
+  // The test mutates `miniature.bzl` to add a `print()` call inside the macro body -- this
+  // does not change any attribute of the emitted `native.genrule`, so a fix that only looks
+  // at rule attrs would miss it. The user's example in #259 was exactly this pattern.
+  @Test
+  fun testMacroBzlChangeImpactsCallers_regressionForIssue259And227() {
+    val workspaceA = copyTestWorkspace("macro_invalidation")
+    val workspaceB = copyTestWorkspace("macro_invalidation")
+
+    // Mutate only the macro body in B by adding a `print()` call. This deliberately does
+    // not touch the genrule attrs the macro emits, so the bug shows up only via the .bzl
+    // file content rather than any rule-attribute hash diff.
+    val bzlInB = File(workspaceB, "miniature.bzl")
+    val originalBzl = bzlInB.readText()
+    val mutatedBzl = originalBzl.replace(
+        "def miniature(name, src, **kwargs):",
+        "def miniature(name, src, **kwargs):\n    print(\"miniature: \" + name)")
+    assertThat(mutatedBzl != originalBzl).isEqualTo(true)
+    bzlInB.writeText(mutatedBzl)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceA.absolutePath,
+                "-b", "bazel",
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                to.absolutePath))
+        .isEqualTo(0)
+
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "-sh", from.absolutePath,
+                "-fh", to.absolutePath,
+                "-o", impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    val callerImpacted = impacted.any { it.contains("logo_miniature") }
+    assertThat(callerImpacted)
+        .transform("//:logo_miniature should be impacted by miniature.bzl edit; got: $impacted") { it }
+        .isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

@@ -1446,6 +1446,82 @@ class E2ETest {
         .isEqualTo(true)
   }
 
+  // ------------------------------------------------------------------------
+  // Reproducer for https://github.com/Tinder/bazel-diff/issues/259 and #227.
+  // ------------------------------------------------------------------------
+  // Both issues describe the same underlying gap: when a BUILD file `load()`s a .bzl
+  // macro, editing the .bzl macro body is not reflected in `bazel-diff get-impacted-targets`.
+  // The user in #259 noticed this regression after upgrading to Bazel 7. The user in #227
+  // hit it with a shared `all_gke_service.bzl` macro loaded by many BUILD files. In both
+  // cases, none of the targets that call the macro are reported as impacted.
+  //
+  // We reproduce the bug with a minimal in-tree workspace `macro_invalidation`:
+  //   - `miniature.bzl` defines a `miniature(name, src)` macro that wraps `native.genrule`.
+  //   - `BUILD` does `load(":miniature.bzl", "miniature")` and calls `miniature(...)` to
+  //     produce `//:logo_miniature`.
+  //
+  // The test generates hashes against the original workspace, mutates only `miniature.bzl`
+  // (changing the genrule cmd), and asserts that `//:logo_miniature` shows up as impacted.
+  // Today it does not, because the rule's transitive hash doesn't capture loaded .bzl
+  // file contents. Once that's fixed, remove @Ignore.
+  @Test
+  @org.junit.Ignore(
+      "Reproducer for https://github.com/Tinder/bazel-diff/issues/259 (and the duplicate " +
+          "#227): editing a .bzl macro body does not invalidate targets that call the macro. " +
+          "Today bazel-diff misses .bzl file content as part of a Rule's transitive hash, " +
+          "so `bazel-diff get-impacted-targets` returns nothing.")
+  fun testMacroBzlChangeImpactsCallers_reproducerForIssue259And227() {
+    val workspaceA = copyTestWorkspace("macro_invalidation")
+    val workspaceB = copyTestWorkspace("macro_invalidation")
+
+    // Mutate only the macro body in B. Anything that ends up in the genrule cmd is enough
+    // to demonstrate the issue -- the user's example was adding a `print()`.
+    val bzlInB = File(workspaceB, "miniature.bzl")
+    val originalBzl = bzlInB.readText()
+    val mutatedBzl = originalBzl.replace("cmd = \"cp \$< \$@\"", "cmd = \"cp \$< \$@ && true\"")
+    assertThat(mutatedBzl != originalBzl).isEqualTo(true)
+    bzlInB.writeText(mutatedBzl)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceA.absolutePath,
+                "-b", "bazel",
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                to.absolutePath))
+        .isEqualTo(0)
+
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "-sh", from.absolutePath,
+                "-fh", to.absolutePath,
+                "-o", impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    // Desired behaviour: the macro call site appears as impacted.
+    // Current behaviour: bazel-diff returns an empty list, so this assertion fails.
+    val callerImpacted = impacted.any { it.contains("logo_miniature") }
+    assertThat(callerImpacted)
+        .transform("//:logo_miniature should be impacted by miniature.bzl edit; got: $impacted") { it }
+        .isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

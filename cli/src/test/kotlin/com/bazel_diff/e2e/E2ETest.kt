@@ -1354,6 +1354,98 @@ class E2ETest {
         .isEqualTo(true)
   }
 
+  // ------------------------------------------------------------------------
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/266
+  // ------------------------------------------------------------------------
+  // The user reported that updating go.mod (e.g. bumping a dependency version) did not
+  // change the hash of go_test/go_library targets that depend on that module. The setup
+  // is bzlmod + rules_go + gazelle's go_deps extension reading go.mod.
+  //
+  // I built a minimal `go_mod_change` workspace with exactly that wiring (rules_go 0.60.0,
+  // gazelle 0.45.0, a `go_library` and `go_test` depending on @com_github_pkg_errors) and
+  // verified by hand with the locally built CLI that current bazel-diff DOES detect the
+  // change end-to-end:
+  //
+  //   v0.9.1 -> v0.9.0 of github.com/pkg/errors:
+  //     impacted: //:lib, //:lib_test
+  //
+  // The mechanism is the bzlmod `mod show_repo` integration: gazelle's go_deps extension
+  // re-resolves on every `bazel mod` invocation and the synthetic `//external:*` target
+  // for the changed module reflects the new version, which propagates into `//:lib`'s
+  // transitive hash.
+  //
+  // This regression-protection test (NOT @Ignore'd) locks in that behaviour. If a future
+  // change to bzlmod mod show_repo handling or to gazelle's extension wiring breaks
+  // go.mod tracking again, the test will fail.
+  //
+  // Requires Bazel 8.6.0+ for the `mod show_repo --output=streamed_proto` path. The test
+  // skips itself on older Bazel via `Assume.assumeTrue` (matching the convention in
+  // `testBzlmodShowRepoDetectsModuleBazelChanges`).
+  @Test
+  fun testGoModUpdateImpactsGoTargets_regressionForIssue266() {
+    val version = getBazelVersion()
+    org.junit.Assume.assumeNotNull(version)
+    val v = version!!
+    val comparator =
+        compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+    val hasModShowRepo = comparator.compare(v, Triple(8, 6, 0)) >= 0 && v != Triple(9, 0, 0)
+    org.junit.Assume.assumeTrue(
+        "Requires Bazel 8.6.0+ or 9.0.1+ (current: ${v.first}.${v.second}.${v.third})",
+        hasModShowRepo)
+
+    val workspaceA = copyTestWorkspace("go_mod_change")
+    val workspaceB = copyTestWorkspace("go_mod_change")
+
+    // Mutate go.mod in B to depend on v0.9.0 instead of v0.9.1. go.sum in the fixture
+    // already contains both versions' entries.
+    val goModInB = File(workspaceB, "go.mod")
+    val original = goModInB.readText()
+    val mutated = original.replace("github.com/pkg/errors v0.9.1", "github.com/pkg/errors v0.9.0")
+    assertThat(mutated != original).isEqualTo(true)
+    goModInB.writeText(mutated)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceA.absolutePath,
+                "-b", "bazel",
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "-sh", from.absolutePath,
+                "-fh", to.absolutePath,
+                "-o", impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    val libImpacted = impacted.any { it == "//:lib" || it == "@@//:lib" }
+    val libTestImpacted = impacted.any { it == "//:lib_test" || it == "@@//:lib_test" }
+    assertThat(libImpacted)
+        .transform("//:lib should be impacted when go.mod changes pkg/errors version; got: $impacted") { it }
+        .isEqualTo(true)
+    assertThat(libTestImpacted)
+        .transform("//:lib_test should be impacted when go.mod changes pkg/errors version; got: $impacted") { it }
+        .isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

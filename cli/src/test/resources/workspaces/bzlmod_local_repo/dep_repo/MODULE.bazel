@@ -1,0 +1,4 @@
+module(
+    name = "dep_repo",
+    version = "0.0.0",
+)

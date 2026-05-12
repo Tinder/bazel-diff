@@ -1,0 +1,6 @@
+module(
+    name = "toolchain_change_test",
+    version = "0.0.0",
+)
+
+register_toolchains("//:greeting_toolchain")

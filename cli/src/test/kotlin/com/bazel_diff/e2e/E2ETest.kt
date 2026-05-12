@@ -1300,6 +1300,90 @@ class E2ETest {
         .isEqualTo(true)
   }
 
+  // ------------------------------------------------------------------------
+  // Reproducer for https://github.com/Tinder/bazel-diff/issues/101
+  // ------------------------------------------------------------------------
+  // The user reported that changing a toolchain definition (e.g. `cc_toolchain_config.bzl`)
+  // is not detected by bazel-diff. Root cause: toolchain resolution happens at analysis time,
+  // so `bazel query 'deps(//:my_target)'` -- which bazel-diff uses by default -- does not
+  // contain the toolchain target. Any change to the registered toolchain's attrs flips that
+  // target's hash, but the consumer rule never sees the dep, so it is not marked impacted.
+  //
+  // The new `toolchain_change` fixture demonstrates this with a tiny custom toolchain:
+  //   - `greeting_toolchain` rule produces a `ToolchainInfo` with a `greeting` string
+  //   - `greeter` rule declares `toolchains = ["//:greeting_toolchain_type"]` (implicit dep)
+  //   - `MODULE.bazel` does `register_toolchains("//:greeting_toolchain")`
+  //   - `//:my_greeter` is a `greeter` target
+  //
+  // I confirmed by hand against the built CLI:
+  //   query mode (default):
+  //     impacted: //:BUILD, //:greeting_toolchain_impl   <-- //:my_greeter missing (bug)
+  //   --useCquery:
+  //     impacted: @@//:BUILD, @@//:greeting_toolchain_impl, @@//:my_greeter   <-- correct
+  //
+  // The reproducer test asserts that query mode (the default and the one the user is on per
+  // the comment "cquery mode is slow") catches the toolchain change. Drop @Ignore once
+  // bazel-diff tracks implicit toolchain deps in query mode (or makes cquery cheap enough
+  // to be the default).
+  @Test
+  @org.junit.Ignore(
+      "Reproducer for https://github.com/Tinder/bazel-diff/issues/101 - implicit toolchain " +
+          "deps are not visible to `bazel query`, so changes to a registered toolchain's " +
+          "config (e.g. cc_toolchain_config.bzl attrs) do not propagate to rules that " +
+          "resolve it at analysis time. cquery mode catches it; the user's default query " +
+          "mode does not.")
+  fun testToolchainConfigChangeImpactsConsumer_reproducerForIssue101() {
+    val workspaceA = copyTestWorkspace("toolchain_change")
+    val workspaceB = copyTestWorkspace("toolchain_change")
+
+    // Mutate only the toolchain's `greeting` attr in B. The greeter rule does not change.
+    val buildInB = File(workspaceB, "BUILD")
+    val originalBuild = buildInB.readText()
+    val mutatedBuild = originalBuild.replace("greeting = \"Hello\"", "greeting = \"Hi\"")
+    assertThat(mutatedBuild != originalBuild).isEqualTo(true)
+    buildInB.writeText(mutatedBuild)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+
+    // Query mode (default) -- matches the user's setup.
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceA.absolutePath,
+                "-b", "bazel",
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "-sh", from.absolutePath,
+                "-fh", to.absolutePath,
+                "-o", impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    // Desired: //:my_greeter is impacted (its output depends on the toolchain's greeting).
+    // Current query-mode behaviour: only //:BUILD and //:greeting_toolchain_impl appear.
+    val greeterImpacted = impacted.any { it == "//:my_greeter" || it == "@@//:my_greeter" }
+    assertThat(greeterImpacted)
+        .transform("//:my_greeter should be impacted when the registered toolchain's config changes. Got: $impacted") { it }
+        .isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

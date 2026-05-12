@@ -1,0 +1,1 @@
+workspace(name = "module_bazel_comment_test")

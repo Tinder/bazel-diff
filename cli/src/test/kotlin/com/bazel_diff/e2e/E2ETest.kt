@@ -1300,6 +1300,88 @@ class E2ETest {
         .isEqualTo(true)
   }
 
+  // ------------------------------------------------------------------------
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/83
+  // ------------------------------------------------------------------------
+  // The original 2021 report (#83) was that a comment-only edit to `WORKSPACE` in a
+  // rules_go + Gazelle setup caused every external Go dep -- and the `go_binary`
+  // depending on them -- to be reported as impacted. The user pinned it down to a
+  // single comment added to `WORKSPACE`.
+  //
+  // The bzlmod-era analog of that bug would be a comment-only edit to `MODULE.bazel`
+  // causing the entire dep graph to re-hash. This is exactly the over-triggering shape
+  // PR #314 was designed to prevent: rather than seed every target's hash with the raw
+  // MODULE.bazel content, bazel-diff parses `bazel mod graph --output=json` and only
+  // re-hashes targets when the resolved module graph differs.
+  //
+  // I verified by hand with the locally built CLI: adding a leading `# comment` line to
+  // MODULE.bazel produces an empty impacted-targets list (correct).
+  //
+  // This passing regression test locks in that behaviour. If a future change goes back
+  // to seeding hashes with raw MODULE.bazel content, this test will fail. WORKSPACE mode
+  // is no longer supported in current Bazel, so a WORKSPACE-comment reproducer would need
+  // a legacy-Bazel fixture; the bzlmod equivalent is the right shape going forward.
+  @Test
+  fun testModuleBazelCommentOnlyChangeDoesNotImpactTargets_regressionForIssue83() {
+    val version = getBazelVersion()
+    org.junit.Assume.assumeNotNull(version)
+    val v = version!!
+    val comparator =
+        compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+    val hasModShowRepo = comparator.compare(v, Triple(8, 6, 0)) >= 0 && v != Triple(9, 0, 0)
+    org.junit.Assume.assumeTrue(
+        "Requires Bazel 8.6.0+ or 9.0.1+ (current: ${v.first}.${v.second}.${v.third})",
+        hasModShowRepo)
+
+    val workspaceA = copyTestWorkspace("module_bazel_comment")
+    val workspaceB = copyTestWorkspace("module_bazel_comment")
+
+    // Prepend a comment to MODULE.bazel in B. The resolved module graph is byte-identical
+    // to A's; only the raw source bytes differ.
+    val moduleBazelInB = File(workspaceB, "MODULE.bazel")
+    val originalModule = moduleBazelInB.readText()
+    moduleBazelInB.writeText("# A comment that should be a no-op for impacted targets.\n" + originalModule)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceA.absolutePath,
+                "-b", "bazel",
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "-sh", from.absolutePath,
+                "-fh", to.absolutePath,
+                "-o", impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    // Desired and current behaviour: a comment-only MODULE.bazel edit does not invalidate
+    // any targets. If a future change reintroduces over-triggering, this assertion fails
+    // and points back to the relevant module-graph-diffing logic.
+    assertThat(impacted.isEmpty())
+        .transform("A comment-only MODULE.bazel change must not impact any targets (got: $impacted)") { it }
+        .isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

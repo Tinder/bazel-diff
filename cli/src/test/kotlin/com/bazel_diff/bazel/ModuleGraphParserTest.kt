@@ -264,4 +264,61 @@ class ModuleGraphParserTest {
     assertThat(result).hasSize(2)
     assertThat(result).containsExactlyInAnyOrder("root", "abseil-cpp@20240116.2")
   }
+
+  // ------------------------------------------------------------------------
+  // Reproducer for https://github.com/Tinder/bazel-diff/issues/335
+  // ------------------------------------------------------------------------
+  // bazel-diff 18.0.x captured stderr alongside stdout when fetching the bzlmod graph
+  // (BazelModService used Redirect.CAPTURE for both streams, which internally calls
+  // redirectErrorStream(true)). That meant `getModuleGraphJson()` could return a payload
+  // shaped like:
+  //   "INFO: Checking for file changes...\n{...real JSON...}\n"
+  //
+  // 18.1.0 fixed the redirect (PR #330), but a CI workflow that reused a base graph file
+  // produced by an older deployment now feeds this stderr-prefixed string back into
+  // parseModuleGraph(). The current implementation calls JsonParser.parseString() on the
+  // whole input and silently returns emptyMap() when parsing fails. Downstream,
+  // findChangedModules(emptyMap, fullMap) treats every module in the new graph as "added"
+  // and CalculateImpactedTargetsInteractor.queryTargetsDependingOnModules() then spawns
+  // a serial `bazel query rdeps(//..., @@<repo>//...)` subprocess per match -- thousands of
+  // them on a real workspace, taking hours.
+  //
+  // The fix is to make parseModuleGraph tolerant of leading non-JSON noise: locate the
+  // first '{' and parse from there, or strip known stderr prefixes. Once the parser
+  // handles this input, remove @Ignore from this test.
+  @Test
+  @org.junit.Ignore(
+      "Reproducer for https://github.com/Tinder/bazel-diff/issues/335 - parseModuleGraph " +
+          "should be robust to stderr-pollution prefixes from older bazel-diff versions. " +
+          "Today it silently returns emptyMap() and downstream code treats every module " +
+          "as 'added', triggering thousands of serial bazel queries.")
+  fun parseModuleGraph_withStderrPolluted_extractsModules_reproducerForIssue335() {
+    val pollutedJson =
+        """
+      INFO: Checking for file changes...
+      {
+        "key": "root",
+        "name": "my-project",
+        "version": "1.0.0",
+        "apparentName": "my-project",
+        "dependencies": [
+          {
+            "key": "guava@31.1",
+            "name": "guava",
+            "version": "31.1",
+            "apparentName": "guava",
+            "dependencies": []
+          }
+        ]
+      }
+    """
+            .trimIndent()
+
+    val result = parser.parseModuleGraph(pollutedJson)
+
+    // Desired behaviour: the stderr prefix is tolerated and both modules are extracted.
+    // Current behaviour: JsonParser.parseString fails and parseModuleGraph returns emptyMap().
+    assertThat(result).hasSize(2)
+    assertThat(result.keys).containsExactlyInAnyOrder("root", "guava@31.1")
+  }
 }

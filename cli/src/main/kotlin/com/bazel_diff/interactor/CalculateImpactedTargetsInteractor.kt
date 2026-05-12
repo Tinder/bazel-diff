@@ -4,7 +4,6 @@ import com.bazel_diff.bazel.BazelQueryService
 import com.bazel_diff.bazel.ModuleGraphParser
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.log.Logger
-import com.google.common.annotations.VisibleForTesting
 import com.google.common.collect.Maps
 import com.google.gson.Gson
 import java.io.Writer
@@ -21,8 +20,6 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
   private val gson: Gson by inject()
   private val logger: Logger by inject()
   private val moduleGraphParser = ModuleGraphParser()
-
-  @VisibleForTesting class InvalidDependencyEdgesException(message: String) : Exception(message)
 
   enum class ImpactType {
     DIRECT,
@@ -200,24 +197,47 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       return TargetDistanceMetrics(0, 0).also { impactedTargets[label] = it }
     }
 
-    val directDeps =
-        depEdges[label]
-            ?: throw InvalidDependencyEdgesException(
-                "$label was indirectly impacted, but has no dependencies.")
+    // Fix for https://github.com/Tinder/bazel-diff/issues/268: when an indirectly-impacted
+    // target has either no entry in the dep-edges file, or only deps that are not in
+    // `impactedLabels`, the previous behaviour was to throw InvalidDependencyEdgesException
+    // and crash the whole job. The most common cause is the user filtering the hash JSON via
+    // `--targetType=Rule`, which strips out SourceFile/GeneratedFile entries. When such a
+    // filtered-out target is the only changed dep of an indirectly-impacted Rule, all the
+    // Rule's deps from the dep-edges file (which was not filtered) are absent from the
+    // impacted-labels map, so the search for an impacted predecessor turns up empty.
+    //
+    // Conservative fallback: log a warning that points at the most likely cause and report
+    // distance 0 so the target still appears in the impacted-targets output. The user gets
+    // a result instead of a crash, with enough breadcrumbs to act on the real bug if it's
+    // not the targetType-filter case.
+    val directDeps = depEdges[label]
+    if (directDeps == null) {
+      logger.w {
+        "$label was indirectly impacted, but has no dependencies in the dep-edges file. " +
+            "Falling back to distance 0. If you ran generate-hashes with --targetType, " +
+            "note that filtering by target type drops non-Rule entries (SourceFile, " +
+            "GeneratedFile) and is incompatible with distance metrics computed from a " +
+            "full dep-edges file -- see https://github.com/Tinder/bazel-diff/issues/268"
+      }
+      return TargetDistanceMetrics(0, 0).also { impactedTargets[label] = it }
+    }
+
+    val impactedDepLabels =
+        directDeps.parallelStream().filter { it in impactedLabels }.collect(Collectors.toList())
+    if (impactedDepLabels.isEmpty()) {
+      logger.w {
+        "$label was indirectly impacted, but none of its ${directDeps.size} deps in the " +
+            "dep-edges file are themselves impacted (most likely because they were filtered " +
+            "out of the hash JSON via --targetType). Falling back to distance 0 -- see " +
+            "https://github.com/Tinder/bazel-diff/issues/268"
+      }
+      return TargetDistanceMetrics(0, 0).also { impactedTargets[label] = it }
+    }
 
     // Now compute the distance for label, which was indirectly impacted
     val (targetDistance, packageDistance) =
-        directDeps
+        impactedDepLabels
             .parallelStream()
-            .filter { it in impactedLabels }
-            .collect(Collectors.toList())
-            .let { impactedDepLabels ->
-              if (impactedDepLabels.isEmpty()) {
-                throw InvalidDependencyEdgesException(
-                    "$label was indirectly impacted, but has no impacted dependencies.")
-              }
-              impactedDepLabels.parallelStream()
-            }
             .map { dep ->
               val distanceMetrics =
                   calculateDistance(dep, depEdges, impactedTargets, impactedLabels)

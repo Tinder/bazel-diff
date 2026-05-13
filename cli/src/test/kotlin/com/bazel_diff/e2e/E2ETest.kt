@@ -1606,6 +1606,101 @@ class E2ETest {
         .isEqualTo(true)
   }
 
+  // ------------------------------------------------------------------------
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/228
+  // ------------------------------------------------------------------------
+  // The user reported:
+  //   "Trying to understand if bazel-diff still works for go deps brought in via the new
+  //    gazelle/rules_go bzlmod mechanism ... Our hashes file does not include any of the
+  //    external go dependencies since migrating to the new mechanism."
+  //
+  // The concern is whether the hashes JSON produced by `generate-hashes` contains an entry
+  // for the external Go repository that gazelle's `go_deps` extension materializes
+  // (e.g. `com_github_pkg_errors`), or whether those targets are silently dropped after a
+  // bzlmod migration.
+  //
+  // The existing `testGoModUpdateImpactsGoTargets_regressionForIssue266` test verifies that
+  // bumping a version in go.mod *propagates* to dependent main-repo targets. That is a
+  // separate signal from "is the external Go module itself present in the hashes JSON".
+  //
+  // On a current build (Bazel 9.1) the hashes JSON for the `go_mod_change` fixture includes:
+  //
+  //   //:BUILD
+  //   //:lib
+  //   //:lib.go
+  //   //:lib_test
+  //   //:lib_test.go
+  //   //external:com_github_pkg_errors
+  //   //external:gazelle
+  //   //external:rules_go
+  //
+  // The `//external:<apparent_name>` entries are the synthetic labels BazelClient produces
+  // by querying `bazel mod show_repo --output=streamed_proto` (the same mechanism used by
+  // the #255 fix). They are exactly the surface the user in #228 was looking for: a
+  // per-bzlmod-module entry in the hashes JSON whose hash changes when that module's
+  // resolved version changes.
+  //
+  // This regression-protection test (NOT @Ignore'd) locks in that behaviour. If a future
+  // change drops external bzlmod entries from generate-hashes again, the test fails with a
+  // diagnostic that names the missing label.
+  //
+  // Requires Bazel 8.6.0+ for the bzlmod / `mod show_repo --output=streamed_proto` path,
+  // matching the convention used by `testGoModUpdateImpactsGoTargets_regressionForIssue266`.
+  @Test
+  fun testExternalGoDepsAppearInHashes_regressionForIssue228() {
+    val version = getBazelVersion()
+    org.junit.Assume.assumeNotNull(version)
+    val v = version!!
+    val comparator =
+        compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+    val hasModShowRepo = comparator.compare(v, Triple(8, 6, 0)) >= 0 && v != Triple(9, 0, 0)
+    org.junit.Assume.assumeTrue(
+        "Requires Bazel 8.6.0+ or 9.0.1+ (current: ${v.first}.${v.second}.${v.third})",
+        hasModShowRepo)
+
+    val workspace = copyTestWorkspace("go_mod_change")
+    val outputDir = temp.newFolder()
+    val hashesPath = File(outputDir, "hashes.json")
+
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspace.absolutePath,
+                "-b", "bazel",
+                hashesPath.absolutePath))
+        .isEqualTo(0)
+
+    val rawJson = hashesPath.readText()
+    assertThat(rawJson.isNotEmpty())
+        .transform("generate-hashes produced an empty hashes file") { it }
+        .isEqualTo(true)
+
+    // Parse the hashes JSON. Format is either {"hashes": {...}, "metadata": {...}} (bzlmod /
+    // new format) or just {...} (legacy). The label keys live in the inner "hashes" object
+    // when present.
+    val parsed = Gson().fromJson(rawJson, com.google.gson.JsonObject::class.java)
+    val hashesObj = if (parsed.has("hashes")) parsed.getAsJsonObject("hashes") else parsed
+    val labels = hashesObj.keySet()
+
+    // Sanity: main-repo targets must be present.
+    val libPresent = labels.any { it == "//:lib" || it == "@@//:lib" }
+    assertThat(libPresent)
+        .transform("hashes should include //:lib; got keys: ${labels.sorted()}") { it }
+        .isEqualTo(true)
+
+    // The #228 assertion: the external Go module brought in by gazelle's `go_deps`
+    // extension must appear as a synthetic //external:<apparent_name> entry in the hashes
+    // JSON. The hash of that entry is what allows a `go.mod` version bump to propagate to
+    // dependent targets (issue #266) and is the per-module signal the user asked about.
+    val externalGoDepLabel = labels.firstOrNull { it.contains("com_github_pkg_errors") }
+    assertThat(externalGoDepLabel)
+        .transform(
+            "expected a hashes entry referencing the external Go dep `com_github_pkg_errors` " +
+                "(per #228); got keys: ${labels.sorted()}") { it }
+        .isEqualTo("//external:com_github_pkg_errors")
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

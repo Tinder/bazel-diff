@@ -2,14 +2,21 @@ package com.bazel_diff.interactor
 
 import assertk.assertThat
 import assertk.assertions.*
+import com.bazel_diff.bazel.BazelQueryService
+import com.bazel_diff.bazel.BazelTarget
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.testModule
 import java.io.StringWriter
 import org.junit.Rule
 import org.junit.Test
+import org.koin.core.context.loadKoinModules
+import org.koin.dsl.module
 import org.koin.test.KoinTest
 import org.koin.test.KoinTestRule
 import org.mockito.junit.MockitoJUnit
+import org.mockito.kotlin.any
+import org.mockito.kotlin.doAnswer
+import org.mockito.kotlin.mock
 
 class CalculateImpactedTargetsInteractorTest : KoinTest {
   @get:Rule val mockitoRule = MockitoJUnit.rule()
@@ -638,5 +645,68 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
     val output = outputWriter.toString().trim().split("\n")
     // Only target1 should be impacted (hash changed) - module logic was skipped
     assertThat(output).containsExactly("//:target1")
+  }
+
+  @Test
+  fun testUnionsRdepsAcrossChangedModules() {
+    // Guard against regressing to per-repo fan-out. Two changed modules matching two
+    // canonical repos should produce a single unioned rdeps query, not two.
+    val captured = mutableListOf<String>()
+    val fakeQueryService: BazelQueryService = mock {
+      onBlocking { query(any(), any()) } doAnswer {
+        captured.add(it.getArgument(0))
+        emptyList<BazelTarget>()
+      }
+    }
+    loadKoinModules(module { single { fakeQueryService } })
+
+    val from = mapOf(
+        "//:target1" to TargetHash("", "a", "a"),
+        "@@abseil-cpp~20240116.2//:strings" to TargetHash("", "e1", "e1"),
+        "@@aspect_bazel_lib~2.22.5//:copy_to_bin" to TargetHash("", "e2", "e2"),
+    )
+    val to = mapOf(
+        "//:target1" to TargetHash("", "a", "a"),
+        "@@abseil-cpp~20240722.0//:strings" to TargetHash("", "e1b", "e1b"),
+        "@@aspect_bazel_lib~2.23.0//:copy_to_bin" to TargetHash("", "e2b", "e2b"),
+    )
+    val fromGraph = """
+      {
+        "key": "root", "name": "root", "version": "", "apparentName": "root",
+        "dependencies": [
+          {"key": "abseil-cpp@20240116.2", "name": "abseil-cpp", "version": "20240116.2", "apparentName": "abseil-cpp"},
+          {"key": "aspect_bazel_lib@2.22.5", "name": "aspect_bazel_lib", "version": "2.22.5", "apparentName": "aspect_bazel_lib"}
+        ]
+      }
+    """.trimIndent()
+    val toGraph = """
+      {
+        "key": "root", "name": "root", "version": "", "apparentName": "root",
+        "dependencies": [
+          {"key": "abseil-cpp@20240722.0", "name": "abseil-cpp", "version": "20240722.0", "apparentName": "abseil-cpp"},
+          {"key": "aspect_bazel_lib@2.23.0", "name": "aspect_bazel_lib", "version": "2.23.0", "apparentName": "aspect_bazel_lib"}
+        ]
+      }
+    """.trimIndent()
+
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor().execute(
+        from = from,
+        to = to,
+        outputWriter = outputWriter,
+        targetTypes = null,
+        fromModuleGraphJson = fromGraph,
+        toModuleGraphJson = toGraph,
+    )
+
+    // Exactly one query - the whole point of this test. The per-repo loop would emit two.
+    assertThat(captured).hasSize(1)
+    val queryExpression = captured.single()
+    assertThat(queryExpression).startsWith("rdeps(//..., ")
+    assertThat(queryExpression).endsWith(")")
+    // Both matched canonical repos must appear, joined by " + ".
+    assertThat(queryExpression).contains("@@abseil-cpp~20240722.0//...")
+    assertThat(queryExpression).contains("@@aspect_bazel_lib~2.23.0//...")
+    assertThat(queryExpression).contains(" + ")
   }
 }

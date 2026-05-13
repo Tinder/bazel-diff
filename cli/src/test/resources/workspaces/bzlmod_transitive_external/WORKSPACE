@@ -1,0 +1,1 @@
+workspace(name = "bzlmod_transitive_external_test")

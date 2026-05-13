@@ -70,6 +70,56 @@ class ModuleGraphParser {
   }
 
   /**
+   * Parses the JSON from `bazel mod graph --output=json` and returns each module's direct
+   * `bazel_dep` neighbours as a `module_name -> [dep_module_name, ...]` map.
+   *
+   * Module names (the `name` field of the `module(name = ...)` declaration) are used as the
+   * key here because the alternative -- `module_key` -- is not always populated on the
+   * `Build.Repository` protos returned by `bazel mod show_repo`, which is what consumers want
+   * to look up against. Module names are universally present and sufficient to find a unique
+   * row in the graph for the common no-multi-version case.
+   *
+   * The same module may appear in multiple places in the JSON tree (`bazel mod graph` inlines
+   * each module once and references it via `unexpanded` afterwards). This method walks every
+   * `dependencies` array it sees, so even the `unexpanded` references contribute an edge. The
+   * resulting map is keyed by the parent's `module_name` and contains the union of all direct
+   * dep names observed across the tree.
+   *
+   * Returns an empty map on parse failure (same tolerance as [parseModuleGraph]).
+   */
+  fun parseModuleGraphDepEdges(json: String): Map<String, List<String>> {
+    val edges = mutableMapOf<String, MutableSet<String>>()
+    try {
+      val root = try {
+        JsonParser.parseString(json).asJsonObject
+      } catch (_: Exception) {
+        val start = json.indexOf('{')
+        if (start < 0) return emptyMap()
+        JsonParser.parseString(json.substring(start)).asJsonObject
+      }
+      extractDepEdges(root, edges)
+    } catch (_: Exception) {
+      return emptyMap()
+    }
+    return edges.mapValues { it.value.toList() }
+  }
+
+  private fun extractDepEdges(obj: JsonObject, edges: MutableMap<String, MutableSet<String>>) {
+    val name = obj.get("name")?.asString ?: return
+    val deps = obj.get("dependencies")?.asJsonArray ?: return
+    val collected = edges.getOrPut(name) { mutableSetOf() }
+    for (dep in deps) {
+      if (!dep.isJsonObject) continue
+      val depObj = dep.asJsonObject
+      val depName = depObj.get("name")?.asString ?: continue
+      collected.add(depName)
+      // Even if this child is `unexpanded`, recurse to pick up edges from its own expansion
+      // elsewhere in the tree.
+      extractDepEdges(depObj, edges)
+    }
+  }
+
+  /**
    * Compares two module graphs and returns the keys of modules that changed.
    *
    * A module is considered changed if:

@@ -1702,51 +1702,51 @@ class E2ETest {
   }
 
   // ------------------------------------------------------------------------
-  // Reproducer for https://github.com/Tinder/bazel-diff/issues/184
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/184
   // ------------------------------------------------------------------------
   // The user reported that a change inside an external repo C does not propagate to an
   // internal target A, when A depends on external repo B and B in turn depends on C. The
   // concrete report uses rules_python's pip_parse, where requirements.txt resolves into a
   // separate external repo for every package; the user's py_test rule (A) depends on @moto
   // (B), and @moto's BUILD targets depend on @cryptography (C). Bumping cryptography in
-  // requirements.txt does not surface A as impacted.
+  // requirements.txt did not surface A as impacted.
   //
-  // The root cause as described in the issue is that "external repos are treated as an
-  // opaque blob" by default, and `--fineGrainedHashExternalRepos` only opens up the named
-  // repos -- the chain through a wrapping external repo is not followed automatically.
-  // This is exactly the shape of #197's still-unfixed case (see @Ahajha's comment), but
-  // the #184 user described it in terms of a transitive build-time dependency rather than
-  // an alias re-export, so a separate fixture documents the deeper chain.
+  // Root cause: BazelQueryService.queryBzlmodRepos synthesised a `//external:<repo>` target
+  // per bzlmod-managed repo, hashed by repo *metadata* only. There was no rule_input edge
+  // between those synthetic targets and no content hash of the underlying directory, so a
+  // change inside @inner never reached @outer or //:consume.
   //
-  // The reproducer workspace `bzlmod_transitive_external` wires up:
+  // Fix: queryBzlmodRepos now (a) parses `bazel mod graph --output=json` for the dep edges
+  // and emits `addRuleInput("//external:<dep_apparent>")` per direct bzlmod dep, and (b)
+  // computes a recursive content hash of the directory for `local_repository`-rule repos
+  // (which is what `local_path_override` lowers to) and attaches it as a synthetic
+  // `_bazel_diff_content_hash` attribute. RuleHasher then follows the chain
+  // //:consume -> //external:outer -> //external:inner during digest computation.
   //
+  // Workspace `bzlmod_transitive_external`:
   //   //:consume         genrule, depends on @outer//:lib
   //   @outer//:lib       genrule in the outer module, depends on @inner//:data
   //   @inner//:data      filegroup in the inner module wrapping inner/data.txt
   //
   // Both `outer` and `inner` are real bzlmod modules brought in via `local_path_override`.
-  // outer's MODULE.bazel declares `bazel_dep(name = "inner")` (no override; only the root
-  // module is allowed to use local_path_override). `.bazelignore` excludes the two
-  // sub-trees so bazel does not treat them as packages of the main module.
   //
-  // Verified by hand against the locally built CLI (Bazel 9.1):
+  // This test asserts the post-fix behaviour: changing inner/data.txt with no extra flags
+  // surfaces //:consume in the impacted-targets output.
   //
-  //   $ bazel-diff generate-hashes -w <A> ...   # inner/data.txt = "hello"
-  //   $ bazel-diff generate-hashes -w <B> ...   # inner/data.txt = "world"
-  //   $ diff <(jq -S '.hashes' A.json) <(jq -S '.hashes' B.json)   # empty -- no diff
-  //   $ bazel-diff get-impacted-targets ...
-  //   (impacted file is empty)
-  //
-  // The expected behavior is that `//:consume` should be reported as impacted -- the
-  // build-time content it transitively consumes via @outer/@inner changed. This test
-  // asserts that expectation. It is `@Ignore`d so CI stays green until #184 is fixed.
+  // Requires Bazel 8.6.0+ for the `mod show_repo --output=streamed_proto` path that produces
+  // the synthetic targets the fix mutates; same gating as
+  // [testBzlmodShowRepoDetectsModuleBazelChanges].
   @Test
-  @org.junit.Ignore(
-      "Reproducer for https://github.com/Tinder/bazel-diff/issues/184 -- transitive " +
-          "external repo file change is not detected. Remove @Ignore once the fix lands.")
-  fun testTransitiveExternalRepoChangeImpactsConsumer_reproducerForIssue184() {
+  fun testTransitiveExternalRepoChangeImpactsConsumer_regressionForIssue184() {
     val version = getBazelVersion()
     org.junit.Assume.assumeNotNull(version)
+    val v = version!!
+    val comparator =
+        compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+    val hasModShowRepo = comparator.compare(v, Triple(8, 6, 0)) >= 0 && v != Triple(9, 0, 0)
+    org.junit.Assume.assumeTrue(
+        "Requires Bazel 8.6.0+ or 9.0.1+ (current: ${v.first}.${v.second}.${v.third})",
+        hasModShowRepo)
 
     val workspaceA = copyTestWorkspace("bzlmod_transitive_external")
     val workspaceB = copyTestWorkspace("bzlmod_transitive_external")

@@ -1,0 +1,10 @@
+module(
+    name = "bzlmod_local_repo_test",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "dep_repo", version = "0.0.0")
+local_path_override(
+    module_name = "dep_repo",
+    path = "dep_repo",
+)

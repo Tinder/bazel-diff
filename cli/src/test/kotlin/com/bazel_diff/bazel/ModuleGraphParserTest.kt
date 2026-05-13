@@ -91,6 +91,30 @@ class ModuleGraphParserTest {
   }
 
   @Test
+  fun parseModuleGraph_withStderrPrefix_extractsModules() {
+    val cleanJson =
+        """
+      {
+        "key": "<root>",
+        "name": "ws",
+        "version": "",
+        "apparentName": "ws",
+        "dependencies": [
+          {"key": "a@1", "name": "a", "version": "1", "apparentName": "a"}
+        ]
+      }
+    """
+            .trimIndent()
+    val polluted = "INFO: Invocation ID: abc\nLoading: 0 packages loaded\n$cleanJson"
+
+    val clean = parser.parseModuleGraph(cleanJson)
+    val actual = parser.parseModuleGraph(polluted)
+
+    assertThat(actual).hasSize(2)
+    assertThat(actual).isEqualTo(clean)
+  }
+
+  @Test
   fun parseModuleGraph_withInvalidJson_returnsEmptyMap() {
     val json = "{ invalid json"
 

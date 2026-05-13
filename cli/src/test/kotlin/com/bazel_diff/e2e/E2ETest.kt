@@ -1382,6 +1382,230 @@ class E2ETest {
         .isEqualTo(true)
   }
 
+  // ------------------------------------------------------------------------
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/196
+  // ------------------------------------------------------------------------
+  // The original 2023 report was that bazel-diff failed to query a bzlmod workspace whose
+  // dependencies were all wired through local repositories (no BCR fetches). honnix narrowed
+  // it down to cquery returning labels with apparent vs canonical repo names that did not
+  // match the compatible target set; PR #224 fixed that handling.
+  //
+  // This is a passing regression-protection test (NOT @Ignore). It exercises a minimal
+  // bzlmod workspace where the only dependency uses `local_path_override`, runs
+  // generate-hashes in both query and cquery modes, and asserts both produce a non-empty
+  // hash JSON that covers the local-repo target. If a future change reintroduces the
+  // canonical-name mismatch or breaks local_path_override resolution, this test fails.
+  @Test
+  fun testBzlmodLocalPathOverrideWorks_regressionForIssue196() {
+    val workspace = copyTestWorkspace("bzlmod_local_repo")
+    val outputDir = temp.newFolder()
+    val queryOutput = File(outputDir, "query.json")
+    val cqueryOutput = File(outputDir, "cquery.json")
+
+    val cli = CommandLine(BazelDiff())
+
+    // Query mode: must succeed and include //:consume + the synthetic //external entry.
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspace.absolutePath,
+                "-b", "bazel",
+                queryOutput.absolutePath))
+        .isEqualTo(0)
+    val queryJson = queryOutput.readText()
+    assertThat(queryJson.contains("//:consume"))
+        .transform("query-mode hashes should include //:consume; got: $queryJson") { it }
+        .isEqualTo(true)
+
+    // cquery mode: must succeed and include the canonical @@dep_repo+ label for the
+    // local-overridden repo (the exact shape that PR #224 made work).
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspace.absolutePath,
+                "-b", "bazel",
+                "--useCquery",
+                cqueryOutput.absolutePath))
+        .isEqualTo(0)
+    val cqueryJson = cqueryOutput.readText()
+    assertThat(cqueryJson.contains("@@//:consume") || cqueryJson.contains("//:consume"))
+        .transform("cquery-mode hashes should include the consumer target; got: $cqueryJson") { it }
+        .isEqualTo(true)
+    assertThat(cqueryJson.contains("dep_repo"))
+        .transform("cquery-mode hashes should reference dep_repo (local_path_override target); got: $cqueryJson") { it }
+        .isEqualTo(true)
+  }
+
+  // ------------------------------------------------------------------------
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/266
+  // ------------------------------------------------------------------------
+  // The user reported that updating go.mod (e.g. bumping a dependency version) did not
+  // change the hash of go_test/go_library targets that depend on that module. The setup
+  // is bzlmod + rules_go + gazelle's go_deps extension reading go.mod.
+  //
+  // I built a minimal `go_mod_change` workspace with exactly that wiring (rules_go 0.60.0,
+  // gazelle 0.45.0, a `go_library` and `go_test` depending on @com_github_pkg_errors) and
+  // verified by hand with the locally built CLI that current bazel-diff DOES detect the
+  // change end-to-end:
+  //
+  //   v0.9.1 -> v0.9.0 of github.com/pkg/errors:
+  //     impacted: //:lib, //:lib_test
+  //
+  // The mechanism is the bzlmod `mod show_repo` integration: gazelle's go_deps extension
+  // re-resolves on every `bazel mod` invocation and the synthetic `//external:*` target
+  // for the changed module reflects the new version, which propagates into `//:lib`'s
+  // transitive hash.
+  //
+  // This regression-protection test (NOT @Ignore'd) locks in that behaviour. If a future
+  // change to bzlmod mod show_repo handling or to gazelle's extension wiring breaks
+  // go.mod tracking again, the test will fail.
+  //
+  // Requires Bazel 8.6.0+ for the `mod show_repo --output=streamed_proto` path. The test
+  // skips itself on older Bazel via `Assume.assumeTrue` (matching the convention in
+  // `testBzlmodShowRepoDetectsModuleBazelChanges`).
+  @Test
+  fun testGoModUpdateImpactsGoTargets_regressionForIssue266() {
+    val version = getBazelVersion()
+    org.junit.Assume.assumeNotNull(version)
+    val v = version!!
+    val comparator =
+        compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+    val hasModShowRepo = comparator.compare(v, Triple(8, 6, 0)) >= 0 && v != Triple(9, 0, 0)
+    org.junit.Assume.assumeTrue(
+        "Requires Bazel 8.6.0+ or 9.0.1+ (current: ${v.first}.${v.second}.${v.third})",
+        hasModShowRepo)
+
+    val workspaceA = copyTestWorkspace("go_mod_change")
+    val workspaceB = copyTestWorkspace("go_mod_change")
+
+    // Mutate go.mod in B to depend on v0.9.0 instead of v0.9.1. go.sum in the fixture
+    // already contains both versions' entries.
+    val goModInB = File(workspaceB, "go.mod")
+    val original = goModInB.readText()
+    val mutated = original.replace("github.com/pkg/errors v0.9.1", "github.com/pkg/errors v0.9.0")
+    assertThat(mutated != original).isEqualTo(true)
+    goModInB.writeText(mutated)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceA.absolutePath,
+                "-b", "bazel",
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "-sh", from.absolutePath,
+                "-fh", to.absolutePath,
+                "-o", impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    val libImpacted = impacted.any { it == "//:lib" || it == "@@//:lib" }
+    val libTestImpacted = impacted.any { it == "//:lib_test" || it == "@@//:lib_test" }
+    assertThat(libImpacted)
+        .transform("//:lib should be impacted when go.mod changes pkg/errors version; got: $impacted") { it }
+        .isEqualTo(true)
+    assertThat(libTestImpacted)
+        .transform("//:lib_test should be impacted when go.mod changes pkg/errors version; got: $impacted") { it }
+        .isEqualTo(true)
+  }
+
+  // ------------------------------------------------------------------------
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/259 and #227.
+  // ------------------------------------------------------------------------
+  // Both issues describe the same underlying gap: when a BUILD file `load()`s a .bzl
+  // macro, editing the .bzl macro body in a way that does not change the generated rule's
+  // attrs is not reflected in `bazel-diff get-impacted-targets`. The user in #259
+  // noticed this regression after upgrading to Bazel 7 -- Bazel pre-7 populated
+  // `Rule.skylark_environment_hash_code` in the query proto so .bzl-content changes
+  // bubbled in naturally; Bazel 7+ leaves that field empty, so bazel-diff missed the change.
+  //
+  // The fix in BuildGraphHasher.hashAllBazelTargetsAndSourcefiles walks every BUILD
+  // source file's `subincludeList` (the `subinclude` proto field, which lists every .bzl
+  // loaded by that BUILD), softDigests each main-repo .bzl file, and mixes the union of
+  // digests into the seed hash. This restores the pre-Bazel-7 behaviour: a `.bzl`-only
+  // edit invalidates the targets that depend on it.
+  //
+  // The reproducer workspace `macro_invalidation` has:
+  //   - `miniature.bzl` defines a `miniature(name, src)` macro that wraps `native.genrule`.
+  //   - `BUILD` does `load(":miniature.bzl", "miniature")` and calls `miniature(...)` to
+  //     produce `//:logo_miniature`.
+  //
+  // The test mutates `miniature.bzl` to add a `print()` call inside the macro body -- this
+  // does not change any attribute of the emitted `native.genrule`, so a fix that only looks
+  // at rule attrs would miss it. The user's example in #259 was exactly this pattern.
+  @Test
+  fun testMacroBzlChangeImpactsCallers_regressionForIssue259And227() {
+    val workspaceA = copyTestWorkspace("macro_invalidation")
+    val workspaceB = copyTestWorkspace("macro_invalidation")
+
+    // Mutate only the macro body in B by adding a `print()` call. This deliberately does
+    // not touch the genrule attrs the macro emits, so the bug shows up only via the .bzl
+    // file content rather than any rule-attribute hash diff.
+    val bzlInB = File(workspaceB, "miniature.bzl")
+    val originalBzl = bzlInB.readText()
+    val mutatedBzl = originalBzl.replace(
+        "def miniature(name, src, **kwargs):",
+        "def miniature(name, src, **kwargs):\n    print(\"miniature: \" + name)")
+    assertThat(mutatedBzl != originalBzl).isEqualTo(true)
+    bzlInB.writeText(mutatedBzl)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceA.absolutePath,
+                "-b", "bazel",
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                to.absolutePath))
+        .isEqualTo(0)
+
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "-sh", from.absolutePath,
+                "-fh", to.absolutePath,
+                "-o", impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    val callerImpacted = impacted.any { it.contains("logo_miniature") }
+    assertThat(callerImpacted)
+        .transform("//:logo_miniature should be impacted by miniature.bzl edit; got: $impacted") { it }
+        .isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

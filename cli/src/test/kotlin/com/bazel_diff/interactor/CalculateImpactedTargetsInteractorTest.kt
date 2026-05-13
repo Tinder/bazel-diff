@@ -2,14 +2,21 @@ package com.bazel_diff.interactor
 
 import assertk.assertThat
 import assertk.assertions.*
+import com.bazel_diff.bazel.BazelQueryService
+import com.bazel_diff.bazel.BazelTarget
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.testModule
 import java.io.StringWriter
 import org.junit.Rule
 import org.junit.Test
+import org.koin.core.context.loadKoinModules
+import org.koin.dsl.module
 import org.koin.test.KoinTest
 import org.koin.test.KoinTestRule
 import org.mockito.junit.MockitoJUnit
+import org.mockito.kotlin.any
+import org.mockito.kotlin.doAnswer
+import org.mockito.kotlin.mock
 
 class CalculateImpactedTargetsInteractorTest : KoinTest {
   @get:Rule val mockitoRule = MockitoJUnit.rule()
@@ -210,25 +217,27 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
   }
 
   @Test
-  fun testInvalidEdgesRaises() {
+  fun testInvalidEdgesFallsBackToDistanceZero() {
+    // Regression coverage for the issue-#268 fix: when an indirectly impacted target has
+    // either no dep-edges entry OR no impacted predecessors in its dep-edges (typically
+    // because the user filtered the hash JSON with --targetType=Rule and the only changed
+    // dep is a non-Rule like a GeneratedFile), `computeAllDistances` should log a warning
+    // and report the target at distance 0 instead of throwing.
     var (depEdges, startHashes) = createTargetHashes("//:1 <- //:2")
     val endHashes = startHashes.toMutableMap()
 
     makeIndirectlyChanged(endHashes, "//:2")
 
     val interactor = CalculateImpactedTargetsInteractor()
-    assertThat { interactor.computeAllDistances(startHashes, endHashes, depEdges) }
-        .isFailure()
-        .message()
-        .isEqualTo("//:2 was indirectly impacted, but has no impacted dependencies.")
 
-    assertThat {
-          // empty dep edges
-          interactor.computeAllDistances(startHashes, endHashes, mapOf())
-        }
-        .isFailure()
-        .message()
-        .isEqualTo("//:2 was indirectly impacted, but has no dependencies.")
+    // Case A: //:2 has a dep-edges entry (//:1) but //:1 is not impacted in this scenario,
+    // so there are no impacted deps. Should fall back to distance 0, not throw.
+    val withEdges = interactor.computeAllDistances(startHashes, endHashes, depEdges)
+    assertThat(withEdges).containsOnly("//:2" to TargetDistanceMetrics(0, 0))
+
+    // Case B: //:2 has no dep-edges entry at all (empty map). Same fallback.
+    val withoutEdges = interactor.computeAllDistances(startHashes, endHashes, mapOf())
+    assertThat(withoutEdges).containsOnly("//:2" to TargetDistanceMetrics(0, 0))
   }
 
   /**
@@ -597,6 +606,53 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
     assertThat(filteredJson).doesNotContain("//external:boost.assert")
   }
 
+  // ------------------------------------------------------------------------
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/268
+  // ------------------------------------------------------------------------
+  // Users who pass `--targetType=Rule` to `generate-hashes` end up with hash JSONs that
+  // only contain Rule entries -- SourceFile and GeneratedFile rows are stripped at write
+  // time. When that JSON is then fed back into `get-impacted-targets --depsFile=...`
+  // (which routes through `executeWithDistances` -> `computeAllDistances`), an indirectly
+  // impacted Rule whose only changed dependency is a filtered-out GeneratedFile previously
+  // triggered:
+  //
+  //   InvalidDependencyEdgesException("<label> was indirectly impacted, but has no impacted dependencies.")
+  //
+  // and crashed the whole job. The fix (this PR) replaces that throw with a logger.w() that
+  // points at --targetType as the most likely cause, and returns a conservative
+  // TargetDistanceMetrics(0, 0) so the indirectly impacted Rule still appears in the
+  // impacted-targets output. @agustinmista's exact scenario in the issue thread.
+  @Test
+  fun computeAllDistances_targetTypeFilteredDep_fallsBackToDistanceZero_regressionForIssue268() {
+    // Setup mirrors the user's scenario:
+    //   //pkg:rule (Rule) depends on //pkg:generated (GeneratedFile). The user ran
+    //   `generate-hashes --targetType=Rule`, so //pkg:generated never made it into the
+    //   `from`/`to` hash JSONs. The underlying source feeding //pkg:generated changed,
+    //   so //pkg:rule's *transitive* hash flipped (indirect impact) while its directHash
+    //   stayed put. The dep edges file, on the other hand, still records the
+    //   Rule -> GeneratedFile edge because it was generated without the type filter.
+    val startHashes =
+        mutableMapOf(
+            "//pkg:rule" to TargetHash("Rule", "rule-direct-hash", "rule-transitive-hash-v1"),
+        )
+    val endHashes =
+        mutableMapOf(
+            "//pkg:rule" to TargetHash("Rule", "rule-direct-hash", "rule-transitive-hash-v2"),
+        )
+    val depEdges =
+        mapOf<String, List<String>>(
+            "//pkg:rule" to listOf("//pkg:generated"),
+        )
+
+    val interactor = CalculateImpactedTargetsInteractor()
+
+    // Pre-fix this would throw InvalidDependencyEdgesException. Post-fix the call returns
+    // a conservative distance-0 entry for //pkg:rule (warning logged) so the indirectly
+    // impacted Rule still surfaces in the output.
+    val impacted = interactor.computeAllDistances(startHashes, endHashes, depEdges)
+    assertThat(impacted).containsOnly("//pkg:rule" to TargetDistanceMetrics(0, 0))
+  }
+
   @Test
   fun testIdenticalModuleGraphsSkipsParsing() {
     // When module graphs are identical, should skip parsing and use normal hash comparison
@@ -638,5 +694,68 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
     val output = outputWriter.toString().trim().split("\n")
     // Only target1 should be impacted (hash changed) - module logic was skipped
     assertThat(output).containsExactly("//:target1")
+  }
+
+  @Test
+  fun testUnionsRdepsAcrossChangedModules() {
+    // Guard against regressing to per-repo fan-out. Two changed modules matching two
+    // canonical repos should produce a single unioned rdeps query, not two.
+    val captured = mutableListOf<String>()
+    val fakeQueryService: BazelQueryService = mock {
+      onBlocking { query(any(), any()) } doAnswer {
+        captured.add(it.getArgument(0))
+        emptyList<BazelTarget>()
+      }
+    }
+    loadKoinModules(module { single { fakeQueryService } })
+
+    val from = mapOf(
+        "//:target1" to TargetHash("", "a", "a"),
+        "@@abseil-cpp~20240116.2//:strings" to TargetHash("", "e1", "e1"),
+        "@@aspect_bazel_lib~2.22.5//:copy_to_bin" to TargetHash("", "e2", "e2"),
+    )
+    val to = mapOf(
+        "//:target1" to TargetHash("", "a", "a"),
+        "@@abseil-cpp~20240722.0//:strings" to TargetHash("", "e1b", "e1b"),
+        "@@aspect_bazel_lib~2.23.0//:copy_to_bin" to TargetHash("", "e2b", "e2b"),
+    )
+    val fromGraph = """
+      {
+        "key": "root", "name": "root", "version": "", "apparentName": "root",
+        "dependencies": [
+          {"key": "abseil-cpp@20240116.2", "name": "abseil-cpp", "version": "20240116.2", "apparentName": "abseil-cpp"},
+          {"key": "aspect_bazel_lib@2.22.5", "name": "aspect_bazel_lib", "version": "2.22.5", "apparentName": "aspect_bazel_lib"}
+        ]
+      }
+    """.trimIndent()
+    val toGraph = """
+      {
+        "key": "root", "name": "root", "version": "", "apparentName": "root",
+        "dependencies": [
+          {"key": "abseil-cpp@20240722.0", "name": "abseil-cpp", "version": "20240722.0", "apparentName": "abseil-cpp"},
+          {"key": "aspect_bazel_lib@2.23.0", "name": "aspect_bazel_lib", "version": "2.23.0", "apparentName": "aspect_bazel_lib"}
+        ]
+      }
+    """.trimIndent()
+
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor().execute(
+        from = from,
+        to = to,
+        outputWriter = outputWriter,
+        targetTypes = null,
+        fromModuleGraphJson = fromGraph,
+        toModuleGraphJson = toGraph,
+    )
+
+    // Exactly one query - the whole point of this test. The per-repo loop would emit two.
+    assertThat(captured).hasSize(1)
+    val queryExpression = captured.single()
+    assertThat(queryExpression).startsWith("rdeps(//..., ")
+    assertThat(queryExpression).endsWith(")")
+    // Both matched canonical repos must appear, joined by " + ".
+    assertThat(queryExpression).contains("@@abseil-cpp~20240722.0//...")
+    assertThat(queryExpression).contains("@@aspect_bazel_lib~2.23.0//...")
+    assertThat(queryExpression).contains(" + ")
   }
 }

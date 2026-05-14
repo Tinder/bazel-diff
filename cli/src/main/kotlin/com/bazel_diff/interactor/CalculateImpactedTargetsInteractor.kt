@@ -357,8 +357,12 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       logger.i { "Found ${rdepLabels.size} workspace targets depending on changed modules" }
       impactedTargets.addAll(rdepLabels)
     } catch (e: Exception) {
-      logger.e(e) { "Unioned rdeps query failed - conservatively marking all workspace targets impacted" }
-      impactedTargets.addAll(allTargets.keys.filter { !it.startsWith("@@") })
+      logger.e(e) { "Unioned rdeps query failed - falling back to buildable workspace targets (or every hashed label on bzlmod-only shapes)" }
+      val buildableWorkspaceTargets = allTargets.keys.filter(::isBuildableWorkspaceTarget)
+      impactedTargets.addAll(
+          if (buildableWorkspaceTargets.isEmpty()) allTargets.keys
+          else buildableWorkspaceTargets
+      )
     }
 
     // Union with hash-diff results to surface labels whose content changed alongside
@@ -375,4 +379,10 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       prefixes.any { repo.startsWith(it) }
     }.toSet()
   }
+
+  // Distinct from the `excludeExternalTargets` filter at the output sites: this
+  // also strips `@@` so the rdeps-failure fallback can detect a bzlmod-only
+  // workspace shape.
+  private fun isBuildableWorkspaceTarget(label: String): Boolean =
+      !label.startsWith("@@") && !label.startsWith("//external:")
 }

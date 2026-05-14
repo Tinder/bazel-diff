@@ -271,6 +271,62 @@ class CalculateImpactedTargetsInteractorModuleQueryTest : KoinTest {
   } }
 
   @Test
+  fun queryFailureOnBzlmodOnlyShapeEmitsAllHashedLabels() { runBlocking {
+    // No workspace-local `//...` labels, so the fallback must surface the
+    // full hash set. Otherwise the downstream `excludeExternalTargets`
+    // strip reduces it to empty.
+    val hashes = mapOf(
+        "@@abseil-cpp+//absl:strings" to TargetHash("Rule", "a", "a"),
+        "@@abseil-cpp+//absl:base" to TargetHash("Rule", "b", "b"),
+        "//external:com_google_absl" to TargetHash("Rule", "c", "c"))
+
+    whenever(queryService.query(any(), any()))
+        .thenThrow(RuntimeException("simulated bazel query failure"))
+
+    val writer = StringWriter()
+    CalculateImpactedTargetsInteractor().execute(
+        from = hashes,
+        to = hashes,
+        outputWriter = writer,
+        targetTypes = null,
+        fromModuleGraphJson = graph("abseil-cpp", "20240116.2"),
+        toModuleGraphJson = graph("abseil-cpp", "20240722.0"))
+
+    verify(queryService).query(eq("rdeps(//..., @@abseil-cpp+//...)"), eq(false))
+    assertThat(outputLines(writer)).containsExactlyInAnyOrder(
+        "@@abseil-cpp+//absl:strings",
+        "@@abseil-cpp+//absl:base",
+        "//external:com_google_absl")
+  } }
+
+  @Test
+  fun queryFailureOnMixedWorkspacePreservesGranularity() { runBlocking {
+    // Fallback must return only the buildable `//...` subset when one
+    // exists, not every hashed label.
+    val hashes = mapOf(
+        "//app:app" to TargetHash("Rule", "a", "a"),
+        "//lib:util" to TargetHash("Rule", "b", "b"),
+        "@@abseil-cpp+//absl:strings" to TargetHash("Rule", "c", "c"),
+        "@@other+//x:y" to TargetHash("Rule", "d", "d"),
+        "//external:abseil-cpp" to TargetHash("Rule", "e", "e"))
+
+    whenever(queryService.query(any(), any()))
+        .thenThrow(RuntimeException("simulated bazel query failure"))
+
+    val writer = StringWriter()
+    CalculateImpactedTargetsInteractor().execute(
+        from = hashes,
+        to = hashes,
+        outputWriter = writer,
+        targetTypes = null,
+        fromModuleGraphJson = graph("abseil-cpp", "20240116.2"),
+        toModuleGraphJson = graph("abseil-cpp", "20240722.0"))
+
+    assertThat(outputLines(writer)).containsExactlyInAnyOrder(
+        "//app:app", "//lib:util")
+  } }
+
+  @Test
   fun executeWithDistancesRunsModuleQueryPath() { runBlocking {
     // Covers the module-query call site in `executeWithDistances`.
     val hashes = mapOf(

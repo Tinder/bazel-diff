@@ -57,7 +57,10 @@ class ModuleGraphParser {
     val version = obj.get("version")?.asString
     val apparentName = obj.get("apparentName")?.asString
 
-    if (key != null && name != null && version != null && apparentName != null) {
+    // Bazel's MODULE.bazel spec requires module names to be non-empty; reject
+    // empty `name` so the synthetic `<root>` entry of an unnamed MODULE.bazel
+    // doesn't reach downstream canonical-repo matching.
+    if (key != null && !name.isNullOrEmpty() && version != null && apparentName != null) {
       modules[key] = Module(key, name, version, apparentName)
     }
 

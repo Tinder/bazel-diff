@@ -26,6 +26,7 @@ class BazelQueryService(
     private val noBazelrc: Boolean,
 ) : KoinComponent {
   private val logger: Logger by inject()
+  private val modService: BazelModService by inject()
   private val version: Triple<Int, Int, Int> by lazy { runBlocking { determineBazelVersion() } }
 
   @OptIn(ExperimentalCoroutinesApi::class)
@@ -307,16 +308,69 @@ class BazelQueryService(
           }
         }
 
+    // Discover the bzlmod module-graph edges so we can encode the dep relationships between
+    // synthetic //external:* targets. Without this, a target that depends on @outer//... only
+    // sees //external:outer's *metadata* hash and never picks up content changes in @outer's
+    // own bzlmod deps (e.g. @inner). With these edges in place, RuleHasher follows the chain
+    // //:consumer -> //external:outer -> //external:inner during digest computation, so a
+    // change inside @inner propagates all the way to the main-repo consumer without the user
+    // having to enumerate every wrapping repo in --fineGrainedHashExternalRepos. See
+    // https://github.com/Tinder/bazel-diff/issues/184 (transitive build-time chain) and
+    // https://github.com/Tinder/bazel-diff/issues/197 (alias-wrap chain).
+    val moduleGraphJson = modService.getModuleGraphJson()
+    val moduleDepEdges =
+        if (moduleGraphJson != null) {
+          ModuleGraphParser().parseModuleGraphDepEdges(moduleGraphJson)
+        } else {
+          emptyMap()
+        }
+    // `bazel mod show_repo` does not populate Repository.module_key in current Bazel, so
+    // bridge from a module's `name` (always present in `bazel mod graph` output) to that
+    // repo's `canonical_name` by stripping any trailing `+<version>` suffix produced by
+    // bzlmod's canonical-name scheme. This is best-effort: it works for the no-version-conflict
+    // case (canonical = "<name>+" or "<name>+<version>"). Module-extension repos do not appear
+    // in `bazel mod graph` at all, so they get no synthetic dep edges -- their contents are
+    // captured via repo metadata + the per-repo content hash below.
+    val moduleNameToCanonical = mutableMapOf<String, String>()
+    for (repo in repos) {
+      val canonical = repo.canonicalName
+      val moduleName = canonical.substringBefore('+').ifEmpty { canonical }
+      // Only register a name -> canonical edge if the canonical "looks like a module repo"
+      // (single `+`, no extension separator). Skip extension-generated repos like
+      // "rules_jvm_external++maven+maven".
+      if (canonical.count { it == '+' } == 1) {
+        moduleNameToCanonical[moduleName] = canonical
+      }
+    }
+    val canonicalToRootApparent: Map<String, List<String>> =
+        canonicalToApparent.mapValues { it.value.toList() }
+
     val targets = mutableListOf<BazelTarget.Rule>()
     for (repo in repos) {
+      // Derive this repo's bzlmod module name from its canonical name and look up its direct
+      // deps in the module graph. Translate each dep's module name -> its canonical name ->
+      // root-visible apparent name; that's what `BazelRule.transformRuleInput` collapses
+      // non-fine-grained `@<apparent>//...` rule_inputs to, so adding `//external:<apparent>`
+      // as a rule_input here is what wires up the dep chain.
+      val moduleName =
+          repo.canonicalName.takeIf { it.count { c -> c == '+' } == 1 }?.substringBefore('+')
+      val depApparentNames =
+          if (moduleName != null) {
+            moduleDepEdges[moduleName]
+                .orEmpty()
+                .mapNotNull { moduleNameToCanonical[it] }
+                .flatMap { canonicalToRootApparent[it].orEmpty() }
+          } else {
+            emptyList()
+          }
       val apparentNames = canonicalToApparent[repo.canonicalName]
       if (apparentNames != null) {
         for (apparentName in apparentNames) {
-          targets.add(repositoryToTarget(repo, apparentName))
+          targets.add(repositoryToTarget(repo, apparentName, depApparentNames))
         }
       } else {
         // Fallback: use canonical name if no apparent name mapping exists
-        targets.add(repositoryToTarget(repo, repo.canonicalName))
+        targets.add(repositoryToTarget(repo, repo.canonicalName, depApparentNames))
       }
     }
 
@@ -328,20 +382,93 @@ class BazelQueryService(
    * Converts a Build.Repository proto into a synthetic BazelTarget.Rule named
    * `//external:<targetName>`. This mirrors how WORKSPACE repos appear as `//external:*`
    * targets, and matches the names produced by `transformRuleInput` in BazelRule.kt.
+   *
+   * For each bzlmod dep of this repo (as discovered from `bazel mod graph`) a corresponding
+   * `//external:<dep_apparent_name>` is added to the rule's `rule_input` list, so
+   * [RuleHasher] follows the dep chain when computing the digest. For repos backed by a
+   * `local_repository` rule (which is what `local_path_override` lowers to), the contents
+   * of the local directory are also rolled into a synthetic `_bazel_diff_content_hash`
+   * attribute so file content changes inside the repo flip the synthetic target's hash.
    */
-  private fun repositoryToTarget(repo: Build.Repository, targetName: String): BazelTarget.Rule {
+  private fun repositoryToTarget(
+      repo: Build.Repository,
+      targetName: String,
+      depApparentNames: List<String>
+  ): BazelTarget.Rule {
     val ruleClass = repo.repoRuleName.ifEmpty { "bzlmod_repo" }
+
+    val attributes = repo.attributeList.toMutableList()
+    val contentHash = computeLocalRepoContentHash(repo)
+    if (contentHash != null) {
+      attributes.add(
+          Build.Attribute.newBuilder()
+              .setName("_bazel_diff_content_hash")
+              .setType(Build.Attribute.Discriminator.STRING)
+              .setStringValue(contentHash)
+              .build())
+    }
+
+    val ruleBuilder =
+        Build.Rule.newBuilder()
+            .setName("//external:$targetName")
+            .setRuleClass(ruleClass)
+            .addAllAttribute(attributes)
+    for (dep in depApparentNames.toSortedSet()) {
+      if (dep != targetName) ruleBuilder.addRuleInput("//external:$dep")
+    }
 
     val target =
         Build.Target.newBuilder()
             .setType(Build.Target.Discriminator.RULE)
-            .setRule(
-                Build.Rule.newBuilder()
-                    .setName("//external:$targetName")
-                    .setRuleClass(ruleClass)
-                    .addAllAttribute(repo.attributeList))
+            .setRule(ruleBuilder)
             .build()
     return BazelTarget.Rule(target)
+  }
+
+  /**
+   * Returns a stable hex sha256 over the files inside a `local_repository`-backed repo on
+   * disk, or null if the repo is not local-backed or the directory cannot be read.
+   *
+   * `local_path_override(module_name = "X", path = "...")` in MODULE.bazel lowers to a
+   * `local_repository` rule, whose `path` attribute is relative to the workspace root. Hashing
+   * that directory makes file content edits surface in the synthetic //external:X target's
+   * digest, which fixes the "external repo file change is invisible" half of
+   * [#184](https://github.com/Tinder/bazel-diff/issues/184) /
+   * [#197](https://github.com/Tinder/bazel-diff/issues/197).
+   */
+  private fun computeLocalRepoContentHash(repo: Build.Repository): String? {
+    if (repo.repoRuleName != "local_repository") return null
+    val pathAttr =
+        repo.attributeList.find { it.name == "path" && it.type == Build.Attribute.Discriminator.STRING }
+            ?: return null
+    val pathStr = pathAttr.stringValue.ifEmpty { return null }
+    val rawPath = java.nio.file.Paths.get(pathStr)
+    val repoDir =
+        (if (rawPath.isAbsolute) rawPath.toFile() else workingDirectory.resolve(rawPath).toFile())
+    if (!repoDir.exists() || !repoDir.isDirectory) return null
+
+    return try {
+      val digest = java.security.MessageDigest.getInstance("SHA-256")
+      repoDir
+          .walkTopDown()
+          .filter { it.isFile }
+          // Skip MODULE.bazel.lock: bazel auto-regenerates it on every invocation in ways
+          // that don't reflect a real source change (it depends on resolution state). Letting
+          // it flip the content hash makes generate-hashes non-deterministic across runs.
+          .filter { it.name != "MODULE.bazel.lock" }
+          .map { Pair(it.relativeTo(repoDir).invariantSeparatorsPath, it) }
+          .sortedBy { it.first }
+          .forEach { (relPath, file) ->
+            digest.update(relPath.toByteArray(Charsets.UTF_8))
+            digest.update(0x00)
+            digest.update(file.readBytes())
+            digest.update(0x00)
+          }
+      digest.digest().joinToString("") { "%02x".format(it) }
+    } catch (e: Exception) {
+      logger.w { "Failed to content-hash local repo at $repoDir: ${e.message}" }
+      null
+    }
   }
 
   /**

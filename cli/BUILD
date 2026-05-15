@@ -121,8 +121,8 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
-    name = "ProcessStdinHangReproducerTest",
-    test_class = "com.bazel_diff.process.ProcessStdinHangReproducerTest",
+    name = "ProcessStdinHangRegressionTest",
+    test_class = "com.bazel_diff.process.ProcessStdinHangRegressionTest",
     runtime_deps = [":cli-test-lib"],
 )
 

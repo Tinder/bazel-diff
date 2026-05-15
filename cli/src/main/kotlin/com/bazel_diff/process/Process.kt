@@ -57,6 +57,12 @@ suspend fun process(
           }
           .start()
 
+  // Close the subprocess's stdin so reads from it see EOF immediately.
+  // Without this, subprocesses that read stdin on startup (e.g. aspect CLI's
+  // interactive first-run path, #256) block forever waiting for input we
+  // never send, and waitFor() then blocks forever too.
+  process.outputStream.close()
+
   // Handles async consumptions before the blocking output handling.
   if (stdout is Redirect.Consume) {
     process.inputStream.lineFlow(stdout.consumer)

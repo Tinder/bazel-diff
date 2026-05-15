@@ -1702,36 +1702,28 @@ class E2ETest {
   }
 
   // ------------------------------------------------------------------------
-  // Reproducer for https://github.com/Tinder/bazel-diff/issues/197
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/197
   // ------------------------------------------------------------------------
-  // The simple case (a main-repo target consuming a file from a single external repo)
-  // already works on current bazel-diff. The unfixed shape is the one @Ahajha called out
-  // in https://github.com/Tinder/bazel-diff/issues/197#issuecomment-2616103349: a target
-  // inside one external repo is re-wrapped by ANOTHER external repo, and the main repo
-  // consumes only the wrapping repo. When the inner repo's source file changes, the
-  // main-repo consumer should be reported as impacted -- but today it is not, unless the
-  // user manually enumerates every wrapping external repo in --fineGrainedHashExternalRepos.
+  // The simple case (a main-repo target consuming a file from a single external repo) already
+  // worked before this fix. The unfixed shape was the one @Ahajha called out in
+  // https://github.com/Tinder/bazel-diff/issues/197#issuecomment-2616103349: a target inside
+  // one external repo is re-wrapped by ANOTHER external repo, and the main repo consumes only
+  // the wrapping repo. When the inner repo's source file changed, the main-repo consumer was
+  // not reported as impacted unless the user manually enumerated every wrapping external repo
+  // in --fineGrainedHashExternalRepos.
   //
   // The `wrapped_external_repo` fixture wires this up with bzlmod:
   //   inner_repo  -> filegroup wrapping data.txt
   //   middle_repo -> alias re-exporting @inner_repo//:all_files
   //   //:consumer -> genrule consuming @middle_repo//:wrapped
   //
-  // I confirmed by hand against the built CLI:
-  //   --fineGrainedHashExternalRepos=@inner_repo            -> //:consumer NOT impacted (bug)
-  //   --fineGrainedHashExternalRepos=@inner_repo,@middle_repo -> //:consumer impacted (workaround)
-  //
-  // The asked-for behaviour is that listing the source of truth (@inner_repo) is enough;
-  // bazel-diff should follow the dep chain through the wrapping repo without it being
-  // enumerated. Once that lands, drop the @Ignore.
+  // The fix in `Modules.kt` auto-expands the fine-grained set with bzlmod modules that
+  // transitively depend on a user-listed repo, by walking `bazel mod graph --output=json`.
+  // Listing only `@inner_repo` is now enough: `@middle_repo` is added automatically, its
+  // alias target is queried as a real rule, and its `actual` attribute carries the dep
+  // chain down to `@inner_repo//:data.txt`.
   @Test
-  @org.junit.Ignore(
-      "Reproducer for https://github.com/Tinder/bazel-diff/issues/197 - a main-repo target " +
-          "that consumes a wrapped external dep is not marked impacted when the inner repo's " +
-          "source file changes, unless every wrapping external repo is enumerated in " +
-          "--fineGrainedHashExternalRepos. Drop @Ignore once propagation through alias/ wrapper " +
-          "external repos works without the manual enumeration workaround.")
-  fun testWrappedExternalRepoFileChangeImpactsMainConsumer_reproducerForIssue197() {
+  fun testWrappedExternalRepoFileChangeImpactsMainConsumer_regressionForIssue197() {
     val workspaceA = copyTestWorkspace("wrapped_external_repo")
     val workspaceB = copyTestWorkspace("wrapped_external_repo")
 

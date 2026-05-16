@@ -70,6 +70,107 @@ class ModuleGraphParser {
   }
 
   /**
+   * Result of parsing the bzlmod dependency graph as edges keyed by `apparentName`.
+   *
+   * @property edges Map from a module's `apparentName` to the set of `apparentName`s of its direct
+   *   bzlmod dependencies. Populated for every module reached when walking the JSON tree.
+   * @property rootApparentNames `apparentName`s for the root module(s) (key `<root>`). The root is
+   *   the main repo and is always queried via `//...:all-targets`, so dependents-expansion should
+   *   never add it to a fine-grained set.
+   */
+  data class GraphEdges(
+      val edges: Map<String, Set<String>>,
+      val rootApparentNames: Set<String>,
+  )
+
+  /**
+   * Parses `bazel mod graph --output=json` into apparent-name dependency edges. Tolerates a
+   * non-JSON prefix (e.g. leaked stderr) using the same recovery as [parseModuleGraph].
+   *
+   * Each module in the JSON tree contributes an edge for every entry in its `dependencies` array.
+   * `unexpanded` dependency stubs (modules that the bzlmod resolver already described elsewhere
+   * in the graph) still contribute the edge but are not recursed into to avoid duplicate work.
+   */
+  fun parseModuleGraphEdges(json: String): GraphEdges {
+    val edges = mutableMapOf<String, MutableSet<String>>()
+    val rootApparentNames = mutableSetOf<String>()
+    try {
+      val root =
+          try {
+            JsonParser.parseString(json).asJsonObject
+          } catch (_: Exception) {
+            val start = json.indexOf('{')
+            if (start < 0) return GraphEdges(emptyMap(), emptySet())
+            JsonParser.parseString(json.substring(start)).asJsonObject
+          }
+      walkEdges(root, edges, rootApparentNames, isRoot = true)
+    } catch (_: Exception) {
+      return GraphEdges(emptyMap(), emptySet())
+    }
+    return GraphEdges(edges.mapValues { it.value.toSet() }, rootApparentNames.toSet())
+  }
+
+  private fun walkEdges(
+      obj: JsonObject,
+      edges: MutableMap<String, MutableSet<String>>,
+      rootApparentNames: MutableSet<String>,
+      isRoot: Boolean,
+  ) {
+    val apparentName = obj.get("apparentName")?.asString ?: return
+    if (isRoot) rootApparentNames.add(apparentName)
+    val mySet = edges.getOrPut(apparentName) { mutableSetOf() }
+    val deps = obj.get("dependencies")?.asJsonArray ?: return
+    for (dep in deps) {
+      if (!dep.isJsonObject) continue
+      val depObj = dep.asJsonObject
+      val depApparent = depObj.get("apparentName")?.asString ?: continue
+      mySet.add(depApparent)
+      val unexpanded = depObj.get("unexpanded")?.asBoolean ?: false
+      if (!unexpanded) {
+        walkEdges(depObj, edges, rootApparentNames, isRoot = false)
+      }
+    }
+  }
+
+  /**
+   * Computes the set of `apparentName`s that transitively depend on any module in [targets] by
+   * traversing [edges] in reverse. Excludes [rootApparentNames] from the result.
+   *
+   * Background: `--fineGrainedHashExternalRepos` opts a leaf module (e.g. `@inner_repo`) into
+   * per-target hashing. When another bzlmod module (`@middle_repo`) wraps it via alias or
+   * re-export and the main repo depends only on the wrapper, the wrapper's targets must also be
+   * queried for the hash chain to reach the leaf. This is the engine for that auto-expansion
+   * (issue #197). The set returned here is what the caller should add to the user-supplied set.
+   */
+  fun findTransitiveDependents(
+      edges: Map<String, Set<String>>,
+      targets: Set<String>,
+      rootApparentNames: Set<String>,
+  ): Set<String> {
+    if (edges.isEmpty() || targets.isEmpty()) return emptySet()
+    val reverse = mutableMapOf<String, MutableSet<String>>()
+    for ((from, deps) in edges) {
+      for (dep in deps) {
+        reverse.getOrPut(dep) { mutableSetOf() }.add(from)
+      }
+    }
+    val out = mutableSetOf<String>()
+    val visited = targets.toMutableSet()
+    val queue: ArrayDeque<String> = ArrayDeque(targets)
+    while (queue.isNotEmpty()) {
+      val cur = queue.removeFirst()
+      val parents = reverse[cur] ?: continue
+      for (p in parents) {
+        if (p in visited) continue
+        visited.add(p)
+        if (p !in rootApparentNames) out.add(p)
+        queue.addLast(p)
+      }
+    }
+    return out
+  }
+
+  /**
    * Compares two module graphs and returns the keys of modules that changed.
    *
    * A module is considered changed if:

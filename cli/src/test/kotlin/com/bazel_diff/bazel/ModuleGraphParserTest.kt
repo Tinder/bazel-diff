@@ -274,6 +274,128 @@ class ModuleGraphParserTest {
     assertThat(result).containsExactlyInAnyOrder("root", "abseil-cpp@20240116.2")
   }
 
+  // Edge / transitive-dependents tests are regression coverage for issue #197: when
+  // `@inner_repo` is the user-listed fine-grained repo and `@middle_repo` wraps it, the
+  // expansion has to follow `bazel mod graph` backwards to add `@middle_repo` automatically.
+
+  @Test
+  fun parseModuleGraphEdges_realIssue197Shape_extractsEdgesAndRoot() {
+    // Mirrors `bazel mod graph --output=json` for the `wrapped_external_repo` fixture:
+    // <root> -> inner_repo, middle_repo; middle_repo -> inner_repo (unexpanded reference).
+    val json =
+        """
+      {
+        "key": "<root>",
+        "name": "wrapped_external_repo_test",
+        "version": "0.0.0",
+        "apparentName": "wrapped_external_repo_test",
+        "dependencies": [
+          {
+            "key": "inner_repo@_",
+            "name": "inner_repo",
+            "version": "0.0.0",
+            "apparentName": "inner_repo",
+            "dependencies": []
+          },
+          {
+            "key": "middle_repo@_",
+            "name": "middle_repo",
+            "version": "0.0.0",
+            "apparentName": "middle_repo",
+            "dependencies": [
+              {
+                "key": "inner_repo@_",
+                "name": "inner_repo",
+                "version": "0.0.0",
+                "apparentName": "inner_repo",
+                "unexpanded": true
+              }
+            ]
+          }
+        ]
+      }
+    """
+            .trimIndent()
+
+    val graph = parser.parseModuleGraphEdges(json)
+
+    assertThat(graph.rootApparentNames).containsExactlyInAnyOrder("wrapped_external_repo_test")
+    assertThat(graph.edges["wrapped_external_repo_test"])
+        .isNotNull()
+        .containsExactlyInAnyOrder("inner_repo", "middle_repo")
+    assertThat(graph.edges["middle_repo"])
+        .isNotNull()
+        .containsExactlyInAnyOrder("inner_repo")
+    // inner_repo has no outgoing deps.
+    assertThat(graph.edges["inner_repo"]).isNotNull().isEmpty()
+  }
+
+  @Test
+  fun findTransitiveDependents_issue197_addsMiddleRepoButNotRoot() {
+    // Same shape as parseModuleGraphEdges_realIssue197Shape: <root> wraps both, middle_repo wraps
+    // inner_repo. Listing `inner_repo` as a target must surface `middle_repo` (so wrapper-only
+    // consumers in the main repo get correctly invalidated) and must NOT surface the root
+    // (the root is the main repo, already queried via `//...:all-targets`).
+    val edges =
+        mapOf(
+            "wrapped_external_repo_test" to setOf("inner_repo", "middle_repo"),
+            "middle_repo" to setOf("inner_repo"),
+            "inner_repo" to emptySet(),
+        )
+
+    val result =
+        parser.findTransitiveDependents(
+            edges,
+            targets = setOf("inner_repo"),
+            rootApparentNames = setOf("wrapped_external_repo_test"))
+
+    assertThat(result).containsExactlyInAnyOrder("middle_repo")
+  }
+
+  @Test
+  fun findTransitiveDependents_multiLevelWrapping_followsChain() {
+    // inner -> middle -> outer -> root. Listing inner must add both middle and outer.
+    val edges =
+        mapOf(
+            "root_app" to setOf("outer"),
+            "outer" to setOf("middle"),
+            "middle" to setOf("inner"),
+            "inner" to emptySet(),
+        )
+
+    val result =
+        parser.findTransitiveDependents(
+            edges, targets = setOf("inner"), rootApparentNames = setOf("root_app"))
+
+    assertThat(result).containsExactlyInAnyOrder("middle", "outer")
+  }
+
+  @Test
+  fun findTransitiveDependents_unrelatedRepos_returnsEmpty() {
+    // A repo with no chain to the targets should not be expanded into.
+    val edges =
+        mapOf(
+            "root_app" to setOf("inner", "unrelated"),
+            "inner" to emptySet(),
+            "unrelated" to emptySet(),
+        )
+
+    val result =
+        parser.findTransitiveDependents(
+            edges, targets = setOf("inner"), rootApparentNames = setOf("root_app"))
+
+    assertThat(result).isEmpty()
+  }
+
+  @Test
+  fun findTransitiveDependents_emptyTargets_returnsEmpty() {
+    val edges = mapOf("a" to setOf("b"), "b" to emptySet())
+
+    val result = parser.findTransitiveDependents(edges, targets = emptySet(), rootApparentNames = emptySet())
+
+    assertThat(result).isEmpty()
+  }
+
   @Test
   fun findChangedModules_withNewGraphEmpty_returnsAllOldModuleKeys() {
     val oldGraph =

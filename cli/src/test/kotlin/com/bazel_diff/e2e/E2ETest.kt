@@ -1701,6 +1701,83 @@ class E2ETest {
         .isEqualTo("//external:com_github_pkg_errors")
   }
 
+  // ------------------------------------------------------------------------
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/197
+  // ------------------------------------------------------------------------
+  // The simple case (a main-repo target consuming a file from a single external repo) already
+  // worked before this fix. The unfixed shape was the one @Ahajha called out in
+  // https://github.com/Tinder/bazel-diff/issues/197#issuecomment-2616103349: a target inside
+  // one external repo is re-wrapped by ANOTHER external repo, and the main repo consumes only
+  // the wrapping repo. When the inner repo's source file changed, the main-repo consumer was
+  // not reported as impacted unless the user manually enumerated every wrapping external repo
+  // in --fineGrainedHashExternalRepos.
+  //
+  // The `wrapped_external_repo` fixture wires this up with bzlmod:
+  //   inner_repo  -> filegroup wrapping data.txt
+  //   middle_repo -> alias re-exporting @inner_repo//:all_files
+  //   //:consumer -> genrule consuming @middle_repo//:wrapped
+  //
+  // The fix in `Modules.kt` auto-expands the fine-grained set with bzlmod modules that
+  // transitively depend on a user-listed repo, by walking `bazel mod graph --output=json`.
+  // Listing only `@inner_repo` is now enough: `@middle_repo` is added automatically, its
+  // alias target is queried as a real rule, and its `actual` attribute carries the dep
+  // chain down to `@inner_repo//:data.txt`.
+  @Test
+  fun testWrappedExternalRepoFileChangeImpactsMainConsumer_regressionForIssue197() {
+    val workspaceA = copyTestWorkspace("wrapped_external_repo")
+    val workspaceB = copyTestWorkspace("wrapped_external_repo")
+
+    // Mutate only inner_repo/data.txt in B -- this is the source of truth.
+    val innerDataInB = File(workspaceB, "inner_repo/data.txt")
+    innerDataInB.writeText("version two\n")
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+
+    // Only enumerate the source-of-truth repo. middle_repo is a transitive wrapper that
+    // users don't expect to have to manually call out (they may not even know about it).
+    val fineGrained = "@inner_repo"
+
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceA.absolutePath,
+                "-b", "bazel",
+                "--fineGrainedHashExternalRepos", fineGrained,
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "--fineGrainedHashExternalRepos", fineGrained,
+                to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "-sh", from.absolutePath,
+                "-fh", to.absolutePath,
+                "-o", impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    // Desired: //:consumer follows the dep chain through @middle_repo:wrapped -> @inner_repo:all_files
+    // -> data.txt and shows up as impacted. Current behaviour: only @inner_repo:* targets are
+    // impacted; the chain stops at the unhashed @middle_repo "blob".
+    val consumerImpacted = impacted.any { it == "//:consumer" || it == "@@//:consumer" }
+    assertThat(consumerImpacted)
+        .transform("//:consumer should be impacted (chain: inner_repo/data.txt -> @inner_repo:all_files -> @middle_repo:wrapped -> //:consumer). Got impacted: $impacted") { it }
+        .isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

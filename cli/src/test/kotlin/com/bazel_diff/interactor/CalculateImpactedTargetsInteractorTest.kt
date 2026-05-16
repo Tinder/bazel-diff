@@ -758,4 +758,153 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
     assertThat(queryExpression).contains("@@aspect_bazel_lib~2.23.0//...")
     assertThat(queryExpression).contains(" + ")
   }
+
+  // ------------------------------------------------------------------------
+  // Reproducer for https://github.com/Tinder/bazel-diff/issues/335 fix #2
+  // ------------------------------------------------------------------------
+  // When the two module-graph JSON payloads passed to get-impacted-targets are not
+  // byte-equal but one of them fails to parse, `findChangedModules(emptyMap, fullMap)`
+  // reports every module in the successfully-parsed graph as "added" and the impacted
+  // set explodes:
+  //
+  //   * With a BazelQueryService bound, every "added" module fans out into an rdeps
+  //     query against its canonical repo(s). On the workspace in #335 that produced
+  //     ~5,000 serial subprocesses and the run took multiple hours.
+  //   * With no BazelQueryService bound (or one that errors), the failure-tolerant
+  //     fallback path returns `allTargets.keys` -- every hashed label is reported as
+  //     impacted, which on a large workspace defeats the point of running bazel-diff.
+  //
+  // Both outcomes are far worse than the per-target hash diff that would have run if
+  // bazel-diff hadn't been told there was a module graph at all.
+  //
+  // Today this asymmetry was caused by the stderr-pollution shape #336 fixed (an
+  // 18.0.x base graph fed into 18.1.0+ would parse to empty before that PR). It can
+  // still happen for genuinely unparseable input: a truncated/corrupted base graph
+  // pulled out of object storage, a future bazel-mod-graph serialisation change, or
+  // a base graph captured before bazel itself learned to emit `--output=json`.
+  //
+  // Fix #2 from the issue: when one parsed map is empty and the other is not, while
+  // `fromModuleGraphJson != toModuleGraphJson`, fall back to `computeSimpleImpactedTargets`
+  // instead of treating every module in the populated graph as "added". A per-target
+  // hash diff is bounded by the size of the hash set; the module-fan-out path is not.
+  //
+  // The reproducer is `@Ignore`d so CI stays green. Drop the annotation once the
+  // asymmetry-detection fallback lands and confirm this test passes: only the target
+  // whose hash actually changed should appear in the impacted set.
+  @Test
+  @org.junit.Ignore(
+      "Reproducer for https://github.com/Tinder/bazel-diff/issues/335 fix #2 " +
+          "(parse-asymmetry should fall back to computeSimpleImpactedTargets). " +
+          "Today an unparseable base graph + parseable head graph causes every module " +
+          "in the head graph to be treated as 'added', and -- with no BazelQueryService " +
+          "bound to handle the rdeps fan-out -- every target ends up reported as " +
+          "impacted. The desired behaviour is to detect the asymmetry and fall back " +
+          "to a per-target hash diff. Drop @Ignore once the fallback lands.")
+  fun execute_parseAsymmetryFallsBackToSimpleHashDiff_reproducerForIssue335Fix2() {
+    // Three targets, only //:changed has actually changed.
+    val startHashes =
+        mapOf(
+            "//:changed" to TargetHash("Rule", "h1-old", "h1-old"),
+            "//:unchanged_a" to TargetHash("Rule", "h2", "h2"),
+            "//:unchanged_b" to TargetHash("Rule", "h3", "h3"),
+        )
+    val endHashes =
+        mapOf(
+            "//:changed" to TargetHash("Rule", "h1-new", "h1-new"),
+            "//:unchanged_a" to TargetHash("Rule", "h2", "h2"),
+            "//:unchanged_b" to TargetHash("Rule", "h3", "h3"),
+        )
+
+    // fromGraph has no '{' at all, so ModuleGraphParser.parseModuleGraph falls through
+    // to `if (start < 0) return emptyMap()`. Mirrors a corrupted base-graph stored from
+    // an old bazel-diff run or a totally different serialisation format.
+    val fromModuleGraph = "garbage-non-json-payload"
+    // toGraph parses cleanly to two modules; without the fix those two modules look
+    // like "added" relative to the empty fromGraph.
+    val toModuleGraph =
+        """
+        {
+          "key": "root", "name": "root", "version": "", "apparentName": "root",
+          "dependencies": [
+            {"key": "modA@1.0", "name": "modA", "version": "1.0", "apparentName": "modA"},
+            {"key": "modB@1.0", "name": "modB", "version": "1.0", "apparentName": "modB"}
+          ]
+        }
+        """
+            .trimIndent()
+
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = startHashes,
+            to = endHashes,
+            outputWriter = outputWriter,
+            targetTypes = null,
+            fromModuleGraphJson = fromModuleGraph,
+            toModuleGraphJson = toModuleGraph,
+        )
+
+    val impacted = outputWriter.toString().trimEnd('\n').split("\n").filter { it.isNotEmpty() }.toSet()
+    // With the fallback: only the actually-changed target is in the impacted set.
+    // Without the fallback (today): every hashed target is reported because
+    // queryTargetsDependingOnModules returns `allTargets.keys` when no BazelQueryService
+    // is bound -- i.e. {//:changed, //:unchanged_a, //:unchanged_b}.
+    assertThat(impacted).containsOnly("//:changed")
+  }
+
+  // Same asymmetry case as above, but routed through executeWithDistances (the path
+  // taken when --depsFile is passed to get-impacted-targets). The fix must cover both
+  // execute() and executeWithDistances() -- both branch on `changedModules.isNotEmpty()`
+  // and call queryTargetsDependingOnModules independently.
+  @Test
+  @org.junit.Ignore(
+      "Reproducer for https://github.com/Tinder/bazel-diff/issues/335 fix #2 " +
+          "via the executeWithDistances() path. Drop @Ignore once the asymmetry " +
+          "fallback lands and confirm only the hash-diff target is reported.")
+  fun executeWithDistances_parseAsymmetryFallsBackToSimpleHashDiff_reproducerForIssue335Fix2() {
+    val startHashes =
+        mapOf(
+            "//:changed" to TargetHash("Rule", "h1-old", "h1-old"),
+            "//:unchanged_a" to TargetHash("Rule", "h2", "h2"),
+            "//:unchanged_b" to TargetHash("Rule", "h3", "h3"),
+        )
+    val endHashes =
+        mapOf(
+            "//:changed" to TargetHash("Rule", "h1-new", "h1-new"),
+            "//:unchanged_a" to TargetHash("Rule", "h2", "h2"),
+            "//:unchanged_b" to TargetHash("Rule", "h3", "h3"),
+        )
+
+    val fromModuleGraph = "garbage-non-json-payload"
+    val toModuleGraph =
+        """
+        {
+          "key": "root", "name": "root", "version": "", "apparentName": "root",
+          "dependencies": [
+            {"key": "modA@1.0", "name": "modA", "version": "1.0", "apparentName": "modA"}
+          ]
+        }
+        """
+            .trimIndent()
+
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor()
+        .executeWithDistances(
+            from = startHashes,
+            to = endHashes,
+            depEdges = emptyMap(),
+            outputWriter = outputWriter,
+            targetTypes = null,
+            fromModuleGraphJson = fromModuleGraph,
+            toModuleGraphJson = toModuleGraph,
+        )
+
+    val output = outputWriter.toString()
+    // With the fallback: only //:changed appears in the distance-metrics JSON.
+    // Without the fallback: every target is reported, all at distance 0 (because the
+    // "module-impacted" branch in executeWithDistances forces distance 0).
+    assertThat(output).contains("//:changed")
+    assertThat(output).doesNotContain("//:unchanged_a")
+    assertThat(output).doesNotContain("//:unchanged_b")
+  }
 }

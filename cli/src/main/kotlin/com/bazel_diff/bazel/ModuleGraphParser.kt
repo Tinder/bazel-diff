@@ -120,6 +120,51 @@ class ModuleGraphParser {
   }
 
   /**
+   * Returns a copy of [edges] with back-edges removed so the result is acyclic.
+   *
+   * `bazel mod graph` legitimately contains cycles: for example `rules_go` declares
+   * `bazel_dep(name = "gazelle", dev_dependency = True)` while `gazelle` declares
+   * `bazel_dep(name = "rules_go")`, so the dep graph has `rules_go <-> gazelle`. Feeding both
+   * edges into [BazelQueryService.queryBzlmodRepos] as `rule_input`s on the synthetic
+   * `//external:*` targets makes `RuleHasher` recurse infinitely and throw
+   * `CircularDependencyException`. We need a cycle-free dep DAG before emitting edges.
+   *
+   * The algorithm is a single DFS, visiting nodes in lexicographic order with their out-edges
+   * also sorted. An edge to a node currently on the DFS path is a back-edge (it would close
+   * a cycle) and is dropped; every other edge is kept. The result is therefore (a) acyclic
+   * and (b) deterministic across runs.
+   *
+   * Dropping the back-edge is conservative: a content change in the dropped-edge target still
+   * surfaces via its own synthetic `//external:*` target's hash (each repo gets one), so
+   * main-repo consumers that depend on either side of the cycle still see the change. We
+   * only lose the ability to propagate through the cycle itself, which is fine because all
+   * SCC members are co-dependent and a change in any of them already invalidates their own
+   * hashes directly.
+   */
+  fun breakCycles(edges: Map<String, List<String>>): Map<String, List<String>> {
+    val result = mutableMapOf<String, List<String>>()
+    val visited = mutableSetOf<String>()
+    val onPath = mutableSetOf<String>()
+
+    fun dfs(node: String) {
+      if (node in visited) return
+      onPath.add(node)
+      val kept = mutableListOf<String>()
+      for (target in edges[node].orEmpty().sorted()) {
+        if (target in onPath) continue // back-edge
+        kept.add(target)
+        dfs(target)
+      }
+      result[node] = kept
+      onPath.remove(node)
+      visited.add(node)
+    }
+
+    for (node in edges.keys.sorted()) dfs(node)
+    return result
+  }
+
+  /**
    * Compares two module graphs and returns the keys of modules that changed.
    *
    * A module is considered changed if:

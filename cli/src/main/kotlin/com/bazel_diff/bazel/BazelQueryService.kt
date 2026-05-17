@@ -320,7 +320,12 @@ class BazelQueryService(
     val moduleGraphJson = modService.getModuleGraphJson()
     val moduleDepEdges =
         if (moduleGraphJson != null) {
-          ModuleGraphParser().parseModuleGraphDepEdges(moduleGraphJson)
+          val parser = ModuleGraphParser()
+          // `bazel mod graph` can return cycles (e.g. rules_go <-> gazelle via the latter's
+          // dev_dependency). Emitting both directions as rule_inputs on the synthetic
+          // //external:* targets triggers RuleHasher.CircularDependencyException, so break
+          // cycles into a deterministic DAG before deriving dep edges.
+          parser.breakCycles(parser.parseModuleGraphDepEdges(moduleGraphJson))
         } else {
           emptyMap()
         }

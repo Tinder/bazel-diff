@@ -284,6 +284,24 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
     val fromGraph = moduleGraphParser.parseModuleGraph(fromModuleGraphJson)
     val toGraph = moduleGraphParser.parseModuleGraph(toModuleGraphJson)
 
+    // Parse-asymmetry guard for https://github.com/Tinder/bazel-diff/issues/335.
+    // The JSON strings differ (otherwise we wouldn't be here), but exactly one side parsed
+    // to a non-empty graph. `bazel mod graph --output=json` always emits at least the root
+    // module, so an empty parse means the JSON was unparseable -- truncated, corrupted, a
+    // future serialisation change, or an older stderr-polluted capture from before #336.
+    // Treating every module on the parseable side as "added" would explode the impacted
+    // set: ~5k serial rdeps subprocesses with a real BazelQueryService, or `allTargets.keys`
+    // with none bound. Return empty so callers fall back to the per-target hash diff, which
+    // is bounded and correct for this case.
+    if (fromGraph.isEmpty() != toGraph.isEmpty()) {
+      logger.w {
+        "Module graph parse asymmetry detected (one side parsed to ${fromGraph.size} modules, " +
+            "the other to ${toGraph.size}). Falling back to per-target hash diff. " +
+            "See https://github.com/Tinder/bazel-diff/issues/335"
+      }
+      return emptySet()
+    }
+
     // Find changed modules
     val changedModules = moduleGraphParser.findChangedModules(fromGraph, toGraph)
 

@@ -48,6 +48,11 @@ jobs:
           if-no-files-found: warn
       - name: Enforce coverage threshold (>= 90% main-source line coverage)
         env:
+          # Must match the `Run bazel-diff tests` step above, otherwise bazelisk
+          # downloads the default bazel from .bazelversion and starts a fresh
+          # server whose output base loses track of the coverage report symlink
+          # (seen flaking on macos-latest x bazel 9.x).
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
           COVERAGE_THRESHOLD: '90'
         run: ~/go/bin/bazelisk run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat
       - name: Upload test logs

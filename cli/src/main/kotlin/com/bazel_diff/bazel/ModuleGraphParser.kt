@@ -70,6 +70,101 @@ class ModuleGraphParser {
   }
 
   /**
+   * Parses the JSON from `bazel mod graph --output=json` and returns each module's direct
+   * `bazel_dep` neighbours as a `module_name -> [dep_module_name, ...]` map.
+   *
+   * Module names (the `name` field of the `module(name = ...)` declaration) are used as the
+   * key here because the alternative -- `module_key` -- is not always populated on the
+   * `Build.Repository` protos returned by `bazel mod show_repo`, which is what consumers want
+   * to look up against. Module names are universally present and sufficient to find a unique
+   * row in the graph for the common no-multi-version case.
+   *
+   * The same module may appear in multiple places in the JSON tree (`bazel mod graph` inlines
+   * each module once and references it via `unexpanded` afterwards). This method walks every
+   * `dependencies` array it sees, so even the `unexpanded` references contribute an edge. The
+   * resulting map is keyed by the parent's `module_name` and contains the union of all direct
+   * dep names observed across the tree.
+   *
+   * Returns an empty map on parse failure (same tolerance as [parseModuleGraph]).
+   */
+  fun parseModuleGraphDepEdges(json: String): Map<String, List<String>> {
+    val edges = mutableMapOf<String, MutableSet<String>>()
+    try {
+      val root = try {
+        JsonParser.parseString(json).asJsonObject
+      } catch (_: Exception) {
+        val start = json.indexOf('{')
+        if (start < 0) return emptyMap()
+        JsonParser.parseString(json.substring(start)).asJsonObject
+      }
+      extractDepEdges(root, edges)
+    } catch (_: Exception) {
+      return emptyMap()
+    }
+    return edges.mapValues { it.value.toList() }
+  }
+
+  private fun extractDepEdges(obj: JsonObject, edges: MutableMap<String, MutableSet<String>>) {
+    val name = obj.get("name")?.asString ?: return
+    val deps = obj.get("dependencies")?.asJsonArray ?: return
+    val collected = edges.getOrPut(name) { mutableSetOf() }
+    for (dep in deps) {
+      if (!dep.isJsonObject) continue
+      val depObj = dep.asJsonObject
+      val depName = depObj.get("name")?.asString ?: continue
+      collected.add(depName)
+      // Even if this child is `unexpanded`, recurse to pick up edges from its own expansion
+      // elsewhere in the tree.
+      extractDepEdges(depObj, edges)
+    }
+  }
+
+  /**
+   * Returns a copy of [edges] with back-edges removed so the result is acyclic.
+   *
+   * `bazel mod graph` legitimately contains cycles: for example `rules_go` declares
+   * `bazel_dep(name = "gazelle", dev_dependency = True)` while `gazelle` declares
+   * `bazel_dep(name = "rules_go")`, so the dep graph has `rules_go <-> gazelle`. Feeding both
+   * edges into [BazelQueryService.queryBzlmodRepos] as `rule_input`s on the synthetic
+   * `//external:*` targets makes `RuleHasher` recurse infinitely and throw
+   * `CircularDependencyException`. We need a cycle-free dep DAG before emitting edges.
+   *
+   * The algorithm is a single DFS, visiting nodes in lexicographic order with their out-edges
+   * also sorted. An edge to a node currently on the DFS path is a back-edge (it would close
+   * a cycle) and is dropped; every other edge is kept. The result is therefore (a) acyclic
+   * and (b) deterministic across runs.
+   *
+   * Dropping the back-edge is conservative: a content change in the dropped-edge target still
+   * surfaces via its own synthetic `//external:*` target's hash (each repo gets one), so
+   * main-repo consumers that depend on either side of the cycle still see the change. We
+   * only lose the ability to propagate through the cycle itself, which is fine because all
+   * SCC members are co-dependent and a change in any of them already invalidates their own
+   * hashes directly.
+   */
+  fun breakCycles(edges: Map<String, List<String>>): Map<String, List<String>> {
+    val result = mutableMapOf<String, List<String>>()
+    val visited = mutableSetOf<String>()
+    val onPath = mutableSetOf<String>()
+
+    fun dfs(node: String) {
+      if (node in visited) return
+      onPath.add(node)
+      val kept = mutableListOf<String>()
+      for (target in edges[node].orEmpty().sorted()) {
+        if (target in onPath) continue // back-edge
+        kept.add(target)
+        dfs(target)
+      }
+      result[node] = kept
+      onPath.remove(node)
+      visited.add(node)
+    }
+
+    for (node in edges.keys.sorted()) dfs(node)
+    return result
+  }
+
+  /**
    * Compares two module graphs and returns the keys of modules that changed.
    *
    * A module is considered changed if:

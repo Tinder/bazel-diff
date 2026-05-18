@@ -1,0 +1,4 @@
+module(
+    name = "inner",
+    version = "0.0.0",
+)

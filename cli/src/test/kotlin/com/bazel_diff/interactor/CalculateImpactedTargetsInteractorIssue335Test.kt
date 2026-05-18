@@ -25,29 +25,24 @@ import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
 
 /**
- * Reproducer for the "loose substring match" tail of
+ * Regression coverage for the "loose substring match" tail of
  * https://github.com/Tinder/bazel-diff/issues/335 (fix #3 in the issue body).
  *
- * `CalculateImpactedTargetsInteractor.queryTargetsDependingOnModules` resolves changed module
- * keys to canonical external repos with:
+ * `CalculateImpactedTargetsInteractor.queryTargetsDependingOnModules` historically resolved
+ * changed module keys to canonical external repos with `it.contains(moduleName)`. That was a
+ * very loose match: in a workspace with many module extensions a single changed module like
+ * `aspect_bazel_lib` matched every canonical repo whose name started with that string -- e.g.
+ * `@@aspect_bazel_lib+`, `@@aspect_bazel_lib++toolchains+bats_toolchains`, etc. Each match
+ * became its own serial `bazel query rdeps(//..., @@<repo>//...)` subprocess. On the workspace
+ * in #335 that fan-out produced ~5,000 subprocesses and took multiple hours.
  *
- * ```
- * val moduleRepos = allTargets.keys
- *     .filter { it.startsWith("@@") && it.contains(moduleName) }
- *     .map { it.substring(2).substringBefore("//") }
- *     .toSet()
- * ```
+ * The fix tightens the match to the base module repo only (the canonical name has the shape
+ * `<moduleName><sep><versionSegment>` with no further `+`/`~` segments). Extension-repo content
+ * changes propagate to main-repo consumers through the normal dep-hash chain, so the simple
+ * per-target hash diff already catches them.
  *
- * `it.contains(moduleName)` is a very loose match. In a workspace with many module extensions
- * a single changed module like `aspect_bazel_lib` matches every canonical repo whose name
- * starts with that string -- e.g. `@@aspect_bazel_lib+`, `@@aspect_bazel_lib++toolchains+bats_toolchains`,
- * etc. Each match becomes its own serial `bazel query rdeps(//..., @@<repo>//...)` subprocess.
- * On the workspace in #335 that fan-out produced ~5,000 subprocesses and took multiple hours.
- *
- * This test asserts that resolving a single changed module yields at most one rdeps query
- * (the one targeting the actual changed repo). The fix is either to match the canonical repo
- * key exactly (e.g. `aspect_bazel_lib+` -- the part before any further `+`/`~`), or to look up
- * the repo via `bazel mod dump_repo_mapping` instead of a substring scan.
+ * This test asserts that resolving a single changed module yields exactly one rdeps query,
+ * scoped to the actual base repo.
  */
 class CalculateImpactedTargetsInteractorIssue335Test : KoinTest {
 
@@ -57,13 +52,10 @@ class CalculateImpactedTargetsInteractorIssue335Test : KoinTest {
   @Before
   fun setUp() {
     // Capture every query expression that flows through queryService.query(...).
+    // The production caller in queryTargetsDependingOnModules always passes
+    // `useCquery = false`, so one matcher pair covers it.
     runBlocking {
       whenever(queryService.query(any<String>(), eq(false))).thenAnswer { invocation ->
-        val q = invocation.getArgument<String>(0)
-        capturedQueries.add(q)
-        emptyList<BazelTarget>()
-      }
-      whenever(queryService.query(any<String>())).thenAnswer { invocation ->
         val q = invocation.getArgument<String>(0)
         capturedQueries.add(q)
         emptyList<BazelTarget>()
@@ -85,13 +77,7 @@ class CalculateImpactedTargetsInteractorIssue335Test : KoinTest {
   }
 
   @Test
-  @org.junit.Ignore(
-      "Reproducer for https://github.com/Tinder/bazel-diff/issues/335 fix #3 (loose " +
-          "substring match in queryTargetsDependingOnModules). Today a single changed module " +
-          "fans out into one rdeps subprocess per repo whose canonical name contains the " +
-          "apparent module name, which explodes on workspaces with many module extensions. " +
-          "Drop @Ignore once the match is tightened to the actual canonical repo key.")
-  fun queryTargetsDependingOnModules_doesNotOverMatchExtensionRepoNames_reproducerForIssue335() {
+  fun queryTargetsDependingOnModules_doesNotOverMatchExtensionRepoNames_regressionForIssue335() {
     // Simulate the #335 workspace: one module (aspect_bazel_lib) and several module-extension
     // repos whose canonical names also begin with "aspect_bazel_lib". The bug is that all
     // of those get treated as the "changed module" and each spawns its own rdeps query.

@@ -109,6 +109,36 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "BazelTargetTest",
+    test_class = "com.bazel_diff.bazel.BazelTargetTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "BazelTargetTypeTest",
+    test_class = "com.bazel_diff.bazel.BazelTargetTypeTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "BazelDiffTest",
+    test_class = "com.bazel_diff.cli.BazelDiffTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "VersionProviderTest",
+    test_class = "com.bazel_diff.cli.VersionProviderTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "StderrLoggerTest",
+    test_class = "com.bazel_diff.log.StderrLoggerTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "BazelModServiceTest",
     test_class = "com.bazel_diff.bazel.BazelModServiceTest",
     runtime_deps = [":cli-test-lib"],

@@ -340,17 +340,36 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       return allTargets.keys
     }
 
-    // Map every changed module to its matching bzlmod canonical repos. A single module
-    // name can match multiple canonical repos (e.g. rules_jvm_external matches
-    // rules_jvm_external~~maven~maven, rules_jvm_external~~toolchains~...). Log per
-    // module so an operator can attribute a pathologically large impacted set back to
-    // a specific module bump.
+    // Map every changed module to its bzlmod canonical *base* repo. We deliberately do
+    // NOT pull in module-extension repos here (e.g. `aspect_bazel_lib++toolchains+bats_toolchains`):
+    // a loose `it.contains(moduleName)` substring scan matched all of them and produced
+    // ~5,000 serial rdeps subprocesses on the workspace in
+    // https://github.com/Tinder/bazel-diff/issues/335. Extension-repo target hashes
+    // propagate to main-repo consumers via the normal dep-hash chain, so the simple
+    // hash diff already catches consumers when an extension repo's contents actually
+    // change. The rdeps query only needs to find main-repo targets whose dependency on
+    // the module's *base* repo isn't reflected in a hash flip (MODULE.bazel-only bumps,
+    // dep additions/removals against an otherwise-unchanged repo, etc.).
+    //
+    // Canonical-name forms we recognise as the base repo for module X:
+    //   * Bazel 7+ default form:        `X+`                 (no version embedded)
+    //   * Bazel <7 form / multi-version: `X~<version>`       (e.g. abseil-cpp~20240722.0)
+    //   * Bazel 7+ with explicit version: `X+<version>`      (no further `+` segments)
+    //
+    // Extension-repo forms we reject:
+    //   * `X++<ext>+<repo>`             (Bazel 7+, empty version)
+    //   * `X+<version>+<ext>+<repo>`    (Bazel 7+, embedded version)
+    //   * `X~<version>~<ext>~<repo>`    (Bazel <7)
     val moduleRepos = mutableSetOf<String>()
     for (moduleKey in changedModuleKeys) {
       val moduleName = moduleKey.substringBefore("@")
       val matched = allTargets.keys
-          .filter { it.startsWith("@@") && it.contains(moduleName) }
-          .map { it.substring(2).substringBefore("//") }
+          .filter { it.startsWith("@@") }
+          .mapNotNull { target ->
+            val canonical = target.substring(2).substringBefore("//")
+            if (canonicalRepoIsBaseForModule(canonical, moduleName)) canonical else null
+          }
+          .distinct()
       if (matched.isEmpty()) {
         logger.w { "No external repository matched module $moduleKey" }
       } else {
@@ -383,5 +402,28 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
 
     logger.i { "Total targets impacted by module changes: ${impactedTargets.size}" }
     return impactedTargets
+  }
+
+  /**
+   * Returns true if [canonical] (a bzlmod canonical repo name, with `@@` and `//...` stripped)
+   * is the base repo for [moduleName] -- i.e. the module's own repo, not a module-extension repo
+   * defined by that module.
+   *
+   * The base repo has the shape `<moduleName><sep><versionSegment>` where `<sep>` is `+` or `~`
+   * and `<versionSegment>` contains no further separators. Module-extension repos always layer
+   * additional `+` or `~` segments onto the canonical name and are rejected. See
+   * https://github.com/Tinder/bazel-diff/issues/335 for the motivating bug.
+   *
+   * Module names in bzlmod are restricted to `[a-z0-9._-]`, so neither `+` nor `~` can appear
+   * inside [moduleName] itself; the separator check below is unambiguous.
+   */
+  private fun canonicalRepoIsBaseForModule(canonical: String, moduleName: String): Boolean {
+    if (!canonical.startsWith(moduleName)) return false
+    val rest = canonical.substring(moduleName.length)
+    if (rest.isEmpty()) return false
+    val separator = rest[0]
+    if (separator != '+' && separator != '~') return false
+    val versionSegment = rest.substring(1)
+    return !versionSegment.contains('+') && !versionSegment.contains('~')
   }
 }

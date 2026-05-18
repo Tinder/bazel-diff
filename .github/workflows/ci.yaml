@@ -38,7 +38,7 @@ jobs:
       - name: Run bazel-diff tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... --enable_bzlmod=true --enable_workspace=false
+        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... //tools:coverage_check_test --enable_bzlmod=true --enable_workspace=false
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         if: always()
@@ -46,6 +46,10 @@ jobs:
           name: coverage-report-jre21-${{ matrix.os }}-bazel-${{ matrix.bazel }}
           path: bazel-out/_coverage/_coverage_report.dat
           if-no-files-found: warn
+      - name: Enforce coverage threshold (>= 90% main-source line coverage)
+        env:
+          COVERAGE_THRESHOLD: '90'
+        run: ~/go/bin/bazelisk run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()

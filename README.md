@@ -532,6 +532,37 @@ To run the tests simply run
 bazel test //...
 ```
 
+## Code coverage
+
+CI enforces a minimum **90% line coverage** on production sources (`cli/src/main/...`). To
+run the same check locally:
+
+```terminal
+make coverage
+```
+
+This invokes `bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test`
+and then runs `//tools:coverage-check` against the resulting LCOV report. The check is a
+Python `py_binary` ([`tools/coverage_check.py`](tools/coverage_check.py)) that prints a
+per-file table sorted by coverage (worst first), the overall percentage, and exits
+non-zero if main-source coverage is below the threshold.
+
+If you've already produced a coverage report and just want to re-check the threshold,
+`make coverage-check` runs only the binary against `bazel-out/_coverage/_coverage_report.dat`.
+
+The enforcement logic itself is tested under `//tools:coverage_check_test` — run it
+directly with `make coverage-test` (or `bazel test //tools:coverage_check_test`).
+
+To experiment with a different threshold (e.g. while ratcheting up), set
+`COVERAGE_THRESHOLD`:
+
+```terminal
+COVERAGE_THRESHOLD=80 make coverage
+```
+
+The CI matrix runs the same check on every Linux/macOS test job, so a PR cannot
+land if it drops main-source line coverage below the threshold.
+
 ## Versioning
 
 We use [SemVer](http://semver.org/) for versioning. For the versions available,

@@ -1,0 +1,16 @@
+module(
+    name = "bzlmod_transitive_external_test",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "outer", version = "0.0.0")
+local_path_override(
+    module_name = "outer",
+    path = "outer",
+)
+
+bazel_dep(name = "inner", version = "0.0.0")
+local_path_override(
+    module_name = "inner",
+    path = "inner",
+)

@@ -1,0 +1,6 @@
+module(
+    name = "outer",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "inner", version = "0.0.0")

@@ -1701,6 +1701,103 @@ class E2ETest {
         .isEqualTo("//external:com_github_pkg_errors")
   }
 
+  // ------------------------------------------------------------------------
+  // Regression coverage for https://github.com/Tinder/bazel-diff/issues/184
+  // ------------------------------------------------------------------------
+  // The user reported that a change inside an external repo C does not propagate to an
+  // internal target A, when A depends on external repo B and B in turn depends on C. The
+  // concrete report uses rules_python's pip_parse, where requirements.txt resolves into a
+  // separate external repo for every package; the user's py_test rule (A) depends on @moto
+  // (B), and @moto's BUILD targets depend on @cryptography (C). Bumping cryptography in
+  // requirements.txt did not surface A as impacted.
+  //
+  // Root cause: BazelQueryService.queryBzlmodRepos synthesised a `//external:<repo>` target
+  // per bzlmod-managed repo, hashed by repo *metadata* only. There was no rule_input edge
+  // between those synthetic targets and no content hash of the underlying directory, so a
+  // change inside @inner never reached @outer or //:consume.
+  //
+  // Fix: queryBzlmodRepos now (a) parses `bazel mod graph --output=json` for the dep edges
+  // and emits `addRuleInput("//external:<dep_apparent>")` per direct bzlmod dep, and (b)
+  // computes a recursive content hash of the directory for `local_repository`-rule repos
+  // (which is what `local_path_override` lowers to) and attaches it as a synthetic
+  // `_bazel_diff_content_hash` attribute. RuleHasher then follows the chain
+  // //:consume -> //external:outer -> //external:inner during digest computation.
+  //
+  // Workspace `bzlmod_transitive_external`:
+  //   //:consume         genrule, depends on @outer//:lib
+  //   @outer//:lib       genrule in the outer module, depends on @inner//:data
+  //   @inner//:data      filegroup in the inner module wrapping inner/data.txt
+  //
+  // Both `outer` and `inner` are real bzlmod modules brought in via `local_path_override`.
+  //
+  // This test asserts the post-fix behaviour: changing inner/data.txt with no extra flags
+  // surfaces //:consume in the impacted-targets output.
+  //
+  // Requires Bazel 8.6.0+ for the `mod show_repo --output=streamed_proto` path that produces
+  // the synthetic targets the fix mutates; same gating as
+  // [testBzlmodShowRepoDetectsModuleBazelChanges].
+  @Test
+  fun testTransitiveExternalRepoChangeImpactsConsumer_regressionForIssue184() {
+    val version = getBazelVersion()
+    org.junit.Assume.assumeNotNull(version)
+    val v = version!!
+    val comparator =
+        compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+    val hasModShowRepo = comparator.compare(v, Triple(8, 6, 0)) >= 0 && v != Triple(9, 0, 0)
+    org.junit.Assume.assumeTrue(
+        "Requires Bazel 8.6.0+ or 9.0.1+ (current: ${v.first}.${v.second}.${v.third})",
+        hasModShowRepo)
+
+    val workspaceA = copyTestWorkspace("bzlmod_transitive_external")
+    val workspaceB = copyTestWorkspace("bzlmod_transitive_external")
+
+    // Mutate the deepest, transitively-consumed file in B. Nothing in workspaceB's main
+    // module changes; only inner/data.txt (which @inner re-exports via :data) is touched.
+    val innerDataInB = File(workspaceB, "inner/data.txt")
+    val original = innerDataInB.readText()
+    val mutated = "world\n"
+    assertThat(mutated != original).isEqualTo(true)
+    innerDataInB.writeText(mutated)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceA.absolutePath,
+                "-b", "bazel",
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "-sh", from.absolutePath,
+                "-fh", to.absolutePath,
+                "-o", impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    val consumerImpacted = impacted.any { it == "//:consume" || it == "@@//:consume" }
+    assertThat(consumerImpacted)
+        .transform(
+            "//:consume should be impacted when inner/data.txt changes (transitive external dep " +
+                "via @outer -> @inner per #184); got: $impacted") { it }
+        .isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

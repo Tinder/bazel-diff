@@ -274,6 +274,70 @@ class ModuleGraphParserTest {
     assertThat(result).containsExactlyInAnyOrder("root", "abseil-cpp@20240116.2")
   }
 
+  // ---------------------------------------------------------------------------------------
+  // breakCycles
+  // ---------------------------------------------------------------------------------------
+
+  @Test
+  fun breakCycles_acyclicInput_returnsEdgesUnchanged() {
+    val edges = mapOf("a" to listOf("b", "c"), "b" to listOf("c"), "c" to emptyList())
+
+    val result = parser.breakCycles(edges)
+
+    assertThat(result["a"]!!).containsExactlyInAnyOrder("b", "c")
+    assertThat(result["b"]!!).containsExactlyInAnyOrder("c")
+    assertThat(result["c"]!!).isEmpty()
+  }
+
+  @Test
+  fun breakCycles_twoNodeCycle_dropsOneEdge() {
+    // The real-world case: rules_go <-> gazelle. Adding both rule_inputs
+    // makes RuleHasher recurse infinitely; we keep exactly one direction.
+    val edges = mapOf("gazelle" to listOf("rules_go"), "rules_go" to listOf("gazelle"))
+
+    val result = parser.breakCycles(edges)
+
+    val total = result.values.sumOf { it.size }
+    assertThat(total).isEqualTo(1)
+    // Deterministic: sorted DFS starts at "gazelle" first, so its edge survives
+    // and rules_go's back-edge is the one that gets dropped.
+    assertThat(result["gazelle"]!!).containsExactlyInAnyOrder("rules_go")
+    assertThat(result["rules_go"]!!).isEmpty()
+  }
+
+  @Test
+  fun breakCycles_threeNodeCycle_breaksCycleDeterministically() {
+    val edges = mapOf("a" to listOf("b"), "b" to listOf("c"), "c" to listOf("a"))
+
+    val result = parser.breakCycles(edges)
+
+    // Whatever the algorithm picks, the result must be a DAG: total edges = nodes - 1
+    // (otherwise the algorithm would have kept a cycle), and both forward edges survive
+    // because DFS visits a -> b -> c first and then c -> a is the back-edge.
+    assertThat(result["a"]!!).containsExactlyInAnyOrder("b")
+    assertThat(result["b"]!!).containsExactlyInAnyOrder("c")
+    assertThat(result["c"]!!).isEmpty()
+  }
+
+  @Test
+  fun breakCycles_selfLoop_dropsSelfEdge() {
+    val edges = mapOf("a" to listOf("a", "b"), "b" to emptyList())
+
+    val result = parser.breakCycles(edges)
+
+    assertThat(result["a"]!!).containsExactlyInAnyOrder("b")
+  }
+
+  @Test
+  fun breakCycles_isDeterministic() {
+    val edges = mapOf("gazelle" to listOf("rules_go"), "rules_go" to listOf("gazelle"))
+
+    val first = parser.breakCycles(edges)
+    val second = parser.breakCycles(edges)
+
+    assertThat(first).isEqualTo(second)
+  }
+
   @Test
   fun findChangedModules_withNewGraphEmpty_returnsAllOldModuleKeys() {
     val oldGraph =

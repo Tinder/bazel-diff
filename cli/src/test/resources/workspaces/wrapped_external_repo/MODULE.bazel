@@ -1,0 +1,16 @@
+module(
+    name = "wrapped_external_repo_test",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "inner_repo", version = "0.0.0")
+local_path_override(
+    module_name = "inner_repo",
+    path = "inner_repo",
+)
+
+bazel_dep(name = "middle_repo", version = "0.0.0")
+local_path_override(
+    module_name = "middle_repo",
+    path = "middle_repo",
+)

@@ -28,3 +28,10 @@ user.bazelrc
 .DS_Store
 !.bazelversion
 archives/
+# Coverage HTML report (genhtml output from `make coverage-html`).
+coverage-html/
+# Claude Code local state (per-user settings + scratch worktrees).
+# Skills under .claude/skills/ ARE checked in -- they're shared team docs --
+# so this is a precise ignore list, not a blanket .claude/ ignore.
+.claude/settings.local.json
+.claude/worktrees/

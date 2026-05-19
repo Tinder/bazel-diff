@@ -6,11 +6,14 @@ Run via Bazel:
 
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
+import coverage_check
 from coverage_check import (
     FileCoverage,
     filter_main_source,
@@ -228,6 +231,101 @@ class MainTest(unittest.TestCase):
             self.assertEqual(self._run_main([path])[0], 0)
         finally:
             del os.environ["COVERAGE_THRESHOLD"]
+
+
+class HtmlReportTest(unittest.TestCase):
+    """Cover the --html flag without requiring genhtml to actually be installed."""
+
+    def _write_lcov(self, content: str) -> str:
+        fd, path = tempfile.mkstemp(suffix=".dat")
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def _run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_html_flag_invokes_genhtml_with_correct_args(self):
+        # Mock both `which` (so the function doesn't reject the call) and `run`
+        # (so we don't actually invoke a subprocess). The test asserts the
+        # contract: genhtml is invoked with the LCOV file, --output-directory,
+        # and --quiet, then the absolute index.html path is printed.
+        path = self._write_lcov(SIMPLE_LCOV)
+        out_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: os.rmdir(out_dir) if os.path.isdir(out_dir) else None)
+
+        with patch.object(coverage_check.shutil, "which", return_value="/usr/bin/genhtml") as mock_which, \
+             patch.object(coverage_check.subprocess, "run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            rc, stdout, _ = self._run_main(
+                [path, "--threshold", "50", "--html", out_dir]
+            )
+
+        self.assertEqual(rc, 0)
+        mock_which.assert_called_once_with("genhtml")
+        mock_run.assert_called_once_with(
+            ["genhtml", path, "--output-directory", out_dir, "--quiet"],
+            check=True,
+        )
+        # The absolute index.html path is surfaced so the user can open it
+        # directly from their terminal.
+        self.assertIn(os.path.abspath(os.path.join(out_dir, "index.html")), stdout)
+
+    def test_html_flag_errors_clearly_when_genhtml_missing(self):
+        # When genhtml is absent we exit 2 with a clear install-hint message,
+        # even if the threshold itself would have passed -- the user
+        # explicitly asked for HTML output and we couldn't produce it.
+        path = self._write_lcov(SIMPLE_LCOV)
+        out_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: os.rmdir(out_dir) if os.path.isdir(out_dir) else None)
+
+        with patch.object(coverage_check.shutil, "which", return_value=None):
+            rc, _, stderr = self._run_main(
+                [path, "--threshold", "50", "--html", out_dir]
+            )
+
+        self.assertEqual(rc, 2)
+        self.assertIn("genhtml not found", stderr)
+        self.assertIn("brew install lcov", stderr)
+
+    def test_html_flag_errors_when_genhtml_returns_nonzero(self):
+        path = self._write_lcov(SIMPLE_LCOV)
+        out_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: os.rmdir(out_dir) if os.path.isdir(out_dir) else None)
+
+        with patch.object(coverage_check.shutil, "which", return_value="/usr/bin/genhtml"), \
+             patch.object(coverage_check.subprocess, "run",
+                          side_effect=subprocess.CalledProcessError(returncode=3, cmd=["genhtml"])):
+            rc, _, stderr = self._run_main(
+                [path, "--threshold", "50", "--html", out_dir]
+            )
+
+        self.assertEqual(rc, 2)
+        self.assertIn("genhtml exited with code 3", stderr)
+
+    def test_html_generated_even_when_threshold_fails(self):
+        # The interactive-investigation case: someone below threshold needs the
+        # HTML report to see WHERE the gaps are. We render the HTML and THEN
+        # return exit 1 for the threshold failure.
+        path = self._write_lcov(SIMPLE_LCOV)
+        out_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: os.rmdir(out_dir) if os.path.isdir(out_dir) else None)
+
+        with patch.object(coverage_check.shutil, "which", return_value="/usr/bin/genhtml"), \
+             patch.object(coverage_check.subprocess, "run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            rc, stdout, stderr = self._run_main(
+                [path, "--threshold", "95", "--html", out_dir]
+            )
+
+        self.assertEqual(rc, 1)
+        mock_run.assert_called_once()  # HTML still produced
+        self.assertIn("HTML report:", stdout)
+        self.assertIn("FAIL", stderr)
 
 
 if __name__ == "__main__":

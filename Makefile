@@ -34,3 +34,9 @@ coverage-check:
 .PHONY: coverage-test
 coverage-test:
 	bazel test //tools:coverage_check_test
+
+.PHONY: coverage-html
+coverage-html:
+	bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test
+	bazel run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat --html coverage-html
+	@echo "Open coverage-html/index.html in a browser to inspect."

@@ -21,6 +21,8 @@ Exit codes:
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Iterable, List
@@ -119,6 +121,30 @@ def format_report(
     return "\n".join(lines)
 
 
+def generate_html_report(lcov_path: str, output_dir: str) -> str:
+    """Render an annotated HTML coverage report from `lcov_path` into `output_dir`.
+
+    Returns the absolute path to the generated `index.html`. Raises FileNotFoundError
+    if `genhtml` is not on PATH (the LCOV `lcov` package; install via
+    `brew install lcov` on macOS or `apt-get install lcov` on Debian/Ubuntu) and
+    `subprocess.CalledProcessError` if genhtml itself fails.
+
+    The directory is created if it doesn't exist; existing files are overwritten
+    by genhtml's normal behaviour (it always re-emits the full report).
+    """
+    if shutil.which("genhtml") is None:
+        raise FileNotFoundError(
+            "genhtml not found on PATH. Install lcov (brew install lcov / "
+            "apt-get install lcov) and retry."
+        )
+    os.makedirs(output_dir, exist_ok=True)
+    subprocess.run(
+        ["genhtml", lcov_path, "--output-directory", output_dir, "--quiet"],
+        check=True,
+    )
+    return os.path.abspath(os.path.join(output_dir, "index.html"))
+
+
 def _chdir_to_workspace_if_invoked_via_bazel_run() -> None:
     """`bazel run //tools:coverage-check -- bazel-out/_coverage/...` would otherwise
     leave us in the runfiles directory and fail to find the LCOV file. When Bazel
@@ -162,6 +188,16 @@ def main(argv: List[str] | None = None) -> int:
             "(default: cli/src/main/,tools/coverage_check.py)."
         ),
     )
+    parser.add_argument(
+        "--html",
+        metavar="DIR",
+        help=(
+            "Also write an annotated HTML coverage report to DIR (requires "
+            "`genhtml`: brew install lcov / apt-get install lcov). The "
+            "threshold check still runs and still gates the exit code; --html "
+            "only adds an additional artifact for interactive inspection."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not os.path.isfile(args.lcov):
@@ -190,6 +226,22 @@ def main(argv: List[str] | None = None) -> int:
         return 2
 
     print(format_report(records, total_lh, total_lf, args.threshold))
+
+    # Generate the HTML report before the threshold gate so an interactive
+    # investigation has the report to look at even when the gate fails -- the
+    # below-threshold case is exactly when the report is most useful.
+    if args.html:
+        try:
+            index_path = generate_html_report(args.lcov, args.html)
+            print(f"HTML report: {index_path}")
+        except FileNotFoundError as e:
+            # Fail loudly: the user explicitly asked for HTML and we couldn't
+            # produce it. Better to bail than to silently skip and confuse them.
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        except subprocess.CalledProcessError as e:
+            print(f"error: genhtml exited with code {e.returncode}.", file=sys.stderr)
+            return 2
 
     overall = total_lh / total_lf * 100.0
     # Allow a tiny epsilon so 89.99999... that displays as 90.00 still passes a 90

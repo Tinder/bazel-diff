@@ -553,6 +553,12 @@ If you've already produced a coverage report and just want to re-check the thres
 The enforcement logic itself is tested under `//tools:coverage_check_test` — run it
 directly with `make coverage-test` (or `bazel test //tools:coverage_check_test`).
 
+For an interactive HTML report (annotated source with covered/uncovered lines
+highlighted), use `make coverage-html`. This requires the `lcov` package
+(`brew install lcov` on macOS, `apt-get install lcov` on Debian/Ubuntu) and writes
+the report to `coverage-html/index.html`. The threshold gate still runs and still
+sets the exit code — HTML is an additional artifact, not a replacement.
+
 To experiment with a different threshold (e.g. while ratcheting up), set
 `COVERAGE_THRESHOLD`:
 

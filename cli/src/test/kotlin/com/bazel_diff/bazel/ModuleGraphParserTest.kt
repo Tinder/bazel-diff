@@ -6,6 +6,7 @@ import assertk.assertions.hasSize
 import assertk.assertions.isEmpty
 import assertk.assertions.isEqualTo
 import assertk.assertions.isNotNull
+import assertk.assertions.isNull
 import org.junit.Test
 
 class ModuleGraphParserTest {
@@ -130,6 +131,31 @@ class ModuleGraphParserTest {
     val result = parser.parseModuleGraph(json)
 
     assertThat(result).isEmpty()
+  }
+
+  @Test
+  fun parseModuleGraph_withEmptyName_skipsModule() {
+    // Reproduces the JSON shape `bazel mod graph --output=json` emits for an
+    // unnamed root MODULE.bazel.
+    val json =
+        """
+      {
+        "key": "<root>",
+        "name": "",
+        "version": "",
+        "apparentName": "",
+        "dependencies": [
+          {"key": "platforms@1.0.0", "name": "platforms", "version": "1.0.0", "apparentName": "platforms"}
+        ]
+      }
+    """
+            .trimIndent()
+
+    val result = parser.parseModuleGraph(json)
+
+    assertThat(result).hasSize(1)
+    assertThat(result["platforms@1.0.0"]).isNotNull()
+    assertThat(result["<root>"]).isNull()
   }
 
   @Test

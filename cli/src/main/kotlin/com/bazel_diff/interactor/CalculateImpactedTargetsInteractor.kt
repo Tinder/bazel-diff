@@ -1,6 +1,7 @@
 package com.bazel_diff.interactor
 
 import com.bazel_diff.bazel.BazelQueryService
+import com.bazel_diff.bazel.Module
 import com.bazel_diff.bazel.ModuleGraphParser
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.log.Logger
@@ -50,7 +51,7 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
 
     val impactedTargets = if (changedModules.isNotEmpty()) {
       logger.i { "Module changes detected - querying for targets that depend on changed modules" }
-      queryTargetsDependingOnModules(changedModules, to)
+      queryTargetsDependingOnModules(changedModules, from, to)
     } else {
       computeSimpleImpactedTargets(from, to)
     }
@@ -103,7 +104,7 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
 
     val impactedTargets = if (changedModules.isNotEmpty()) {
       logger.i { "Module changes detected - querying for targets that depend on changed modules" }
-      val moduleImpactedTargets = queryTargetsDependingOnModules(changedModules, to)
+      val moduleImpactedTargets = queryTargetsDependingOnModules(changedModules, from, to)
       // Mark module-impacted targets with distance 0, then compute distances from there
       val moduleImpactedHashes = from.filterKeys { !moduleImpactedTargets.contains(it) }
       computeAllDistances(moduleImpactedHashes, to, depEdges)
@@ -259,40 +260,27 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
   }
 
   /**
-   * Detects module changes by comparing module graphs and returns changed module keys.
+   * Detects module changes by comparing module graphs and returns the changed Modules.
    *
-   * This method:
-   * 1. Parses the from and to module graphs
-   * 2. Identifies which modules changed (added, removed, or version changed)
-   * 3. Logs the changes for visibility
-   * 4. Returns the set of changed module keys
+   * Resolves each changed key against the "to" graph first (the state we will query
+   * against), falling back to the "from" graph for modules that were removed.
    *
-   * @param fromModuleGraphJson JSON from `bazel mod graph --output=json` for starting revision
-   * @param toModuleGraphJson JSON from `bazel mod graph --output=json` for final revision
-   * @return Set of changed module keys, empty if no changes
+   * @param fromModuleGraphJson JSON from `bazel mod graph --output=json` for the starting revision
+   * @param toModuleGraphJson JSON from `bazel mod graph --output=json` for the final revision
+   * @return Set of changed Modules, empty if no changes
    */
   private fun detectChangedModules(
       fromModuleGraphJson: String?,
       toModuleGraphJson: String?
-  ): Set<String> {
-    // If either module graph is missing, assume no changes
+  ): Set<Module> {
     if (fromModuleGraphJson == null || toModuleGraphJson == null) {
       return emptySet()
     }
 
-    // Parse module graphs
     val fromGraph = moduleGraphParser.parseModuleGraph(fromModuleGraphJson)
     val toGraph = moduleGraphParser.parseModuleGraph(toModuleGraphJson)
 
-    // Parse-asymmetry guard for https://github.com/Tinder/bazel-diff/issues/335.
-    // The JSON strings differ (otherwise we wouldn't be here), but exactly one side parsed
-    // to a non-empty graph. `bazel mod graph --output=json` always emits at least the root
-    // module, so an empty parse means the JSON was unparseable -- truncated, corrupted, a
-    // future serialisation change, or an older stderr-polluted capture from before #336.
-    // Treating every module on the parseable side as "added" would explode the impacted
-    // set: ~5k serial rdeps subprocesses with a real BazelQueryService, or `allTargets.keys`
-    // with none bound. Return empty so callers fall back to the per-target hash diff, which
-    // is bounded and correct for this case.
+    // Parse-asymmetry guard for https://github.com/Tinder/bazel-diff/issues/335 fix #2.
     if (fromGraph.isEmpty() != toGraph.isEmpty()) {
       logger.w {
         "Module graph parse asymmetry detected (one side parsed to ${fromGraph.size} modules, " +
@@ -302,31 +290,30 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       return emptySet()
     }
 
-    // Find changed modules
-    val changedModules = moduleGraphParser.findChangedModules(fromGraph, toGraph)
+    val changedKeys = moduleGraphParser.findChangedModules(fromGraph, toGraph)
 
-    if (changedModules.isEmpty()) {
+    if (changedKeys.isEmpty()) {
       logger.i { "No module changes detected" }
-    } else {
-      logger.i { "Detected ${changedModules.size} module changes: ${changedModules.joinToString(", ")}" }
+      return emptySet()
     }
 
+    val changedModules = changedKeys.mapNotNull { key -> toGraph[key] ?: fromGraph[key] }.toSet()
+    logger.i { "Detected ${changedModules.size} module changes: ${changedModules.joinToString(", ") { it.key }}" }
     return changedModules
   }
 
   /**
    * Queries Bazel to find all workspace targets that depend on any changed module.
    *
-   * Maps every changed module to its matching bzlmod canonical repos, then issues a
-   * single `rdeps(//..., @@a//... + @@b//... + ...)` query. Bazel executes the union
-   * in one analysis pass, avoiding per-repo subprocess fan-out.
-   *
-   * @param changedModuleKeys Set of changed module keys (e.g., "abseil-cpp@20240722.0")
-   * @param allTargets Map of all targets from the final revision
-   * @return Set of target labels that are impacted by module changes
+   * Resolves each changed module to its base canonical repo (see
+   * [canonicalRepoIsBaseForModule]) and issues a single unioned `rdeps(//..., …)`
+   * query. The hash-diff over `from`/`allTargets` is unioned in below to surface
+   * labels whose content changed alongside a MODULE.bazel update; this is also how
+   * extension-repo content changes propagate to main-repo consumers.
    */
   private fun queryTargetsDependingOnModules(
-      changedModuleKeys: Set<String>,
+      changedModules: Set<Module>,
+      from: Map<String, TargetHash>,
       allTargets: Map<String, TargetHash>
   ): Set<String> {
     val queryService: BazelQueryService? = try {
@@ -340,65 +327,55 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       return allTargets.keys
     }
 
-    // Map every changed module to its bzlmod canonical *base* repo. We deliberately do
-    // NOT pull in module-extension repos here (e.g. `aspect_bazel_lib++toolchains+bats_toolchains`):
-    // a loose `it.contains(moduleName)` substring scan matched all of them and produced
-    // ~5,000 serial rdeps subprocesses on the workspace in
-    // https://github.com/Tinder/bazel-diff/issues/335. Extension-repo target hashes
-    // propagate to main-repo consumers via the normal dep-hash chain, so the simple
-    // hash diff already catches consumers when an extension repo's contents actually
-    // change. The rdeps query only needs to find main-repo targets whose dependency on
-    // the module's *base* repo isn't reflected in a hash flip (MODULE.bazel-only bumps,
-    // dep additions/removals against an otherwise-unchanged repo, etc.).
-    //
-    // Canonical-name forms we recognise as the base repo for module X:
-    //   * Bazel 7+ default form:        `X+`                 (no version embedded)
-    //   * Bazel <7 form / multi-version: `X~<version>`       (e.g. abseil-cpp~20240722.0)
-    //   * Bazel 7+ with explicit version: `X+<version>`      (no further `+` segments)
-    //
-    // Extension-repo forms we reject:
-    //   * `X++<ext>+<repo>`             (Bazel 7+, empty version)
-    //   * `X+<version>+<ext>+<repo>`    (Bazel 7+, embedded version)
-    //   * `X~<version>~<ext>~<repo>`    (Bazel <7)
+    val canonicalRepos: Set<String> = allTargets.keys.asSequence()
+        .filter { it.startsWith("@@") }
+        .map { it.substring(2).substringBefore("//") }
+        .filter { it.isNotEmpty() }
+        .toSet()
+
     val moduleRepos = mutableSetOf<String>()
-    for (moduleKey in changedModuleKeys) {
-      val moduleName = moduleKey.substringBefore("@")
-      val matched = allTargets.keys
-          .filter { it.startsWith("@@") }
-          .mapNotNull { target ->
-            val canonical = target.substring(2).substringBefore("//")
-            if (canonicalRepoIsBaseForModule(canonical, moduleName)) canonical else null
-          }
-          .distinct()
-      if (matched.isEmpty()) {
-        logger.w { "No external repository matched module $moduleKey" }
-      } else {
-        logger.i { "Module $moduleKey matched ${matched.size} repos: ${matched.joinToString(", ")}" }
-        moduleRepos.addAll(matched)
+    var skippedNoMatch = 0
+    for (module in changedModules) {
+      logger.i { "Resolving repos for changed module: ${module.name} (key: ${module.key})" }
+      val resolved = canonicalRepos.filter { canonicalRepoIsBaseForModule(it, module.name) }.toSet()
+      if (resolved.isEmpty()) {
+        logger.i { "No external repository found for module ${module.name} (skipped)" }
+        skippedNoMatch++
+        continue
       }
+      logger.i { "Found ${resolved.size} repositories for module ${module.name}: ${resolved.joinToString(", ")}" }
+      moduleRepos.addAll(resolved)
+    }
+    if (skippedNoMatch > 0) {
+      logger.i { "Skipped $skippedNoMatch of ${changedModules.size} changed modules with no materialised repos in allTargets" }
     }
 
     if (moduleRepos.isEmpty()) {
       logger.i { "No external repositories matched any changed module" }
-      return computeSimpleImpactedTargets(emptyMap(), allTargets)
+      return computeSimpleImpactedTargets(from, allTargets)
     }
 
-    logger.i { "Querying rdeps for ${moduleRepos.size} repositories across ${changedModuleKeys.size} changed modules" }
+    logger.i { "Querying rdeps for ${moduleRepos.size} repositories across ${changedModules.size} changed modules" }
 
     val impactedTargets = mutableSetOf<String>()
     try {
-      // Single unioned rdeps query: bazel executes the union in one analysis pass.
       val queryExpression = "rdeps(//..., ${moduleRepos.joinToString(" + ") { "@@$it//..." }})"
       val rdeps = runBlocking { queryService.query(queryExpression, useCquery = false) }
       val rdepLabels = rdeps.map { it.name }.filter { !it.startsWith("@@") }
       logger.i { "Found ${rdepLabels.size} workspace targets depending on changed modules" }
       impactedTargets.addAll(rdepLabels)
     } catch (e: Exception) {
-      logger.e(e) { "Unioned rdeps query failed - conservatively marking all workspace targets impacted" }
-      impactedTargets.addAll(allTargets.keys.filter { !it.startsWith("@@") })
+      logger.e(e) { "Unioned rdeps query failed - falling back to buildable workspace targets (or every hashed label on bzlmod-only shapes)" }
+      val buildableWorkspaceTargets = allTargets.keys.filter(::isBuildableWorkspaceTarget)
+      impactedTargets.addAll(
+          if (buildableWorkspaceTargets.isEmpty()) allTargets.keys
+          else buildableWorkspaceTargets
+      )
     }
 
-    impactedTargets.addAll(computeSimpleImpactedTargets(emptyMap(), allTargets))
+    // Union with hash-diff results to surface labels whose content changed alongside
+    // the MODULE.bazel update.
+    impactedTargets.addAll(computeSimpleImpactedTargets(from, allTargets))
 
     logger.i { "Total targets impacted by module changes: ${impactedTargets.size}" }
     return impactedTargets
@@ -426,4 +403,10 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
     val versionSegment = rest.substring(1)
     return !versionSegment.contains('+') && !versionSegment.contains('~')
   }
+
+  // Distinct from the `excludeExternalTargets` filter at the output sites: this
+  // also strips `@@` so the rdeps-failure fallback can detect a bzlmod-only
+  // workspace shape.
+  private fun isBuildableWorkspaceTarget(label: String): Boolean =
+      !label.startsWith("@@") && !label.startsWith("//external:")
 }

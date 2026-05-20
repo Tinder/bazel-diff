@@ -9,6 +9,13 @@ on:
 jobs:
   test-jre21:
     runs-on: ${{ matrix.os }}
+    # contents:write is needed by the "Publish coverage badge" step below, which
+    # commits the regenerated coverage.json back to master on push events and
+    # to the PR head branch on internal pull requests. The step itself is gated
+    # on the canonical matrix entry and a non-fork PR, but the permission has
+    # to be declared at the job level.
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -46,12 +53,57 @@ jobs:
           name: coverage-report-jre21-${{ matrix.os }}-bazel-${{ matrix.bazel }}
           path: bazel-out/_coverage/_coverage_report.dat
           if-no-files-found: warn
-      - name: Enforce coverage threshold (>= 90% main-source line coverage)
+      - name: Generate coverage badge JSON
+        # Decoupled from the threshold gate below so the badge still updates on
+        # PRs that drop coverage. Passing --threshold 0 means this step never
+        # fails on coverage value; the strict gate runs as its own step after
+        # the badge has been published.
         env:
           # Must match the `Run bazel-diff tests` step above, otherwise bazelisk
           # downloads the default bazel from .bazelversion and starts a fresh
           # server whose output base loses track of the coverage report symlink
           # (seen flaking on macos-latest x bazel 9.x).
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+        run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json --threshold 0 bazel-out/_coverage/_coverage_report.dat
+      - name: Publish coverage badge
+        # Auto-commits coverage.json back to master on pushes and back to the
+        # PR's head branch on internal pull requests so the README badge always
+        # tracks the latest tested state. Skipped on:
+        #   - any matrix entry other than the canonical Linux + Bazel 9.x
+        #     runner (so the entries don't race to commit the same file), and
+        #   - fork PRs (the default GITHUB_TOKEN is read-only against forks).
+        if: |
+          matrix.os == 'ubuntu-latest' && matrix.bazel == '9.x' && (
+            (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+            (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+          )
+        env:
+          HEAD_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || 'master' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # actions/checkout fetches the merge commit for pull_request events;
+            # the PR's head branch isn't in the local repo yet. Stash the
+            # freshly-generated coverage.json, then switch to the PR head so the
+            # commit lands where the PR author can see it.
+            cp coverage.json /tmp/coverage.json
+            git fetch origin "$HEAD_REF"
+            git checkout -B "$HEAD_REF" "origin/$HEAD_REF"
+            cp /tmp/coverage.json coverage.json
+          fi
+          if [ -z "$(git status --porcelain coverage.json)" ]; then
+            echo "coverage.json unchanged; nothing to publish."
+            exit 0
+          fi
+          git add coverage.json
+          # [skip ci] is belt-and-suspenders — GITHUB_TOKEN pushes already do
+          # not retrigger workflows, but the marker makes the intent explicit
+          # in the log.
+          git commit -m "ci: update coverage badge [skip ci]"
+          git push origin "HEAD:$HEAD_REF"
+      - name: Enforce coverage threshold (>= 90% main-source line coverage)
+        env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           COVERAGE_THRESHOLD: '90'
         run: ~/go/bin/bazelisk run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat

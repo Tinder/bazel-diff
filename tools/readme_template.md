@@ -1,6 +1,7 @@
 # bazel-diff
 
 [![Build status](https://github.com/Tinder/bazel-diff/actions/workflows/ci.yaml/badge.svg?branch=master)](https://github.com/Tinder/bazel-diff/actions/workflows/ci.yaml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/Tinder/bazel-diff/master/coverage.json)](https://github.com/Tinder/bazel-diff/actions/workflows/ci.yaml)
 
 `bazel-diff` is a command line tool for Bazel projects that allows users to determine the exact affected set of impacted targets between two Git revisions. Using this set, users can test or build the exact modified set of targets.
 

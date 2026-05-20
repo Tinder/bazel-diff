@@ -9,6 +9,12 @@ on:
 jobs:
   test-jre21:
     runs-on: ${{ matrix.os }}
+    # contents:write is needed by the "Publish coverage badge" step below, which
+    # commits the regenerated coverage.json back to master on push events. The
+    # step itself is gated on push + canonical matrix entry, but the permission
+    # has to be declared at the job level.
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +60,26 @@ jobs:
           # (seen flaking on macos-latest x bazel 9.x).
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           COVERAGE_THRESHOLD: '90'
-        run: ~/go/bin/bazelisk run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat
+        run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+      - name: Publish coverage badge to master
+        # Only the canonical Linux + Bazel 9.x runner pushes the badge so the
+        # other matrix entries don't race to commit the same file. Skipped on
+        # pull_request because forks lack write access and the badge should
+        # only ever reflect master.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.os == 'ubuntu-latest' && matrix.bazel == '9.x'
+        run: |
+          if [ -n "$(git status --porcelain coverage.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add coverage.json
+            # [skip ci] is belt-and-suspenders — GITHUB_TOKEN pushes already do
+            # not retrigger workflows, but the marker makes the intent explicit
+            # in the log.
+            git commit -m "ci: update coverage badge [skip ci]"
+            git push origin HEAD:master
+          else
+            echo "coverage.json unchanged; nothing to publish."
+          fi
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()

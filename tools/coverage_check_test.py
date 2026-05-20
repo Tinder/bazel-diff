@@ -5,6 +5,7 @@ Run via Bazel:
 """
 
 import io
+import json
 import os
 import subprocess
 import sys
@@ -16,10 +17,12 @@ from unittest.mock import patch
 import coverage_check
 from coverage_check import (
     FileCoverage,
+    badge_color,
     filter_main_source,
     format_report,
     main,
     parse_lcov,
+    write_badge_json,
 )
 
 
@@ -326,6 +329,117 @@ class HtmlReportTest(unittest.TestCase):
         mock_run.assert_called_once()  # HTML still produced
         self.assertIn("HTML report:", stdout)
         self.assertIn("FAIL", stderr)
+
+
+class BadgeColorTest(unittest.TestCase):
+    def test_color_bands_track_the_gate(self):
+        # Boundaries: <60 red, <75 orange, <90 yellow, >=90 brightgreen.
+        # The 90% boundary is the project's enforced gate; coverage at-or-above
+        # it must read brightgreen so the badge confirms the gate is met.
+        self.assertEqual(badge_color(0.0), "red")
+        self.assertEqual(badge_color(59.99), "red")
+        self.assertEqual(badge_color(60.0), "orange")
+        self.assertEqual(badge_color(74.99), "orange")
+        self.assertEqual(badge_color(75.0), "yellow")
+        self.assertEqual(badge_color(89.99), "yellow")
+        self.assertEqual(badge_color(90.0), "brightgreen")
+        self.assertEqual(badge_color(100.0), "brightgreen")
+
+
+class WriteBadgeJsonTest(unittest.TestCase):
+    def _read_json(self, path: str) -> dict:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_writes_shields_endpoint_schema(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+
+        write_badge_json(path, 92.345)
+        payload = self._read_json(path)
+
+        # https://shields.io/endpoint requires schemaVersion=1 plus label/message/color.
+        self.assertEqual(payload["schemaVersion"], 1)
+        self.assertEqual(payload["label"], "coverage")
+        self.assertEqual(payload["message"], "92.3%")
+        self.assertEqual(payload["color"], "brightgreen")
+
+    def test_creates_parent_directory(self):
+        # The CI step writes into the repo root; we shouldn't require the caller
+        # to pre-create intermediate directories when they pass a nested path.
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp))
+        path = os.path.join(tmp, "nested", "deeper", "badge.json")
+
+        write_badge_json(path, 50.0)
+
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(self._read_json(path)["color"], "red")
+
+    def test_below_threshold_still_writes(self):
+        # write_badge_json itself doesn't gate on the threshold — the caller does.
+        # We want the badge to surface a regression rather than freeze on the
+        # last-good value, so a sub-90% number renders honestly (yellow here).
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+
+        write_badge_json(path, 80.0)
+        payload = self._read_json(path)
+
+        self.assertEqual(payload["message"], "80.0%")
+        self.assertEqual(payload["color"], "yellow")
+
+
+class MainBadgeJsonTest(unittest.TestCase):
+    def _write_lcov(self, content: str) -> str:
+        fd, path = tempfile.mkstemp(suffix=".dat")
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def _run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_badge_json_emitted_when_threshold_passes(self):
+        path = self._write_lcov(SIMPLE_LCOV)
+        fd, badge_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(os.remove, badge_path)
+
+        rc, _, _ = self._run_main(
+            [path, "--threshold", "50", "--badge-json", badge_path]
+        )
+
+        self.assertEqual(rc, 0)
+        with open(badge_path) as f:
+            payload = json.load(f)
+        # SIMPLE_LCOV main-source = 9 hit / 15 total = 60.0%
+        self.assertEqual(payload["message"], "60.0%")
+
+    def test_badge_json_emitted_when_threshold_fails(self):
+        # A sub-threshold run must still update the badge — otherwise a regression
+        # silently keeps the old badge value and the README lies. The exit code
+        # still fails the gate; only the badge artifact is decoupled.
+        path = self._write_lcov(SIMPLE_LCOV)
+        fd, badge_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(os.remove, badge_path)
+
+        rc, _, _ = self._run_main(
+            [path, "--threshold", "90", "--badge-json", badge_path]
+        )
+
+        self.assertEqual(rc, 1)
+        with open(badge_path) as f:
+            payload = json.load(f)
+        self.assertEqual(payload["message"], "60.0%")
+        self.assertEqual(payload["color"], "orange")
 
 
 if __name__ == "__main__":

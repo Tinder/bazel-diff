@@ -20,6 +20,7 @@ Exit codes:
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -121,6 +122,43 @@ def format_report(
     return "\n".join(lines)
 
 
+def badge_color(pct: float) -> str:
+    """Pick a shields.io color band that visually tracks the project's 90% gate.
+
+    Anything at-or-above the gate is brightgreen; below the gate degrades through
+    yellow/orange/red so the badge becomes a quick visual signal of how far the
+    main-source coverage has drifted.
+    """
+    if pct >= 90.0:
+        return "brightgreen"
+    if pct >= 75.0:
+        return "yellow"
+    if pct >= 60.0:
+        return "orange"
+    return "red"
+
+
+def write_badge_json(path: str, overall_pct: float) -> None:
+    """Write a shields.io endpoint badge JSON describing the overall coverage.
+
+    See https://shields.io/endpoint — the schema is `{schemaVersion, label,
+    message, color}`. Consumed by a README badge URL of the form
+    `https://img.shields.io/endpoint?url=…/coverage.json`.
+    """
+    payload = {
+        "schemaVersion": 1,
+        "label": "coverage",
+        "message": f"{overall_pct:.1f}%",
+        "color": badge_color(overall_pct),
+    }
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+        f.write("\n")
+
+
 def generate_html_report(lcov_path: str, output_dir: str) -> str:
     """Render an annotated HTML coverage report from `lcov_path` into `output_dir`.
 
@@ -198,6 +236,17 @@ def main(argv: List[str] | None = None) -> int:
             "only adds an additional artifact for interactive inspection."
         ),
     )
+    parser.add_argument(
+        "--badge-json",
+        metavar="PATH",
+        help=(
+            "Also write a shields.io endpoint JSON describing the overall "
+            "main-source coverage to PATH. Consumed by the README badge "
+            "(https://img.shields.io/endpoint?url=…). Written regardless of "
+            "whether the threshold passes so a regression is visible on the "
+            "badge instead of being silently skipped."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not os.path.isfile(args.lcov):
@@ -244,6 +293,10 @@ def main(argv: List[str] | None = None) -> int:
             return 2
 
     overall = total_lh / total_lf * 100.0
+
+    if args.badge_json:
+        write_badge_json(args.badge_json, overall)
+
     # Allow a tiny epsilon so 89.99999... that displays as 90.00 still passes a 90
     # threshold. Use the raw value, not the rounded one, otherwise 89.99 would slip
     # through.

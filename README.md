@@ -261,7 +261,8 @@ workspace.
 ```terminal
 Missing required options: '--startingHashes=<startingHashesJSONPath>', '--finalHashes=<finalHashesJSONPath>', '--workspacePath=<workspacePath>'
 Usage: bazel-diff get-impacted-targets [-v] [--[no-]excludeExternalTargets] [--
-                                       [no-]noBazelrc] [-b=<bazelPath>]
+                                       [no-]noBazelrc] [--[no-]
+                                       writeEmptyOutput] [-b=<bazelPath>]
                                        [-d=<depsMappingJSONPath>]
                                        -fh=<finalHashesJSONPath>
                                        [-o=<outputPath>]
@@ -313,6 +314,16 @@ Command-line utility to analyze the state of the bazel build graph
   -w, --workspacePath=<workspacePath>
                          Path to Bazel workspace directory. Required for module
                            change detection.
+      --[no-]writeEmptyOutput
+                         If true (default), always write the output file (or
+                           stdout) even when no targets are impacted. Pass
+                           --no-writeEmptyOutput to suppress the write entirely
+                           on an empty impacted set, so CI can branch on file
+                           existence instead of file contents (`if [ -f
+                           impacted.txt ]; then bazel test
+                           --target_pattern_file=...`). Only meaningful when
+                           -o/--output is set; with stdout, nothing is written
+                           either way.
 ```
 <!-- END_SECTION: cli-help -->
 

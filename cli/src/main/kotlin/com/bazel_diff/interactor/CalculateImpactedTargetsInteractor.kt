@@ -36,6 +36,33 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       toModuleGraphJson: String? = null,
       excludeExternalTargets: Boolean = false,
   ) {
+    val filtered =
+        computeImpactedTargets(
+            from,
+            to,
+            targetTypes,
+            fromModuleGraphJson,
+            toModuleGraphJson,
+            excludeExternalTargets)
+    writeImpactedTargets(outputWriter, filtered)
+  }
+
+  /**
+   * Computes the sorted, filtered list of impacted target labels.
+   *
+   * Pure data step: detects module changes, computes the impacted set, applies
+   * target-type and external-target filters, and sorts. No I/O. Splitting compute
+   * from write lets callers short-circuit before opening an output file
+   * (see [GetImpactedTargetsCommand]'s --writeEmptyOutput handling).
+   */
+  fun computeImpactedTargets(
+      from: Map<String, TargetHash>,
+      to: Map<String, TargetHash>,
+      targetTypes: Set<String>?,
+      fromModuleGraphJson: String? = null,
+      toModuleGraphJson: String? = null,
+      excludeExternalTargets: Boolean = false,
+  ): List<String> {
     /** This call might be faster if end hashes is a sorted map */
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
@@ -56,13 +83,15 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       computeSimpleImpactedTargets(from, to)
     }
 
-    impactedTargets
+    return impactedTargets
         .filter { typeFilter.accepts(it) }
         .filter { !excludeExternalTargets || !it.startsWith("//external:") }
         .sortedWith(impactedTargetOrdering(to, from))
-        .let { filtered ->
-          outputWriter.use { writer -> filtered.forEach { writer.write("$it\n") } }
-        }
+  }
+
+  /** Writes [filtered] as one label per line to [outputWriter] and closes it. */
+  fun writeImpactedTargets(outputWriter: Writer, filtered: List<String>) {
+    outputWriter.use { writer -> filtered.forEach { writer.write("$it\n") } }
   }
 
   fun computeSimpleImpactedTargets(
@@ -90,6 +119,34 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       toModuleGraphJson: String? = null,
       excludeExternalTargets: Boolean = false,
   ) {
+    val filtered =
+        computeImpactedTargetsWithDistances(
+            from,
+            to,
+            depEdges,
+            targetTypes,
+            fromModuleGraphJson,
+            toModuleGraphJson,
+            excludeExternalTargets)
+    writeImpactedTargetsWithDistances(outputWriter, filtered)
+  }
+
+  /**
+   * Computes the sorted, filtered map of impacted target labels to distance metrics.
+   *
+   * Pure data step paralleling [computeImpactedTargets] but for the --depEdgesFile mode.
+   * Splitting compute from write lets callers short-circuit before opening an output
+   * file (see [GetImpactedTargetsCommand]'s --writeEmptyOutput handling).
+   */
+  fun computeImpactedTargetsWithDistances(
+      from: Map<String, TargetHash>,
+      to: Map<String, TargetHash>,
+      depEdges: Map<String, List<String>>,
+      targetTypes: Set<String>?,
+      fromModuleGraphJson: String? = null,
+      toModuleGraphJson: String? = null,
+      excludeExternalTargets: Boolean = false,
+  ): Map<String, TargetDistanceMetrics> {
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
     // Quick check: if module graph JSON is identical, skip module change detection entirely
@@ -113,22 +170,27 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
     }
 
     val ordering = impactedTargetOrdering(to, from)
-    impactedTargets
+    return impactedTargets
         .filterKeys { typeFilter.accepts(it) }
         .filterKeys { !excludeExternalTargets || !it.startsWith("//external:") }
         .toSortedMap(ordering)
-        .let { filtered ->
-          outputWriter.use { writer ->
-            writer.write(
-                gson.toJson(
-                    filtered.map {
-                      mapOf(
-                          "label" to it.key,
-                          "targetDistance" to it.value.targetDistance,
-                          "packageDistance" to it.value.packageDistance)
-                    }))
-          }
-        }
+  }
+
+  /** Writes [filtered] as a JSON list of distance-metric objects to [outputWriter] and closes it. */
+  fun writeImpactedTargetsWithDistances(
+      outputWriter: Writer,
+      filtered: Map<String, TargetDistanceMetrics>,
+  ) {
+    outputWriter.use { writer ->
+      writer.write(
+          gson.toJson(
+              filtered.map {
+                mapOf(
+                    "label" to it.key,
+                    "targetDistance" to it.value.targetDistance,
+                    "packageDistance" to it.value.packageDistance)
+              }))
+    }
   }
 
   private fun impactedTargetOrdering(

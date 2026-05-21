@@ -1875,6 +1875,73 @@ class E2ETest {
         .isEqualTo(true)
   }
 
+  @Test
+  fun testGetImpactedTargets_writeEmptyOutput() {
+    // Validates the --[no-]writeEmptyOutput flag added on get-impacted-targets so CI can
+    // branch on file existence (`[ -f impacted.txt ] && bazel test --target_pattern_file=...`)
+    // instead of file contents. Inspired by ewhauser/bazel-differ's --output-on-empty.
+    val workspace = copyTestWorkspace("distance_metrics")
+    val outputDir = temp.newFolder()
+    val hashes = File(outputDir, "hashes.json")
+
+    val cli = CommandLine(BazelDiff())
+    cli.execute(
+        "generate-hashes",
+        "-w", workspace.absolutePath,
+        "-b", "bazel",
+        hashes.absolutePath)
+
+    // Case 1: empty diff (compare hashes against itself) with --no-writeEmptyOutput
+    // -> the output file must NOT be created.
+    val omittedOutput = File(outputDir, "omitted.txt")
+    val omittedExitCode = cli.execute(
+        "get-impacted-targets",
+        "-w", workspace.absolutePath,
+        "-b", "bazel",
+        "-sh", hashes.absolutePath,
+        "-fh", hashes.absolutePath,
+        "--no-writeEmptyOutput",
+        "-o", omittedOutput.absolutePath)
+    assertThat(omittedExitCode).isEqualTo(0)
+    assertThat(omittedOutput.exists()).isEqualTo(false)
+
+    // Case 2: empty diff with the default (--writeEmptyOutput) -> empty file is created.
+    val emptyOutput = File(outputDir, "empty.txt")
+    val emptyExitCode = cli.execute(
+        "get-impacted-targets",
+        "-w", workspace.absolutePath,
+        "-b", "bazel",
+        "-sh", hashes.absolutePath,
+        "-fh", hashes.absolutePath,
+        "-o", emptyOutput.absolutePath)
+    assertThat(emptyExitCode).isEqualTo(0)
+    assertThat(emptyOutput.exists()).isEqualTo(true)
+    assertThat(emptyOutput.readText()).isEqualTo("")
+
+    // Case 3: non-empty diff with --no-writeEmptyOutput -> file IS written (flag only
+    // suppresses on empty). Modify the workspace and re-hash to produce a real diff.
+    File(workspace, "A/one.sh").appendText("foo")
+    val hashesAfter = File(outputDir, "hashes_after.json")
+    cli.execute(
+        "generate-hashes",
+        "-w", workspace.absolutePath,
+        "-b", "bazel",
+        hashesAfter.absolutePath)
+
+    val populatedOutput = File(outputDir, "populated.txt")
+    val populatedExitCode = cli.execute(
+        "get-impacted-targets",
+        "-w", workspace.absolutePath,
+        "-b", "bazel",
+        "-sh", hashes.absolutePath,
+        "-fh", hashesAfter.absolutePath,
+        "--no-writeEmptyOutput",
+        "-o", populatedOutput.absolutePath)
+    assertThat(populatedExitCode).isEqualTo(0)
+    assertThat(populatedOutput.exists()).isEqualTo(true)
+    assertThat(populatedOutput.readText().isNotEmpty()).isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

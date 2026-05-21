@@ -42,6 +42,25 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
   }
 
   @Test
+  fun computeImpactedTargets_returnsEmpty_whenStartAndFinalMatch() {
+    // Covers the compute step that GetImpactedTargetsCommand uses to short-circuit
+    // file creation under --no-writeEmptyOutput. When the two hash maps are equal,
+    // there is no diff and the returned list must be empty so the CLI can opt out
+    // of writing the output file at all.
+    val hashes =
+        mapOf(
+            "//pkg:rule_a" to TargetHash("Rule", "r_a", "r_a"),
+            "//pkg:src_a" to TargetHash("SourceFile", "s_a", "s_a"),
+        )
+
+    val computed =
+        CalculateImpactedTargetsInteractor()
+            .computeImpactedTargets(from = hashes, to = hashes, targetTypes = null)
+
+    assertThat(computed).isEmpty()
+  }
+
+  @Test
   fun testExecuteSortsByKindThenLabel() {
     val startHashes =
         mapOf(

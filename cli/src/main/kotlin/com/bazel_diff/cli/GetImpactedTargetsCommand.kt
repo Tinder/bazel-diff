@@ -106,6 +106,21 @@ class GetImpactedTargetsCommand : Callable<Int> {
   var noBazelrc = false
 
   @CommandLine.Option(
+      names = ["--writeEmptyOutput"],
+      negatable = true,
+      defaultValue = "true",
+      fallbackValue = "true",
+      description =
+          [
+              "If true (default), always write the output file (or stdout) even when no targets " +
+                  "are impacted. Pass --no-writeEmptyOutput to suppress the write entirely on " +
+                  "an empty impacted set, so CI can branch on file existence instead of file " +
+                  "contents (`if [ -f impacted.txt ]; then bazel test --target_pattern_file=...`). " +
+                  "Only meaningful when -o/--output is set; with stdout, nothing is written either way."],
+      scope = CommandLine.ScopeType.LOCAL)
+  var writeEmptyOutput: Boolean = true
+
+  @CommandLine.Option(
       names = ["--excludeExternalTargets"],
       negatable = true,
       description =
@@ -166,36 +181,42 @@ class GetImpactedTargetsCommand : Callable<Int> {
                       com.bazel_diff.bazel.BazelModService::class.java)
                   .isBzlmodEnabled
 
-      val outputWriter =
-          BufferedWriter(
-              when (val path = outputPath) {
-                null -> FileWriter(FileDescriptor.out)
-                else -> FileWriter(path)
-              })
+      val interactor = CalculateImpactedTargetsInteractor()
 
+      // Compute first so we can decide whether to write at all. The interactor's
+      // compute step is pure (no I/O); we only open the output file when we
+      // actually have something to write or when --writeEmptyOutput is set (the
+      // default). Deferring the open avoids leaving an empty file behind when
+      // the user opted out of empty output -- the intended CI ergonomics.
       try {
-        if (depsMappingJSONPath != null) {
-          val depsMapping = deserialiser.deserializeDeps(depsMappingJSONPath!!)
-          CalculateImpactedTargetsInteractor()
-              .executeWithDistances(
+        val depsMapping = depsMappingJSONPath?.let { deserialiser.deserializeDeps(it) }
+        if (depsMapping != null) {
+          val computed =
+              interactor.computeImpactedTargetsWithDistances(
                   fromData.hashes,
                   toData.hashes,
                   depsMapping,
-                  outputWriter,
                   targetType,
                   fromData.moduleGraphJson,
                   toData.moduleGraphJson,
                   resolvedExcludeExternalTargets)
+          if (computed.isEmpty() && !writeEmptyOutput && outputPath != null) {
+            return CommandLine.ExitCode.OK
+          }
+          interactor.writeImpactedTargetsWithDistances(openOutputWriter(), computed)
         } else {
-          CalculateImpactedTargetsInteractor()
-              .execute(
+          val computed =
+              interactor.computeImpactedTargets(
                   fromData.hashes,
                   toData.hashes,
-                  outputWriter,
                   targetType,
                   fromData.moduleGraphJson,
                   toData.moduleGraphJson,
                   resolvedExcludeExternalTargets)
+          if (computed.isEmpty() && !writeEmptyOutput && outputPath != null) {
+            return CommandLine.ExitCode.OK
+          }
+          interactor.writeImpactedTargets(openOutputWriter(), computed)
         }
         CommandLine.ExitCode.OK
       } catch (e: IOException) {
@@ -205,6 +226,13 @@ class GetImpactedTargetsCommand : Callable<Int> {
       stopKoin()
     }
   }
+
+  private fun openOutputWriter(): BufferedWriter =
+      BufferedWriter(
+          when (val path = outputPath) {
+            null -> FileWriter(FileDescriptor.out)
+            else -> FileWriter(path)
+          })
 
   private fun validate() {
     if (!startingHashesJSONPath.canRead()) {

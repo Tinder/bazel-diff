@@ -240,16 +240,45 @@ internal class SourceFileHasherTest : KoinTest {
         val permsWithoutExec =
             Files.getPosixFilePermissions(filePath) - PosixFilePermission.OWNER_EXECUTE
         Files.setPosixFilePermissions(filePath, permsWithoutExec)
-        val nonExecutableHash =
-            hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
+        val nonExecutableHash = hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
 
         val permsWithExec = permsWithoutExec + PosixFilePermission.OWNER_EXECUTE
         Files.setPosixFilePermissions(filePath, permsWithExec)
-        val executableHash =
-            hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
+        val executableHash = hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
 
         // Hashes must differ when executable bit changes — currently fails (issue #325)
         assertThat(nonExecutableHash).isNotEqualTo(executableHash)
+      }
+
+  // Only the OWNER execute bit matters — git's index only tracks 100644 vs 100755, so toggling the
+  // group/others execute bits should not produce a different hash (avoids churn from umask
+  // differences between checkouts).
+  @Test
+  fun testHashIgnoresGroupAndOthersExecuteBits() =
+      runBlocking<Unit> {
+        val testDir = Files.createTempDirectory("group_other_exec_test")
+        val filePath = testDir.resolve("path/to/file.txt")
+        Files.createDirectories(filePath.parent)
+        Files.createFile(filePath)
+        filePath.toFile().writeText("contents")
+
+        val target = "//path/to:file.txt"
+        val hasher = SourceFileHasherImpl(testDir, null, externalRepoResolver)
+
+        val ownerOnly = setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE)
+        Files.setPosixFilePermissions(filePath, ownerOnly)
+        val baselineHash = hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
+
+        val withGroupExec = ownerOnly + PosixFilePermission.GROUP_EXECUTE
+        Files.setPosixFilePermissions(filePath, withGroupExec)
+        val groupExecHash = hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
+
+        val withOthersExec = ownerOnly + PosixFilePermission.OTHERS_EXECUTE
+        Files.setPosixFilePermissions(filePath, withOthersExec)
+        val othersExecHash = hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
+
+        assertThat(groupExecHash).isEqualTo(baselineHash)
+        assertThat(othersExecHash).isEqualTo(baselineHash)
       }
 
   @Test

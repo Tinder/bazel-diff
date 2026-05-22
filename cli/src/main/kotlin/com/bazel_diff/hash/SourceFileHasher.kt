@@ -92,17 +92,7 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
         safePutBytes(contentHash.toByteArray())
         putBytes(byteArrayOf(0x01))
         val absoluteFilePath = workingDirectory.resolve(filenamePath)
-        val isExecutable =
-            try {
-              Files.getPosixFilePermissions(absoluteFilePath).let { perms ->
-                perms.contains(PosixFilePermission.OWNER_EXECUTE) ||
-                    perms.contains(PosixFilePermission.GROUP_EXECUTE) ||
-                    perms.contains(PosixFilePermission.OTHERS_EXECUTE)
-              }
-            } catch (_: Exception) {
-              absoluteFilePath.toFile().canExecute()
-            }
-        putBytes(byteArrayOf(if (isExecutable) 0x01 else 0x00))
+        putBytes(byteArrayOf(if (isOwnerExecutable(absoluteFilePath)) 0x01 else 0x00))
       } else {
         val absoluteFilePath = workingDirectory.resolve(filenamePath)
         val file = absoluteFilePath.toFile()
@@ -115,17 +105,7 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
             }
             // Mark that file exists
             putBytes(byteArrayOf(0x01))
-            val isExecutable =
-                try {
-                  Files.getPosixFilePermissions(absoluteFilePath).let { perms ->
-                    perms.contains(PosixFilePermission.OWNER_EXECUTE) ||
-                        perms.contains(PosixFilePermission.GROUP_EXECUTE) ||
-                        perms.contains(PosixFilePermission.OTHERS_EXECUTE)
-                  }
-                } catch (_: Exception) {
-                  file.canExecute()
-                }
-            putBytes(byteArrayOf(if (isExecutable) 0x01 else 0x00))
+            putBytes(byteArrayOf(if (isOwnerExecutable(absoluteFilePath)) 0x01 else 0x00))
           }
         } else {
           logger.w { "File $absoluteFilePath not found" }
@@ -154,6 +134,16 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
 
     return digest(sourceFileTarget, modifiedFilepaths)
   }
+
+  // Git's index only tracks the owner execute bit (100644 vs 100755); group/others bits don't
+  // affect the build and differ between checkouts under different umasks. Mirror that behavior so
+  // hashes don't churn when only group/others bits flip.
+  private fun isOwnerExecutable(absoluteFilePath: Path): Boolean =
+      try {
+        Files.getPosixFilePermissions(absoluteFilePath).contains(PosixFilePermission.OWNER_EXECUTE)
+      } catch (_: Exception) {
+        absoluteFilePath.toFile().canExecute()
+      }
 
   private fun isMainRepo(name: String): Int {
     if (name.startsWith("//")) {

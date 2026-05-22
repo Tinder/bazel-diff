@@ -11,6 +11,33 @@ import com.google.devtools.build.lib.query2.proto.proto2api.Build
 // https://github.com/bazelbuild/bazel/blob/6971b016f1e258e3bb567a0f9fe7a88ad565d8f2/src/main/java/com/google/devtools/build/lib/query2/query/output/SyntheticAttributeHashCalculator.java#L78-L81
 private val DEFAULT_IGNORED_ATTRS = arrayOf("generator_location")
 
+// Separator used to fold a cquery dep-edge's `configurationChecksum` into a rule-input string.
+// Bazel target/package names are restricted to `[A-Za-z0-9/._+=,@~-]*` plus `:` between package
+// and target, so `|` is invalid in a label and is a safe in-band encoding that survives the
+// existing `List<String>` return type of `ruleInputList()`. `RuleHasher` splits on this character
+// to recover the bare label for `allRulesMap` / `sourceDigests` lookups and dep tracking; the
+// full encoded string is what gets mixed into the transitive hash, so two configured graphs that
+// share dep labels but differ in per-edge configuration produce distinct rule digests. See #359.
+const val CONFIGURED_RULE_INPUT_SEPARATOR: Char = '|'
+
+fun encodeConfiguredRuleInput(input: Build.ConfiguredRuleInput): String {
+  // Fall back to a bare label when the checksum is empty -- this matches the pre-#359 behaviour
+  // for the known Bazel quirk where cquery's `transitions=lite` output sometimes omits the
+  // configurationChecksum for an edge, and avoids appending a dangling separator.
+  val checksum = input.configurationChecksum
+  return if (checksum.isNullOrEmpty()) {
+    input.label
+  } else {
+    "${input.label}${CONFIGURED_RULE_INPUT_SEPARATOR}${checksum}"
+  }
+}
+
+fun decodeConfiguredRuleInputLabel(encoded: String): String {
+  // No separator present -> the input is a bare label (non-cquery callers, empty-checksum
+  // fallback, or //external:* synthetic inputs), so this is a no-op.
+  return encoded.substringBefore(CONFIGURED_RULE_INPUT_SEPARATOR)
+}
+
 class BazelRule(private val rule: Build.Rule) {
   fun digest(ignoredAttrs: Set<String>): ByteArray {
     return sha256 {
@@ -27,7 +54,7 @@ class BazelRule(private val rule: Build.Rule) {
 
   fun ruleInputList(useCquery: Boolean, fineGrainedHashExternalRepos: Set<String>): List<String> {
     return if (useCquery) {
-      rule.configuredRuleInputList.map { it.label } +
+      rule.configuredRuleInputList.map { encodeConfiguredRuleInput(it) } +
           rule.ruleInputList
               .map { ruleInput: String ->
                 transformRuleInput(fineGrainedHashExternalRepos, ruleInput)

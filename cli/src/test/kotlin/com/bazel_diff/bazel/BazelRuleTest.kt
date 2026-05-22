@@ -6,7 +6,6 @@ import assertk.assertions.isNotEqualTo
 import com.google.devtools.build.lib.query2.proto.proto2api.Build
 import com.google.devtools.build.lib.query2.proto.proto2api.Build.Attribute
 import com.google.devtools.build.lib.query2.proto.proto2api.Build.Rule
-import org.junit.Ignore
 import org.junit.Test
 
 class BazelRuleTest {
@@ -51,26 +50,18 @@ class BazelRuleTest {
         .isEqualTo(BazelRule(rule2Pb).digest(emptySet()))
   }
 
-  // Reproducer for https://github.com/Tinder/bazel-diff/issues/359
+  // Fix for https://github.com/Tinder/bazel-diff/issues/359
   //
-  // Under --useCquery, BazelRule.ruleInputList() reads each entry from configured_rule_input but
-  // only takes `.label`, discarding `.configurationChecksum`. Two configured graphs that share
-  // dep labels but differ in per-edge configuration -- a `cfg = "exec"` transition flip, a
-  // --platforms swap, a --config=... change, or a `--define` toggling a select() inside a dep --
-  // produce identical ruleInputList() output, so RuleHasher's transitive walk visits the same
-  // labels and yields identical digests. The user-visible symptom is that bazel-diff under
-  // cquery returns an empty impacted-targets set despite a real change in the configured graph,
-  // diverging from bazel-contrib/target-determinator which keys hashes by
-  // (label, configurationChecksum) and mixes the dep-edge configuration into the rule digest.
-  //
-  // @Ignore on the assertion below pins the current (buggy) behaviour as a reproducer: the
-  // companion `_currentBehaviourBuggy` test asserts the lists are equal, so the suite stays
-  // green; the `@Ignore`d test documents the desired post-fix invariant and can be flipped on
-  // (or merged with `_currentBehaviourBuggy`) when the fix lands.
+  // Under --useCquery, BazelRule.ruleInputList() now folds each ConfiguredRuleInput's
+  // configurationChecksum into the rule-input string via CONFIGURED_RULE_INPUT_SEPARATOR (`|`).
+  // Two configured graphs that share dep labels but differ in per-edge configuration -- a
+  // `cfg = "exec"` transition flip, a --platforms swap, a --config=... change, or a `--define`
+  // toggling a select() inside a dep -- produce distinct ruleInputList() output, so RuleHasher's
+  // transitive walk mixes those bytes into the digest and the parent target's hash changes.
+  // RuleHasher decodes back to the bare label when looking the input up in `allRulesMap` /
+  // `sourceDigests` and when tracking deps, so the user-visible deps output stays clean.
   @Test
-  @Ignore(
-      "Reproducer for #359 -- expected to pass once cquery rule inputs are keyed by (label, configurationChecksum). Today the lists collapse and this assertion fails. The companion *_currentBehaviourBuggy_issue359 tests pin down the current behaviour so CI stays green; flipping this @Ignore off should be the second-to-last step of the fix PR.")
-  fun testCqueryRuleInputListDistinguishesConfigurationChecksum_reproducerForIssue359() {
+  fun testCqueryRuleInputListDistinguishesConfigurationChecksum_issue359() {
     val ruleA = configuredGenrule(depLabel = "//:dep", configurationChecksum = "cfg-checksum-A")
     val ruleB = configuredGenrule(depLabel = "//:dep", configurationChecksum = "cfg-checksum-B")
 
@@ -79,39 +70,78 @@ class BazelRuleTest {
     val inputsB =
         BazelRule(ruleB).ruleInputList(useCquery = true, fineGrainedHashExternalRepos = emptySet())
 
-    // Today: both `[//:dep]` -- the test fails. After the fix it should pass.
     assertThat(inputsA).isNotEqualTo(inputsB)
   }
 
-  // Companion test that locks in the *current* buggy behaviour so we have a regression signal:
-  // if this test ever starts failing, it means the collapse has been (partially) fixed and the
-  // `@Ignore`d assertion above should be revisited. This keeps the reproducer visible in source
-  // without breaking CI.
+  // Pins the on-the-wire encoding so the format is observable and future changes are intentional.
+  // The `|` separator is invalid in a Bazel label, so the encoded string cannot collide with any
+  // real label and can be safely round-tripped by RuleHasher's `decodeConfiguredRuleInputLabel`.
   @Test
-  fun testCqueryRuleInputListCollapsesConfigurationChecksum_currentBehaviourBuggy_issue359() {
-    val ruleA = configuredGenrule(depLabel = "//:dep", configurationChecksum = "cfg-checksum-A")
-    val ruleB = configuredGenrule(depLabel = "//:dep", configurationChecksum = "cfg-checksum-B")
+  fun testCqueryRuleInputListEncodesLabelAndChecksum_issue359() {
+    val rule = configuredGenrule(depLabel = "//:dep", configurationChecksum = "cfg-checksum-A")
 
-    val inputsA =
-        BazelRule(ruleA).ruleInputList(useCquery = true, fineGrainedHashExternalRepos = emptySet())
-    val inputsB =
-        BazelRule(ruleB).ruleInputList(useCquery = true, fineGrainedHashExternalRepos = emptySet())
+    val inputs =
+        BazelRule(rule).ruleInputList(useCquery = true, fineGrainedHashExternalRepos = emptySet())
 
-    // Current (buggy) behaviour: both lists are exactly `[//:dep]`.
-    assertThat(inputsA).isEqualTo(listOf("//:dep"))
-    assertThat(inputsB).isEqualTo(listOf("//:dep"))
-    assertThat(inputsA).isEqualTo(inputsB)
+    assertThat(inputs).isEqualTo(listOf("//:dep|cfg-checksum-A"))
   }
 
-  // Also pins the buggy behaviour at the digest level: two BazelRules that differ ONLY in the
-  // dep-edge configuration checksum currently produce identical `digest(...)` output, because
-  // configured_rule_input is not part of BazelRule.digest() at all (see BazelRule.digest()).
+  // The empty-checksum fallback (a known Bazel cquery quirk) must NOT append a dangling separator
+  // -- we drop back to a bare label so RuleHasher's lookup keeps working unchanged.
   @Test
-  fun testBazelRuleDigestIgnoresConfigurationChecksum_currentBehaviourBuggy_issue359() {
-    val ruleA = configuredGenrule(depLabel = "//:dep", configurationChecksum = "cfg-checksum-A")
-    val ruleB = configuredGenrule(depLabel = "//:dep", configurationChecksum = "cfg-checksum-B")
+  fun testCqueryRuleInputListEmptyChecksumFallsBackToBareLabel_issue359() {
+    val rule = configuredGenrule(depLabel = "//:dep", configurationChecksum = "")
 
-    assertThat(BazelRule(ruleA).digest(emptySet())).isEqualTo(BazelRule(ruleB).digest(emptySet()))
+    val inputs =
+        BazelRule(rule).ruleInputList(useCquery = true, fineGrainedHashExternalRepos = emptySet())
+
+    assertThat(inputs).isEqualTo(listOf("//:dep"))
+  }
+
+  // Without --useCquery, configured_rule_input is irrelevant: the legacy ruleInputList field is
+  // the source of truth, so the encoding must not leak into the non-cquery path.
+  @Test
+  fun testNonCqueryRuleInputListIgnoresConfiguredRuleInput_issue359() {
+    val rule =
+        Rule.newBuilder()
+            .setRuleClass("genrule")
+            .setName("//:gen")
+            .addRuleInput("//:legacy_dep")
+            .addConfiguredRuleInput(
+                Build.ConfiguredRuleInput.newBuilder()
+                    .setLabel("//:dep")
+                    .setConfigurationChecksum("cfg-checksum-A")
+                    .build())
+            .build()
+
+    val inputs =
+        BazelRule(rule).ruleInputList(useCquery = false, fineGrainedHashExternalRepos = emptySet())
+
+    assertThat(inputs).isEqualTo(listOf("//:legacy_dep"))
+  }
+
+  // Pins the round-trip behaviour `RuleHasher` relies on: the full encoded string lives in the
+  // hash, and the bare label is what gets looked up in `allRulesMap` / `sourceDigests` and
+  // tracked in `deps`. If the round-trip ever drifts the user-facing JSON would start emitting
+  // dep labels with `|<checksum>` suffixes.
+  @Test
+  fun testDecodeConfiguredRuleInputLabelRoundTrip_issue359() {
+    val withChecksum =
+        encodeConfiguredRuleInput(
+            Build.ConfiguredRuleInput.newBuilder()
+                .setLabel("//:dep")
+                .setConfigurationChecksum("cfg-A")
+                .build())
+    assertThat(decodeConfiguredRuleInputLabel(withChecksum)).isEqualTo("//:dep")
+
+    val withoutChecksum =
+        encodeConfiguredRuleInput(Build.ConfiguredRuleInput.newBuilder().setLabel("//:dep").build())
+    assertThat(decodeConfiguredRuleInputLabel(withoutChecksum)).isEqualTo("//:dep")
+
+    // Non-encoded labels (the non-cquery path or //external:* synthetic inputs) must round-trip
+    // unchanged so the decode is safe to call unconditionally in RuleHasher.
+    assertThat(decodeConfiguredRuleInputLabel("//:bare")).isEqualTo("//:bare")
+    assertThat(decodeConfiguredRuleInputLabel("//external:foo")).isEqualTo("//external:foo")
   }
 
   private fun configuredGenrule(depLabel: String, configurationChecksum: String): Rule {

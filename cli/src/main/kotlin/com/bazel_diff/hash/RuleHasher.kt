@@ -2,6 +2,7 @@ package com.bazel_diff.hash
 
 import com.bazel_diff.bazel.BazelRule
 import com.bazel_diff.bazel.BazelSourceFileTarget
+import com.bazel_diff.bazel.decodeConfiguredRuleInputLabel
 import com.bazel_diff.log.Logger
 import com.google.common.annotations.VisibleForTesting
 import java.nio.file.Path
@@ -56,12 +57,18 @@ class RuleHasher(
           putDirectBytes(seedHash)
 
           for (ruleInput in rule.ruleInputList(useCquery, fineGrainedHashExternalRepos)) {
+            // Under --useCquery, `ruleInput` may carry an embedded configurationChecksum (see
+            // BazelRule.CONFIGURED_RULE_INPUT_SEPARATOR / #359). The full encoded string is what
+            // we mix into the hash so two configured graphs differing only by per-edge
+            // configuration produce distinct digests; the bare label is what we use to look up
+            // the input in `allRulesMap` / `sourceDigests` and to track in `deps`.
             putDirectBytes(ruleInput.toByteArray())
+            val inputLabel = decodeConfiguredRuleInputLabel(ruleInput)
 
-            val inputRule = allRulesMap[ruleInput]
+            val inputRule = allRulesMap[inputLabel]
             when {
-              inputRule == null && sourceDigests.containsKey(ruleInput) -> {
-                putDirectBytes(sourceDigests[ruleInput])
+              inputRule == null && sourceDigests.containsKey(inputLabel) -> {
+                putDirectBytes(sourceDigests[inputLabel])
               }
               inputRule?.name != null && inputRule.name != rule.name -> {
                 val ruleInputHash =
@@ -74,23 +81,23 @@ class RuleHasher(
                         depPathClone,
                         ignoredAttrs,
                         modifiedFilepaths)
-                putTransitiveBytes(ruleInput, ruleInputHash.overallDigest)
+                putTransitiveBytes(inputLabel, ruleInputHash.overallDigest)
               }
               else -> {
                 val heuristicDigest =
                     sourceFileHasher.softDigest(
-                        BazelSourceFileTarget(ruleInput, ByteArray(0)), modifiedFilepaths)
+                        BazelSourceFileTarget(inputLabel, ByteArray(0)), modifiedFilepaths)
                 when {
                   heuristicDigest != null -> {
                     logger.i {
-                      "Source file $ruleInput picked up as an input for rule ${rule.name}"
+                      "Source file $inputLabel picked up as an input for rule ${rule.name}"
                     }
-                    sourceDigests[ruleInput] = heuristicDigest
+                    sourceDigests[inputLabel] = heuristicDigest
                     putDirectBytes(heuristicDigest)
                   }
                   else ->
                       logger.w {
-                        "Unable to calculate digest for input $ruleInput for rule ${rule.name}"
+                        "Unable to calculate digest for input $inputLabel for rule ${rule.name}"
                       }
                 }
               }

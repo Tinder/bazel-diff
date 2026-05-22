@@ -333,7 +333,7 @@ First, add the following snippet to your project:
 #### Bzlmod snippet
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "24.0.0")
+bazel_dep(name = "bazel-diff", version = "25.0.0")
 ```
 
 You can now run the tool with:

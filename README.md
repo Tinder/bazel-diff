@@ -25,7 +25,7 @@ This approach was inspired by the [following BazelConf talk](https://www.youtube
 ## Prerequisites
 
 * Git
-* Bazel 3.3.0 or higher
+* Bazel 8.x or higher
 * Java 8 JDK or higher (Bazel requires this)
 
 ## Getting Started

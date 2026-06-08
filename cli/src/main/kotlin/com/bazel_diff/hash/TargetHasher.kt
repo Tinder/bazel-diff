@@ -16,6 +16,7 @@ class TargetHasher : KoinComponent {
       sourceDigests: ConcurrentMap<String, ByteArray>,
       ruleHashes: ConcurrentMap<String, TargetDigest>,
       seedHash: ByteArray?,
+      packageBzlSeeds: Map<String, ByteArray>,
       ignoredAttrs: Set<String>,
       modifiedFilepaths: Set<Path>
   ): TargetDigest {
@@ -37,6 +38,7 @@ class TargetHasher : KoinComponent {
                   ruleHashes,
                   sourceDigests,
                   seedHash,
+                  packageBzlSeeds,
                   depPath = null,
                   ignoredAttrs,
                   modifiedFilepaths)
@@ -53,14 +55,18 @@ class TargetHasher : KoinComponent {
             ruleHashes,
             sourceDigests,
             seedHash,
+            packageBzlSeeds,
             depPath = null,
             ignoredAttrs,
             modifiedFilepaths)
       }
       is BazelTarget.SourceFile -> {
+        // Mix in the `.bzl` seed for this source file's own package only, so a macro edit in
+        // another package leaves this file's hash untouched (issue #365).
         val digest = sha256 {
           safePutBytes(sourceDigests[target.sourceFileName])
           safePutBytes(seedHash)
+          safePutBytes(packageBzlSeeds[labelToPackage(target.sourceFileName)])
         }
         TargetDigest(digest, digest)
       }

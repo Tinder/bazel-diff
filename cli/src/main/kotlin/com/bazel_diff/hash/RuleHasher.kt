@@ -38,6 +38,7 @@ class RuleHasher(
       ruleHashes: ConcurrentMap<String, TargetDigest>,
       sourceDigests: ConcurrentMap<String, ByteArray>,
       seedHash: ByteArray?,
+      packageBzlSeeds: Map<String, ByteArray>,
       depPath: LinkedHashSet<String>?,
       ignoredAttrs: Set<String>,
       modifiedFilepaths: Set<Path>
@@ -55,6 +56,11 @@ class RuleHasher(
         targetSha256(trackDepLabels) {
           putDirectBytes(rule.digest(ignoredAttrs))
           putDirectBytes(seedHash)
+          // Mix in the `.bzl` seed for this rule's own package only. Each rule always looks up
+          // its own package (not the caller's), so this stays consistent under the memoized,
+          // depth-first recursion below and a macro edit re-hashes only the packages that
+          // `load()` it (issue #365).
+          putDirectBytes(packageBzlSeeds[labelToPackage(rule.name)])
 
           for (ruleInput in rule.ruleInputList(useCquery, fineGrainedHashExternalRepos)) {
             // Under --useCquery, `ruleInput` may carry an embedded configurationChecksum (see
@@ -78,6 +84,7 @@ class RuleHasher(
                         ruleHashes,
                         sourceDigests,
                         seedHash,
+                        packageBzlSeeds,
                         depPathClone,
                         ignoredAttrs,
                         modifiedFilepaths)

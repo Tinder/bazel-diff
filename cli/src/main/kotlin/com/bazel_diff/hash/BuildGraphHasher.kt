@@ -55,22 +55,13 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
         }
     val seedForFilepaths =
         runBlocking(Dispatchers.IO) { createSeedForFilepaths(seedFilepaths) }
-    val seedForBzlFiles = createSeedForBzlFiles(allTargets, modifiedFilepaths)
-    // Only mix the bzl-files seed when at least one main-repo `.bzl` was actually hashed.
-    // This keeps the seed (and therefore every target's hash) byte-for-byte stable for
-    // workspaces that don't load any tracked .bzl files, preserving cached hashes from
-    // before this change.
-    val combinedSeed =
-        if (seedForBzlFiles != null) {
-          sha256 {
-            safePutBytes(seedForFilepaths)
-            safePutBytes(seedForBzlFiles)
-          }
-        } else {
-          seedForFilepaths
-        }
+    // Attribute each BUILD file's loaded `.bzl` digests to the package that loads them, so a
+    // `.bzl` edit only re-hashes targets in packages that actually `load()` it -- not every
+    // target in the workspace (issue #365). A package that loads no tracked `.bzl` gets nothing
+    // mixed in, keeping its targets' hashes byte-for-byte stable.
+    val packageBzlSeeds = createPackageBzlSeeds(allTargets, modifiedFilepaths)
     return hashAllTargets(
-        combinedSeed, sourceDigests, allTargets, ignoredAttrs, modifiedFilepaths)
+        seedForFilepaths, packageBzlSeeds, sourceDigests, allTargets, ignoredAttrs, modifiedFilepaths)
   }
 
   private fun hashSourcefiles(
@@ -111,6 +102,7 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
 
   private fun hashAllTargets(
       seedHash: ByteArray,
+      packageBzlSeeds: Map<String, ByteArray>,
       sourceDigests: ConcurrentMap<String, ByteArray>,
       allTargets: List<BazelTarget>,
       ignoredAttrs: Set<String>,
@@ -130,6 +122,7 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
                   sourceDigests,
                   ruleHashes,
                   seedHash,
+                  packageBzlSeeds,
                   ignoredAttrs,
                   modifiedFilepaths)
           Pair(
@@ -187,8 +180,9 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
   }
 
   /**
-   * Builds a seed-hash contribution from the contents of every `.bzl` (and `.scl`) file the
-   * workspace's BUILD files load.
+   * Builds a per-package seed-hash contribution from the contents of every `.bzl` (and `.scl`)
+   * file that package's BUILD file loads, keyed by package label (e.g. `//pkg`, `//` for the
+   * root package).
    *
    * Background: Bazel pre-7 populated [Build.Rule.skylark_environment_hash_code] in the query
    * proto, so any change to a `.bzl` file loaded by a rule's BUILD file naturally bubbled into
@@ -197,41 +191,61 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
    * [#227](https://github.com/Tinder/bazel-diff/issues/227): editing a macro body (e.g. adding
    * `print()`) no longer invalidated any caller because the emitted rule attrs were identical.
    *
-   * Fix: walk every queried SourceFile target's `subincludeList` (the `Build.SourceFile.subinclude`
-   * proto field, which already lists every `.bzl` the BUILD file loaded), softDigest each main-repo
-   * `.bzl`, and roll the union of digests into the workspace-wide seed. This is intentionally
-   * conservative -- a single `.bzl` edit re-hashes every target -- because `.bzl` edits are rare
-   * and missing them silently is the worse failure mode. Per-package precision would require
-   * mapping each rule to its package's BUILD file, which isn't a direct dep relationship in the
-   * query proto.
+   * Fix: each package's BUILD `SourceFile` target carries a `subincludeList` (the
+   * `Build.SourceFile.subinclude` proto field) listing every `.bzl` that BUILD loaded. We
+   * softDigest each main-repo `.bzl` and roll the digests for a given package into a seed
+   * attributed to that package. Callers then mix only their own package's seed into each
+   * target's hash, so editing a `.bzl` re-hashes exactly the targets in packages that
+   * `load()` it -- not every target in the workspace
+   * ([#365](https://github.com/Tinder/bazel-diff/issues/365)). A package that loads no tracked
+   * `.bzl` has no entry here, so nothing is mixed in and its targets stay byte-for-byte stable.
    *
    * External-repo `.bzl` files (`@repo//...`, `@@canonical//...`) are skipped because
    * [SourceFileHasher.softDigest] returns null for non-main-repo labels, which keeps the seed
    * stable across BCR fetches that don't actually change repo contents.
    */
-  private fun createSeedForBzlFiles(
+  private fun createPackageBzlSeeds(
       allTargets: List<BazelTarget>,
       modifiedFilepaths: Set<Path>
-  ): ByteArray? {
-    val subincludes =
-        allTargets
-            .asSequence()
-            .filterIsInstance<BazelTarget.SourceFile>()
-            .flatMap { it.subincludeList.asSequence() }
-            .toSortedSet()
-    val tracked = mutableListOf<Pair<String, ByteArray>>()
-    for (label in subincludes) {
-      val digest =
-          sourceFileHasher.softDigest(
-              BazelSourceFileTarget(label, ByteArray(0)), modifiedFilepaths)
-      if (digest != null) tracked += label to digest
+  ): Map<String, ByteArray> {
+    // Union the loaded `.bzl` labels per package. Every source file in a package shares the same
+    // BUILD, but the `subinclude` field is populated on the BUILD's SourceFile target; group by
+    // package so we don't depend on which source file carries it.
+    val packageToLabels = sortedMapOf<String, java.util.SortedSet<String>>()
+    for (target in allTargets) {
+      if (target !is BazelTarget.SourceFile || target.subincludeList.isEmpty()) continue
+      packageToLabels
+          .getOrPut(labelToPackage(target.sourceFileName)) { sortedSetOf() }
+          .addAll(target.subincludeList)
     }
-    if (tracked.isEmpty()) return null
-    return sha256 {
-      for ((label, digest) in tracked) {
-        safePutBytes(label.toByteArray())
-        safePutBytes(digest)
+
+    val result = mutableMapOf<String, ByteArray>()
+    for ((pkg, labels) in packageToLabels) {
+      val tracked = mutableListOf<Pair<String, ByteArray>>()
+      for (label in labels) {
+        val digest =
+            sourceFileHasher.softDigest(
+                BazelSourceFileTarget(label, ByteArray(0)), modifiedFilepaths)
+        if (digest != null) tracked += label to digest
+      }
+      if (tracked.isEmpty()) continue
+      result[pkg] = sha256 {
+        for ((label, digest) in tracked) {
+          safePutBytes(label.toByteArray())
+          safePutBytes(digest)
+        }
       }
     }
+    return result
   }
+}
+
+/**
+ * Returns the package portion of a Bazel label, i.e. everything before the target separator `:`.
+ * `//pkg:a` -> `//pkg`, `//:logo` -> `//`, `@@repo//pkg:a` -> `@@repo//pkg`. Labels without a `:`
+ * (not expected from `bazel query` output) are returned unchanged.
+ */
+internal fun labelToPackage(label: String): String {
+  val colon = label.lastIndexOf(':')
+  return if (colon >= 0) label.substring(0, colon) else label
 }

@@ -1875,6 +1875,125 @@ class E2ETest {
         .isEqualTo(true)
   }
 
+  // ------------------------------------------------------------------------
+  // Reproducer for https://github.com/Tinder/bazel-diff/issues/365
+  // ------------------------------------------------------------------------
+  // The user reported that after upgrading bazel-diff (12.0.0 -> 25.0.0), ADDING (or editing) a
+  // `.bzl` macro and `load()`ing it -- even in an otherwise-empty BUILD file -- caused EVERY
+  // target in the repository to be reported as impacted, not just the targets that load the macro.
+  //
+  // Root cause: the #259/#227 fix in BuildGraphHasher.createSeedForBzlFiles rolls the union of
+  // EVERY main-repo `.bzl` file's digest into a single workspace-wide seed that is then mixed into
+  // every target's hash. Its own doc comment acknowledges the tradeoff: "a single `.bzl` edit
+  // re-hashes every target". So introducing a brand-new, unrelated `.bzl` flips the seed (here from
+  // "no tracked .bzl" to "one tracked .bzl"), which changes the hash of completely unrelated
+  // targets -- e.g. native genrules in another package that load nothing.
+  //
+  // Fixture `bzl_seed_overtrigger` has a single package `//pkg` with two native genrules
+  // (`//pkg:a`, `//pkg:b`) that load no `.bzl`. The scenario adds a NEW package `//macros` whose
+  // BUILD only does `load("//macros:defs.bzl", "my_macro")` (an empty load -- exactly the shape
+  // from the issue). The new `//macros:*` source files are legitimately new, but `//pkg:a` /
+  // `//pkg:b` must not be affected by a macro they never load.
+
+  /**
+   * Copies the fixture twice, adds an unrelated macro + empty-`load()` BUILD to B, runs the full
+   * generate-hashes / get-impacted-targets flow, and returns the impacted-targets set.
+   */
+  private fun runIssue365MacroAddScenario(): Set<String> {
+    val workspaceA = copyTestWorkspace("bzl_seed_overtrigger")
+    val workspaceB = copyTestWorkspace("bzl_seed_overtrigger")
+
+    // In B, add a brand-new package that defines a macro and `load()`s it in an otherwise-empty
+    // BUILD file. Nothing in //pkg changes.
+    File(workspaceB, "macros").mkdirs()
+    File(workspaceB, "macros/defs.bzl")
+        .writeText(
+            "def my_macro(name, **kwargs):\n" +
+                "    native.genrule(name = name, outs = [name + \".txt\"], cmd = \"echo hi > \$@\", **kwargs)\n")
+    File(workspaceB, "macros/BUILD").writeText("load(\"//macros:defs.bzl\", \"my_macro\")\n")
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w",
+                workspaceA.absolutePath,
+                "-b",
+                "bazel",
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    return impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+  }
+
+  // Desired post-fix invariant: adding an unrelated macro must NOT impact //pkg:a or //pkg:b.
+  // @Ignore'd because it fails today (the global .bzl seed re-hashes every target). Flipping this
+  // @Ignore off should be the second-to-last step of the fix PR; at that point the companion
+  // *_currentBehaviourBuggy_issue365 test below must be deleted or updated.
+  @Test
+  @org.junit.Ignore(
+      "Reproducer for #365 -- expected to pass once the .bzl seed is attributed per-package " +
+          "instead of as a single workspace-wide seed. Today BuildGraphHasher.createSeedForBzlFiles " +
+          "mixes the union of all .bzl digests into every target's hash, so adding an unrelated " +
+          "macro impacts //pkg:a and //pkg:b and this assertion fails.")
+  fun testAddingUnrelatedMacroDoesNotImpactExistingTargets_reproducerForIssue365() {
+    val impacted = runIssue365MacroAddScenario()
+    val unrelatedImpacted =
+        impacted.filter {
+          it == "//pkg:a" || it == "@@//pkg:a" || it == "//pkg:b" || it == "@@//pkg:b"
+        }
+    assertThat(unrelatedImpacted.isEmpty())
+        .transform(
+            "Adding an unrelated macro in //macros must not impact //pkg:a or //pkg:b; got: $impacted") {
+              it
+            }
+        .isEqualTo(true)
+  }
+
+  // Pins the current (buggy) behaviour so CI stays green and the reproducer stays visible in
+  // source. When the fix lands, this test should be deleted/updated and the @Ignore above flipped.
+  @Test
+  fun testAddingUnrelatedMacroImpactsExistingTargets_currentBehaviourBuggy_issue365() {
+    val impacted = runIssue365MacroAddScenario()
+    val aImpacted = impacted.any { it == "//pkg:a" || it == "@@//pkg:a" }
+    val bImpacted = impacted.any { it == "//pkg:b" || it == "@@//pkg:b" }
+    assertThat(aImpacted && bImpacted)
+        .transform(
+            "Documents the #365 over-triggering bug: adding an unrelated macro currently impacts " +
+                "//pkg:a and //pkg:b. Got: $impacted") {
+              it
+            }
+        .isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

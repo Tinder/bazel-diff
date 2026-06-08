@@ -1,0 +1,4 @@
+module(
+    name = "bzl_seed_overtrigger",
+    version = "0.0.0",
+)

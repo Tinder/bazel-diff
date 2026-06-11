@@ -65,6 +65,3 @@ jobs:
               --title "ci: update coverage badge to ${NEW_COVERAGE}" \
               --body "Automated coverage badge refresh. Main-source line coverage is now **${NEW_COVERAGE}**."
           fi
-          # Queue the PR to merge automatically once required checks pass. This
-          # is idempotent, so it is safe to re-run against an already-queued PR.
-          gh pr merge "$BRANCH" --auto --squash --delete-branch

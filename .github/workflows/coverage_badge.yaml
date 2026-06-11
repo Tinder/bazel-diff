@@ -1,0 +1,70 @@
+name: Coverage badge
+
+# Regenerates the coverage badge (coverage.json) on a daily schedule and opens
+# a PR if the value has changed. This replaces the previous approach of pushing
+# the badge directly to master from CI, which raced/force-pushed and failed CI.
+on:
+  schedule:
+    # 13:00 UTC daily.
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+
+jobs:
+  update-coverage-badge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+        id: go
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+      - uses: actions/checkout@v4
+      - name: Run bazel-diff tests with coverage
+        env:
+          USE_BAZEL_VERSION: '9.x'
+        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... //tools:coverage_check_test --enable_bzlmod=true --enable_workspace=false
+      - name: Regenerate coverage badge
+        env:
+          USE_BAZEL_VERSION: '9.x'
+          COVERAGE_THRESHOLD: '90'
+        run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+      - name: Open PR if coverage badge changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$(git status --porcelain coverage.json)" ]; then
+            echo "coverage.json unchanged; nothing to do."
+            exit 0
+          fi
+          NEW_COVERAGE="$(python3 -c 'import json,sys; print(json.load(open("coverage.json"))["message"])')"
+          BRANCH="ci/coverage-badge-update"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add coverage.json
+          git commit -m "ci: update coverage badge to ${NEW_COVERAGE}"
+          # Force-push the dedicated, bot-owned branch so re-runs reuse one PR
+          # instead of accumulating stale branches. This never touches master.
+          git push --force origin "$BRANCH"
+          if gh pr view "$BRANCH" --json state --jq '.state' 2>/dev/null | grep -q OPEN; then
+            echo "PR already open for $BRANCH; it now points at the latest badge."
+          else
+            gh pr create \
+              --base master \
+              --head "$BRANCH" \
+              --title "ci: update coverage badge to ${NEW_COVERAGE}" \
+              --body "Automated coverage badge refresh. Main-source line coverage is now **${NEW_COVERAGE}**."
+          fi
+          # Queue the PR to merge automatically once required checks pass. This
+          # is idempotent, so it is safe to re-run against an already-queued PR.
+          gh pr merge "$BRANCH" --auto --squash --delete-branch

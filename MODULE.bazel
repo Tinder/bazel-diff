@@ -25,10 +25,14 @@ single_version_override(
 
 bazel_dep(name = "grpc", version = "1.76.0", repo_name = "com_github_grpc_grpc")
 
-# Override transitive dependencies to Bazel 9 compatible versions
-bazel_dep(name = "rules_nodejs", version = "6.7.3")
-bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
-bazel_dep(name = "rules_python", version = "1.8.4")
+# Override transitive dependencies to Bazel 9 compatible versions.
+# Marked dev_dependency: these are only needed when building bazel-diff itself
+# (as the root module). rules_nodejs and rules_foreign_cc are not referenced by
+# any bazel-diff target, and rules_python is supplied transitively (proto codegen)
+# regardless, so consumers resolve their own versions via MVS.
+bazel_dep(name = "rules_nodejs", version = "6.7.3", dev_dependency = True)
+bazel_dep(name = "rules_foreign_cc", version = "0.15.1", dev_dependency = True)
+bazel_dep(name = "rules_python", version = "1.8.4", dev_dependency = True)
 
 maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
 maven.install(

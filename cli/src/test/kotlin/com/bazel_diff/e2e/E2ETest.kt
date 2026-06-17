@@ -19,31 +19,48 @@ class E2ETest {
   private fun CommandLine.execute(args: List<String>) = execute(*args.toTypedArray())
 
   private fun filterBazelDiffInternalTargets(targets: Set<String>): Set<String> {
-    return targets.filter { target ->
-      // Filter out bazel-diff's own internal test targets
-      !target.contains("bazel-diff-integration-test") &&
-      !target.contains("@@//:BUILD") &&
-      !target.contains("bazel_diff_maven") && // Filter out bazel-diff's maven dependencies
-      // Filter out platform-specific Maven alias targets that may or may not appear in cquery
-      // results depending on Bazel version and platform (macOS vs Linux)
-      !target.matches(Regex(".*rules_jvm_external\\+\\+maven\\+maven//:com_google_code_findbugs_jsr305$")) &&
-      !target.matches(Regex(".*rules_jvm_external\\+\\+maven\\+maven//:com_google_guava_failureaccess$")) &&
-      !target.matches(Regex(".*rules_jvm_external\\+\\+maven\\+maven//:com_google_guava_listenablefuture$")) &&
-      !target.matches(Regex(".*rules_jvm_external\\+//private/tools/java/com/github/bazelbuild/rules_jvm_external/jar:AddJarManifestEntry$")) &&
-      // Filter out junit and hamcrest which may appear on some platforms
-      !target.matches(Regex(".*rules_jvm_external\\+\\+maven\\+maven//:junit_junit$")) &&
-      !target.matches(Regex(".*rules_jvm_external\\+\\+maven\\+maven//:org_hamcrest_hamcrest_core$"))
-    }.toSet()
+    return targets
+        .filter { target ->
+          // Filter out bazel-diff's own internal test targets
+          !target.contains("bazel-diff-integration-test") &&
+              !target.contains("@@//:BUILD") &&
+              !target.contains("bazel_diff_maven") && // Filter out bazel-diff's maven dependencies
+              // Filter out platform-specific Maven alias targets that may or may not appear in
+              // cquery
+              // results depending on Bazel version and platform (macOS vs Linux)
+              !target.matches(
+                  Regex(
+                      ".*rules_jvm_external\\+\\+maven\\+maven//:com_google_code_findbugs_jsr305$")) &&
+              !target.matches(
+                  Regex(
+                      ".*rules_jvm_external\\+\\+maven\\+maven//:com_google_guava_failureaccess$")) &&
+              !target.matches(
+                  Regex(
+                      ".*rules_jvm_external\\+\\+maven\\+maven//:com_google_guava_listenablefuture$")) &&
+              !target.matches(
+                  Regex(
+                      ".*rules_jvm_external\\+//private/tools/java/com/github/bazelbuild/rules_jvm_external/jar:AddJarManifestEntry$")) &&
+              // Filter out junit and hamcrest which may appear on some platforms
+              !target.matches(Regex(".*rules_jvm_external\\+\\+maven\\+maven//:junit_junit$")) &&
+              !target.matches(
+                  Regex(".*rules_jvm_external\\+\\+maven\\+maven//:org_hamcrest_hamcrest_core$"))
+        }
+        .toSet()
   }
 
-  private fun assertTargetsMatch(actual: Set<String>, expected: Set<String>, testContext: String = "") {
+  private fun assertTargetsMatch(
+      actual: Set<String>,
+      expected: Set<String>,
+      testContext: String = ""
+  ) {
     if (actual != expected) {
       val missingTargets = expected - actual
       val unexpectedTargets = actual - expected
 
       val debugMessage = buildString {
         appendLine("\n========================================")
-        appendLine("Target list mismatch${if (testContext.isNotEmpty()) " in $testContext" else ""}")
+        appendLine(
+            "Target list mismatch${if (testContext.isNotEmpty()) " in $testContext" else ""}")
         appendLine("========================================")
 
         if (missingTargets.isNotEmpty()) {
@@ -120,8 +137,9 @@ class E2ETest {
             "-o",
             impactedTargetsOutput.absolutePath) + extraGetImpactedTargetsArgs)
 
-    val actual: Set<String> = filterBazelDiffInternalTargets(
-        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
+    val actual: Set<String> =
+        filterBazelDiffInternalTargets(
+            impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     val expected: Set<String> =
         javaClass.getResourceAsStream(expectedResultFile).use {
           filterBazelDiffInternalTargets(
@@ -147,13 +165,14 @@ class E2ETest {
     val outputPath = File(outputDir, "hashes.json")
 
     val cli = CommandLine(BazelDiff())
-    val exitCode = cli.execute(
-        "generate-hashes",
-        "-w",
-        workingDirectory.absolutePath,
-        "-b",
-        "bazel",
-        outputPath.absolutePath)
+    val exitCode =
+        cli.execute(
+            "generate-hashes",
+            "-w",
+            workingDirectory.absolutePath,
+            "-b",
+            "bazel",
+            outputPath.absolutePath)
 
     assertThat(exitCode).isEqualTo(0)
     assertThat(outputPath.readText().isNotEmpty()).isEqualTo(true)
@@ -161,10 +180,7 @@ class E2ETest {
 
   @Test
   fun testE2EWithNoKeepGoing() {
-    testE2E(
-        listOf("--no-keep_going"),
-        emptyList(),
-        "/fixture/impacted_targets-1-2.txt")
+    testE2E(listOf("--no-keep_going"), emptyList(), "/fixture/impacted_targets-1-2.txt")
   }
 
   @Test
@@ -196,12 +212,15 @@ class E2ETest {
     val output = File(outputDir, "hashes.json")
 
     val cli = CommandLine(BazelDiff())
-    val exitCode = cli.execute(
-        "generate-hashes",
-        "-w", workspace.absolutePath,
-        "-b", "bazel",
-        "--useCquery",
-        output.absolutePath)
+    val exitCode =
+        cli.execute(
+            "generate-hashes",
+            "-w",
+            workspace.absolutePath,
+            "-b",
+            "bazel",
+            "--useCquery",
+            output.absolutePath)
 
     assertThat(exitCode).isEqualTo(0)
 
@@ -280,14 +299,17 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    val actual: Set<String> = filterBazelDiffInternalTargets(
-        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
+    val actual: Set<String> =
+        filterBazelDiffInternalTargets(
+            impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     val expected: Set<String> =
         javaClass
             .getResourceAsStream(
                 "/fixture/fine-grained-hash-external-repo-test-impacted-targets.txt")
-            .use { filterBazelDiffInternalTargets(
-                it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()) }
+            .use {
+              filterBazelDiffInternalTargets(
+                  it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet())
+            }
 
     assertTargetsMatch(actual, expected, "testFineGrainedHashExternalRepo")
   }
@@ -367,8 +389,9 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    val actual: Set<String> = filterBazelDiffInternalTargets(
-        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
+    val actual: Set<String> =
+        filterBazelDiffInternalTargets(
+            impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     val expected: Set<String> =
         javaClass.getResourceAsStream(expectedResultFile).use {
           filterBazelDiffInternalTargets(
@@ -460,8 +483,9 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    val actual: Set<String> = filterBazelDiffInternalTargets(
-        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
+    val actual: Set<String> =
+        filterBazelDiffInternalTargets(
+            impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     val expected: Set<String> =
         javaClass.getResourceAsStream(expectedResultFile).use {
           filterBazelDiffInternalTargets(
@@ -474,9 +498,7 @@ class E2ETest {
   @Test
   fun testBzlmodTransitiveDepsQuery() {
     testBzlmodTransitiveDeps(
-        emptyList(),
-        "@bazel_diff_maven",
-        "/fixture/bzlmod-transitive-test-impacted-targets.txt")
+        emptyList(), "@bazel_diff_maven", "/fixture/bzlmod-transitive-test-impacted-targets.txt")
   }
 
   @Test
@@ -552,28 +574,35 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    val actual: Set<String> = filterBazelDiffInternalTargets(
-        impactedTargetsOutput.readLines().filter { it.isNotBlank() && !it.startsWith("#") }.toSet())
+    val actual: Set<String> =
+        filterBazelDiffInternalTargets(
+            impactedTargetsOutput
+                .readLines()
+                .filter { it.isNotBlank() && !it.startsWith("#") }
+                .toSet())
     val expected: Set<String> =
         javaClass.getResourceAsStream(expectedResultFile).use {
           filterBazelDiffInternalTargets(
-              it.bufferedReader().readLines().filter { it.isNotBlank() && !it.startsWith("#") }.toSet())
+              it.bufferedReader()
+                  .readLines()
+                  .filter { it.isNotBlank() && !it.startsWith("#") }
+                  .toSet())
         }
 
     assertTargetsMatch(actual, expected, "testBzlmodCCTransitiveDeps")
   }
 
   @Test
-  @org.junit.Ignore("Skipped due to Bazel version compatibility issues in test environment. " +
-      "The fixtures use Bazel 7.0.0 but test environment uses Bazel 8+, causing bzlmod/abseil-cpp " +
-      "package loading errors. This test is ready to run when Bazel version handling is resolved. " +
-      "Module graph hashing has been implemented and should detect transitive dependency changes.")
+  @org.junit.Ignore(
+      "Skipped due to Bazel version compatibility issues in test environment. " +
+          "The fixtures use Bazel 7.0.0 but test environment uses Bazel 8+, causing bzlmod/abseil-cpp " +
+          "package loading errors. This test is ready to run when Bazel version handling is resolved. " +
+          "Module graph hashing has been implemented and should detect transitive dependency changes.")
   fun testBzlmodCCTransitiveDepsQuery() {
     // This test validates that MODULE.bazel changes are now detected via module graph hashing.
     // Both target-a and target-b should be impacted when abseil-cpp version changes.
     testBzlmodCCTransitiveDeps(
-        emptyList(),
-        "/fixture/bzlmod-cc-transitive-test-impacted-targets.txt")
+        emptyList(), "/fixture/bzlmod-cc-transitive-test-impacted-targets.txt")
   }
 
   @Test
@@ -685,15 +714,19 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    var actual: Set<String> = filterBazelDiffInternalTargets(
-        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
+    var actual: Set<String> =
+        filterBazelDiffInternalTargets(
+            impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     var expected: Set<String> =
         javaClass
             .getResourceAsStream("/fixture/cquery-test-guava-upgrade-android-impacted-targets.txt")
-            .use { filterBazelDiffInternalTargets(
-                it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()) }
+            .use {
+              filterBazelDiffInternalTargets(
+                  it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet())
+            }
 
-    assertTargetsMatch(actual, expected, "testUseCqueryWithExternalDependencyChange - Android platform")
+    assertTargetsMatch(
+        actual, expected, "testUseCqueryWithExternalDependencyChange - Android platform")
 
     // Query JRE platform
 
@@ -737,13 +770,16 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    actual = filterBazelDiffInternalTargets(
-        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
+    actual =
+        filterBazelDiffInternalTargets(
+            impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     expected =
         javaClass
             .getResourceAsStream("/fixture/cquery-test-guava-upgrade-jre-impacted-targets.txt")
-            .use { filterBazelDiffInternalTargets(
-                it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()) }
+            .use {
+              filterBazelDiffInternalTargets(
+                  it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet())
+            }
 
     assertTargetsMatch(actual, expected, "testUseCqueryWithExternalDependencyChange - JRE platform")
   }
@@ -858,14 +894,17 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    var actual: Set<String> = filterBazelDiffInternalTargets(
-        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
+    var actual: Set<String> =
+        filterBazelDiffInternalTargets(
+            impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     var expected: Set<String> =
         javaClass
             .getResourceAsStream(
                 "/fixture/cquery-test-android-code-change-android-impacted-targets.txt")
-            .use { filterBazelDiffInternalTargets(
-                it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()) }
+            .use {
+              filterBazelDiffInternalTargets(
+                  it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet())
+            }
 
     assertTargetsMatch(actual, expected, "testUseCqueryWithAndroidCodeChange - Android platform")
 
@@ -911,18 +950,20 @@ class E2ETest {
         "-o",
         impactedTargetsOutput.absolutePath)
 
-    actual = filterBazelDiffInternalTargets(
-        impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
+    actual =
+        filterBazelDiffInternalTargets(
+            impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
     expected =
         javaClass
             .getResourceAsStream(
                 "/fixture/cquery-test-android-code-change-jre-impacted-targets.txt")
-            .use { filterBazelDiffInternalTargets(
-                it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet()) }
+            .use {
+              filterBazelDiffInternalTargets(
+                  it.bufferedReader().readLines().filter { it.isNotBlank() }.toSet())
+            }
 
     assertTargetsMatch(actual, expected, "testUseCqueryWithAndroidCodeChange - JRE platform")
   }
-
 
   @Test
   fun testTargetDistanceMetrics() {
@@ -979,7 +1020,8 @@ class E2ETest {
     val gson = Gson()
     val shape = object : TypeToken<List<Map<String, Any>>>() {}.type
     val actual =
-        gson.fromJson<List<Map<String, Any>>>(impactedTargetsOutput.readText(), shape)
+        gson
+            .fromJson<List<Map<String, Any>>>(impactedTargetsOutput.readText(), shape)
             .filter { target ->
               // Filter out Bazel convenience symlink targets (bazel-*) as they're not reliably
               // present across all environments
@@ -1029,26 +1071,23 @@ class E2ETest {
     val cli = CommandLine(BazelDiff())
 
     // First, verify that generate-hashes works without --useCquery
-    val exitCodeWithoutCquery = cli.execute(
-        "generate-hashes",
-        "-w",
-        workspace.absolutePath,
-        "-b",
-        "bazel",
-        from.absolutePath)
+    val exitCodeWithoutCquery =
+        cli.execute(
+            "generate-hashes", "-w", workspace.absolutePath, "-b", "bazel", from.absolutePath)
 
     assertThat(exitCodeWithoutCquery).isEqualTo(0)
 
     // Now, verify that generate-hashes fails with --useCquery due to the failing target
     // This demonstrates the issue described in #301
-    val exitCodeWithCquery = cli.execute(
-        "generate-hashes",
-        "-w",
-        workspace.absolutePath,
-        "-b",
-        "bazel",
-        "--useCquery",
-        from.absolutePath)
+    val exitCodeWithCquery =
+        cli.execute(
+            "generate-hashes",
+            "-w",
+            workspace.absolutePath,
+            "-b",
+            "bazel",
+            "--useCquery",
+            from.absolutePath)
 
     // The cquery should fail because it tries to analyze the failing_analysis_target
     // which is designed to fail during analysis
@@ -1056,30 +1095,32 @@ class E2ETest {
 
     // Test with --no-keep_going: cquery should fail (no partial results, immediate failure)
     val outputNoKeepGoing = File(outputDir, "hashes_no_keep_going.json")
-    val exitCodeWithNoKeepGoing = cli.execute(
-        "generate-hashes",
-        "-w",
-        workspace.absolutePath,
-        "-b",
-        "bazel",
-        "--useCquery",
-        "--no-keep_going",
-        outputNoKeepGoing.absolutePath)
+    val exitCodeWithNoKeepGoing =
+        cli.execute(
+            "generate-hashes",
+            "-w",
+            workspace.absolutePath,
+            "-b",
+            "bazel",
+            "--useCquery",
+            "--no-keep_going",
+            outputNoKeepGoing.absolutePath)
     assertThat(exitCodeWithNoKeepGoing).isEqualTo(1)
 
     // Test with --keep_going enabled (default behavior)
     // With keep_going, cquery returns partial results but still exits with code 1
     // The current implementation allows exit codes 0 and 3, but cquery with keep_going
     // returns exit code 1 when some targets fail analysis
-    val exitCodeWithCqueryKeepGoing = cli.execute(
-        "generate-hashes",
-        "-w",
-        workspace.absolutePath,
-        "-b",
-        "bazel",
-        "--useCquery",
-        "--keep_going",
-        from.absolutePath)
+    val exitCodeWithCqueryKeepGoing =
+        cli.execute(
+            "generate-hashes",
+            "-w",
+            workspace.absolutePath,
+            "-b",
+            "bazel",
+            "--useCquery",
+            "--keep_going",
+            from.absolutePath)
 
     // This currently fails (exit code 1) because bazel-diff only allows exit codes 0 and 3
     // but cquery with --keep_going returns exit code 1 when partial results are available
@@ -1089,18 +1130,20 @@ class E2ETest {
     // Note: We use explicit target selection instead of wildcard + except because
     // cquery analyzes targets during pattern expansion, so "//...:all-targets except X"
     // would still try to analyze X. The solution is to explicitly specify which targets to query.
-    val exitCodeWithCustomExpression = cli.execute(
-        "generate-hashes",
-        "-w",
-        workspace.absolutePath,
-        "-b",
-        "bazel",
-        "--useCquery",
-        "--cqueryExpression",
-        "deps(//:normal_target) + deps(//:dependent_target)",
-        from.absolutePath)
+    val exitCodeWithCustomExpression =
+        cli.execute(
+            "generate-hashes",
+            "-w",
+            workspace.absolutePath,
+            "-b",
+            "bazel",
+            "--useCquery",
+            "--cqueryExpression",
+            "deps(//:normal_target) + deps(//:dependent_target)",
+            from.absolutePath)
 
-    // With the custom expression that explicitly lists only the non-failing targets, this should succeed
+    // With the custom expression that explicitly lists only the non-failing targets, this should
+    // succeed
     assertThat(exitCodeWithCustomExpression).isEqualTo(0)
 
     // Verify the hashes were generated successfully and contain the expected targets
@@ -1112,18 +1155,22 @@ class E2ETest {
   }
 
   /**
-   * Returns the Bazel version triple by running `bazel version`, or null if it cannot be determined.
+   * Returns the Bazel version triple by running `bazel version`, or null if it cannot be
+   * determined.
    */
   private fun getBazelVersion(): Triple<Int, Int, Int>? {
     return try {
-      val process = ProcessBuilder("bazel", "version")
-          .redirectErrorStream(true)
-          .start()
+      val process = ProcessBuilder("bazel", "version").redirectErrorStream(true).start()
       val output = process.inputStream.bufferedReader().readText()
       process.waitFor()
-      val versionLine = output.lines().firstOrNull { it.startsWith("Build label: ") }
-          ?.removePrefix("Build label: ")?.trim() ?: return null
-      val parts = versionLine.split('-')[0].split('.').map { it.takeWhile { c -> c.isDigit() }.toInt() }
+      val versionLine =
+          output
+              .lines()
+              .firstOrNull { it.startsWith("Build label: ") }
+              ?.removePrefix("Build label: ")
+              ?.trim() ?: return null
+      val parts =
+          versionLine.split('-')[0].split('.').map { it.takeWhile { c -> c.isDigit() }.toInt() }
       Triple(parts[0], parts[1], parts[2])
     } catch (_: Exception) {
       null
@@ -1143,7 +1190,8 @@ class E2ETest {
     val version = getBazelVersion()
     org.junit.Assume.assumeNotNull(version)
     val v = version!!
-    val comparator = compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+    val comparator =
+        compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
     val hasModShowRepo = comparator.compare(v, Triple(8, 6, 0)) >= 0 && v != Triple(9, 0, 0)
     org.junit.Assume.assumeTrue(
         "Requires Bazel 8.6.0+ or 9.0.1+ (current: ${v.first}.${v.second}.${v.third})",
@@ -1162,28 +1210,29 @@ class E2ETest {
 
     // Generate hashes for both snapshots WITHOUT --fineGrainedHashExternalRepos.
     // The mod show_repo integration should still detect the MODULE.bazel change.
-    val exitFrom = cli.execute(
-        "generate-hashes",
-        "-w", projectA.absolutePath,
-        "-b", bazelPath,
-        from.absolutePath)
+    val exitFrom =
+        cli.execute(
+            "generate-hashes", "-w", projectA.absolutePath, "-b", bazelPath, from.absolutePath)
     assertThat(exitFrom).isEqualTo(0)
 
-    val exitTo = cli.execute(
-        "generate-hashes",
-        "-w", projectB.absolutePath,
-        "-b", bazelPath,
-        to.absolutePath)
+    val exitTo =
+        cli.execute(
+            "generate-hashes", "-w", projectB.absolutePath, "-b", bazelPath, to.absolutePath)
     assertThat(exitTo).isEqualTo(0)
 
     // Get impacted targets
     cli.execute(
         "get-impacted-targets",
-        "-w", projectB.absolutePath,
-        "-b", bazelPath,
-        "-sh", from.absolutePath,
-        "-fh", to.absolutePath,
-        "-o", impactedTargetsOutput.absolutePath)
+        "-w",
+        projectB.absolutePath,
+        "-b",
+        bazelPath,
+        "-sh",
+        from.absolutePath,
+        "-fh",
+        to.absolutePath,
+        "-o",
+        impactedTargetsOutput.absolutePath)
 
     val impactedTargets = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
 
@@ -1196,11 +1245,15 @@ class E2ETest {
 
     // bazel-diff-integration-lib depends only on local targets (Submodule), NOT on any
     // external maven artifact. It should NOT be impacted by the guava version change.
-    val integrationLibImpacted = impactedTargets.any {
-      it.contains("bazel-diff-integration-lib") && !it.contains("libbazel-diff-integration-lib")
-    }
+    val integrationLibImpacted =
+        impactedTargets.any {
+          it.contains("bazel-diff-integration-lib") && !it.contains("libbazel-diff-integration-lib")
+        }
     assertThat(integrationLibImpacted)
-        .transform("bazel-diff-integration-lib should NOT be in impacted targets: $impactedTargets") { it }
+        .transform(
+            "bazel-diff-integration-lib should NOT be in impacted targets: $impactedTargets") {
+              it
+            }
         .isEqualTo(false)
 
     // Submodule has no external deps at all - it should not be impacted.
@@ -1227,7 +1280,8 @@ class E2ETest {
     val version = getBazelVersion()
     org.junit.Assume.assumeNotNull(version)
     val v = version!!
-    val comparator = compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+    val comparator =
+        compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
     val hasModShowRepo = comparator.compare(v, Triple(8, 6, 0)) >= 0 && v != Triple(9, 0, 0)
     org.junit.Assume.assumeTrue(
         "Requires Bazel 8.6.0+ or 9.0.1+ (current: ${v.first}.${v.second}.${v.third})",
@@ -1246,57 +1300,65 @@ class E2ETest {
     val cli = CommandLine(BazelDiff())
 
     assertThat(
-        cli.execute(
-            "generate-hashes",
-            "-w", projectA.absolutePath,
-            "-b", bazelPath,
-            from.absolutePath))
+            cli.execute(
+                "generate-hashes", "-w", projectA.absolutePath, "-b", bazelPath, from.absolutePath))
         .isEqualTo(0)
     assertThat(
-        cli.execute(
-            "generate-hashes",
-            "-w", projectB.absolutePath,
-            "-b", bazelPath,
-            to.absolutePath))
+            cli.execute(
+                "generate-hashes", "-w", projectB.absolutePath, "-b", bazelPath, to.absolutePath))
         .isEqualTo(0)
 
     // Default invocation: bzlmod is detected, so --excludeExternalTargets auto-defaults to true.
     assertThat(
-        cli.execute(
-            "get-impacted-targets",
-            "-w", projectB.absolutePath,
-            "-b", bazelPath,
-            "-sh", from.absolutePath,
-            "-fh", to.absolutePath,
-            "-o", defaultOutput.absolutePath))
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                projectB.absolutePath,
+                "-b",
+                bazelPath,
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                defaultOutput.absolutePath))
         .isEqualTo(0)
 
     val defaultLines = defaultOutput.readLines().filter { it.isNotBlank() }
     val leakedExternal = defaultLines.filter { it.startsWith("//external:") }
     assertThat(leakedExternal.isEmpty())
         .transform(
-            "default impacted-targets output should not contain //external:* labels, but found: $leakedExternal") { it }
+            "default impacted-targets output should not contain //external:* labels, but found: $leakedExternal") {
+              it
+            }
         .isEqualTo(true)
 
     // Opt-out: --no-excludeExternalTargets reproduces the pre-#326 behavior so the synthetic
     // labels show up. This proves the labels really exist in the hashes (so the filter is doing
     // real work) and gives users an escape hatch.
     assertThat(
-        cli.execute(
-            "get-impacted-targets",
-            "-w", projectB.absolutePath,
-            "-b", bazelPath,
-            "-sh", from.absolutePath,
-            "-fh", to.absolutePath,
-            "--no-excludeExternalTargets",
-            "-o", optOutOutput.absolutePath))
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                projectB.absolutePath,
+                "-b",
+                bazelPath,
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "--no-excludeExternalTargets",
+                "-o",
+                optOutOutput.absolutePath))
         .isEqualTo(0)
 
     val optOutLines = optOutOutput.readLines().filter { it.isNotBlank() }
     val externalsWithOptOut = optOutLines.filter { it.startsWith("//external:") }
     assertThat(externalsWithOptOut.isNotEmpty())
         .transform(
-            "with --no-excludeExternalTargets, the impacted-targets output should expose synthetic //external:* labels (none found in: $optOutLines)") { it }
+            "with --no-excludeExternalTargets, the impacted-targets output should expose synthetic //external:* labels (none found in: $optOutLines)") {
+              it
+            }
         .isEqualTo(true)
   }
 
@@ -1340,7 +1402,8 @@ class E2ETest {
     // to A's; only the raw source bytes differ.
     val moduleBazelInB = File(workspaceB, "MODULE.bazel")
     val originalModule = moduleBazelInB.readText()
-    moduleBazelInB.writeText("# A comment that should be a no-op for impacted targets.\n" + originalModule)
+    moduleBazelInB.writeText(
+        "# A comment that should be a no-op for impacted targets.\n" + originalModule)
 
     val outputDir = temp.newFolder()
     val from = File(outputDir, "starting_hashes.json")
@@ -1351,26 +1414,25 @@ class E2ETest {
 
     assertThat(
             cli.execute(
-                "generate-hashes",
-                "-w", workspaceA.absolutePath,
-                "-b", "bazel",
-                from.absolutePath))
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
-                "generate-hashes",
-                "-w", workspaceB.absolutePath,
-                "-b", "bazel",
-                to.absolutePath))
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
                 "get-impacted-targets",
-                "-w", workspaceB.absolutePath,
-                "-b", "bazel",
-                "-sh", from.absolutePath,
-                "-fh", to.absolutePath,
-                "-o", impactedTargetsOutput.absolutePath))
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
         .isEqualTo(0)
 
     val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
@@ -1378,7 +1440,10 @@ class E2ETest {
     // any targets. If a future change reintroduces over-triggering, this assertion fails
     // and points back to the relevant module-graph-diffing logic.
     assertThat(impacted.isEmpty())
-        .transform("A comment-only MODULE.bazel change must not impact any targets (got: $impacted)") { it }
+        .transform(
+            "A comment-only MODULE.bazel change must not impact any targets (got: $impacted)") {
+              it
+            }
         .isEqualTo(true)
   }
 
@@ -1408,8 +1473,10 @@ class E2ETest {
     assertThat(
             cli.execute(
                 "generate-hashes",
-                "-w", workspace.absolutePath,
-                "-b", "bazel",
+                "-w",
+                workspace.absolutePath,
+                "-b",
+                "bazel",
                 queryOutput.absolutePath))
         .isEqualTo(0)
     val queryJson = queryOutput.readText()
@@ -1422,8 +1489,10 @@ class E2ETest {
     assertThat(
             cli.execute(
                 "generate-hashes",
-                "-w", workspace.absolutePath,
-                "-b", "bazel",
+                "-w",
+                workspace.absolutePath,
+                "-b",
+                "bazel",
                 "--useCquery",
                 cqueryOutput.absolutePath))
         .isEqualTo(0)
@@ -1432,7 +1501,10 @@ class E2ETest {
         .transform("cquery-mode hashes should include the consumer target; got: $cqueryJson") { it }
         .isEqualTo(true)
     assertThat(cqueryJson.contains("dep_repo"))
-        .transform("cquery-mode hashes should reference dep_repo (local_path_override target); got: $cqueryJson") { it }
+        .transform(
+            "cquery-mode hashes should reference dep_repo (local_path_override target); got: $cqueryJson") {
+              it
+            }
         .isEqualTo(true)
   }
 
@@ -1495,36 +1567,41 @@ class E2ETest {
 
     assertThat(
             cli.execute(
-                "generate-hashes",
-                "-w", workspaceA.absolutePath,
-                "-b", "bazel",
-                from.absolutePath))
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
-                "generate-hashes",
-                "-w", workspaceB.absolutePath,
-                "-b", "bazel",
-                to.absolutePath))
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
                 "get-impacted-targets",
-                "-w", workspaceB.absolutePath,
-                "-b", "bazel",
-                "-sh", from.absolutePath,
-                "-fh", to.absolutePath,
-                "-o", impactedTargetsOutput.absolutePath))
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
         .isEqualTo(0)
 
     val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
     val libImpacted = impacted.any { it == "//:lib" || it == "@@//:lib" }
     val libTestImpacted = impacted.any { it == "//:lib_test" || it == "@@//:lib_test" }
     assertThat(libImpacted)
-        .transform("//:lib should be impacted when go.mod changes pkg/errors version; got: $impacted") { it }
+        .transform(
+            "//:lib should be impacted when go.mod changes pkg/errors version; got: $impacted") {
+              it
+            }
         .isEqualTo(true)
     assertThat(libTestImpacted)
-        .transform("//:lib_test should be impacted when go.mod changes pkg/errors version; got: $impacted") { it }
+        .transform(
+            "//:lib_test should be impacted when go.mod changes pkg/errors version; got: $impacted") {
+              it
+            }
         .isEqualTo(true)
   }
 
@@ -1562,9 +1639,10 @@ class E2ETest {
     // file content rather than any rule-attribute hash diff.
     val bzlInB = File(workspaceB, "miniature.bzl")
     val originalBzl = bzlInB.readText()
-    val mutatedBzl = originalBzl.replace(
-        "def miniature(name, src, **kwargs):",
-        "def miniature(name, src, **kwargs):\n    print(\"miniature: \" + name)")
+    val mutatedBzl =
+        originalBzl.replace(
+            "def miniature(name, src, **kwargs):",
+            "def miniature(name, src, **kwargs):\n    print(\"miniature: \" + name)")
     assertThat(mutatedBzl != originalBzl).isEqualTo(true)
     bzlInB.writeText(mutatedBzl)
 
@@ -1576,33 +1654,34 @@ class E2ETest {
     val cli = CommandLine(BazelDiff())
     assertThat(
             cli.execute(
-                "generate-hashes",
-                "-w", workspaceA.absolutePath,
-                "-b", "bazel",
-                from.absolutePath))
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
-                "generate-hashes",
-                "-w", workspaceB.absolutePath,
-                "-b", "bazel",
-                to.absolutePath))
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
         .isEqualTo(0)
 
     assertThat(
             cli.execute(
                 "get-impacted-targets",
-                "-w", workspaceB.absolutePath,
-                "-b", "bazel",
-                "-sh", from.absolutePath,
-                "-fh", to.absolutePath,
-                "-o", impactedTargetsOutput.absolutePath))
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
         .isEqualTo(0)
 
     val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
     val callerImpacted = impacted.any { it.contains("logo_miniature") }
     assertThat(callerImpacted)
-        .transform("//:logo_miniature should be impacted by miniature.bzl edit; got: $impacted") { it }
+        .transform("//:logo_miniature should be impacted by miniature.bzl edit; got: $impacted") {
+          it
+        }
         .isEqualTo(true)
   }
 
@@ -1650,7 +1729,8 @@ class E2ETest {
     rootModuleB.writeText(rootBumped)
 
     val depModuleB = File(workspaceB, "proto_dep/MODULE.bazel")
-    depModuleB.writeText(depModuleB.readText().replace("version = \"1.0.0\"", "version = \"2.0.0\""))
+    depModuleB.writeText(
+        depModuleB.readText().replace("version = \"1.0.0\"", "version = \"2.0.0\""))
 
     // ...and ship a new field in the proto, mirroring a real upstream release.
     val protoB = File(workspaceB, "proto_dep/greeting.proto")
@@ -1671,37 +1751,53 @@ class E2ETest {
     assertThat(
             cli.execute(
                 "generate-hashes",
-                "-w", workspaceA.absolutePath,
-                "-b", "bazel",
-                "--fineGrainedHashExternalRepos", "@proto_dep",
+                "-w",
+                workspaceA.absolutePath,
+                "-b",
+                "bazel",
+                "--fineGrainedHashExternalRepos",
+                "@proto_dep",
                 from.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
                 "generate-hashes",
-                "-w", workspaceB.absolutePath,
-                "-b", "bazel",
-                "--fineGrainedHashExternalRepos", "@proto_dep",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "--fineGrainedHashExternalRepos",
+                "@proto_dep",
                 to.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
                 "get-impacted-targets",
-                "-w", workspaceB.absolutePath,
-                "-b", "bazel",
-                "-sh", from.absolutePath,
-                "-fh", to.absolutePath,
-                "-o", impactedTargetsOutput.absolutePath))
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
         .isEqualTo(0)
 
     val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
     val consumerImpacted = impacted.any { it == "//:consumer" || it == "@@//:consumer" }
     val javaProtoImpacted = impacted.any { it.endsWith("proto_dep//:greeting_java_proto") }
     assertThat(consumerImpacted)
-        .transform("//:consumer should be impacted by a proto_dep version bump; got: $impacted") { it }
+        .transform("//:consumer should be impacted by a proto_dep version bump; got: $impacted") {
+          it
+        }
         .isEqualTo(true)
     assertThat(javaProtoImpacted)
-        .transform("@proto_dep//:greeting_java_proto should be impacted by the proto change; got: $impacted") { it }
+        .transform(
+            "@proto_dep//:greeting_java_proto should be impacted by the proto change; got: $impacted") {
+              it
+            }
         .isEqualTo(true)
   }
 
@@ -1765,8 +1861,10 @@ class E2ETest {
     assertThat(
             cli.execute(
                 "generate-hashes",
-                "-w", workspace.absolutePath,
-                "-b", "bazel",
+                "-w",
+                workspace.absolutePath,
+                "-b",
+                "bazel",
                 hashesPath.absolutePath))
         .isEqualTo(0)
 
@@ -1796,7 +1894,9 @@ class E2ETest {
     assertThat(externalGoDepLabel)
         .transform(
             "expected a hashes entry referencing the external Go dep `com_github_pkg_errors` " +
-                "(per #228); got keys: ${labels.sorted()}") { it }
+                "(per #228); got keys: ${labels.sorted()}") {
+              it
+            }
         .isEqualTo("//external:com_github_pkg_errors")
   }
 
@@ -1866,26 +1966,25 @@ class E2ETest {
     val cli = CommandLine(BazelDiff())
     assertThat(
             cli.execute(
-                "generate-hashes",
-                "-w", workspaceA.absolutePath,
-                "-b", "bazel",
-                from.absolutePath))
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
-                "generate-hashes",
-                "-w", workspaceB.absolutePath,
-                "-b", "bazel",
-                to.absolutePath))
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
                 "get-impacted-targets",
-                "-w", workspaceB.absolutePath,
-                "-b", "bazel",
-                "-sh", from.absolutePath,
-                "-fh", to.absolutePath,
-                "-o", impactedTargetsOutput.absolutePath))
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
         .isEqualTo(0)
 
     val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
@@ -1893,7 +1992,9 @@ class E2ETest {
     assertThat(consumerImpacted)
         .transform(
             "//:consume should be impacted when inner/data.txt changes (transitive external dep " +
-                "via @outer -> @inner per #184); got: $impacted") { it }
+                "via @outer -> @inner per #184); got: $impacted") {
+              it
+            }
         .isEqualTo(true)
   }
 
@@ -1941,36 +2042,51 @@ class E2ETest {
     assertThat(
             cli.execute(
                 "generate-hashes",
-                "-w", workspaceA.absolutePath,
-                "-b", "bazel",
-                "--fineGrainedHashExternalRepos", fineGrained,
+                "-w",
+                workspaceA.absolutePath,
+                "-b",
+                "bazel",
+                "--fineGrainedHashExternalRepos",
+                fineGrained,
                 from.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
                 "generate-hashes",
-                "-w", workspaceB.absolutePath,
-                "-b", "bazel",
-                "--fineGrainedHashExternalRepos", fineGrained,
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "--fineGrainedHashExternalRepos",
+                fineGrained,
                 to.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
                 "get-impacted-targets",
-                "-w", workspaceB.absolutePath,
-                "-b", "bazel",
-                "-sh", from.absolutePath,
-                "-fh", to.absolutePath,
-                "-o", impactedTargetsOutput.absolutePath))
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
         .isEqualTo(0)
 
     val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
-    // Desired: //:consumer follows the dep chain through @middle_repo:wrapped -> @inner_repo:all_files
+    // Desired: //:consumer follows the dep chain through @middle_repo:wrapped ->
+    // @inner_repo:all_files
     // -> data.txt and shows up as impacted. Current behaviour: only @inner_repo:* targets are
     // impacted; the chain stops at the unhashed @middle_repo "blob".
     val consumerImpacted = impacted.any { it == "//:consumer" || it == "@@//:consumer" }
     assertThat(consumerImpacted)
-        .transform("//:consumer should be impacted (chain: inner_repo/data.txt -> @inner_repo:all_files -> @middle_repo:wrapped -> //:consumer). Got impacted: $impacted") { it }
+        .transform(
+            "//:consumer should be impacted (chain: inner_repo/data.txt -> @inner_repo:all_files -> @middle_repo:wrapped -> //:consumer). Got impacted: $impacted") {
+              it
+            }
         .isEqualTo(true)
   }
 
@@ -2022,21 +2138,11 @@ class E2ETest {
     val cli = CommandLine(BazelDiff())
     assertThat(
             cli.execute(
-                "generate-hashes",
-                "-w",
-                workspaceA.absolutePath,
-                "-b",
-                "bazel",
-                from.absolutePath))
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
-                "generate-hashes",
-                "-w",
-                workspaceB.absolutePath,
-                "-b",
-                "bazel",
-                to.absolutePath))
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(

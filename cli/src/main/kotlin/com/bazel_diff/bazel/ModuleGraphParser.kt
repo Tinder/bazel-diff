@@ -3,30 +3,23 @@ package com.bazel_diff.bazel
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 
-/**
- * Data class representing a module in the dependency graph.
- */
-data class Module(
-    val key: String,
-    val name: String,
-    val version: String,
-    val apparentName: String
-)
+/** Data class representing a module in the dependency graph. */
+data class Module(val key: String, val name: String, val version: String, val apparentName: String)
 
 /**
  * Parses and compares Bazel module graphs to detect changes.
  *
- * Instead of including the entire module graph in the hash seed (which causes all targets
- * to rehash when MODULE.bazel changes), this class identifies which specific modules changed
- * so we can query only the targets that depend on those modules.
+ * Instead of including the entire module graph in the hash seed (which causes all targets to rehash
+ * when MODULE.bazel changes), this class identifies which specific modules changed so we can query
+ * only the targets that depend on those modules.
  */
 class ModuleGraphParser {
   /**
    * Parses the JSON output from `bazel mod graph --output=json`.
    *
-   * Tolerates a non-JSON prefix (e.g. leaked stderr from bazel-diff
-   * 17.0.1..18.0.5, which captured stderr into moduleGraphJson via
-   * Process.kt's captureAll -> ProcessBuilder.redirectErrorStream(true)).
+   * Tolerates a non-JSON prefix (e.g. leaked stderr from bazel-diff 17.0.1..18.0.5, which captured
+   * stderr into moduleGraphJson via Process.kt's captureAll ->
+   * ProcessBuilder.redirectErrorStream(true)).
    *
    * @param json The JSON string from bazel mod graph
    * @return A map of module keys to Module objects
@@ -35,13 +28,14 @@ class ModuleGraphParser {
     val modules = mutableMapOf<String, Module>()
 
     try {
-      val root = try {
-        JsonParser.parseString(json).asJsonObject
-      } catch (_: Exception) {
-        val start = json.indexOf('{')
-        if (start < 0) return emptyMap()
-        JsonParser.parseString(json.substring(start)).asJsonObject
-      }
+      val root =
+          try {
+            JsonParser.parseString(json).asJsonObject
+          } catch (_: Exception) {
+            val start = json.indexOf('{')
+            if (start < 0) return emptyMap()
+            JsonParser.parseString(json.substring(start)).asJsonObject
+          }
       extractModules(root, modules)
     } catch (e: Exception) {
       // If parsing fails, return empty map
@@ -76,30 +70,31 @@ class ModuleGraphParser {
    * Parses the JSON from `bazel mod graph --output=json` and returns each module's direct
    * `bazel_dep` neighbours as a `module_name -> [dep_module_name, ...]` map.
    *
-   * Module names (the `name` field of the `module(name = ...)` declaration) are used as the
-   * key here because the alternative -- `module_key` -- is not always populated on the
-   * `Build.Repository` protos returned by `bazel mod show_repo`, which is what consumers want
-   * to look up against. Module names are universally present and sufficient to find a unique
-   * row in the graph for the common no-multi-version case.
+   * Module names (the `name` field of the `module(name = ...)` declaration) are used as the key
+   * here because the alternative -- `module_key` -- is not always populated on the
+   * `Build.Repository` protos returned by `bazel mod show_repo`, which is what consumers want to
+   * look up against. Module names are universally present and sufficient to find a unique row in
+   * the graph for the common no-multi-version case.
    *
-   * The same module may appear in multiple places in the JSON tree (`bazel mod graph` inlines
-   * each module once and references it via `unexpanded` afterwards). This method walks every
+   * The same module may appear in multiple places in the JSON tree (`bazel mod graph` inlines each
+   * module once and references it via `unexpanded` afterwards). This method walks every
    * `dependencies` array it sees, so even the `unexpanded` references contribute an edge. The
-   * resulting map is keyed by the parent's `module_name` and contains the union of all direct
-   * dep names observed across the tree.
+   * resulting map is keyed by the parent's `module_name` and contains the union of all direct dep
+   * names observed across the tree.
    *
    * Returns an empty map on parse failure (same tolerance as [parseModuleGraph]).
    */
   fun parseModuleGraphDepEdges(json: String): Map<String, List<String>> {
     val edges = mutableMapOf<String, MutableSet<String>>()
     try {
-      val root = try {
-        JsonParser.parseString(json).asJsonObject
-      } catch (_: Exception) {
-        val start = json.indexOf('{')
-        if (start < 0) return emptyMap()
-        JsonParser.parseString(json.substring(start)).asJsonObject
-      }
+      val root =
+          try {
+            JsonParser.parseString(json).asJsonObject
+          } catch (_: Exception) {
+            val start = json.indexOf('{')
+            if (start < 0) return emptyMap()
+            JsonParser.parseString(json.substring(start)).asJsonObject
+          }
       extractDepEdges(root, edges)
     } catch (_: Exception) {
       return emptyMap()
@@ -125,24 +120,23 @@ class ModuleGraphParser {
   /**
    * Returns a copy of [edges] with back-edges removed so the result is acyclic.
    *
-   * `bazel mod graph` legitimately contains cycles: for example `rules_go` declares
-   * `bazel_dep(name = "gazelle", dev_dependency = True)` while `gazelle` declares
-   * `bazel_dep(name = "rules_go")`, so the dep graph has `rules_go <-> gazelle`. Feeding both
-   * edges into [BazelQueryService.queryBzlmodRepos] as `rule_input`s on the synthetic
-   * `//external:*` targets makes `RuleHasher` recurse infinitely and throw
-   * `CircularDependencyException`. We need a cycle-free dep DAG before emitting edges.
+   * `bazel mod graph` legitimately contains cycles: for example `rules_go` declares `bazel_dep(name
+   * = "gazelle", dev_dependency = True)` while `gazelle` declares `bazel_dep(name = "rules_go")`,
+   * so the dep graph has `rules_go <-> gazelle`. Feeding both edges into
+   * [BazelQueryService.queryBzlmodRepos] as `rule_input`s on the synthetic `//external:*` targets
+   * makes `RuleHasher` recurse infinitely and throw `CircularDependencyException`. We need a
+   * cycle-free dep DAG before emitting edges.
    *
-   * The algorithm is a single DFS, visiting nodes in lexicographic order with their out-edges
-   * also sorted. An edge to a node currently on the DFS path is a back-edge (it would close
-   * a cycle) and is dropped; every other edge is kept. The result is therefore (a) acyclic
-   * and (b) deterministic across runs.
+   * The algorithm is a single DFS, visiting nodes in lexicographic order with their out-edges also
+   * sorted. An edge to a node currently on the DFS path is a back-edge (it would close a cycle) and
+   * is dropped; every other edge is kept. The result is therefore (a) acyclic and (b) deterministic
+   * across runs.
    *
    * Dropping the back-edge is conservative: a content change in the dropped-edge target still
-   * surfaces via its own synthetic `//external:*` target's hash (each repo gets one), so
-   * main-repo consumers that depend on either side of the cycle still see the change. We
-   * only lose the ability to propagate through the cycle itself, which is fine because all
-   * SCC members are co-dependent and a change in any of them already invalidates their own
-   * hashes directly.
+   * surfaces via its own synthetic `//external:*` target's hash (each repo gets one), so main-repo
+   * consumers that depend on either side of the cycle still see the change. We only lose the
+   * ability to propagate through the cycle itself, which is fine because all SCC members are
+   * co-dependent and a change in any of them already invalidates their own hashes directly.
    */
   fun breakCycles(edges: Map<String, List<String>>): Map<String, List<String>> {
     val result = mutableMapOf<String, List<String>>()
@@ -191,8 +185,8 @@ class ModuleGraphParser {
    * non-JSON prefix (e.g. leaked stderr) using the same recovery as [parseModuleGraph].
    *
    * Each module in the JSON tree contributes an edge for every entry in its `dependencies` array.
-   * `unexpanded` dependency stubs (modules that the bzlmod resolver already described elsewhere
-   * in the graph) still contribute the edge but are not recursed into to avoid duplicate work.
+   * `unexpanded` dependency stubs (modules that the bzlmod resolver already described elsewhere in
+   * the graph) still contribute the edge but are not recursed into to avoid duplicate work.
    */
   fun parseModuleGraphEdges(json: String): GraphEdges {
     val edges = mutableMapOf<String, MutableSet<String>>()
@@ -240,10 +234,10 @@ class ModuleGraphParser {
    * traversing [edges] in reverse. Excludes [rootApparentNames] from the result.
    *
    * Background: `--fineGrainedHashExternalRepos` opts a leaf module (e.g. `@inner_repo`) into
-   * per-target hashing. When another bzlmod module (`@middle_repo`) wraps it via alias or
-   * re-export and the main repo depends only on the wrapper, the wrapper's targets must also be
-   * queried for the hash chain to reach the leaf. This is the engine for that auto-expansion
-   * (issue #197). The set returned here is what the caller should add to the user-supplied set.
+   * per-target hashing. When another bzlmod module (`@middle_repo`) wraps it via alias or re-export
+   * and the main repo depends only on the wrapper, the wrapper's targets must also be queried for
+   * the hash chain to reach the leaf. This is the engine for that auto-expansion (issue #197). The
+   * set returned here is what the caller should add to the user-supplied set.
    */
   fun findTransitiveDependents(
       edges: Map<String, Set<String>>,

@@ -46,19 +46,23 @@ class BazelQueryService(
       throw RuntimeException("Bazel version command failed, exit code ${result.resultCode}")
     }
 
-    // "bazel version" outputs "Build label: X.Y.Z" on one of the lines; accept that or legacy "bazel X.Y.Z".
+    // "bazel version" outputs "Build label: X.Y.Z" on one of the lines; accept that or legacy
+    // "bazel X.Y.Z".
     val versionString =
         result.output
             .firstOrNull { it.startsWith("Build label: ") }
-            ?.removePrefix("Build label: ")?.trim()
-            ?: result.output
-                .firstOrNull { it.startsWith("bazel ") }
-                ?.removePrefix("bazel ")?.trim()
+            ?.removePrefix("Build label: ")
+            ?.trim()
+            ?: result.output.firstOrNull { it.startsWith("bazel ") }?.removePrefix("bazel ")?.trim()
             ?: throw RuntimeException(
                 "Bazel version command returned unexpected output: ${result.output}")
     // Trim off any prerelease suffixes (e.g., 8.6.0-rc1 or 8.6.0rc1).
     val version =
-        versionString.split('-')[0].split('.').map { it.takeWhile { c -> c.isDigit() }.toInt() }.toTypedArray()
+        versionString
+            .split('-')[0]
+            .split('.')
+            .map { it.takeWhile { c -> c.isDigit() }.toInt() }
+            .toTypedArray()
     return Triple(version[0], version[1], version[2])
   }
 
@@ -234,14 +238,14 @@ class BazelQueryService(
   }
 
   /**
-   * Queries bzlmod-managed external repo definitions using `bazel mod show_repo`.
-   * Requires Bazel 8.6.0+ or 9.0.1+ which supports `--output=streamed_proto` for this command.
+   * Queries bzlmod-managed external repo definitions using `bazel mod show_repo`. Requires Bazel
+   * 8.6.0+ or 9.0.1+ which supports `--output=streamed_proto` for this command.
    *
    * The approach:
-   * 1. Run `bazel mod dump_repo_mapping ""` to discover the root module's apparent→canonical
-   *    repo name mapping (e.g., "bazel_diff_maven" → "rules_jvm_external++maven+maven").
-   * 2. Run `bazel mod show_repo @@<canonical>... --output=streamed_proto` to get Repository
-   *    proto definitions for each repo (works for both module repos and extension-generated repos).
+   * 1. Run `bazel mod dump_repo_mapping ""` to discover the root module's apparent→canonical repo
+   *    name mapping (e.g., "bazel_diff_maven" → "rules_jvm_external++maven+maven").
+   * 2. Run `bazel mod show_repo @@<canonical>... --output=streamed_proto` to get Repository proto
+   *    definitions for each repo (works for both module repos and extension-generated repos).
    * 3. Create synthetic `//external:<apparent_name>` targets for each repo. This matches how
    *    `transformRuleInput` in BazelRule.kt collapses `@apparent_name//...` deps to
    *    `//external:apparent_name`, so the hashing pipeline can detect changes.
@@ -293,7 +297,9 @@ class BazelQueryService(
         )
 
     if (result.resultCode != 0) {
-      logger.w { "bazel mod show_repo failed (exit code ${result.resultCode}), skipping bzlmod repos" }
+      logger.w {
+        "bazel mod show_repo failed (exit code ${result.resultCode}), skipping bzlmod repos"
+      }
       return emptyList()
     }
 
@@ -385,15 +391,15 @@ class BazelQueryService(
 
   /**
    * Converts a Build.Repository proto into a synthetic BazelTarget.Rule named
-   * `//external:<targetName>`. This mirrors how WORKSPACE repos appear as `//external:*`
-   * targets, and matches the names produced by `transformRuleInput` in BazelRule.kt.
+   * `//external:<targetName>`. This mirrors how WORKSPACE repos appear as `//external:*` targets,
+   * and matches the names produced by `transformRuleInput` in BazelRule.kt.
    *
    * For each bzlmod dep of this repo (as discovered from `bazel mod graph`) a corresponding
-   * `//external:<dep_apparent_name>` is added to the rule's `rule_input` list, so
-   * [RuleHasher] follows the dep chain when computing the digest. For repos backed by a
-   * `local_repository` rule (which is what `local_path_override` lowers to), the contents
-   * of the local directory are also rolled into a synthetic `_bazel_diff_content_hash`
-   * attribute so file content changes inside the repo flip the synthetic target's hash.
+   * `//external:<dep_apparent_name>` is added to the rule's `rule_input` list, so [RuleHasher]
+   * follows the dep chain when computing the digest. For repos backed by a `local_repository` rule
+   * (which is what `local_path_override` lowers to), the contents of the local directory are also
+   * rolled into a synthetic `_bazel_diff_content_hash` attribute so file content changes inside the
+   * repo flip the synthetic target's hash.
    */
   private fun repositoryToTarget(
       repo: Build.Repository,
@@ -431,22 +437,26 @@ class BazelQueryService(
   }
 
   /**
-   * Returns a stable hex sha256 over the files inside a `local_repository`-backed repo on
-   * disk, or null if the repo is not local-backed or the directory cannot be read.
+   * Returns a stable hex sha256 over the files inside a `local_repository`-backed repo on disk, or
+   * null if the repo is not local-backed or the directory cannot be read.
    *
    * `local_path_override(module_name = "X", path = "...")` in MODULE.bazel lowers to a
-   * `local_repository` rule, whose `path` attribute is relative to the workspace root. Hashing
-   * that directory makes file content edits surface in the synthetic //external:X target's
-   * digest, which fixes the "external repo file change is invisible" half of
+   * `local_repository` rule, whose `path` attribute is relative to the workspace root. Hashing that
+   * directory makes file content edits surface in the synthetic //external:X target's digest, which
+   * fixes the "external repo file change is invisible" half of
    * [#184](https://github.com/Tinder/bazel-diff/issues/184) /
    * [#197](https://github.com/Tinder/bazel-diff/issues/197).
    */
   private fun computeLocalRepoContentHash(repo: Build.Repository): String? {
     if (repo.repoRuleName != "local_repository") return null
     val pathAttr =
-        repo.attributeList.find { it.name == "path" && it.type == Build.Attribute.Discriminator.STRING }
-            ?: return null
-    val pathStr = pathAttr.stringValue.ifEmpty { return null }
+        repo.attributeList.find {
+          it.name == "path" && it.type == Build.Attribute.Discriminator.STRING
+        } ?: return null
+    val pathStr =
+        pathAttr.stringValue.ifEmpty {
+          return null
+        }
     val rawPath = java.nio.file.Paths.get(pathStr)
     val repoDir =
         (if (rawPath.isAbsolute) rawPath.toFile() else workingDirectory.resolve(rawPath).toFile())
@@ -477,10 +487,9 @@ class BazelQueryService(
   }
 
   /**
-   * Discovers the root module's apparent→canonical repo name mapping by running
-   * `bazel mod dump_repo_mapping ""`. Returns a map of apparent name → canonical name.
-   * Filters out internal repos (bazel_tools, _builtins, local_config_*) that aren't
-   * relevant for dependency hashing.
+   * Discovers the root module's apparent→canonical repo name mapping by running `bazel mod
+   * dump_repo_mapping ""`. Returns a map of apparent name → canonical name. Filters out internal
+   * repos (bazel_tools, _builtins, local_config_*) that aren't relevant for dependency hashing.
    */
   @OptIn(ExperimentalCoroutinesApi::class)
   private suspend fun discoverRepoMapping(): Map<String, String> {

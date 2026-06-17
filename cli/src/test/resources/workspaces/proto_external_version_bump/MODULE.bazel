@@ -1,0 +1,18 @@
+module(
+    name = "proto_external_version_bump_test",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "rules_java", version = "9.3.0")
+bazel_dep(name = "rules_proto", version = "7.1.0")
+bazel_dep(name = "protobuf", version = "33.4")
+
+# proto_dep stands in for a remote module that ships .proto files and exposes
+# java_proto_library targets. We resolve it via local_path_override so the test
+# is hermetic; a "version bump" is simulated by mutating proto_dep's contents
+# (see E2ETest.testProtoExternalVersionBumpImpactsConsumer).
+bazel_dep(name = "proto_dep", version = "1.0.0")
+local_path_override(
+    module_name = "proto_dep",
+    path = "proto_dep",
+)

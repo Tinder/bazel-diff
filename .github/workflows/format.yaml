@@ -1,0 +1,62 @@
+name: Format
+
+# Runs ktfmt over the codebase on a daily schedule and opens a PR only if the
+# formatter produced changes. Mirrors the coverage-badge cron: it force-pushes a
+# dedicated, bot-owned branch so re-runs reuse one PR instead of accumulating
+# stale branches, and it never touches master directly.
+on:
+  schedule:
+    # 12:00 UTC daily (one hour before the coverage-badge cron).
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+        id: go
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+      - uses: actions/checkout@v4
+      - name: Run ktfmt
+        env:
+          USE_BAZEL_VERSION: '9.x'
+        run: ~/go/bin/bazelisk run //cli/format --enable_bzlmod=true --enable_workspace=false
+      - name: Open PR if formatting changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No formatting changes; nothing to do."
+            exit 0
+          fi
+          BRANCH="ci/ktfmt-format"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add -A
+          git commit -m "ci: apply ktfmt formatting"
+          # Force-push the dedicated, bot-owned branch so re-runs reuse one PR
+          # instead of accumulating stale branches. This never touches master.
+          git push --force origin "$BRANCH"
+          if gh pr view "$BRANCH" --json state --jq '.state' 2>/dev/null | grep -q OPEN; then
+            echo "PR already open for $BRANCH; it now points at the latest formatting."
+          else
+            gh pr create \
+              --base master \
+              --head "$BRANCH" \
+              --title "ci: apply ktfmt formatting" \
+              --body "Automated ktfmt run via \`bazel run //cli/format\`. This PR contains formatting-only changes."
+          fi

@@ -1,0 +1,6 @@
+# Test fixture workspaces are deliberately constructed inputs to the E2E tests
+# (e.g. module_bazel_comment exercises comment preservation, cquery_failing_target
+# encodes a specific failure scenario). Exclude them from aspect_rules_lint
+# formatters (buildifier/ktfmt) so the cron jobs never rewrite the very content
+# under test. `rules-lint-ignored` is honored by //cli/format and //cli/format:buildifier.
+cli/src/test/resources/** rules-lint-ignored

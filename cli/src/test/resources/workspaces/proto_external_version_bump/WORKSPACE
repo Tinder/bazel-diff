@@ -1,0 +1,1 @@
+workspace(name = "proto_external_version_bump_test")

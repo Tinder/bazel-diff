@@ -1,0 +1,1 @@
+workspace(name = "proto_dep")

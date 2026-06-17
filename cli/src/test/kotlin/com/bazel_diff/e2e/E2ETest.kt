@@ -1607,6 +1607,105 @@ class E2ETest {
   }
 
   // ------------------------------------------------------------------------
+  // Reproducer: a *remote* proto module version bump must invalidate the
+  // main-repo targets that consume its generated Java protos.
+  // ------------------------------------------------------------------------
+  // Question this answers: if an external dependency that ships .proto files and
+  // exposes `java_proto_library` targets gets a version bump, do the targets that
+  // depend on those Java protos show up as impacted?
+  //
+  // The `proto_external_version_bump` workspace wires up exactly that shape:
+  //   - proto_dep: a module (resolved via local_path_override so the test stays
+  //     hermetic, but standing in for any remote/BCR module) that ships
+  //     `greeting.proto` and exposes `@proto_dep//:greeting_java_proto`.
+  //   - //:consumer: a main-repo java_library that depends on
+  //     `@proto_dep//:greeting_java_proto`.
+  //
+  // We simulate a proto_dep 1.0.0 -> 2.0.0 release the way a real version bump
+  // looks: the module `version` is bumped (root + dep MODULE.bazel) AND the
+  // shipped proto gains a new field. With `--fineGrainedHashExternalRepos
+  // @proto_dep` the external repo's contents are hashed, so the proto change must
+  // propagate `@proto_dep//:greeting_proto` -> `@proto_dep//:greeting_java_proto`
+  // -> `//:consumer`.
+  //
+  // Verified by hand with the locally built CLI: the bump impacts //:consumer,
+  // @proto_dep//:greeting.proto, @proto_dep//:greeting_proto, and
+  // @proto_dep//:greeting_java_proto (the unchanged @proto_dep//:BUILD keeps its
+  // hash). This test locks that in: if fine-grained external hashing ever stops
+  // descending into proto / java_proto_library targets, //:consumer would
+  // silently stop being impacted and this test would fail.
+  @Test
+  fun testRemoteProtoVersionBumpImpactsConsumer() {
+    val workspaceA = copyTestWorkspace("proto_external_version_bump")
+    val workspaceB = copyTestWorkspace("proto_external_version_bump")
+
+    // Bump proto_dep 1.0.0 -> 2.0.0 in B (root + dep MODULE.bazel)...
+    val rootModuleB = File(workspaceB, "MODULE.bazel")
+    val rootOriginal = rootModuleB.readText()
+    val rootBumped =
+        rootOriginal.replace(
+            "bazel_dep(name = \"proto_dep\", version = \"1.0.0\")",
+            "bazel_dep(name = \"proto_dep\", version = \"2.0.0\")")
+    assertThat(rootBumped != rootOriginal).isEqualTo(true)
+    rootModuleB.writeText(rootBumped)
+
+    val depModuleB = File(workspaceB, "proto_dep/MODULE.bazel")
+    depModuleB.writeText(depModuleB.readText().replace("version = \"1.0.0\"", "version = \"2.0.0\""))
+
+    // ...and ship a new field in the proto, mirroring a real upstream release.
+    val protoB = File(workspaceB, "proto_dep/greeting.proto")
+    val protoOriginal = protoB.readText()
+    val protoMutated =
+        protoOriginal.replace(
+            "message Greeting {\n  string message = 1;\n}",
+            "message Greeting {\n  string message = 1;\n  string locale = 2;\n}")
+    assertThat(protoMutated != protoOriginal).isEqualTo(true)
+    protoB.writeText(protoMutated)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceA.absolutePath,
+                "-b", "bazel",
+                "--fineGrainedHashExternalRepos", "@proto_dep",
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "--fineGrainedHashExternalRepos", "@proto_dep",
+                to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "-sh", from.absolutePath,
+                "-fh", to.absolutePath,
+                "-o", impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+    val consumerImpacted = impacted.any { it == "//:consumer" || it == "@@//:consumer" }
+    val javaProtoImpacted = impacted.any { it.endsWith("proto_dep//:greeting_java_proto") }
+    assertThat(consumerImpacted)
+        .transform("//:consumer should be impacted by a proto_dep version bump; got: $impacted") { it }
+        .isEqualTo(true)
+    assertThat(javaProtoImpacted)
+        .transform("@proto_dep//:greeting_java_proto should be impacted by the proto change; got: $impacted") { it }
+        .isEqualTo(true)
+  }
+
+  // ------------------------------------------------------------------------
   // Regression coverage for https://github.com/Tinder/bazel-diff/issues/228
   // ------------------------------------------------------------------------
   // The user reported:

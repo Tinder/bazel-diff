@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package example.greeting;
+
+option java_package = "com.example.greeting";
+option java_multiple_files = true;
+
+// v1.0.0 of the greeting message shipped by the remote proto_dep module.
+message Greeting {
+  string message = 1;
+}

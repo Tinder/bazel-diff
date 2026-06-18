@@ -89,10 +89,11 @@ fun hasherModule(
         keepGoing,
         debug)
   }
+  single { BazelModService(workingDirectory, bazelPath, startupOptions, debug) }
   single {
-    BazelModService(workingDirectory, bazelPath, startupOptions, debug)
+    BazelClient(
+        useCquery, cqueryExpression, updatedFineGrainedHashExternalRepos, excludeExternalTargets)
   }
-  single { BazelClient(useCquery, cqueryExpression, updatedFineGrainedHashExternalRepos, excludeExternalTargets) }
   single { BuildGraphHasher(get()) }
   single { TargetHasher() }
   single { RuleHasher(useCquery, trackDeps, updatedFineGrainedHashExternalRepos) }
@@ -109,9 +110,9 @@ fun hasherModule(
  * consumed by [BazelClient]/[com.bazel_diff.bazel.BazelRule] and the user-facing CLI flag.
  *
  * If `bazel mod graph --output=json` fails (e.g. bzlmod disabled) or the user supplied nothing,
- * this is a no-op and returns [userSupplied] unchanged. This intentionally degrades gracefully
- * for WORKSPACE-only setups where the bzlmod graph is unavailable -- the wrapped-repo bug
- * (issue #197) is bzlmod-specific anyway.
+ * this is a no-op and returns [userSupplied] unchanged. This intentionally degrades gracefully for
+ * WORKSPACE-only setups where the bzlmod graph is unavailable -- the wrapped-repo bug (issue #197)
+ * is bzlmod-specific anyway.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 private fun expandFineGrainedHashExternalReposWithBzlmodDependents(
@@ -130,16 +131,15 @@ private fun expandFineGrainedHashExternalReposWithBzlmodDependents(
         add("graph")
         add("--output=json")
       }
-  val result =
-      runBlocking {
-        process(
-            *cmd.toTypedArray(),
-            stdout = Redirect.CAPTURE,
-            stderr = Redirect.SILENT,
-            workingDirectory = workingDirectory.toFile(),
-            destroyForcibly = true,
-        )
-      }
+  val result = runBlocking {
+    process(
+        *cmd.toTypedArray(),
+        stdout = Redirect.CAPTURE,
+        stderr = Redirect.SILENT,
+        workingDirectory = workingDirectory.toFile(),
+        destroyForcibly = true,
+    )
+  }
   if (result.resultCode != 0) return userSupplied
   val json = result.output.joinToString("\n").trim()
   if (json.isEmpty()) return userSupplied

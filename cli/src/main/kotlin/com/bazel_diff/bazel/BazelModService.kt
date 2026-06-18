@@ -10,8 +10,8 @@ import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
 /**
- * Service that runs `bazel mod` to detect whether Bzlmod is enabled in the workspace.
- * Used to decide whether to query //external:all-targets (disabled when Bzlmod is active).
+ * Service that runs `bazel mod` to detect whether Bzlmod is enabled in the workspace. Used to
+ * decide whether to query //external:all-targets (disabled when Bzlmod is active).
  */
 class BazelModService(
     private val workingDirectory: Path,
@@ -21,13 +21,16 @@ class BazelModService(
 ) : KoinComponent {
   private val logger: Logger by inject()
 
-  /** True if Bzlmod is enabled (e.g. `bazel mod graph` succeeds). When true, //external is not available. */
+  /**
+   * True if Bzlmod is enabled (e.g. `bazel mod graph` succeeds). When true, //external is not
+   * available.
+   */
   val isBzlmodEnabled: Boolean by lazy { runBlocking { checkBzlmodEnabled() } }
 
   /**
-   * Returns the module dependency graph as a string for hashing purposes.
-   * This captures all module dependencies and their versions, allowing bazel-diff to detect
-   * when MODULE.bazel changes (e.g., when a module version is updated).
+   * Returns the module dependency graph as a string for hashing purposes. This captures all module
+   * dependencies and their versions, allowing bazel-diff to detect when MODULE.bazel changes (e.g.,
+   * when a module version is updated).
    *
    * @return The output of `bazel mod graph` if bzlmod is enabled, or null if disabled/error.
    */
@@ -68,8 +71,8 @@ class BazelModService(
   /**
    * Returns the module dependency graph in JSON format for precise change detection.
    *
-   * @return The JSON output of `bazel mod graph --output=json` if bzlmod is enabled,
-   *         or null if disabled/error.
+   * @return The JSON output of `bazel mod graph --output=json` if bzlmod is enabled, or null if
+   *   disabled/error.
    */
   @OptIn(ExperimentalCoroutinesApi::class)
   suspend fun getModuleGraphJson(): String? {

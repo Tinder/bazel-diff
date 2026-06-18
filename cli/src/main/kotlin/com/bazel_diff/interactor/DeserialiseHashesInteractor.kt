@@ -9,10 +9,7 @@ import java.io.FileReader
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
-data class HashFileData(
-    val hashes: Map<String, TargetHash>,
-    val moduleGraphJson: String?
-)
+data class HashFileData(val hashes: Map<String, TargetHash>, val moduleGraphJson: String?)
 
 class DeserialiseHashesInteractor : KoinComponent {
   private val gson: Gson by inject()
@@ -32,9 +29,7 @@ class DeserialiseHashesInteractor : KoinComponent {
       val hashesMap: Map<String, String> = gson.fromJson(jsonObject.get("hashes"), hashesShape)
       val hashes = hashesMap.mapValues { TargetHash.fromJson(it.value) }
 
-      val moduleGraphJson = jsonObject.getAsJsonObject("metadata")
-          ?.get("moduleGraphJson")
-          ?.asString
+      val moduleGraphJson = jsonObject.getAsJsonObject("metadata")?.get("moduleGraphJson")?.asString
 
       return HashFileData(hashes, moduleGraphJson)
     } else {

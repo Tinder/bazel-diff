@@ -33,9 +33,7 @@ class BuildGraphHasherTest : KoinTest {
           single<SourceFileHasher> { fakeSourceFileHasher }
           single<com.bazel_diff.bazel.BazelModService> {
             mock<com.bazel_diff.bazel.BazelModService>().apply {
-              runBlocking {
-                whenever(getModuleGraph()).thenReturn(null)
-              }
+              runBlocking { whenever(getModuleGraph()).thenReturn(null) }
             }
           }
         }

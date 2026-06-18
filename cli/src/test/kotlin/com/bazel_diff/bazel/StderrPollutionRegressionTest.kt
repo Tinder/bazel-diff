@@ -32,7 +32,8 @@ class StderrPollutionRegressionTest : KoinTest {
       Analyzing: 0 targets (0 packages loaded, 0 targets configured)
       INFO: Invocation ID: 4d8d5c62-1f1c-4f72-9a3e-5fbd5e6ac3d2
       INFO: Current date is 2026-04-20
-      """.trimIndent()
+      """
+          .trimIndent()
 
   private val cleanGraphJson =
       """
@@ -50,7 +51,8 @@ class StderrPollutionRegressionTest : KoinTest {
           {"key": "googletest@1.14.0", "name": "googletest", "version": "1.14.0", "apparentName": "com_google_googletest"}
         ]
       }
-      """.trimIndent()
+      """
+          .trimIndent()
 
   private val pollutedGraphJson = "$stderrPrefix\n$cleanGraphJson"
 
@@ -89,10 +91,12 @@ class StderrPollutionRegressionTest : KoinTest {
 
   @Test
   fun `large head graph produces no spurious fan-out`() {
-    val deps = (1..100).joinToString(",\n") { i ->
-      """          {"key": "mod$i@1.0", "name": "mod$i", "version": "1.0", "apparentName": "mod$i"}"""
-    }
-    val bigHeadGraph = """
+    val deps =
+        (1..100).joinToString(",\n") { i ->
+          """          {"key": "mod$i@1.0", "name": "mod$i", "version": "1.0", "apparentName": "mod$i"}"""
+        }
+    val bigHeadGraph =
+        """
       {
         "key": "<root>",
         "name": "my-workspace",
@@ -102,7 +106,8 @@ class StderrPollutionRegressionTest : KoinTest {
 $deps
         ]
       }
-      """.trimIndent()
+      """
+            .trimIndent()
     val bigPolluted = "$stderrPrefix\n$bigHeadGraph"
 
     val fromGraph = parser.parseModuleGraph(bigPolluted)
@@ -114,21 +119,23 @@ $deps
 
   @Test
   fun `end-to-end - semantically identical graph compared across versions reports no impacted targets`() {
-    val hashes = mapOf(
-        "//:target1" to TargetHash("", "unchanged1", "unchanged1"),
-        "//:target2" to TargetHash("", "unchanged2", "unchanged2"),
-        "//:target3" to TargetHash("", "unchanged3", "unchanged3"),
-    )
+    val hashes =
+        mapOf(
+            "//:target1" to TargetHash("", "unchanged1", "unchanged1"),
+            "//:target2" to TargetHash("", "unchanged2", "unchanged2"),
+            "//:target3" to TargetHash("", "unchanged3", "unchanged3"),
+        )
 
     val outputWriter = StringWriter()
-    CalculateImpactedTargetsInteractor().execute(
-        from = hashes,
-        to = hashes,
-        outputWriter = outputWriter,
-        targetTypes = null,
-        fromModuleGraphJson = pollutedGraphJson,
-        toModuleGraphJson = cleanGraphJson,
-    )
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = hashes,
+            to = hashes,
+            outputWriter = outputWriter,
+            targetTypes = null,
+            fromModuleGraphJson = pollutedGraphJson,
+            toModuleGraphJson = cleanGraphJson,
+        )
 
     val impacted = outputWriter.toString().trim().split("\n").filter { it.isNotEmpty() }
     assertThat(impacted).isEmpty()
@@ -136,20 +143,22 @@ $deps
 
   @Test
   fun `end-to-end - same bazel-diff version on both sides is fast path`() {
-    val hashes = mapOf(
-        "//:target1" to TargetHash("", "unchanged1", "unchanged1"),
-        "//:target2" to TargetHash("", "unchanged2", "unchanged2"),
-    )
+    val hashes =
+        mapOf(
+            "//:target1" to TargetHash("", "unchanged1", "unchanged1"),
+            "//:target2" to TargetHash("", "unchanged2", "unchanged2"),
+        )
 
     val outputWriter = StringWriter()
-    CalculateImpactedTargetsInteractor().execute(
-        from = hashes,
-        to = hashes,
-        outputWriter = outputWriter,
-        targetTypes = null,
-        fromModuleGraphJson = cleanGraphJson,
-        toModuleGraphJson = cleanGraphJson,
-    )
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = hashes,
+            to = hashes,
+            outputWriter = outputWriter,
+            targetTypes = null,
+            fromModuleGraphJson = cleanGraphJson,
+            toModuleGraphJson = cleanGraphJson,
+        )
 
     val impacted = outputWriter.toString().trim().split("\n").filter { it.isNotEmpty() }
     assertThat(impacted).isEmpty()

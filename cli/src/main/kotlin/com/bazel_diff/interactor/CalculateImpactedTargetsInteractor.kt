@@ -43,18 +43,22 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
     val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
 
     // Detect module changes and query for impacted targets
-    val changedModules = if (moduleGraphChanged) {
-      detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
-    } else {
-      emptySet()
-    }
+    val changedModules =
+        if (moduleGraphChanged) {
+          detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
+        } else {
+          emptySet()
+        }
 
-    val impactedTargets = if (changedModules.isNotEmpty()) {
-      logger.i { "Module changes detected - querying for targets that depend on changed modules" }
-      queryTargetsDependingOnModules(changedModules, from, to)
-    } else {
-      computeSimpleImpactedTargets(from, to)
-    }
+    val impactedTargets =
+        if (changedModules.isNotEmpty()) {
+          logger.i {
+            "Module changes detected - querying for targets that depend on changed modules"
+          }
+          queryTargetsDependingOnModules(changedModules, from, to)
+        } else {
+          computeSimpleImpactedTargets(from, to)
+        }
 
     impactedTargets
         .filter { typeFilter.accepts(it) }
@@ -96,21 +100,25 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
     val moduleGraphChanged = fromModuleGraphJson != toModuleGraphJson
 
     // Detect module changes and query for impacted targets
-    val changedModules = if (moduleGraphChanged) {
-      detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
-    } else {
-      emptySet()
-    }
+    val changedModules =
+        if (moduleGraphChanged) {
+          detectChangedModules(fromModuleGraphJson, toModuleGraphJson)
+        } else {
+          emptySet()
+        }
 
-    val impactedTargets = if (changedModules.isNotEmpty()) {
-      logger.i { "Module changes detected - querying for targets that depend on changed modules" }
-      val moduleImpactedTargets = queryTargetsDependingOnModules(changedModules, from, to)
-      // Mark module-impacted targets with distance 0, then compute distances from there
-      val moduleImpactedHashes = from.filterKeys { !moduleImpactedTargets.contains(it) }
-      computeAllDistances(moduleImpactedHashes, to, depEdges)
-    } else {
-      computeAllDistances(from, to, depEdges)
-    }
+    val impactedTargets =
+        if (changedModules.isNotEmpty()) {
+          logger.i {
+            "Module changes detected - querying for targets that depend on changed modules"
+          }
+          val moduleImpactedTargets = queryTargetsDependingOnModules(changedModules, from, to)
+          // Mark module-impacted targets with distance 0, then compute distances from there
+          val moduleImpactedHashes = from.filterKeys { !moduleImpactedTargets.contains(it) }
+          computeAllDistances(moduleImpactedHashes, to, depEdges)
+        } else {
+          computeAllDistances(from, to, depEdges)
+        }
 
     val ordering = impactedTargetOrdering(to, from)
     impactedTargets
@@ -136,8 +144,9 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       from: Map<String, TargetHash>
   ): Comparator<String> {
     fun kindRank(label: String): Int {
-      val type = to[label]?.type?.takeIf { it.isNotEmpty() }
-          ?: from[label]?.type?.takeIf { it.isNotEmpty() }
+      val type =
+          to[label]?.type?.takeIf { it.isNotEmpty() }
+              ?: from[label]?.type?.takeIf { it.isNotEmpty() }
       return when (type) {
         "SourceFile" -> 0
         "GeneratedFile" -> 1
@@ -262,8 +271,8 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
   /**
    * Detects module changes by comparing module graphs and returns the changed Modules.
    *
-   * Resolves each changed key against the "to" graph first (the state we will query
-   * against), falling back to the "from" graph for modules that were removed.
+   * Resolves each changed key against the "to" graph first (the state we will query against),
+   * falling back to the "from" graph for modules that were removed.
    *
    * @param fromModuleGraphJson JSON from `bazel mod graph --output=json` for the starting revision
    * @param toModuleGraphJson JSON from `bazel mod graph --output=json` for the final revision
@@ -298,40 +307,44 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
     }
 
     val changedModules = changedKeys.mapNotNull { key -> toGraph[key] ?: fromGraph[key] }.toSet()
-    logger.i { "Detected ${changedModules.size} module changes: ${changedModules.joinToString(", ") { it.key }}" }
+    logger.i {
+      "Detected ${changedModules.size} module changes: ${changedModules.joinToString(", ") { it.key }}"
+    }
     return changedModules
   }
 
   /**
    * Queries Bazel to find all workspace targets that depend on any changed module.
    *
-   * Resolves each changed module to its base canonical repo (see
-   * [canonicalRepoIsBaseForModule]) and issues a single unioned `rdeps(//..., …)`
-   * query. The hash-diff over `from`/`allTargets` is unioned in below to surface
-   * labels whose content changed alongside a MODULE.bazel update; this is also how
-   * extension-repo content changes propagate to main-repo consumers.
+   * Resolves each changed module to its base canonical repo (see [canonicalRepoIsBaseForModule])
+   * and issues a single unioned `rdeps(//..., …)` query. The hash-diff over `from`/`allTargets` is
+   * unioned in below to surface labels whose content changed alongside a MODULE.bazel update; this
+   * is also how extension-repo content changes propagate to main-repo consumers.
    */
   private fun queryTargetsDependingOnModules(
       changedModules: Set<Module>,
       from: Map<String, TargetHash>,
       allTargets: Map<String, TargetHash>
   ): Set<String> {
-    val queryService: BazelQueryService? = try {
-      inject<BazelQueryService>().value
-    } catch (e: Exception) {
-      null
-    }
+    val queryService: BazelQueryService? =
+        try {
+          inject<BazelQueryService>().value
+        } catch (e: Exception) {
+          null
+        }
 
     if (queryService == null) {
       logger.w { "BazelQueryService not available - cannot query for module dependencies" }
       return allTargets.keys
     }
 
-    val canonicalRepos: Set<String> = allTargets.keys.asSequence()
-        .filter { it.startsWith("@@") }
-        .map { it.substring(2).substringBefore("//") }
-        .filter { it.isNotEmpty() }
-        .toSet()
+    val canonicalRepos: Set<String> =
+        allTargets.keys
+            .asSequence()
+            .filter { it.startsWith("@@") }
+            .map { it.substring(2).substringBefore("//") }
+            .filter { it.isNotEmpty() }
+            .toSet()
 
     val moduleRepos = mutableSetOf<String>()
     var skippedNoMatch = 0
@@ -343,11 +356,15 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
         skippedNoMatch++
         continue
       }
-      logger.i { "Found ${resolved.size} repositories for module ${module.name}: ${resolved.joinToString(", ")}" }
+      logger.i {
+        "Found ${resolved.size} repositories for module ${module.name}: ${resolved.joinToString(", ")}"
+      }
       moduleRepos.addAll(resolved)
     }
     if (skippedNoMatch > 0) {
-      logger.i { "Skipped $skippedNoMatch of ${changedModules.size} changed modules with no materialised repos in allTargets" }
+      logger.i {
+        "Skipped $skippedNoMatch of ${changedModules.size} changed modules with no materialised repos in allTargets"
+      }
     }
 
     if (moduleRepos.isEmpty()) {
@@ -355,7 +372,9 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       return computeSimpleImpactedTargets(from, allTargets)
     }
 
-    logger.i { "Querying rdeps for ${moduleRepos.size} repositories across ${changedModules.size} changed modules" }
+    logger.i {
+      "Querying rdeps for ${moduleRepos.size} repositories across ${changedModules.size} changed modules"
+    }
 
     val impactedTargets = mutableSetOf<String>()
     try {
@@ -365,12 +384,12 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       logger.i { "Found ${rdepLabels.size} workspace targets depending on changed modules" }
       impactedTargets.addAll(rdepLabels)
     } catch (e: Exception) {
-      logger.e(e) { "Unioned rdeps query failed - falling back to buildable workspace targets (or every hashed label on bzlmod-only shapes)" }
+      logger.e(e) {
+        "Unioned rdeps query failed - falling back to buildable workspace targets (or every hashed label on bzlmod-only shapes)"
+      }
       val buildableWorkspaceTargets = allTargets.keys.filter(::isBuildableWorkspaceTarget)
       impactedTargets.addAll(
-          if (buildableWorkspaceTargets.isEmpty()) allTargets.keys
-          else buildableWorkspaceTargets
-      )
+          if (buildableWorkspaceTargets.isEmpty()) allTargets.keys else buildableWorkspaceTargets)
     }
 
     // Union with hash-diff results to surface labels whose content changed alongside
@@ -382,12 +401,12 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
   }
 
   /**
-   * Returns true if [canonical] (a bzlmod canonical repo name, with `@@` and `//...` stripped)
-   * is the base repo for [moduleName] -- i.e. the module's own repo, not a module-extension repo
+   * Returns true if [canonical] (a bzlmod canonical repo name, with `@@` and `//...` stripped) is
+   * the base repo for [moduleName] -- i.e. the module's own repo, not a module-extension repo
    * defined by that module.
    *
-   * The base repo has the shape `<moduleName><sep><versionSegment>` where `<sep>` is `+` or `~`
-   * and `<versionSegment>` contains no further separators. Module-extension repos always layer
+   * The base repo has the shape `<moduleName><sep><versionSegment>` where `<sep>` is `+` or `~` and
+   * `<versionSegment>` contains no further separators. Module-extension repos always layer
    * additional `+` or `~` segments onto the canonical name and are rejected. See
    * https://github.com/Tinder/bazel-diff/issues/335 for the motivating bug.
    *

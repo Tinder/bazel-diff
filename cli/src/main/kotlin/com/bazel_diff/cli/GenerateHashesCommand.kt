@@ -20,7 +20,7 @@ import picocli.CommandLine
     description =
         ["Writes to a file the SHA256 hashes for each Bazel Target in the provided workspace."],
     versionProvider = VersionProvider::class)
-class GenerateHashesCommand : Callable<Int> {
+open class GenerateHashesCommand : Callable<Int> {
   @CommandLine.ParentCommand private lateinit var parent: BazelDiff
 
   @CommandLine.Option(

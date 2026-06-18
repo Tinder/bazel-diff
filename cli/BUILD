@@ -103,6 +103,12 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "FingerprintInteractorTest",
+    test_class = "com.bazel_diff.interactor.FingerprintInteractorTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "BazelRuleTest",
     test_class = "com.bazel_diff.bazel.BazelRuleTest",
     runtime_deps = [":cli-test-lib"],

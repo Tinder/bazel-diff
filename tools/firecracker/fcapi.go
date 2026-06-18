@@ -82,6 +82,17 @@ type drive struct {
 	IsReadOnly   bool   `json:"is_read_only"`
 }
 
+// networkInterface attaches a virtio-net device backed by a host TAP. The guest
+// configures the interface itself (here via the kernel `ip=` boot arg); the host
+// side is the pre-existing TAP named HostDevName. On snapshot restore Firecracker
+// reconnects the device to a TAP of the same name, so the TAP must exist at both
+// record and consume time — see fcDriver.
+type networkInterface struct {
+	IfaceID     string `json:"iface_id"`
+	HostDevName string `json:"host_dev_name"`
+	GuestMAC    string `json:"guest_mac,omitempty"`
+}
+
 type action struct {
 	ActionType string `json:"action_type"`
 }
@@ -116,6 +127,9 @@ func (c *fcClient) setBootSource(b bootSource) error {
 }
 func (c *fcClient) addDrive(d drive) error {
 	return c.do(http.MethodPut, "/drives/"+d.DriveID, d)
+}
+func (c *fcClient) addNetworkInterface(n networkInterface) error {
+	return c.do(http.MethodPut, "/network-interfaces/"+n.IfaceID, n)
 }
 func (c *fcClient) instanceStart() error {
 	return c.do(http.MethodPut, "/actions", action{ActionType: "InstanceStart"})

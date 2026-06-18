@@ -64,6 +64,14 @@ common opts:
   --driver local|firecracker   (default "local")
   --flag <f>            extra bazel-diff flag, repeatable (must match record/consume)
 
+firecracker driver opts:
+  --kernel <path>       guest kernel image (required)
+  --guest-addr <u@h>    guest ssh address (required)
+  --tap-device <name>   host TAP backing the guest NIC (required; see bench/setup_tap.sh)
+  --guest-ip / --host-ip / --netmask / --guest-mac   static TAP addressing
+  --guest-key <path>    ssh identity file
+  --vcpus / --mem-mib   guest sizing (default 4 vCPU / 8192 MiB)
+
 consume exit codes: 0 ok, 1 error, 2 no compatible snapshot (run cold path)
 `)
 }
@@ -85,6 +93,12 @@ type commonFlags struct {
 	guestSnapDir   string
 	guestAddr      string
 	guestKey       string
+	// firecracker guest networking (host TAP + static point-to-point addresses)
+	tapDevice string
+	guestIP   string
+	hostIP    string
+	netmask   string
+	guestMAC  string
 }
 
 func registerCommon(fs *flag.FlagSet, c *commonFlags) {
@@ -102,6 +116,11 @@ func registerCommon(fs *flag.FlagSet, c *commonFlags) {
 	fs.StringVar(&c.guestSnapDir, "guest-snap-dir", "/snap", "in-guest snapshot dir")
 	fs.StringVar(&c.guestAddr, "guest-addr", "", "guest ssh address user@host (firecracker driver)")
 	fs.StringVar(&c.guestKey, "guest-key", "", "guest ssh identity file (firecracker driver)")
+	fs.StringVar(&c.tapDevice, "tap-device", "", "host TAP backing the guest NIC (firecracker driver)")
+	fs.StringVar(&c.guestIP, "guest-ip", "172.16.0.2", "guest IP on the TAP subnet (firecracker driver)")
+	fs.StringVar(&c.hostIP, "host-ip", "172.16.0.1", "host/gateway IP on the TAP subnet (firecracker driver)")
+	fs.StringVar(&c.netmask, "netmask", "255.255.255.252", "TAP subnet mask (firecracker driver)")
+	fs.StringVar(&c.guestMAC, "guest-mac", "06:00:AC:10:00:02", "guest NIC MAC (stable across restore)")
 }
 
 func (c commonFlags) makeDriver() (driver, error) {
@@ -118,6 +137,9 @@ func (c commonFlags) makeDriver() (driver, error) {
 		if c.kernel == "" || c.guestAddr == "" {
 			return nil, fmt.Errorf("firecracker driver requires --kernel and --guest-addr")
 		}
+		if c.tapDevice == "" {
+			return nil, fmt.Errorf("firecracker driver requires --tap-device (the guest is driven over ssh, which needs a NIC)")
+		}
 		return fcDriver{
 			firecrackerBin: c.firecrackerBin,
 			socketPath:     c.socket,
@@ -126,6 +148,13 @@ func (c commonFlags) makeDriver() (driver, error) {
 			memMib:         c.memMib,
 			guestSnapDir:   c.guestSnapDir,
 			guest:          sshGuest{addr: c.guestAddr, identity: c.guestKey},
+			net: netConfig{
+				tapDevice: c.tapDevice,
+				guestIP:   c.guestIP,
+				hostIP:    c.hostIP,
+				netmask:   c.netmask,
+				guestMAC:  c.guestMAC,
+			},
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown driver %q", c.driver)

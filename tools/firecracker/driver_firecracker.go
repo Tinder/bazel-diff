@@ -31,13 +31,54 @@ type fcDriver struct {
 	vcpus          int
 	memMib         int
 	guest          guestRunner
+	net            netConfig
 
 	// guestSnapDir is where warmup writes base_hashes.json / fingerprint.json
 	// inside the guest (matches the CLI defaults under /snap).
 	guestSnapDir string
 }
 
+// netConfig is the guest networking the driver attaches: a virtio-net device
+// backed by a host TAP, with a static point-to-point address pair so the host
+// can ssh in without DHCP. The TAP is owned by CI/operator setup (see
+// bench/setup_tap.sh) — the driver only references it by name and bakes the
+// guest-side address into the kernel `ip=` boot arg. Zero value => no network
+// (the device-less boot used by the boot smoke test).
+type netConfig struct {
+	tapDevice string // host TAP name, e.g. "fc-tap0"
+	guestIP   string // guest address, e.g. "172.16.0.2"
+	hostIP    string // host/gateway address, e.g. "172.16.0.1"
+	netmask   string // e.g. "255.255.255.252"
+	guestMAC  string // stable MAC so the guest's NIC name survives restore
+}
+
+func (n netConfig) enabled() bool { return n.tapDevice != "" }
+
+// bootArg renders the kernel `ip=` directive that statically configures eth0 in
+// the guest at boot, so it is reachable over the TAP with no DHCP server.
+// Format: ip=<client>:<server>:<gw>:<mask>:<host>:<dev>:<autoconf>.
+func (n netConfig) bootArg() string {
+	if !n.enabled() {
+		return ""
+	}
+	return fmt.Sprintf("ip=%s::%s:%s::eth0:off", n.guestIP, n.hostIP, n.netmask)
+}
+
 func (fcDriver) name() string { return "firecracker" }
+
+// bootArgs is the guest kernel command line. It boots from the root virtio-block
+// device (the rootfs drive is added as the first /dev/vda; Firecracker does not
+// synthesize a `root=` arg, so we must pass it). When networking is configured
+// the `ip=` directive is appended so the restored guest comes up addressable.
+// Because boot args are captured in the snapshot, the address baked here is what
+// consume-time ssh must target.
+func (d fcDriver) bootArgs() string {
+	args := "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"
+	if na := d.net.bootArg(); na != "" {
+		args += " " + na
+	}
+	return args
+}
 
 // boot launches the firecracker process against socketPath and returns it so the
 // caller can tear it down. The process is detached from our stdout.
@@ -89,7 +130,7 @@ func (d fcDriver) record(r recordRequest) error {
 	}
 	if err := c.setBootSource(bootSource{
 		KernelImagePath: d.kernelImage,
-		BootArgs:        "console=ttyS0 reboot=k panic=1 pci=off",
+		BootArgs:        d.bootArgs(),
 	}); err != nil {
 		return err
 	}
@@ -98,18 +139,32 @@ func (d fcDriver) record(r recordRequest) error {
 	}); err != nil {
 		return err
 	}
+	// Attach the guest NIC before boot. Net devices cannot be hot-added, and the
+	// device config is captured in the snapshot so consume reconnects to a TAP of
+	// the same name. Skipped only by the device-less boot smoke test.
+	if d.net.enabled() {
+		if err := c.addNetworkInterface(networkInterface{
+			IfaceID: "eth0", HostDevName: d.net.tapDevice, GuestMAC: d.net.guestMAC,
+		}); err != nil {
+			return err
+		}
+	}
 	if err := c.instanceStart(); err != nil {
 		return err
 	}
 
-	// Inside the guest: warm the server, baking base_hashes.json + fingerprint.json.
-	warmup := fmt.Sprintf(
-		"bazel-diff warmup -w %s -b %s --base-hashes %s --fingerprint-output %s %s",
-		r.Workspace, r.Bazel,
-		filepath.Join(d.guestSnapDir, baseHashesName),
-		filepath.Join(d.guestSnapDir, fingerprintName),
-		strings.Join(r.Flags, " "),
-	)
+	// Inside the guest: check out the base revision, then warm the server, baking
+	// base_hashes.json + fingerprint.json. The checkout mirrors localDriver.record
+	// (and consume's target checkout) so the baked hashes are for the base SHA
+	// regardless of what revision the image happens to be baked at.
+	warmup := strings.Join([]string{
+		fmt.Sprintf("git -C %s checkout --force --quiet %s", r.Workspace, r.BaseSHA),
+		fmt.Sprintf("bazel-diff warmup -w %s -b %s --base-hashes %s --fingerprint-output %s %s",
+			r.Workspace, r.Bazel,
+			filepath.Join(d.guestSnapDir, baseHashesName),
+			filepath.Join(d.guestSnapDir, fingerprintName),
+			strings.Join(r.Flags, " ")),
+	}, " && ")
 	if err := d.guest.exec(warmup); err != nil {
 		return fmt.Errorf("guest warmup: %w", err)
 	}
@@ -137,6 +192,15 @@ func (d fcDriver) record(r recordRequest) error {
 // target revision in the warm guest, and runs generate-hashes +
 // get-impacted-targets, copying the impacted list out to r.Out.
 func (d fcDriver) consume(r consumeRequest) error {
+	// On restore Firecracker reconnects the snapshotted virtio-net device to a
+	// host TAP with the same name it had at record time. If that TAP is missing
+	// the restore fails, so check the precondition up front with a clear error.
+	if d.net.enabled() {
+		if err := ensureTapExists(d.net.tapDevice); err != nil {
+			return err
+		}
+	}
+
 	overlay := r.Out + ".rootfs.overlay"
 	if err := copyFile(r.Entry.rootfs(), overlay); err != nil {
 		return fmt.Errorf("preparing COW overlay: %w", err)
@@ -172,6 +236,17 @@ func (d fcDriver) consume(r consumeRequest) error {
 		return fmt.Errorf("guest consume: %w", err)
 	}
 	return d.guest.copyOut(guestOut, r.Out)
+}
+
+// ensureTapExists verifies the host TAP is present before a restore. TAP setup
+// needs CAP_NET_ADMIN and is the operator/CI's responsibility (bench/setup_tap.sh),
+// so the driver only checks for it rather than creating it — keeping the tool
+// privilege-free. A network device appears as /sys/class/net/<name>.
+func ensureTapExists(tap string) error {
+	if _, err := os.Stat(filepath.Join("/sys/class/net", tap)); err != nil {
+		return fmt.Errorf("host TAP %q not found (set it up first, e.g. bench/setup_tap.sh): %w", tap, err)
+	}
+	return nil
 }
 
 func (d fcDriver) baseRootfs() string {

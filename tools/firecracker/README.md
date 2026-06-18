@@ -112,7 +112,43 @@ go test ./...                          # pure logic + API client, runs anywhere
   tests and local end-to-end runs use.
 - **`--driver firecracker`** — boots/snapshots/restores a real microVM via the
   Firecracker API. Requires Linux + `/dev/kvm`, a prepared kernel + rootfs base
-  image, and an ssh-reachable guest. This is the production path (RFC §6).
+  image (`bench/build_guest_image.sh`), and a host TAP (`bench/setup_tap.sh`) so
+  the orchestrator can ssh into the guest. This is the production path (RFC §6).
+
+  The guest gets a virtio-net device backed by the host TAP; the orchestrator
+  bakes a static `ip=` directive into the kernel cmdline so the guest is
+  reachable with no DHCP. Addressing defaults match the guest image's
+  `fcnet-setup.sh` MAC→IP convention (MAC `06:00:AC:10:00:02` → `172.16.0.2/30`).
+  TAP creation needs `CAP_NET_ADMIN`, so it is the operator's job (run
+  `setup_tap.sh` once); the orchestrator stays privilege-free and only checks the
+  TAP exists before a restore. Relevant flags:
+
+  ```
+  --kernel <path>      guest kernel (rootfs.base.ext4 must sit beside it)
+  --guest-addr <u@h>   guest ssh address, e.g. root@172.16.0.2
+  --tap-device <name>  host TAP backing the guest NIC, e.g. fc-tap0
+  --guest-ip / --host-ip / --netmask / --guest-mac   static TAP addressing
+  --guest-key <path>   ssh identity trusted by the guest
+  --vcpus / --mem-mib  guest sizing
+  ```
+
+### Building the guest image
+
+```bash
+# 1. host TAP (once per host; needs root)
+sudo tools/firecracker/bench/setup_tap.sh         # fc-tap0, host 172.16.0.1/30
+
+# 2. kernel + rootfs.base.ext4 with JDK + bazel + git + bazel-diff + workspace
+sudo -E OUT=/tmp/fc-image \
+    BAZEL_DIFF_JAR=bazel-bin/cli/bazel-diff_deploy.jar \
+    BAZEL_BIN=$(which bazelisk) WORKSPACE_SRC=/tmp/bigproj \
+    SSH_PUBKEY=~/.ssh/fc_guest.pub \
+    tools/firecracker/bench/build_guest_image.sh
+```
+
+The image switches sshd from systemd socket-activation to a standalone
+always-running daemon — socket-activated sshd does not service connections
+reliably after a snapshot restore.
 
 ### record / consume
 
@@ -154,6 +190,30 @@ never silently trusted.
 - [x] Synthetic generator + cold/warm benchmark — validates the analysis-time win
 - [x] `fingerprint` + `warmup` CLI hooks (unit-tested)
 - [x] Go orchestrator: store/resolve/fingerprint-match/API client (unit-tested),
-      `local` driver end-to-end, `firecracker` driver implemented (Linux)
-- [ ] Real microVM record/consume timings on self-hosted Linux+KVM CI
-- [ ] Correctness canary (snapshot-consumed vs cold equality) in CI (RFC §5.3)
+      `local` driver end-to-end
+- [x] `firecracker` driver: networking (TAP-backed NIC + static `ip=`) wired into
+      record/consume, restore-time TAP precondition, unit-tested API client
+- [x] Guest image + TAP build scripts (`bench/build_guest_image.sh`,
+      `bench/setup_tap.sh`)
+- [x] Real-microVM canary as a gated Go integration test (`fc_integration_test.go`,
+      build tag `fcintegration`) — runs `fcDriver.record` + `consume` end-to-end
+- [x] One-click CI workflow that builds the image, boots a real microVM, and
+      asserts snapshot-consumed == cold:
+      [`.github/workflows/firecracker-e2e.yml`](../../.github/workflows/firecracker-e2e.yml)
+      (`workflow_dispatch`; runs on a mainline-kernel x86_64 runner with `/dev/kvm`)
+
+### Validation notes (aarch64 / KVM)
+
+The driver was exercised on real Firecracker + `/dev/kvm`. **What works:** microVM
+boot, the full API sequence incl. `PUT /network-interfaces`, ssh into the guest
+over the TAP, `PATCH /vm` pause, `PUT /snapshot/create`, and `PUT /snapshot/load`
++ resume — devices reconnect and the restored guest's *kernel* networking is live
+(host↔guest ping and the TCP handshake to sshd both succeed).
+
+**Known host limitation:** on a downstream 16 KB-page kernel (Raspberry Pi 5,
+`rpi-2712`), the restored guest's *userspace* does not advance after resume
+(sshd accepts the connection but never sends its banner), with both the 5.10 and
+6.1 CI guest kernels — an aarch64 guest-timer-restore quirk below the driver, not
+in the orchestrator's API sequence. Trigger the `Firecracker snapshot e2e`
+workflow (a mainline-kernel, 4 KB-page x86_64 runner with `/dev/kvm`) to land the
+green end-to-end run.

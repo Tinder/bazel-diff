@@ -55,6 +55,9 @@ func TestFCClientCalls(t *testing.T) {
 	if err := c.addDrive(drive{DriveID: "rootfs", PathOnHost: "/r", IsRootDevice: true}); err != nil {
 		t.Fatal(err)
 	}
+	if err := c.addNetworkInterface(networkInterface{IfaceID: "eth0", HostDevName: "fc-tap0", GuestMAC: "06:00:AC:10:00:02"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.instanceStart(); err != nil {
 		t.Fatal(err)
 	}
@@ -74,6 +77,7 @@ func TestFCClientCalls(t *testing.T) {
 		{"PUT", "/machine-config"},
 		{"PUT", "/boot-source"},
 		{"PUT", "/drives/rootfs"},
+		{"PUT", "/network-interfaces/eth0"},
 		{"PUT", "/actions"},
 		{"PATCH", "/vm"},
 		{"PUT", "/snapshot/create"},
@@ -93,9 +97,13 @@ func TestFCClientCalls(t *testing.T) {
 	if v, _ := (*reqs)[2].body["is_root_device"].(bool); !v {
 		t.Fatalf("addDrive body missing is_root_device: %+v", (*reqs)[2].body)
 	}
+	// network interface payload should carry the host TAP name.
+	if (*reqs)[3].body["host_dev_name"] != "fc-tap0" {
+		t.Fatalf("addNetworkInterface body wrong: %+v", (*reqs)[3].body)
+	}
 	// instanceStart action type.
-	if (*reqs)[3].body["action_type"] != "InstanceStart" {
-		t.Fatalf("instanceStart action_type wrong: %+v", (*reqs)[3].body)
+	if (*reqs)[4].body["action_type"] != "InstanceStart" {
+		t.Fatalf("instanceStart action_type wrong: %+v", (*reqs)[4].body)
 	}
 }
 

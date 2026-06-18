@@ -1,17 +1,21 @@
-name: Format
+name: Buildifier
 
-# Runs ktfmt over the codebase on a daily schedule and opens a PR only if the
-# formatter produced changes. Mirrors the coverage-badge cron: it force-pushes a
-# dedicated, bot-owned branch so re-runs reuse one PR instead of accumulating
-# stale branches, and it never touches master directly.
+# Runs buildifier over all Starlark/BUILD files on a daily schedule and opens a
+# PR only if the formatter produced changes. Mirrors the ktfmt format cron: it
+# force-pushes a dedicated, bot-owned branch so re-runs reuse one PR instead of
+# accumulating stale branches, and it never touches master directly.
+#
+# Pinned to the repo's .bazelversion (no USE_BAZEL_VERSION) and run with
+# --lockfile_mode=off so MODULE.bazel.lock is never rewritten — that keeps the
+# generated PR limited to formatting-only changes.
 on:
   schedule:
-    # 12:00 UTC daily (one hour before the coverage-badge cron).
-    - cron: '0 12 * * *'
+    # 12:30 UTC daily (between the ktfmt format and coverage-badge crons).
+    - cron: '30 12 * * *'
   workflow_dispatch:
 
 jobs:
-  format:
+  buildifier:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -30,25 +34,22 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
-      - name: Run ktfmt
-        # Pinned to the repo's .bazelversion (no USE_BAZEL_VERSION) and run with
-        # --lockfile_mode=off so MODULE.bazel.lock is never rewritten, keeping the
-        # generated PR limited to formatting-only changes.
-        run: ~/go/bin/bazelisk run //cli/format --enable_bzlmod=true --enable_workspace=false --lockfile_mode=off
+      - name: Run buildifier
+        run: ~/go/bin/bazelisk run //cli/format:buildifier --enable_bzlmod=true --enable_workspace=false --lockfile_mode=off
       - name: Open PR if formatting changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -z "$(git status --porcelain)" ]; then
-            echo "No formatting changes; nothing to do."
+            echo "No buildifier changes; nothing to do."
             exit 0
           fi
-          BRANCH="ci/ktfmt-format"
+          BRANCH="ci/buildifier-format"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$BRANCH"
           git add -A
-          git commit -m "ci: apply ktfmt formatting"
+          git commit -m "ci: apply buildifier formatting"
           # Force-push the dedicated, bot-owned branch so re-runs reuse one PR
           # instead of accumulating stale branches. This never touches master.
           git push --force origin "$BRANCH"
@@ -58,6 +59,6 @@ jobs:
             gh pr create \
               --base master \
               --head "$BRANCH" \
-              --title "ci: apply ktfmt formatting" \
-              --body "Automated ktfmt run via \`bazel run //cli/format\`. This PR contains formatting-only changes."
+              --title "ci: apply buildifier formatting" \
+              --body "Automated buildifier run via \`bazel run //cli/format:buildifier\`. This PR contains formatting-only changes to BUILD/Starlark files."
           fi

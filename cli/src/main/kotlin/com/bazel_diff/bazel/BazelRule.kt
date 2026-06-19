@@ -44,7 +44,11 @@ class BazelRule(private val rule: Build.Rule) {
       safePutBytes(rule.ruleClassBytes.toByteArray())
       safePutBytes(rule.nameBytes.toByteArray())
       safePutBytes(rule.skylarkEnvironmentHashCodeBytes.toByteArray())
-      for (attribute in rule.attributeList) {
+      // Hash attributes in a canonical (name-sorted) order so a rule's digest is invariant to the
+      // order Bazel happens to emit them in. Attribute names are unique within a rule (the proto
+      // is generated from the rule's attribute map), so a name sort fully canonicalizes the set.
+      // Mirrors target-determinator's `sortedAttributesForHashing` (commit d4b6125).
+      for (attribute in rule.attributeList.sortedBy { it.name }) {
         if (!DEFAULT_IGNORED_ATTRS.contains(attribute.name) &&
             !ignoredAttrs.contains(attribute.name))
             safePutBytes(attribute.toByteArray())
@@ -53,28 +57,34 @@ class BazelRule(private val rule: Build.Rule) {
   }
 
   fun ruleInputList(useCquery: Boolean, fineGrainedHashExternalRepos: Set<String>): List<String> {
-    return if (useCquery) {
-      rule.configuredRuleInputList.map { encodeConfiguredRuleInput(it) } +
-          rule.ruleInputList
-              .map { ruleInput: String ->
-                transformRuleInput(fineGrainedHashExternalRepos, ruleInput)
-              }
-              // Only keep the non-fine-grained ones because the others are already covered by
-              // configuredRuleInputList
-              .filter { it.startsWith("//external:") }
-              .distinct()
-    } else {
-      // Include raw rule inputs plus transformed //external:* inputs so that targets depending
-      // on external repos pick up hash changes from //external:* synthetic targets (e.g. from
-      // bzlmod mod show_repo or WORKSPACE //external:all-targets).
-      rule.ruleInputList +
-          rule.ruleInputList
-              .map { ruleInput: String ->
-                transformRuleInput(fineGrainedHashExternalRepos, ruleInput)
-              }
-              .filter { it.startsWith("//external:") }
-              .distinct()
-    }
+    // Transformed //external:* synthetic inputs so that targets depending on external repos pick
+    // up hash changes from //external:* synthetic targets (e.g. from bzlmod mod show_repo or
+    // WORKSPACE //external:all-targets).
+    val externalSyntheticInputs =
+        rule.ruleInputList
+            .map { ruleInput: String ->
+              transformRuleInput(fineGrainedHashExternalRepos, ruleInput)
+            }
+            .filter { it.startsWith("//external:") }
+
+    val inputs =
+        if (useCquery) {
+          // configuredRuleInputList already covers the non-fine-grained deps (with per-edge
+          // configuration folded in), so only the //external:* synthetic inputs are added.
+          rule.configuredRuleInputList.map { encodeConfiguredRuleInput(it) } +
+              externalSyntheticInputs
+        } else {
+          rule.ruleInputList + externalSyntheticInputs
+        }
+
+    // Canonicalize: dedupe and sort so a target's digest is invariant to the order Bazel happens
+    // to emit (configured) rule inputs in. This matters most under --useCquery, where the same dep
+    // label can surface across multiple configurations and cquery does not guarantee a stable
+    // emission order -- without canonicalization an unchanged target could hash differently
+    // between two otherwise-identical graphs. RuleHasher mixes these bytes into the digest in list
+    // order, so a deterministic order is what keeps the hash stable. Mirrors
+    // target-determinator's `canonicalizeRuleInputs` (commit d4b6125).
+    return inputs.distinct().sorted()
   }
 
   val name: String = rule.name

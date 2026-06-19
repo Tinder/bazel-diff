@@ -144,6 +144,117 @@ class BazelRuleTest {
     assertThat(decodeConfiguredRuleInputLabel("//external:foo")).isEqualTo("//external:foo")
   }
 
+  // Canonicalization (mirrors target-determinator commit d4b6125): a rule's digest must be
+  // invariant to the order Bazel happens to emit attributes in. Attribute names are unique within
+  // a rule, so the same set of attributes in a different order is the same rule and must hash the
+  // same -- otherwise a Bazel upgrade (or any reordering) would spuriously invalidate every target.
+  @Test
+  fun testDigestInvariantToAttributeOrder() {
+    val attrA =
+        Attribute.newBuilder()
+            .setType(Attribute.Discriminator.STRING)
+            .setName("a_attr")
+            .setStringValue("1")
+            .build()
+    val attrZ =
+        Attribute.newBuilder()
+            .setType(Attribute.Discriminator.STRING)
+            .setName("z_attr")
+            .setStringValue("2")
+            .build()
+
+    val forward =
+        Rule.newBuilder()
+            .setRuleClass("java_library")
+            .setName("lib")
+            .addAttribute(attrA)
+            .addAttribute(attrZ)
+            .build()
+    val reversed =
+        Rule.newBuilder()
+            .setRuleClass("java_library")
+            .setName("lib")
+            .addAttribute(attrZ)
+            .addAttribute(attrA)
+            .build()
+
+    assertThat(BazelRule(forward).digest(emptySet()))
+        .isEqualTo(BazelRule(reversed).digest(emptySet()))
+  }
+
+  // Sorting attributes must not erase sensitivity to an actual attribute-value change.
+  @Test
+  fun testDigestStillDetectsAttributeValueChange() {
+    fun ruleWith(value: String) =
+        Rule.newBuilder()
+            .setRuleClass("java_library")
+            .setName("lib")
+            .addAttribute(
+                Attribute.newBuilder()
+                    .setType(Attribute.Discriminator.STRING)
+                    .setName("a_attr")
+                    .setStringValue(value)
+                    .build())
+            .build()
+
+    assertThat(BazelRule(ruleWith("before")).digest(emptySet()))
+        .isNotEqualTo(BazelRule(ruleWith("after")).digest(emptySet()))
+  }
+
+  // Rule inputs are a set, not a sequence: the non-cquery input list must come back deduped and in
+  // a deterministic (sorted) order regardless of Bazel's emission order.
+  @Test
+  fun testNonCqueryRuleInputListDedupesAndSorts() {
+    val rule =
+        Rule.newBuilder()
+            .setRuleClass("genrule")
+            .setName("//:gen")
+            .addRuleInput("//:b")
+            .addRuleInput("//:a")
+            .addRuleInput("//:b")
+            .build()
+
+    val inputs =
+        BazelRule(rule).ruleInputList(useCquery = false, fineGrainedHashExternalRepos = emptySet())
+
+    assertThat(inputs).isEqualTo(listOf("//:a", "//:b"))
+  }
+
+  // The configuration-aware (#359) path is the one most exposed to non-deterministic emission
+  // order: cquery can surface the same dep label across multiple configurations in any order. Two
+  // graphs that differ only by that order describe the same target and must produce an identical
+  // ruleInputList(), or RuleHasher would report a spurious change.
+  @Test
+  fun testCqueryRuleInputListInvariantToConfiguredInputOrder() {
+    fun genruleWith(inputs: List<Build.ConfiguredRuleInput>): Rule {
+      val builder = Rule.newBuilder().setRuleClass("genrule").setName("//:gen")
+      inputs.forEach { builder.addConfiguredRuleInput(it) }
+      return builder.build()
+    }
+
+    val inputA =
+        Build.ConfiguredRuleInput.newBuilder()
+            .setLabel("//:a")
+            .setConfigurationChecksum("cfg-A")
+            .build()
+    val inputB =
+        Build.ConfiguredRuleInput.newBuilder()
+            .setLabel("//:b")
+            .setConfigurationChecksum("cfg-B")
+            .build()
+
+    val forward =
+        BazelRule(genruleWith(listOf(inputA, inputB)))
+            .ruleInputList(useCquery = true, fineGrainedHashExternalRepos = emptySet())
+    // Reversed order, plus a duplicate of inputA to exercise dedupe.
+    val reversed =
+        BazelRule(genruleWith(listOf(inputB, inputA, inputA)))
+            .ruleInputList(useCquery = true, fineGrainedHashExternalRepos = emptySet())
+
+    assertThat(forward).isEqualTo(listOf("//:a|cfg-A", "//:b|cfg-B"))
+    assertThat(forward).isEqualTo(reversed)
+  }
+
   private fun configuredGenrule(depLabel: String, configurationChecksum: String): Rule {
     return Rule.newBuilder()
         .setRuleClass("genrule")

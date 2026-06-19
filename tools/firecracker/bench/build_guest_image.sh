@@ -58,15 +58,41 @@ install -m 600 "$SSH_PUBKEY" "$WORK/root/.ssh/authorized_keys"
 install -d -m 755 "$WORK/snap"
 # Generate guest host keys at build time so the first ssh doesn't race sshd.
 ssh-keygen -A -f "$WORK" >/dev/null 2>&1 || chroot "$WORK" ssh-keygen -A
+# Standalone always-on sshd: socket-activated sshd (the Ubuntu default) does not
+# reliably service connections after a snapshot restore. Enable ssh.service and
+# disable ssh.socket so the daemon is already listening when the VM resumes.
+if [[ -e "$WORK/lib/systemd/system/ssh.service" ]]; then
+  mkdir -p "$WORK/etc/systemd/system/multi-user.target.wants"
+  ln -sf /lib/systemd/system/ssh.service \
+    "$WORK/etc/systemd/system/multi-user.target.wants/ssh.service"
+  rm -f "$WORK/etc/systemd/system/sockets.target.wants/ssh.socket"
+  rm -f "$WORK/etc/systemd/system/ssh.service.requires/ssh.socket"
+fi
 
 echo ">> [4/6] install JDK + git into the chroot"
 mount --bind /dev "$WORK/dev"; mount -t proc proc "$WORK/proc"; mount -t sysfs sys "$WORK/sys"
+# devpts is needed by package postinst scripts (e.g. the JDK invokes java, which
+# calls posix_openpt); without it dpkg --configure fails on minimized bases.
+mkdir -p "$WORK/dev/pts"; mount -t devpts devpts "$WORK/dev/pts"
 cp /etc/resolv.conf "$WORK/etc/resolv.conf"
-trap 'umount -l "$WORK/dev" "$WORK/proc" "$WORK/sys" 2>/dev/null || true' EXIT
+trap 'umount -l "$WORK/dev/pts" "$WORK/dev" "$WORK/proc" "$WORK/sys" 2>/dev/null || true' EXIT
 chroot "$WORK" /bin/bash -euxc "
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y --no-install-recommends $JDK_PKG git ca-certificates >/dev/null
+  # Some hosts' chroot /tmp is missing/unwritable for the unprivileged _apt
+  # sandbox user, which makes apt fail to stage temp files ('Couldn't create
+  # temporary file ...') and then report repos as unsigned. Ensure a sticky
+  # world-writable /tmp and run apt as root (sandbox off) to be host-agnostic.
+  install -d -m 1777 /tmp
+  # Minimized base images can lack apt's spool/log dirs; recreate them so
+  # downloads and dpkg configuration (which writes apt logs) succeed.
+  install -d /var/cache/apt/archives/partial /var/lib/apt/lists/partial /var/log/apt
+  # ...and lack /usr/share/man/manN, which the JDK's update-alternatives needs
+  # to create man symlinks (else 'error creating symbolic link .../java.1.gz').
+  mkdir -p /usr/share/man/man1 /usr/share/man/man2 /usr/share/man/man3 \
+           /usr/share/man/man4 /usr/share/man/man5 /usr/share/man/man6 \
+           /usr/share/man/man7 /usr/share/man/man8
+  apt-get -o APT::Sandbox::User=root update -qq
+  apt-get -o APT::Sandbox::User=root install -y --no-install-recommends $JDK_PKG git ca-certificates >/dev/null
   apt-get clean && rm -rf /var/lib/apt/lists/*
 "
 
@@ -80,11 +106,14 @@ exec java -jar /opt/bazel-diff/bazel-diff_deploy.jar "$@"
 EOF
 chmod 755 "$WORK/usr/local/bin/bazel-diff"
 # Bake the workspace (git repo) under /work. record/consume `git checkout` here.
+# Own it as root (the guest runs commands as root) so git doesn't reject the repo
+# with "detected dubious ownership" (exit 128) when the source uid differs.
 rm -rf "$WORK/work"
 cp -a "$WORKSPACE_SRC" "$WORK/work"
+chown -R 0:0 "$WORK/work"
 
 echo ">> [6/6] build ext4 image ($SIZE_MB MiB) at $ROOTFS_IMG"
-umount -l "$WORK/dev" "$WORK/proc" "$WORK/sys" 2>/dev/null || true
+umount -l "$WORK/dev/pts" "$WORK/dev" "$WORK/proc" "$WORK/sys" 2>/dev/null || true
 trap - EXIT
 rm -f "$ROOTFS_IMG"
 mke2fs -q -F -L rootfs -t ext4 -d "$WORK" "$ROOTFS_IMG" "${SIZE_MB}M"

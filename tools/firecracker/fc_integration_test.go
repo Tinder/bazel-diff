@@ -104,6 +104,10 @@ var noHostKeyChecking = []string{
 	"-o", "StrictHostKeyChecking=no",
 	"-o", "UserKnownHostsFile=/dev/null",
 	"-o", "LogLevel=ERROR",
+	// Bound per-attempt connect time and never prompt, so the driver's
+	// readiness polling fails fast and retries instead of hanging.
+	"-o", "ConnectTimeout=10",
+	"-o", "BatchMode=yes",
 }
 
 func getenvDefault(key, def string) string {

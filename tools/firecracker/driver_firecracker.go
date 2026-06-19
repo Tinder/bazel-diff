@@ -152,6 +152,10 @@ func (d fcDriver) record(r recordRequest) error {
 	if err := c.instanceStart(); err != nil {
 		return err
 	}
+	// Wait for the freshly-booted guest's sshd before issuing commands.
+	if err := d.waitForGuest(120 * time.Second); err != nil {
+		return fmt.Errorf("guest unreachable after boot: %w", err)
+	}
 
 	// Inside the guest: check out the base revision, then warm the server, baking
 	// base_hashes.json + fingerprint.json. The checkout mirrors localDriver.record
@@ -221,6 +225,10 @@ func (d fcDriver) consume(r consumeRequest) error {
 	}); err != nil {
 		return fmt.Errorf("loading snapshot: %w", err)
 	}
+	// The resumed guest's sshd may take a moment to service connections.
+	if err := d.waitForGuest(60 * time.Second); err != nil {
+		return fmt.Errorf("guest unreachable after restore: %w", err)
+	}
 
 	guestTarget := filepath.Join(d.guestSnapDir, "target_hashes.json")
 	guestOut := filepath.Join(d.guestSnapDir, "impacted.txt")
@@ -247,6 +255,21 @@ func ensureTapExists(tap string) error {
 		return fmt.Errorf("host TAP %q not found (set it up first, e.g. bench/setup_tap.sh): %w", tap, err)
 	}
 	return nil
+}
+
+// waitForGuest polls the guest over the configured transport until a trivial
+// command succeeds, so callers don't race the guest's boot (record) or its
+// snapshot-resume (consume) before sshd is serving connections.
+func (d fcDriver) waitForGuest(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var last error
+	for time.Now().Before(deadline) {
+		if last = d.guest.exec("true"); last == nil {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("not reachable within %s: %w", timeout, last)
 }
 
 func (d fcDriver) baseRootfs() string {

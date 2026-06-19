@@ -23,7 +23,11 @@ type fcClient struct {
 func newFCClient(socketPath string) *fcClient {
 	return &fcClient{
 		http: &http.Client{
-			Timeout: 60 * time.Second,
+			// Generous: most calls are instant over the unix socket, but
+			// /snapshot/create and /snapshot/load dump or load the guest's full
+			// memory to/from disk and legitimately take well over a minute for a
+			// multi-GB VM. A short timeout aborts the snapshot mid-write.
+			Timeout: 15 * time.Minute,
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 					var d net.Dialer

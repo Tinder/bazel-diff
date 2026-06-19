@@ -203,12 +203,13 @@ class ModuleGraphParserTest {
   @Test
   fun findChangedModules_withAddedModule_returnsAddedModuleKey() {
     val oldGraph =
-        mapOf("root" to Module("root", "my-project", "1.0.0", "my-project"),)
+        mapOf(
+            "root" to Module("root", "my-project", "1.0.0", "my-project"),
+        )
     val newGraph =
         mapOf(
             "root" to Module("root", "my-project", "1.0.0", "my-project"),
-            "protobuf@21.7" to
-                Module("protobuf@21.7", "protobuf", "21.7", "com_google_protobuf"))
+            "protobuf@21.7" to Module("protobuf@21.7", "protobuf", "21.7", "com_google_protobuf"))
 
     val result = parser.findChangedModules(oldGraph, newGraph)
 
@@ -221,10 +222,11 @@ class ModuleGraphParserTest {
     val oldGraph =
         mapOf(
             "root" to Module("root", "my-project", "1.0.0", "my-project"),
-            "protobuf@21.7" to
-                Module("protobuf@21.7", "protobuf", "21.7", "com_google_protobuf"))
+            "protobuf@21.7" to Module("protobuf@21.7", "protobuf", "21.7", "com_google_protobuf"))
     val newGraph =
-        mapOf("root" to Module("root", "my-project", "1.0.0", "my-project"),)
+        mapOf(
+            "root" to Module("root", "my-project", "1.0.0", "my-project"),
+        )
 
     val result = parser.findChangedModules(oldGraph, newGraph)
 
@@ -258,8 +260,7 @@ class ModuleGraphParserTest {
             "root" to Module("root", "my-project", "1.0.0", "my-project"),
             "abseil-cpp@20240116.2" to
                 Module("abseil-cpp@20240116.2", "abseil-cpp", "20240116.2", "com_google_absl"),
-            "protobuf@21.7" to
-                Module("protobuf@21.7", "protobuf", "21.7", "com_google_protobuf"))
+            "protobuf@21.7" to Module("protobuf@21.7", "protobuf", "21.7", "com_google_protobuf"))
     val newGraph =
         mapOf(
             "root" to Module("root", "my-project", "1.0.0", "my-project"),
@@ -416,9 +417,7 @@ class ModuleGraphParserTest {
     assertThat(graph.edges["wrapped_external_repo_test"])
         .isNotNull()
         .containsExactlyInAnyOrder("inner_repo", "middle_repo")
-    assertThat(graph.edges["middle_repo"])
-        .isNotNull()
-        .containsExactlyInAnyOrder("inner_repo")
+    assertThat(graph.edges["middle_repo"]).isNotNull().containsExactlyInAnyOrder("inner_repo")
     // inner_repo has no outgoing deps.
     assertThat(graph.edges["inner_repo"]).isNotNull().isEmpty()
   }
@@ -484,7 +483,8 @@ class ModuleGraphParserTest {
   fun findTransitiveDependents_emptyTargets_returnsEmpty() {
     val edges = mapOf("a" to setOf("b"), "b" to emptySet())
 
-    val result = parser.findTransitiveDependents(edges, targets = emptySet(), rootApparentNames = emptySet())
+    val result =
+        parser.findTransitiveDependents(edges, targets = emptySet(), rootApparentNames = emptySet())
 
     assertThat(result).isEmpty()
   }

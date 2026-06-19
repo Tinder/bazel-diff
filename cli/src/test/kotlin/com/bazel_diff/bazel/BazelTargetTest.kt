@@ -19,13 +19,14 @@ class BazelTargetTest {
 
   @Test
   fun sourceFileTarget_exposesSourceFileName_andSourceFileType() {
-    val target = Build.Target.newBuilder()
-        .setType(Build.Target.Discriminator.SOURCE_FILE)
-        .setSourceFile(
-            Build.SourceFile.newBuilder()
-                .setName("//pkg:foo.txt")
-                .addSubinclude("//other:bzl.bzl"))
-        .build()
+    val target =
+        Build.Target.newBuilder()
+            .setType(Build.Target.Discriminator.SOURCE_FILE)
+            .setSourceFile(
+                Build.SourceFile.newBuilder()
+                    .setName("//pkg:foo.txt")
+                    .addSubinclude("//other:bzl.bzl"))
+            .build()
     val bt = BazelTarget.SourceFile(target)
     assertThat(bt.name).isEqualTo("//pkg:foo.txt")
     assertThat(bt.sourceFileName).isEqualTo("//pkg:foo.txt")
@@ -35,10 +36,11 @@ class BazelTargetTest {
 
   @Test
   fun ruleTarget_exposesRuleName_andRuleType() {
-    val target = Build.Target.newBuilder()
-        .setType(Build.Target.Discriminator.RULE)
-        .setRule(Build.Rule.newBuilder().setRuleClass("java_library").setName("//:foo"))
-        .build()
+    val target =
+        Build.Target.newBuilder()
+            .setType(Build.Target.Discriminator.RULE)
+            .setRule(Build.Rule.newBuilder().setRuleClass("java_library").setName("//:foo"))
+            .build()
     val bt = BazelTarget.Rule(target)
     assertThat(bt.name).isEqualTo("//:foo")
     assertThat(bt.rule.name).isEqualTo("//:foo")
@@ -47,13 +49,12 @@ class BazelTargetTest {
 
   @Test
   fun generatedFileTarget_exposesNamesAndGeneratedFileType() {
-    val target = Build.Target.newBuilder()
-        .setType(Build.Target.Discriminator.GENERATED_FILE)
-        .setGeneratedFile(
-            Build.GeneratedFile.newBuilder()
-                .setName("//:gen.out")
-                .setGeneratingRule("//:gen"))
-        .build()
+    val target =
+        Build.Target.newBuilder()
+            .setType(Build.Target.Discriminator.GENERATED_FILE)
+            .setGeneratedFile(
+                Build.GeneratedFile.newBuilder().setName("//:gen.out").setGeneratingRule("//:gen"))
+            .build()
     val bt = BazelTarget.GeneratedFile(target)
     assertThat(bt.name).isEqualTo("//:gen.out")
     assertThat(bt.generatedFileName).isEqualTo("//:gen.out")

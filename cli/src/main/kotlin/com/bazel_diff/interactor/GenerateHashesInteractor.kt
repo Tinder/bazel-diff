@@ -69,16 +69,16 @@ class GenerateHashesInteractor : KoinComponent {
         null -> FileWriter(FileDescriptor.out)
         else -> FileWriter(outputPath)
       }.use { fileWriter ->
-        val hashOutput = if (moduleGraphJson != null) {
-          // New format with metadata
-          mapOf(
-            "hashes" to hashes.mapValues { it.value.toJson(includeTargetType) },
-            "metadata" to mapOf("moduleGraphJson" to moduleGraphJson)
-          )
-        } else {
-          // Legacy format for non-bzlmod workspaces
-          hashes.mapValues { it.value.toJson(includeTargetType) }
-        }
+        val hashOutput =
+            if (moduleGraphJson != null) {
+              // New format with metadata
+              mapOf(
+                  "hashes" to hashes.mapValues { it.value.toJson(includeTargetType) },
+                  "metadata" to mapOf("moduleGraphJson" to moduleGraphJson))
+            } else {
+              // Legacy format for non-bzlmod workspaces
+              hashes.mapValues { it.value.toJson(includeTargetType) }
+            }
         fileWriter.write(gson.toJson(hashOutput))
       }
       if (depsMappingJSONPath != null) {

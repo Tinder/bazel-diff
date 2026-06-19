@@ -53,15 +53,19 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
 
           Pair(sourceDigestsFuture.await(), allTargets)
         }
-    val seedForFilepaths =
-        runBlocking(Dispatchers.IO) { createSeedForFilepaths(seedFilepaths) }
+    val seedForFilepaths = runBlocking(Dispatchers.IO) { createSeedForFilepaths(seedFilepaths) }
     // Attribute each BUILD file's loaded `.bzl` digests to the package that loads them, so a
     // `.bzl` edit only re-hashes targets in packages that actually `load()` it -- not every
     // target in the workspace (issue #365). A package that loads no tracked `.bzl` gets nothing
     // mixed in, keeping its targets' hashes byte-for-byte stable.
     val packageBzlSeeds = createPackageBzlSeeds(allTargets, modifiedFilepaths)
     return hashAllTargets(
-        seedForFilepaths, packageBzlSeeds, sourceDigests, allTargets, ignoredAttrs, modifiedFilepaths)
+        seedForFilepaths,
+        packageBzlSeeds,
+        sourceDigests,
+        allTargets,
+        ignoredAttrs,
+        modifiedFilepaths)
   }
 
   private fun hashSourcefiles(
@@ -180,13 +184,13 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
   }
 
   /**
-   * Builds a per-package seed-hash contribution from the contents of every `.bzl` (and `.scl`)
-   * file that package's BUILD file loads, keyed by package label (e.g. `//pkg`, `//` for the
-   * root package).
+   * Builds a per-package seed-hash contribution from the contents of every `.bzl` (and `.scl`) file
+   * that package's BUILD file loads, keyed by package label (e.g. `//pkg`, `//` for the root
+   * package).
    *
    * Background: Bazel pre-7 populated [Build.Rule.skylark_environment_hash_code] in the query
-   * proto, so any change to a `.bzl` file loaded by a rule's BUILD file naturally bubbled into
-   * that rule's hash. Bazel 7+ leaves that field empty, which is the root cause of issues
+   * proto, so any change to a `.bzl` file loaded by a rule's BUILD file naturally bubbled into that
+   * rule's hash. Bazel 7+ leaves that field empty, which is the root cause of issues
    * [#259](https://github.com/Tinder/bazel-diff/issues/259) and
    * [#227](https://github.com/Tinder/bazel-diff/issues/227): editing a macro body (e.g. adding
    * `print()`) no longer invalidated any caller because the emitted rule attrs were identical.
@@ -194,11 +198,11 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
    * Fix: each package's BUILD `SourceFile` target carries a `subincludeList` (the
    * `Build.SourceFile.subinclude` proto field) listing every `.bzl` that BUILD loaded. We
    * softDigest each main-repo `.bzl` and roll the digests for a given package into a seed
-   * attributed to that package. Callers then mix only their own package's seed into each
-   * target's hash, so editing a `.bzl` re-hashes exactly the targets in packages that
-   * `load()` it -- not every target in the workspace
-   * ([#365](https://github.com/Tinder/bazel-diff/issues/365)). A package that loads no tracked
-   * `.bzl` has no entry here, so nothing is mixed in and its targets stay byte-for-byte stable.
+   * attributed to that package. Callers then mix only their own package's seed into each target's
+   * hash, so editing a `.bzl` re-hashes exactly the targets in packages that `load()` it -- not
+   * every target in the workspace ([#365](https://github.com/Tinder/bazel-diff/issues/365)). A
+   * package that loads no tracked `.bzl` has no entry here, so nothing is mixed in and its targets
+   * stay byte-for-byte stable.
    *
    * External-repo `.bzl` files (`@repo//...`, `@@canonical//...`) are skipped because
    * [SourceFileHasher.softDigest] returns null for non-main-repo labels, which keeps the seed

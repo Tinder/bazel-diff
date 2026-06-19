@@ -298,20 +298,22 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
 
   @Test
   fun testModuleChangesWithoutWorkspace() {
-    // When module changes occur and query service is not available, all targets are marked as impacted
-    val startHashes = mapOf(
-        "//:target1" to TargetHash("", "hash1", "hash1"),
-        "//:target2" to TargetHash("", "hash2", "hash2"),
-        "@@abseil-cpp~20240116.2//:strings" to TargetHash("", "ext1", "ext1")
-    )
+    // When module changes occur and query service is not available, all targets are marked as
+    // impacted
+    val startHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1", "hash1"),
+            "//:target2" to TargetHash("", "hash2", "hash2"),
+            "@@abseil-cpp~20240116.2//:strings" to TargetHash("", "ext1", "ext1"))
 
-    val endHashes = mapOf(
-        "//:target1" to TargetHash("", "hash1", "hash1"),
-        "//:target2" to TargetHash("", "hash2", "hash2"),
-        "@@abseil-cpp~20240722.0//:strings" to TargetHash("", "ext2", "ext2")
-    )
+    val endHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1", "hash1"),
+            "//:target2" to TargetHash("", "hash2", "hash2"),
+            "@@abseil-cpp~20240722.0//:strings" to TargetHash("", "ext2", "ext2"))
 
-    val fromModuleGraph = """
+    val fromModuleGraph =
+        """
       {
         "key": "root",
         "name": "root",
@@ -322,9 +324,11 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
           {"key": "abseil-cpp@20240116.2", "name": "abseil-cpp", "version": "20240116.2", "apparentName": "abseil-cpp"}
         ]
       }
-    """.trimIndent()
+    """
+            .trimIndent()
 
-    val toModuleGraph = """
+    val toModuleGraph =
+        """
       {
         "key": "root",
         "name": "root",
@@ -335,7 +339,8 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
           {"key": "abseil-cpp@20240722.0", "name": "abseil-cpp", "version": "20240722.0", "apparentName": "abseil-cpp"}
         ]
       }
-    """.trimIndent()
+    """
+            .trimIndent()
 
     val outputWriter = StringWriter()
     val interactor = CalculateImpactedTargetsInteractor()
@@ -346,31 +351,33 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         outputWriter = outputWriter,
         targetTypes = null,
         fromModuleGraphJson = fromModuleGraph,
-        toModuleGraphJson = toModuleGraph
-    )
+        toModuleGraphJson = toModuleGraph)
 
     val output = outputWriter.toString().trim().split("\n")
-    // Module changes detected but no query service available - all targets including external are impacted
-    assertThat(output).containsExactlyInAnyOrder("//:target1", "//:target2", "@@abseil-cpp~20240722.0//:strings")
+    // Module changes detected but no query service available - all targets including external are
+    // impacted
+    assertThat(output)
+        .containsExactlyInAnyOrder("//:target1", "//:target2", "@@abseil-cpp~20240722.0//:strings")
   }
 
   @Test
   fun testModuleChangesWithWorkspaceButNoQueryService() {
     // When module changes are detected and workspace is provided but query service not available,
     // should fall back to marking all targets as impacted (including external targets)
-    val startHashes = mapOf(
-        "//:target1" to TargetHash("", "hash1", "hash1"),
-        "//:target2" to TargetHash("", "hash2", "hash2"),
-        "@@abseil-cpp~20240116.2//:strings" to TargetHash("", "ext1", "ext1")
-    )
+    val startHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1", "hash1"),
+            "//:target2" to TargetHash("", "hash2", "hash2"),
+            "@@abseil-cpp~20240116.2//:strings" to TargetHash("", "ext1", "ext1"))
 
-    val endHashes = mapOf(
-        "//:target1" to TargetHash("", "hash1", "hash1"),
-        "//:target2" to TargetHash("", "hash2", "hash2"),
-        "@@abseil-cpp~20240722.0//:strings" to TargetHash("", "ext2", "ext2")
-    )
+    val endHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1", "hash1"),
+            "//:target2" to TargetHash("", "hash2", "hash2"),
+            "@@abseil-cpp~20240722.0//:strings" to TargetHash("", "ext2", "ext2"))
 
-    val fromModuleGraph = """
+    val fromModuleGraph =
+        """
       {
         "key": "root",
         "name": "root",
@@ -380,9 +387,11 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
           {"key": "abseil-cpp@20240116.2", "name": "abseil-cpp", "version": "20240116.2", "apparentName": "abseil-cpp"}
         ]
       }
-    """.trimIndent()
+    """
+            .trimIndent()
 
-    val toModuleGraph = """
+    val toModuleGraph =
+        """
       {
         "key": "root",
         "name": "root",
@@ -392,7 +401,8 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
           {"key": "abseil-cpp@20240722.0", "name": "abseil-cpp", "version": "20240722.0", "apparentName": "abseil-cpp"}
         ]
       }
-    """.trimIndent()
+    """
+            .trimIndent()
 
     // No BazelQueryService in the test module, so should fall back to all targets
     val outputWriter = StringWriter()
@@ -404,35 +414,37 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         outputWriter = outputWriter,
         targetTypes = null,
         fromModuleGraphJson = fromModuleGraph,
-        toModuleGraphJson = toModuleGraph
-    )
+        toModuleGraphJson = toModuleGraph)
 
     val output = outputWriter.toString().trim().split("\n")
     // All targets including external should be marked as impacted when query service not available
-    assertThat(output).containsExactlyInAnyOrder("//:target1", "//:target2", "@@abseil-cpp~20240722.0//:strings")
+    assertThat(output)
+        .containsExactlyInAnyOrder("//:target1", "//:target2", "@@abseil-cpp~20240722.0//:strings")
   }
 
   @Test
   fun testNoModuleChanges() {
     // When no module changes occur, should use normal hash comparison
-    val startHashes = mapOf(
-        "//:target1" to TargetHash("", "hash1", "hash1"),
-        "//:target2" to TargetHash("", "hash2", "hash2")
-    )
+    val startHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1", "hash1"),
+            "//:target2" to TargetHash("", "hash2", "hash2"))
 
-    val endHashes = mapOf(
-        "//:target1" to TargetHash("", "hash1-changed", "hash1-changed"),
-        "//:target2" to TargetHash("", "hash2", "hash2")
-    )
+    val endHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1-changed", "hash1-changed"),
+            "//:target2" to TargetHash("", "hash2", "hash2"))
 
-    val moduleGraph = """
+    val moduleGraph =
+        """
       {
         "key": "root",
         "dependencies": [
           {"key": "abseil-cpp@20240116.2", "name": "abseil-cpp", "version": "20240116.2"}
         ]
       }
-    """.trimIndent()
+    """
+            .trimIndent()
 
     val outputWriter = StringWriter()
     val interactor = CalculateImpactedTargetsInteractor()
@@ -443,8 +455,8 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         outputWriter = outputWriter,
         targetTypes = null,
         fromModuleGraphJson = moduleGraph,
-        toModuleGraphJson = moduleGraph  // Same module graph
-    )
+        toModuleGraphJson = moduleGraph // Same module graph
+        )
 
     val output = outputWriter.toString().trim().split("\n")
     // Only target1 should be impacted (hash changed)
@@ -453,20 +465,22 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
 
   @Test
   fun testModuleChangesWithDistances() {
-    // Test executeWithDistances with module changes - when query service is not available, all targets are marked as impacted
-    val startHashes = mapOf(
-        "//:1" to TargetHash("", "//:1", "//:1"),
-        "//:2" to TargetHash("", "//:2", "//:2"),
-        "//:3" to TargetHash("", "//:3", "//:3")
-    )
+    // Test executeWithDistances with module changes - when query service is not available, all
+    // targets are marked as impacted
+    val startHashes =
+        mapOf(
+            "//:1" to TargetHash("", "//:1", "//:1"),
+            "//:2" to TargetHash("", "//:2", "//:2"),
+            "//:3" to TargetHash("", "//:3", "//:3"))
 
-    val endHashes = mapOf(
-        "//:1" to TargetHash("", "//:1-changed", "//:1-changed"),
-        "//:2" to TargetHash("", "//:2", "//:2"),
-        "//:3" to TargetHash("", "//:3", "//:3")
-    )
+    val endHashes =
+        mapOf(
+            "//:1" to TargetHash("", "//:1-changed", "//:1-changed"),
+            "//:2" to TargetHash("", "//:2", "//:2"),
+            "//:3" to TargetHash("", "//:3", "//:3"))
 
-    val fromModuleGraph = """
+    val fromModuleGraph =
+        """
       {
         "key": "root",
         "name": "root",
@@ -476,9 +490,11 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
           {"key": "test-module@1.0", "name": "test-module", "version": "1.0", "apparentName": "test-module"}
         ]
       }
-    """.trimIndent()
+    """
+            .trimIndent()
 
-    val toModuleGraph = """
+    val toModuleGraph =
+        """
       {
         "key": "root",
         "name": "root",
@@ -488,7 +504,8 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
           {"key": "test-module@2.0", "name": "test-module", "version": "2.0", "apparentName": "test-module"}
         ]
       }
-    """.trimIndent()
+    """
+            .trimIndent()
 
     val outputWriter = StringWriter()
     val interactor = CalculateImpactedTargetsInteractor()
@@ -500,8 +517,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         outputWriter = outputWriter,
         targetTypes = null,
         fromModuleGraphJson = fromModuleGraph,
-        toModuleGraphJson = toModuleGraph
-    )
+        toModuleGraphJson = toModuleGraph)
 
     val output = outputWriter.toString()
     // Module changes detected but no query service available - all targets are marked as impacted
@@ -515,15 +531,15 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
   @Test
   fun testMissingModuleGraph() {
     // When module graph is missing, should fall back to normal hash comparison
-    val startHashes = mapOf(
-        "//:target1" to TargetHash("", "hash1", "hash1"),
-        "//:target2" to TargetHash("", "hash2", "hash2")
-    )
+    val startHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1", "hash1"),
+            "//:target2" to TargetHash("", "hash2", "hash2"))
 
-    val endHashes = mapOf(
-        "//:target1" to TargetHash("", "hash1-changed", "hash1-changed"),
-        "//:target2" to TargetHash("", "hash2", "hash2")
-    )
+    val endHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1-changed", "hash1-changed"),
+            "//:target2" to TargetHash("", "hash2", "hash2"))
 
     val outputWriter = StringWriter()
     val interactor = CalculateImpactedTargetsInteractor()
@@ -533,9 +549,8 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         to = endHashes,
         outputWriter = outputWriter,
         targetTypes = null,
-        fromModuleGraphJson = null,  // Missing module graph
-        toModuleGraphJson = null
-    )
+        fromModuleGraphJson = null, // Missing module graph
+        toModuleGraphJson = null)
 
     val output = outputWriter.toString().trim().split("\n")
     // Only target1 should be impacted (hash changed)
@@ -590,7 +605,10 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
             "//foo:bar" to TargetHash("Rule", "h1", "h1"),
             "//external:boost.assert" to TargetHash("Rule", "h2", "h2"),
         )
-    val to = from.mapValues { (_, v) -> v.copy(hash = v.hash + "-changed", directHash = v.directHash + "-changed") }
+    val to =
+        from.mapValues { (_, v) ->
+          v.copy(hash = v.hash + "-changed", directHash = v.directHash + "-changed")
+        }
 
     val filteredWriter = StringWriter()
     CalculateImpactedTargetsInteractor()
@@ -616,7 +634,8 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
   // impacted Rule whose only changed dependency is a filtered-out GeneratedFile previously
   // triggered:
   //
-  //   InvalidDependencyEdgesException("<label> was indirectly impacted, but has no impacted dependencies.")
+  //   InvalidDependencyEdgesException("<label> was indirectly impacted, but has no impacted
+  // dependencies.")
   //
   // and crashed the whole job. The fix (this PR) replaces that throw with a logger.w() that
   // points at --targetType as the most likely cause, and returns a conservative
@@ -657,17 +676,18 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
   fun testIdenticalModuleGraphsSkipsParsing() {
     // When module graphs are identical, should skip parsing and use normal hash comparison
     // This is an optimization to avoid expensive JSON parsing when modules haven't changed
-    val startHashes = mapOf(
-        "//:target1" to TargetHash("", "hash1", "hash1"),
-        "//:target2" to TargetHash("", "hash2", "hash2")
-    )
+    val startHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1", "hash1"),
+            "//:target2" to TargetHash("", "hash2", "hash2"))
 
-    val endHashes = mapOf(
-        "//:target1" to TargetHash("", "hash1-changed", "hash1-changed"),
-        "//:target2" to TargetHash("", "hash2", "hash2")
-    )
+    val endHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1-changed", "hash1-changed"),
+            "//:target2" to TargetHash("", "hash2", "hash2"))
 
-    val moduleGraph = """
+    val moduleGraph =
+        """
       {
         "key": "root",
         "name": "root",
@@ -677,7 +697,8 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
           {"key": "abseil-cpp@20240116.2", "name": "abseil-cpp", "version": "20240116.2", "apparentName": "abseil-cpp"}
         ]
       }
-    """.trimIndent()
+    """
+            .trimIndent()
 
     val outputWriter = StringWriter()
     val interactor = CalculateImpactedTargetsInteractor()
@@ -687,9 +708,8 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         to = endHashes,
         outputWriter = outputWriter,
         targetTypes = null,
-        fromModuleGraphJson = moduleGraph,  // Identical module graphs
-        toModuleGraphJson = moduleGraph
-    )
+        fromModuleGraphJson = moduleGraph, // Identical module graphs
+        toModuleGraphJson = moduleGraph)
 
     val output = outputWriter.toString().trim().split("\n")
     // Only target1 should be impacted (hash changed) - module logic was skipped
@@ -702,24 +722,28 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
     // canonical repos should produce a single unioned rdeps query, not two.
     val captured = mutableListOf<String>()
     val fakeQueryService: BazelQueryService = mock {
-      onBlocking { query(any(), any()) } doAnswer {
-        captured.add(it.getArgument(0))
-        emptyList<BazelTarget>()
-      }
+      onBlocking { query(any(), any()) } doAnswer
+          {
+            captured.add(it.getArgument(0))
+            emptyList<BazelTarget>()
+          }
     }
     loadKoinModules(module { single { fakeQueryService } })
 
-    val from = mapOf(
-        "//:target1" to TargetHash("", "a", "a"),
-        "@@abseil-cpp~20240116.2//:strings" to TargetHash("", "e1", "e1"),
-        "@@aspect_bazel_lib~2.22.5//:copy_to_bin" to TargetHash("", "e2", "e2"),
-    )
-    val to = mapOf(
-        "//:target1" to TargetHash("", "a", "a"),
-        "@@abseil-cpp~20240722.0//:strings" to TargetHash("", "e1b", "e1b"),
-        "@@aspect_bazel_lib~2.23.0//:copy_to_bin" to TargetHash("", "e2b", "e2b"),
-    )
-    val fromGraph = """
+    val from =
+        mapOf(
+            "//:target1" to TargetHash("", "a", "a"),
+            "@@abseil-cpp~20240116.2//:strings" to TargetHash("", "e1", "e1"),
+            "@@aspect_bazel_lib~2.22.5//:copy_to_bin" to TargetHash("", "e2", "e2"),
+        )
+    val to =
+        mapOf(
+            "//:target1" to TargetHash("", "a", "a"),
+            "@@abseil-cpp~20240722.0//:strings" to TargetHash("", "e1b", "e1b"),
+            "@@aspect_bazel_lib~2.23.0//:copy_to_bin" to TargetHash("", "e2b", "e2b"),
+        )
+    val fromGraph =
+        """
       {
         "key": "root", "name": "root", "version": "", "apparentName": "root",
         "dependencies": [
@@ -727,8 +751,10 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
           {"key": "aspect_bazel_lib@2.22.5", "name": "aspect_bazel_lib", "version": "2.22.5", "apparentName": "aspect_bazel_lib"}
         ]
       }
-    """.trimIndent()
-    val toGraph = """
+    """
+            .trimIndent()
+    val toGraph =
+        """
       {
         "key": "root", "name": "root", "version": "", "apparentName": "root",
         "dependencies": [
@@ -736,17 +762,19 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
           {"key": "aspect_bazel_lib@2.23.0", "name": "aspect_bazel_lib", "version": "2.23.0", "apparentName": "aspect_bazel_lib"}
         ]
       }
-    """.trimIndent()
+    """
+            .trimIndent()
 
     val outputWriter = StringWriter()
-    CalculateImpactedTargetsInteractor().execute(
-        from = from,
-        to = to,
-        outputWriter = outputWriter,
-        targetTypes = null,
-        fromModuleGraphJson = fromGraph,
-        toModuleGraphJson = toGraph,
-    )
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = from,
+            to = to,
+            outputWriter = outputWriter,
+            targetTypes = null,
+            fromModuleGraphJson = fromGraph,
+            toModuleGraphJson = toGraph,
+        )
 
     // Exactly one query - the whole point of this test. The per-repo loop would emit two.
     assertThat(captured).hasSize(1)
@@ -828,7 +856,8 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
             toModuleGraphJson = toModuleGraph,
         )
 
-    val impacted = outputWriter.toString().trimEnd('\n').split("\n").filter { it.isNotEmpty() }.toSet()
+    val impacted =
+        outputWriter.toString().trimEnd('\n').split("\n").filter { it.isNotEmpty() }.toSet()
     // With the fallback: only the actually-changed target is in the impacted set.
     // Without the fallback: every hashed target would be reported because
     // queryTargetsDependingOnModules returns `allTargets.keys` when no BazelQueryService

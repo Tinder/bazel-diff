@@ -24,12 +24,14 @@ generate-readme:
 
 .PHONY: coverage
 coverage:
-	bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test
+	bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/go/...
 	bazel run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat
+	bazel run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
 
 .PHONY: coverage-check
 coverage-check:
 	bazel run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat
+	bazel run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
 
 .PHONY: coverage-test
 coverage-test:
@@ -37,6 +39,6 @@ coverage-test:
 
 .PHONY: coverage-html
 coverage-html:
-	bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test
+	bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/go/...
 	bazel run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat --html coverage-html
 	@echo "Open coverage-html/index.html in a browser to inspect."

@@ -274,18 +274,22 @@ bazel test //...
 
 ## Code coverage
 
-CI enforces a minimum **90% line coverage** on production sources (`cli/src/main/...`). To
-run the same check locally:
+CI enforces a minimum **90% line coverage** on production sources. Kotlin
+(`cli/src/main/...`) and Go (`tools/go/...`) are gated **independently** at 90% each, so
+thin coverage in one language can't hide behind well-covered code in the other. To run the
+same checks locally:
 
 ```terminal
 make coverage
 ```
 
-This invokes `bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test`
-and then runs `//tools:coverage-check` against the resulting LCOV report. The check is a
-Python `py_binary` ([`tools/coverage_check.py`](tools/coverage_check.py)) that prints a
+This invokes
+`bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/go/...`
+and then runs `//tools:coverage-check` twice against the resulting LCOV report — once for
+the Kotlin main sources and once scoped to `tools/go/` (`--include tools/go/`). The check is
+a Python `py_binary` ([`tools/coverage_check.py`](tools/coverage_check.py)) that prints a
 per-file table sorted by coverage (worst first), the overall percentage, and exits
-non-zero if main-source coverage is below the threshold.
+non-zero if the scoped coverage is below the threshold.
 
 If you've already produced a coverage report and just want to re-check the threshold,
 `make coverage-check` runs only the binary against `bazel-out/_coverage/_coverage_report.dat`.

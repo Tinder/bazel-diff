@@ -38,7 +38,7 @@ jobs:
       - name: Run bazel-diff tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... //tools:coverage_check_test --enable_bzlmod=true --enable_workspace=false
+        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/go/... --enable_bzlmod=true --enable_workspace=false
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         if: always()
@@ -55,6 +55,15 @@ jobs:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           COVERAGE_THRESHOLD: '90'
         run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+      - name: Enforce Go coverage threshold (>= 90% line coverage under tools/go/)
+        env:
+          # Must match the `Run bazel-diff tests` step above; see the note on the
+          # Kotlin enforcement step for why USE_BAZEL_VERSION has to be pinned here.
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+        # Gate Go independently of the Kotlin overall so thin Go coverage can't hide
+        # behind well-covered Kotlin (and vice versa). --include scopes the report to
+        # Go production source only (tools/go/, which excludes tools/coverage_check.py).
+        run: ~/go/bin/bazelisk run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()

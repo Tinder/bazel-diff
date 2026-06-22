@@ -13,14 +13,15 @@ class BazelTargetTypeTest {
     // is what gives this otherwise-trivial declaration any line coverage.
     val all = BazelTargetType.entries
     assertThat(all).hasSize(6)
-    assertThat(all).containsExactlyInAnyOrder(
-        BazelTargetType.RULE,
-        BazelTargetType.SOURCE_FILE,
-        BazelTargetType.GENERATED_FILE,
-        BazelTargetType.PACKAGE_GROUP,
-        BazelTargetType.ENVIRONMENT_GROUP,
-        BazelTargetType.UNKNOWN,
-    )
+    assertThat(all)
+        .containsExactlyInAnyOrder(
+            BazelTargetType.RULE,
+            BazelTargetType.SOURCE_FILE,
+            BazelTargetType.GENERATED_FILE,
+            BazelTargetType.PACKAGE_GROUP,
+            BazelTargetType.ENVIRONMENT_GROUP,
+            BazelTargetType.UNKNOWN,
+        )
   }
 
   @Test

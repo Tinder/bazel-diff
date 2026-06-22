@@ -1,7 +1,6 @@
 package com.bazel_diff
 
 import com.bazel_diff.bazel.BazelClient
-import com.bazel_diff.bazel.BazelModService
 import com.bazel_diff.hash.*
 import com.bazel_diff.io.ContentHashProvider
 import com.bazel_diff.log.Logger

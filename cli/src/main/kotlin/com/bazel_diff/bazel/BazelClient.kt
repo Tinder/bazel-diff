@@ -18,7 +18,8 @@ class BazelClient(
   suspend fun queryAllTargets(): List<BazelTarget> {
     val queryEpoch = Calendar.getInstance().getTimeInMillis()
 
-    // Skip //external:all-targets when explicitly excluded or when Bzlmod is enabled (//external not
+    // Skip //external:all-targets when explicitly excluded or when Bzlmod is enabled (//external
+    // not
     // available).
     val repoTargetsQuery =
         if (excludeExternalTargets || bazelModService.isBzlmodEnabled) {

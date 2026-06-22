@@ -73,9 +73,7 @@ class GetImpactedTargetsCommand : Callable<Int> {
 
   @CommandLine.Option(
       names = ["-w", "--workspacePath"],
-      description =
-          [
-              "Path to Bazel workspace directory. Required for module change detection."],
+      description = ["Path to Bazel workspace directory. Required for module change detection."],
       scope = CommandLine.ScopeType.LOCAL,
       required = true,
       converter = [NormalisingPathConverter::class])
@@ -131,24 +129,22 @@ class GetImpactedTargetsCommand : Callable<Int> {
     val resolvedBazelPath = bazelPath ?: java.nio.file.Paths.get("bazel")
     startKoin {
       modules(
-        serialisationModule(),
-        loggingModule(parent.verbose),
-        com.bazel_diff.di.hasherModule(
-          workingDirectory = workspacePath,
-          bazelPath = resolvedBazelPath,
-          contentHashPath = null,
-          startupOptions = bazelStartupOptions,
-          commandOptions = emptyList(),
-          cqueryOptions = emptyList(),
-          useCquery = false,
-          cqueryExpression = null,
-          keepGoing = false,
-          trackDeps = false,
-          fineGrainedHashExternalRepos = emptySet(),
-          fineGrainedHashExternalReposFile = null,
-          excludeExternalTargets = false
-        )
-      )
+          serialisationModule(),
+          loggingModule(parent.verbose),
+          com.bazel_diff.di.hasherModule(
+              workingDirectory = workspacePath,
+              bazelPath = resolvedBazelPath,
+              contentHashPath = null,
+              startupOptions = bazelStartupOptions,
+              commandOptions = emptyList(),
+              cqueryOptions = emptyList(),
+              useCquery = false,
+              cqueryExpression = null,
+              keepGoing = false,
+              trackDeps = false,
+              fineGrainedHashExternalRepos = emptySet(),
+              fineGrainedHashExternalReposFile = null,
+              excludeExternalTargets = false))
     }
 
     return try {

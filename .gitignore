@@ -35,3 +35,9 @@ coverage-html/
 # so this is a precise ignore list, not a blanket .claude/ ignore.
 .claude/settings.local.json
 .claude/worktrees/
+
+# Firecracker benchmark harness outputs
+.bench-results/
+
+# Go orchestrator build output (go build . in tools/firecracker)
+/tools/firecracker/firecracker

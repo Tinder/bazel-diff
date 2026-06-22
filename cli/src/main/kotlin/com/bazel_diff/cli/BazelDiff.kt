@@ -7,7 +7,12 @@ import picocli.CommandLine.Spec
 @CommandLine.Command(
     name = "bazel-diff",
     description = ["Writes to a file the impacted targets between two Bazel graph JSON files"],
-    subcommands = [GenerateHashesCommand::class, GetImpactedTargetsCommand::class],
+    subcommands =
+        [
+            GenerateHashesCommand::class,
+            GetImpactedTargetsCommand::class,
+            WarmupCommand::class,
+            FingerprintCommand::class],
     mixinStandardHelpOptions = true,
     versionProvider = VersionProvider::class,
 )

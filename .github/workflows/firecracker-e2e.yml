@@ -1,0 +1,201 @@
+name: Firecracker snapshot e2e
+
+# Real-microVM validation of the Firecracker snapshot driver (tools/firecracker):
+# boot -> NIC over TAP -> warmup -> snapshot -> restore -> resume -> consume, and
+# assert the snapshot-consumed impacted set is byte-identical to the local-driver
+# (cold) set (RFC §5.3 correctness canary).
+#
+# Manual (`workflow_dispatch`) because it needs /dev/kvm and boots a VM. GitHub's
+# hosted Linux runners expose /dev/kvm; if a runner ever lacks it the job fails
+# fast with a clear message. Use the `runner` input to target a beefier/self-
+# hosted host. This is the path the Raspberry Pi dev host cannot finish: its
+# 16 KB-page kernel freezes guest userspace after restore (see
+# tools/firecracker/README.md). A mainline-kernel x86_64 runner does not.
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label (needs Linux + /dev/kvm)'
+        default: 'ubuntu-latest'
+        type: string
+      packages:
+        description: 'Synthetic workspace size (packages)'
+        default: '300'
+        type: string
+      mem_mib:
+        description: 'Guest memory (MiB)'
+        default: '4096'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  firecracker-e2e:
+    runs-on: ${{ inputs.runner }}
+    env:
+      ARCH: x86_64
+      KERNEL_VER: '6.1.128'
+      # Big artifacts (multi-GB rootfs, copied per record/consume) live on /mnt,
+      # which has far more free space than / on GitHub-hosted runners.
+      IMG: /mnt/fc/image
+      WS: /mnt/fc/ws
+      STORE: /mnt/fc/store
+      FC_OUT: /mnt/fc/impacted.fc.txt
+      SIZE_MB: '4096'
+      TAP: fc-tap0
+      GUEST_ADDR: root@172.16.0.2
+      FC_VER: v1.16.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: '^1.21'
+
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
+
+      - name: Install host tooling (squashfs-tools, e2fsprogs, iproute2)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends squashfs-tools e2fsprogs iproute2
+
+      - name: Prepare /mnt scratch (more free space than /)
+        run: |
+          sudo mkdir -p /mnt/fc && sudo chown "$USER" /mnt/fc
+          df -h / /mnt
+
+      - name: Verify /dev/kvm
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm not present on this runner; pick a runner with nested virtualization." >&2
+            exit 1
+          fi
+          sudo chmod 666 /dev/kvm
+          ls -l /dev/kvm
+
+      - name: Build bazel-diff (deploy jar + launcher)
+        run: |
+          ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar
+          ~/go/bin/bazelisk run //:bazel-diff --script_path=/tmp/bazel_diff
+          ls -l bazel-bin/cli/bazel-diff_deploy.jar /tmp/bazel_diff
+
+      - name: Build + unit-test the orchestrator
+        working-directory: tools/firecracker
+        run: |
+          go vet ./... && go vet -tags fcintegration ./...
+          go test ./...
+          go build -o /tmp/bazel-diff-snap .
+
+      - name: Resolve a real bazel binary to bake into the guest
+        id: bazel
+        run: |
+          ~/go/bin/bazelisk version >/dev/null
+          # bazelisk caches the real bazel under ~/.cache/bazelisk/downloads/...
+          BAZEL_REAL=$(find "$HOME/.cache/bazelisk/downloads" -type f \( -name bazel -o -name 'bazel-*' \) -perm -u+x 2>/dev/null | grep -vE '\.(sha256|json)$' | head -1)
+          test -n "$BAZEL_REAL" || { echo "::error::could not locate the bazelisk-downloaded bazel binary" >&2; exit 1; }
+          echo "bin=$BAZEL_REAL" >> "$GITHUB_OUTPUT"
+          # Also make it the host bazel for the local-driver leg.
+          sudo install -m755 "$BAZEL_REAL" /usr/local/bin/bazel
+          echo "baking guest bazel: $BAZEL_REAL"
+
+      - name: Generate synthetic workspace (two revisions)
+        id: ws
+        run: |
+          python3 tools/firecracker/bench/gen_project.py \
+            --out "$WS" --packages "${{ inputs.packages }}" --targets-per-package 4 --git > /tmp/gen.json
+          cat /tmp/gen.json
+          echo "base=$(python3 -c 'import json;print(json.load(open("/tmp/gen.json"))["base_sha"])')" >> "$GITHUB_OUTPUT"
+          echo "target=$(python3 -c 'import json;print(json.load(open("/tmp/gen.json"))["target_sha"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Generate guest ssh keypair
+        run: ssh-keygen -t ed25519 -N '' -f /tmp/fc_guest -C fc-guest
+
+      - name: Download Firecracker
+        run: |
+          curl -fsSL -o /tmp/fc.tgz \
+            "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-${ARCH}.tgz"
+          tar -C /tmp -xzf /tmp/fc.tgz
+          install -m755 "/tmp/release-${FC_VER}-${ARCH}/firecracker-${FC_VER}-${ARCH}" /tmp/firecracker
+          /tmp/firecracker --version | head -1
+
+      - name: Build guest image (kernel + rootfs.base.ext4)
+        run: |
+          sudo -E env \
+            ARCH="$ARCH" KERNEL_VER="$KERNEL_VER" OUT="$IMG" SIZE_MB="$SIZE_MB" \
+            BAZEL_DIFF_JAR="$PWD/bazel-bin/cli/bazel-diff_deploy.jar" \
+            BAZEL_BIN="${{ steps.bazel.outputs.bin }}" \
+            WORKSPACE_SRC="$WS" SSH_PUBKEY=/tmp/fc_guest.pub \
+            tools/firecracker/bench/build_guest_image.sh
+          sudo chown "$USER" "$IMG/rootfs.base.ext4"
+          ls -l "$IMG"
+
+      - name: Set up host TAP
+        run: sudo tools/firecracker/bench/setup_tap.sh "$TAP" 172.16.0.1 30
+
+      - name: Local-driver consume (cold baseline)
+        run: |
+          /tmp/bazel-diff-snap record --driver local --store /tmp/localstore \
+            --workspace "$WS" --base-sha "${{ steps.ws.outputs.base }}" \
+            --bazel /usr/local/bin/bazel --bazel-diff /tmp/bazel_diff
+          /tmp/bazel-diff-snap consume --driver local --store /tmp/localstore \
+            --workspace "$WS" --target-sha "${{ steps.ws.outputs.target }}" \
+            --bazel /usr/local/bin/bazel --bazel-diff /tmp/bazel_diff \
+            --out /tmp/impacted.local.txt
+          sort -o /tmp/impacted.local.txt /tmp/impacted.local.txt
+          echo "local impacted: $(wc -l < /tmp/impacted.local.txt) targets"
+
+      - name: Firecracker-driver record/consume (real microVM)
+        working-directory: tools/firecracker
+        env:
+          FC_BIN: /tmp/firecracker
+          FC_KERNEL: ${{ env.IMG }}/vmlinux-${{ env.KERNEL_VER }}
+          FC_STORE: ${{ env.STORE }}
+          FC_GUEST_ADDR: ${{ env.GUEST_ADDR }}
+          FC_GUEST_KEY: /tmp/fc_guest
+          FC_TAP: ${{ env.TAP }}
+          FC_WORKSPACE: /work
+          FC_BASE_SHA: ${{ steps.ws.outputs.base }}
+          FC_TARGET_SHA: ${{ steps.ws.outputs.target }}
+          FC_BAZEL: /usr/local/bin/bazel
+          FC_BAZEL_DIFF: bazel-diff
+          FC_OUT: ${{ env.FC_OUT }}
+          FC_MEM_MIB: ${{ inputs.mem_mib }}
+          FC_VCPUS: '2'
+        run: |
+          mkdir -p "$FC_STORE"
+          go test -tags fcintegration -run TestFirecrackerRecordConsume -v -timeout 25m ./...
+          sort -o "$FC_OUT" "$FC_OUT"
+          echo "firecracker impacted: $(wc -l < "$FC_OUT") targets"
+
+      - name: Assert snapshot-consumed == cold (RFC §5.3 correctness canary)
+        run: |
+          test -s "$FC_OUT" || { echo "::error::firecracker impacted set is empty" >&2; exit 1; }
+          if ! diff -u /tmp/impacted.local.txt "$FC_OUT"; then
+            echo "::error::snapshot-consumed impacted set differs from the cold/local set" >&2
+            exit 1
+          fi
+          echo "PASS: firecracker-consumed impacted set is byte-identical to the cold/local set ($(wc -l < "$FC_OUT") targets)"
+
+      - name: Upload impacted sets
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: firecracker-e2e-impacted
+          path: |
+            /tmp/impacted.local.txt
+            /mnt/fc/impacted.fc.txt
+            /tmp/gen.json
+          if-no-files-found: warn
+
+      - name: Tear down TAP
+        if: always()
+        run: sudo ip link del "$TAP" 2>/dev/null || true

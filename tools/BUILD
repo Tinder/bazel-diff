@@ -19,11 +19,11 @@ genrule(
 py_binary(
     name = "generate-readme",
     srcs = ["generate_readme.py"],
-    main = "generate_readme.py",
     data = [
-        ":cli_help_output",
         "readme_template.md",
+        ":cli_help_output",
     ],
+    main = "generate_readme.py",
     python_version = "PY3",
 )
 

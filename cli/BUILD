@@ -31,14 +31,14 @@ kt_jvm_library(
     srcs = glob(["src/main/kotlin/**/*.kt"]),
     resources = [":version_file"],
     deps = [
+        "//proto:analysis_v2_java_proto",
+        "//proto:build_java_proto",
         "@bazel_diff_maven//:com_google_code_gson_gson",
         "@bazel_diff_maven//:com_google_guava_guava",
         "@bazel_diff_maven//:info_picocli_picocli",
         "@bazel_diff_maven//:io_insert_koin_koin_core_jvm",
         "@bazel_diff_maven//:org_apache_commons_commons_pool2",
         "@bazel_diff_maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core_jvm",
-        "//proto:analysis_v2_java_proto",
-        "//proto:build_java_proto",
     ],
 )
 
@@ -213,6 +213,6 @@ filegroup(
 java_binary(
     name = "ktfmt",
     main_class = "com.facebook.ktfmt.cli.Main",
-    runtime_deps = ["@ktfmt//jar"],
     visibility = ["//cli/format:__pkg__"],
+    runtime_deps = ["@ktfmt//jar"],
 )

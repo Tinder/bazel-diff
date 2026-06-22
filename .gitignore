@@ -38,3 +38,6 @@ coverage-html/
 
 # Firecracker benchmark harness outputs
 .bench-results/
+
+# Go orchestrator build output (go build . in tools/firecracker)
+/tools/firecracker/firecracker

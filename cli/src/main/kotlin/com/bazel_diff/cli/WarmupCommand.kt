@@ -53,6 +53,16 @@ class WarmupCommand : GenerateHashesCommand() {
       return genResult
     }
 
+    writeFingerprint()
+    return CommandLine.ExitCode.OK
+  }
+
+  /**
+   * Computes the fingerprint over the current flag set + workspace and writes it to
+   * [fingerprintOutputPath]. Split out of [call] so it is unit-testable without the bazel-backed
+   * `generate-hashes` run that [call] performs via `super.call()`.
+   */
+  fun writeFingerprint() {
     val flags =
         FingerprintGatherer.canonicalizeFlags(
             bazelStartupOptions = bazelStartupOptions,
@@ -78,7 +88,5 @@ class WarmupCommand : GenerateHashesCommand() {
 
     fingerprintOutputPath.parentFile?.mkdirs()
     fingerprintOutputPath.writeText(renderFingerprintJson(result, inputs.flags) + "\n")
-
-    return CommandLine.ExitCode.OK
   }
 }

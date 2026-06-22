@@ -109,6 +109,24 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "FingerprintGathererTest",
+    test_class = "com.bazel_diff.cli.FingerprintGathererTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "FingerprintCommandTest",
+    test_class = "com.bazel_diff.cli.FingerprintCommandTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "WarmupCommandTest",
+    test_class = "com.bazel_diff.cli.WarmupCommandTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "BazelRuleTest",
     test_class = "com.bazel_diff.bazel.BazelRuleTest",
     runtime_deps = [":cli-test-lib"],

@@ -64,6 +64,9 @@ func TestFCClientCalls(t *testing.T) {
 	if err := c.pause(); err != nil {
 		t.Fatal(err)
 	}
+	if err := c.resume(); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.createSnapshot(snapshotCreate{SnapshotType: "Full", SnapshotPath: "/v", MemFilePath: "/m"}); err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +82,8 @@ func TestFCClientCalls(t *testing.T) {
 		{"PUT", "/drives/rootfs"},
 		{"PUT", "/network-interfaces/eth0"},
 		{"PUT", "/actions"},
-		{"PATCH", "/vm"},
+		{"PATCH", "/vm"}, // pause
+		{"PATCH", "/vm"}, // resume
 		{"PUT", "/snapshot/create"},
 		{"PUT", "/snapshot/load"},
 	}

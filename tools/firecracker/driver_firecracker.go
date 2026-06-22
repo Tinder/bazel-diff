@@ -36,6 +36,10 @@ type fcDriver struct {
 	// guestSnapDir is where warmup writes base_hashes.json / fingerprint.json
 	// inside the guest (matches the CLI defaults under /snap).
 	guestSnapDir string
+
+	// pollInterval is how often waitForGuest retries the guest; 0 => 2s default.
+	// Overridable so tests don't sleep seconds.
+	pollInterval time.Duration
 }
 
 // netConfig is the guest networking the driver attaches: a virtio-net device
@@ -157,19 +161,7 @@ func (d fcDriver) record(r recordRequest) error {
 		return fmt.Errorf("guest unreachable after boot: %w", err)
 	}
 
-	// Inside the guest: check out the base revision, then warm the server, baking
-	// base_hashes.json + fingerprint.json. The checkout mirrors localDriver.record
-	// (and consume's target checkout) so the baked hashes are for the base SHA
-	// regardless of what revision the image happens to be baked at.
-	warmup := strings.Join([]string{
-		fmt.Sprintf("git -C %s checkout --force --quiet %s", r.Workspace, r.BaseSHA),
-		fmt.Sprintf("bazel-diff warmup -w %s -b %s --base-hashes %s --fingerprint-output %s %s",
-			r.Workspace, r.Bazel,
-			filepath.Join(d.guestSnapDir, baseHashesName),
-			filepath.Join(d.guestSnapDir, fingerprintName),
-			strings.Join(r.Flags, " ")),
-	}, " && ")
-	if err := d.guest.exec(warmup); err != nil {
+	if err := d.guest.exec(d.warmupCommand(r)); err != nil {
 		return fmt.Errorf("guest warmup: %w", err)
 	}
 	// Copy the artifacts out for host-side bookkeeping + cold-fallback reuse.
@@ -230,20 +222,10 @@ func (d fcDriver) consume(r consumeRequest) error {
 		return fmt.Errorf("guest unreachable after restore: %w", err)
 	}
 
-	guestTarget := filepath.Join(d.guestSnapDir, "target_hashes.json")
-	guestOut := filepath.Join(d.guestSnapDir, "impacted.txt")
-	script := strings.Join([]string{
-		fmt.Sprintf("git -C %s checkout --force --quiet %s", r.Workspace, r.TargetSHA),
-		fmt.Sprintf("bazel-diff generate-hashes -w %s -b %s %s %s",
-			r.Workspace, r.Bazel, guestTarget, strings.Join(r.Flags, " ")),
-		fmt.Sprintf("bazel-diff get-impacted-targets -w %s -b %s -sh %s -fh %s -o %s",
-			r.Workspace, r.Bazel,
-			filepath.Join(d.guestSnapDir, baseHashesName), guestTarget, guestOut),
-	}, " && ")
-	if err := d.guest.exec(script); err != nil {
+	if err := d.guest.exec(d.consumeScript(r)); err != nil {
 		return fmt.Errorf("guest consume: %w", err)
 	}
-	return d.guest.copyOut(guestOut, r.Out)
+	return d.guest.copyOut(d.guestImpactedPath(), r.Out)
 }
 
 // ensureTapExists verifies the host TAP is present before a restore. TAP setup
@@ -261,15 +243,53 @@ func ensureTapExists(tap string) error {
 // command succeeds, so callers don't race the guest's boot (record) or its
 // snapshot-resume (consume) before sshd is serving connections.
 func (d fcDriver) waitForGuest(timeout time.Duration) error {
+	interval := d.pollInterval
+	if interval == 0 {
+		interval = 2 * time.Second
+	}
 	deadline := time.Now().Add(timeout)
 	var last error
 	for time.Now().Before(deadline) {
 		if last = d.guest.exec("true"); last == nil {
 			return nil
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(interval)
 	}
 	return fmt.Errorf("not reachable within %s: %w", timeout, last)
+}
+
+// warmupCommand is the shell run in the guest at record time: check out the base
+// revision, then `bazel-diff warmup` to bake base_hashes.json + fingerprint.json.
+// The checkout mirrors localDriver.record (and consume's target checkout) so the
+// baked hashes are for the base SHA regardless of the image's baked revision.
+func (d fcDriver) warmupCommand(r recordRequest) string {
+	return strings.Join([]string{
+		fmt.Sprintf("git -C %s checkout --force --quiet %s", r.Workspace, r.BaseSHA),
+		fmt.Sprintf("bazel-diff warmup -w %s -b %s --base-hashes %s --fingerprint-output %s %s",
+			r.Workspace, r.Bazel,
+			filepath.Join(d.guestSnapDir, baseHashesName),
+			filepath.Join(d.guestSnapDir, fingerprintName),
+			strings.Join(r.Flags, " ")),
+	}, " && ")
+}
+
+func (d fcDriver) guestImpactedPath() string {
+	return filepath.Join(d.guestSnapDir, "impacted.txt")
+}
+
+// consumeScript is the shell run in the restored guest: check out the target
+// revision, generate-hashes for it, then get-impacted-targets against the baked
+// base hashes, writing the impacted list to the in-guest path copied out after.
+func (d fcDriver) consumeScript(r consumeRequest) string {
+	guestTarget := filepath.Join(d.guestSnapDir, "target_hashes.json")
+	return strings.Join([]string{
+		fmt.Sprintf("git -C %s checkout --force --quiet %s", r.Workspace, r.TargetSHA),
+		fmt.Sprintf("bazel-diff generate-hashes -w %s -b %s %s %s",
+			r.Workspace, r.Bazel, guestTarget, strings.Join(r.Flags, " ")),
+		fmt.Sprintf("bazel-diff get-impacted-targets -w %s -b %s -sh %s -fh %s -o %s",
+			r.Workspace, r.Bazel,
+			filepath.Join(d.guestSnapDir, baseHashesName), guestTarget, d.guestImpactedPath()),
+	}, " && ")
 }
 
 func (d fcDriver) baseRootfs() string {

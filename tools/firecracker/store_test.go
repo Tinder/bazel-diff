@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // makeLinearRepo creates a git repo with n commits and returns workspace + SHAs
@@ -53,6 +55,69 @@ func writeSnapshot(t *testing.T, store, fp, baseSHA string) {
 	}
 	if err := os.WriteFile(filepath.Join(dir, baseHashesName), []byte("{}"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNewEntryAndPaths(t *testing.T) {
+	store := t.TempDir()
+	e, err := newEntry(store, "fp1", "sha1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(e.Dir); err != nil {
+		t.Fatalf("newEntry should create the dir: %v", err)
+	}
+	checks := map[string]string{
+		e.memFile():    memFileName,
+		e.vmstate():    vmstateName,
+		e.rootfs():     rootfsName,
+		e.baseHashes(): baseHashesName,
+		e.metadata():   metadataName,
+	}
+	for got, suffix := range checks {
+		if filepath.Base(got) != suffix {
+			t.Fatalf("path %q should end in %q", got, suffix)
+		}
+		if filepath.Dir(got) != e.Dir {
+			t.Fatalf("path %q should live under the entry dir %q", got, e.Dir)
+		}
+	}
+}
+
+func TestWriteMetadata(t *testing.T) {
+	store := t.TempDir()
+	e, _ := newEntry(store, "fp1", "sha1")
+	now := time.Unix(1700000000, 0)
+	if err := writeMetadata(e, metadata{Fingerprint: "fp1", BazelVersion: "8.5.1"}, now); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(e.metadata())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m metadata
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Fingerprint != "fp1" || m.BaseSHA != "sha1" || m.BazelVersion != "8.5.1" {
+		t.Fatalf("metadata fields wrong: %+v", m)
+	}
+	if m.CreatedAtUnix != 1700000000 || m.CreatedAtString == "" {
+		t.Fatalf("metadata timestamps wrong: %+v", m)
+	}
+}
+
+func TestMustAbs(t *testing.T) {
+	abs, err := mustAbs("relative/path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(abs) {
+		t.Fatalf("mustAbs should return an absolute path, got %q", abs)
+	}
+	already := "/already/abs"
+	if got, _ := mustAbs(already); got != already {
+		t.Fatalf("mustAbs of an absolute path should be unchanged, got %q", got)
 	}
 }
 

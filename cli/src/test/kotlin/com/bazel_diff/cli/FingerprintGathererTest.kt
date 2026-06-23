@@ -42,8 +42,17 @@ class FingerprintGathererTest {
   fun canonicalizeFlagsIsOrderIndependentForSets() {
     fun build(tt: Set<String>) =
         FingerprintGatherer.canonicalizeFlags(
-            emptyList(), emptyList(), emptyList(), false, null, false, tt,
-            emptySet(), emptySet(), false, true)
+            emptyList(),
+            emptyList(),
+            emptyList(),
+            false,
+            null,
+            false,
+            tt,
+            emptySet(),
+            emptySet(),
+            false,
+            true)
     assertThat(build(linkedSetOf("a", "b", "c"))).isEqualTo(build(linkedSetOf("c", "a", "b")))
   }
 
@@ -63,8 +72,7 @@ class FingerprintGathererTest {
     val bazel = fakeBazel("Build label: 8.5.1")
 
     val flags = mapOf("useCquery" to "false")
-    val inputs =
-        FingerprintGatherer.gather(ws.toPath(), bazel.toPath(), "26.0.1", flags)
+    val inputs = FingerprintGatherer.gather(ws.toPath(), bazel.toPath(), "26.0.1", flags)
 
     assertThat(inputs.bazelVersion).isEqualTo("8.5.1")
     assertThat(inputs.bazelDiffVersion).isEqualTo("26.0.1")

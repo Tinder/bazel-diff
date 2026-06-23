@@ -44,7 +44,8 @@ class FingerprintCommandTest {
     val a = File(temp.root, "a.json")
     val b = File(temp.root, "b.json")
     command(ws).apply { outputPath = a }.call()
-    command(ws).apply {
+    command(ws)
+        .apply {
           outputPath = b
           useCquery = true
         }

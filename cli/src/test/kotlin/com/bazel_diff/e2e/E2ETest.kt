@@ -2091,6 +2091,105 @@ class E2ETest {
   }
 
   // ------------------------------------------------------------------------
+  // Hermetic fine-grained external-repo hashing across workspaces
+  // ------------------------------------------------------------------------
+  // bazel-diff is only useful for distributed CI if the "from" hashes can be computed on one agent
+  // and the "to" hashes on another. That requires generate-hashes to be hermetic: byte-identical
+  // sources must hash identically regardless of the absolute workspace path or the per-workspace
+  // Bazel output base (which Bazel derives from the workspace path and which, on real agents,
+  // embeds machine-specific directories like `/var/lib/buildkite-agent/builds/<agent>-<instance>/`).
+  //
+  // This test exercises the FINE-GRAINED external-repo path specifically: with
+  // `--fineGrainedHashExternalRepos @inner_repo`, the individual targets inside @inner_repo are
+  // hashed -- including the source file @inner_repo//:data.txt, which flows through
+  // SourceFileHasher (the path made portable by #385). It checks out the same `wrapped_external_repo`
+  // fixture at two different absolute paths (each gets its own output base) and asserts the
+  // fine-grained target hashes are identical.
+  //
+  // The synthetic //external:* blob targets are excluded from the comparison: they are a separate,
+  // non-fine-grained representation built from `bazel mod show_repo`, and for local_path_override
+  // repos their `path` attribute can carry an absolute, machine-specific location. That is a
+  // distinct concern from the fine-grained hashing under test here.
+
+  /**
+   * Parses a generate-hashes output file and returns the inner target => hash map, handling both
+   * the `{"hashes": {...}, "metadata": {...}}` (bzlmod) and the legacy flat `{...}` formats.
+   */
+  private fun readHashesMap(file: File): Map<String, Any> {
+    val parsed = Gson().fromJson(file.readText(), com.google.gson.JsonObject::class.java)
+    val hashesObj = if (parsed.has("hashes")) parsed.getAsJsonObject("hashes") else parsed
+    return Gson().fromJson(hashesObj, object : TypeToken<Map<String, Any>>() {}.type)
+  }
+
+  @Test
+  fun testFineGrainedExternalRepoHashesAreHermeticAcrossWorkspacePaths() {
+    val version = getBazelVersion()
+    org.junit.Assume.assumeNotNull(version)
+    val v = version!!
+    val comparator =
+        compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+    val hasModShowRepo = comparator.compare(v, Triple(8, 6, 0)) >= 0 && v != Triple(9, 0, 0)
+    org.junit.Assume.assumeTrue(
+        "Requires Bazel 8.6.0+ or 9.0.1+ (current: ${v.first}.${v.second}.${v.third})",
+        hasModShowRepo)
+
+    // Two checkouts of byte-identical sources at different absolute paths -- standing in for the
+    // same commit on two different CI agents.
+    val machineX = copyTestWorkspace("wrapped_external_repo")
+    val machineY = copyTestWorkspace("wrapped_external_repo")
+
+    val outputDir = temp.newFolder()
+    val hashesX = File(outputDir, "fine_grained_machine_x.json")
+    val hashesY = File(outputDir, "fine_grained_machine_y.json")
+
+    val fineGrained = "@inner_repo"
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w",
+                machineX.absolutePath,
+                "-b",
+                "bazel",
+                "--fineGrainedHashExternalRepos",
+                fineGrained,
+                hashesX.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w",
+                machineY.absolutePath,
+                "-b",
+                "bazel",
+                "--fineGrainedHashExternalRepos",
+                fineGrained,
+                hashesY.absolutePath))
+        .isEqualTo(0)
+
+    val mapX = readHashesMap(hashesX).filterKeys { !it.startsWith("//external:") }
+    val mapY = readHashesMap(hashesY).filterKeys { !it.startsWith("//external:") }
+
+    // Sanity: the fine-grained external repo's source file must actually be in the hashed set, so
+    // an empty-vs-empty comparison can't masquerade as success and we know the path under test is
+    // covered.
+    assertThat(mapX.keys.any { it.contains("inner_repo") && it.contains("data.txt") })
+        .transform(
+            "expected a fine-grained @inner_repo source target (data.txt) in hashes; got keys: ${mapX.keys.sorted()}") {
+              it
+            }
+        .isEqualTo(true)
+
+    assertTargetsMatch(mapX.keys, mapY.keys, "fine-grained hermetic hashes (key sets)")
+    assertThat(mapX)
+        .transform(
+            "fine-grained external-repo hashes computed at different workspace paths must be identical") {
+              it
+            }
+        .isEqualTo(mapY)
+  }
+
+  // ------------------------------------------------------------------------
   // Regression coverage for https://github.com/Tinder/bazel-diff/issues/365
   // ------------------------------------------------------------------------
   // The user reported that after upgrading bazel-diff (12.0.0 -> 25.0.0), ADDING (or editing) a

@@ -123,6 +123,16 @@ Commands:
                           Target in the provided workspace.
   get-impacted-targets  Command-line utility to analyze the state of the bazel
                           build graph
+  warmup                Record-side entrypoint for Firecracker snapshots: runs
+                          generate-hashes for the base revision, writes base
+                          hashes + fingerprint to known paths, and exits 0 only
+                          once the Bazel server is warm (the host's 'safe to
+                          snapshot' signal).
+  fingerprint           Computes the snapshot cache key over the inputs that
+                          affect the build graph (bazel version, MODULE.bazel.
+                          lock, .bazelrc, bazel-diff version, flag set) and
+                          writes it as JSON. Used to decide whether a
+                          Firecracker snapshot is safe to consume.
 ```
 
 ### `generate-hashes` command
@@ -335,7 +345,7 @@ First, add the following snippet to your project:
 #### Bzlmod snippet
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "27.0.0")
+bazel_dep(name = "bazel-diff", version = "28.0.0")
 ```
 
 You can now run the tool with:
@@ -458,13 +468,13 @@ bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
     <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="eric wang"/><br/><sub><b>eric wang</b></sub></a></td>
     <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="Eric Wang"/><br/><sub><b>Eric Wang</b></sub></a></td>
     <td align="center"><a href="https://github.com/tgeng"><img src="https://avatars.githubusercontent.com/u/29584386?s=64" width="64" alt="Tianyu Geng"/><br/><sub><b>Tianyu Geng</b></sub></a></td>
-    <td align="center"><a href="https://github.com/BalestraPatrick"><img src="https://avatars.githubusercontent.com/u/3658887?s=64" width="64" alt="Patrick Balestra"/><br/><sub><b>Patrick Balestra</b></sub></a></td>
+    <td align="center"><a href="https://github.com/github-actions[bot]"><img src="https://avatars.githubusercontent.com/in/15368?s=64" width="64" alt="github-actions[bot]"/><br/><sub><b>github-actions[bot]</b></sub></a></td>
   </tr>
   <tr>
+    <td align="center"><a href="https://github.com/BalestraPatrick"><img src="https://avatars.githubusercontent.com/u/3658887?s=64" width="64" alt="Patrick Balestra"/><br/><sub><b>Patrick Balestra</b></sub></a></td>
     <td align="center"><a href="https://github.com/purkhusid"><img src="https://avatars.githubusercontent.com/u/5622403?s=64" width="64" alt="Daniel P. Purkhus"/><br/><sub><b>Daniel P. Purkhus</b></sub></a></td>
     <td align="center"><a href="https://github.com/alexeagle"><img src="https://avatars.githubusercontent.com/u/47395?s=64" width="64" alt="Alex Eagle"/><br/><sub><b>Alex Eagle</b></sub></a></td>
     <td align="center"><a href="https://github.com/Malinskiy"><img src="https://avatars.githubusercontent.com/u/2089114?s=64" width="64" alt="Anton Malinskiy"/><br/><sub><b>Anton Malinskiy</b></sub></a></td>
-    <td align="center"><a href="https://github.com/github-actions[bot]"><img src="https://avatars.githubusercontent.com/in/15368?s=64" width="64" alt="github-actions[bot]"/><br/><sub><b>github-actions[bot]</b></sub></a></td>
     <td align="center"><a href="https://github.com/rdark"><img src="https://avatars.githubusercontent.com/u/260691?s=64" width="64" alt="rdark"/><br/><sub><b>rdark</b></sub></a></td>
     <td align="center"><a href="https://github.com/thirtyseven"><img src="https://avatars.githubusercontent.com/u/123678?s=64" width="64" alt="Ted Kaplan"/><br/><sub><b>Ted Kaplan</b></sub></a></td>
   </tr>

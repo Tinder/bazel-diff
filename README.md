@@ -161,9 +161,11 @@ workspace.
                             when invoking `bazel query`
       --contentHashPath=<contentHashPath>
                           Path to content hash json file. It's a map which maps
-                            relative file path from workspace path to its
-                            content hash. Files in this map will skip content
-                            hashing and use provided value
+                            a workspace-relative file path (and
+                            `external/<repoName>/<path>` for fine-grained
+                            external repo files) to its content hash. Files in
+                            this map will skip content hashing and use provided
+                            value
       --cqueryCommandOptions=<cqueryCommandOptions>
                           Additional space separated Bazel command options used
                             when invoking `bazel cquery`. This flag is has no

@@ -66,29 +66,37 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
     return sha256 {
       val name = sourceFileTarget.name
       val index = isMainRepo(name)
-      val filenamePath =
-          if (index != -1) {
-            val filenameSubstring = name.substring(index)
-            Paths.get(filenameSubstring.removePrefix(":").replace(':', '/'))
-          } else if (name.startsWith("@")) {
-            val parts = name.replaceFirst("@+".toRegex(), "").split("//")
-            if (parts.size != 2) {
-              logger.w { "Invalid source label $name" }
-              return@sha256
-            }
-            val repoName = parts[0]
-            if (repoName !in fineGrainedHashExternalRepoNames) {
-              return@sha256
-            }
-            val relativePath = Paths.get(parts[1].removePrefix(":").replace(':', '/'))
-            val externalRepoRoot = externalRepoResolver.resolveExternalRepoRoot(repoName)
-            externalRepoRoot.resolve(relativePath)
-          } else {
-            return@sha256
-          }
-      val filenamePathString = filenamePath.toString()
-      if (relativeFilenameToContentHash?.contains(filenamePathString) == true) {
-        val contentHash = relativeFilenameToContentHash.getValue(filenamePathString)
+      // `filenamePath` locates the file on disk (absolute for external repos, since they live under
+      // the Bazel output base). `contentHashKey` is the key used to look the file up in a
+      // user-provided content-hash map and MUST stay workspace-relative / machine-independent so the
+      // map is portable across machines — the resolved external repo root is an absolute path under
+      // the output base (which embeds machine-specific components like the build-agent dir), so it
+      // must never be used as the lookup key.
+      val filenamePath: Path
+      val contentHashKey: String
+      if (index != -1) {
+        val filenameSubstring = name.substring(index)
+        filenamePath = Paths.get(filenameSubstring.removePrefix(":").replace(':', '/'))
+        contentHashKey = filenamePath.toString()
+      } else if (name.startsWith("@")) {
+        val parts = name.replaceFirst("@+".toRegex(), "").split("//")
+        if (parts.size != 2) {
+          logger.w { "Invalid source label $name" }
+          return@sha256
+        }
+        val repoName = parts[0]
+        if (repoName !in fineGrainedHashExternalRepoNames) {
+          return@sha256
+        }
+        val relativePath = Paths.get(parts[1].removePrefix(":").replace(':', '/'))
+        val externalRepoRoot = externalRepoResolver.resolveExternalRepoRoot(repoName)
+        filenamePath = externalRepoRoot.resolve(relativePath)
+        contentHashKey = Paths.get("external", repoName).resolve(relativePath).toString()
+      } else {
+        return@sha256
+      }
+      if (relativeFilenameToContentHash?.contains(contentHashKey) == true) {
+        val contentHash = relativeFilenameToContentHash.getValue(contentHashKey)
         safePutBytes(contentHash.toByteArray())
         putBytes(byteArrayOf(0x01))
         val absoluteFilePath = workingDirectory.resolve(filenamePath)

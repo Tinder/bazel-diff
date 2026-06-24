@@ -107,6 +107,35 @@ internal class SourceFileHasherTest : KoinTest {
   }
 
   @Test
+  fun testHashExternalRepoWithProvidedContentHash() = runBlocking {
+    // The content-hash map key for an external-repo file must be the workspace-stable
+    // `external/<repoName>/<relativePath>` form, NOT the absolute path under the (machine-specific)
+    // Bazel output base. Otherwise a content-hash map generated on one machine never matches on
+    // another.
+    val externalRepoFilePath = outputBasePath.resolve("external/external_repo/path/to/my_file.txt")
+    Files.createDirectories(externalRepoFilePath.parent)
+    externalRepoFilePath.toFile().writeText("on disk content that must be ignored")
+    val externalRepoFileTarget = "@external_repo//path/to:my_file.txt"
+    val filenameToContentHash =
+        hashMapOf("external/external_repo/path/to/my_file.txt" to "external-content-hash")
+    val hasher =
+        SourceFileHasherImpl(
+            repoAbsolutePath, filenameToContentHash, externalRepoResolver, setOf("external_repo"))
+    val bazelSourceFileTarget = BazelSourceFileTarget(externalRepoFileTarget, seed)
+    val actual = hasher.digest(bazelSourceFileTarget).toHexString()
+    val expected =
+        sha256 {
+              safePutBytes("external-content-hash".toByteArray())
+              putBytes(byteArrayOf(0x01))
+              putBytes(byteArrayOf(0x00)) // writeText creates a non-executable file
+              safePutBytes(seed)
+              safePutBytes(externalRepoFileTarget.toByteArray())
+            }
+            .toHexString()
+    assertThat(actual).isEqualTo(expected)
+  }
+
+  @Test
   fun testSoftHashConcreteFile() = runBlocking {
     val hasher = SourceFileHasherImpl(repoAbsolutePath, null, externalRepoResolver)
     val bazelSourceFileTarget = BazelSourceFileTarget(fixtureFileTarget, seed)

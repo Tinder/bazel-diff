@@ -45,7 +45,7 @@ open class GenerateHashesCommand : Callable<Int> {
       names = ["--contentHashPath"],
       description =
           [
-              "Path to content hash json file. It's a map which maps relative file path from workspace path to its content hash. Files in this map will skip content hashing and use provided value"],
+              "Path to content hash json file. It's a map which maps a workspace-relative file path (and `external/<repoName>/<path>` for fine-grained external repo files) to its content hash. Files in this map will skip content hashing and use provided value"],
       scope = CommandLine.ScopeType.INHERIT,
       required = false)
   var contentHashPath: File? = null

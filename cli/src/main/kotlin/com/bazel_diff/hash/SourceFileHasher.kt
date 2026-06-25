@@ -68,7 +68,8 @@ class SourceFileHasherImpl : KoinComponent, SourceFileHasher {
       val index = isMainRepo(name)
       // `filenamePath` locates the file on disk (absolute for external repos, since they live under
       // the Bazel output base). `contentHashKey` is the key used to look the file up in a
-      // user-provided content-hash map and MUST stay workspace-relative / machine-independent so the
+      // user-provided content-hash map and MUST stay workspace-relative / machine-independent so
+      // the
       // map is portable across machines — the resolved external repo root is an absolute path under
       // the output base (which embeds machine-specific components like the build-agent dir), so it
       // must never be used as the lookup key.

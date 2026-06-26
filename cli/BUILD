@@ -212,6 +212,48 @@ kt_jvm_test(
     ],
 )
 
+kt_jvm_test(
+    name = "ServeCommandTest",
+    test_class = "com.bazel_diff.cli.ServeCommandTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "LocalDiskHashCacheStorageTest",
+    test_class = "com.bazel_diff.server.LocalDiskHashCacheStorageTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "GitClientTest",
+    test_class = "com.bazel_diff.server.GitClientTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "HashServiceTest",
+    jvm_flags = [
+        "-Dnet.bytebuddy.experimental=true",
+    ],
+    test_class = "com.bazel_diff.server.HashServiceTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "ImpactedTargetsServiceTest",
+    jvm_flags = [
+        "-Dnet.bytebuddy.experimental=true",
+    ],
+    test_class = "com.bazel_diff.server.ImpactedTargetsServiceTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "BazelDiffServerTest",
+    test_class = "com.bazel_diff.server.BazelDiffServerTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
 kt_jvm_library(
     name = "cli-test-lib",
     testonly = True,

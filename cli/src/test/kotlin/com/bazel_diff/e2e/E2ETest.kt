@@ -154,6 +154,108 @@ class E2ETest {
     testE2E(emptyList(), emptyList(), "/fixture/impacted_targets-1-2.txt")
   }
 
+  /**
+   * End-to-end coverage for the `serve` query service: builds a two-commit git repo from the
+   * shell-only `distance_metrics` workspace, runs `bazel-diff serve` in a background thread, then
+   * hits `/health` and `/impacted_targets` over real HTTP. Exercises the full
+   * [com.bazel_diff.cli.ServeCommand] path (Koin + hasher wiring, git checkout, real `bazel query`
+   * for both revisions, and the cache) the same way the other E2E tests cover the CLI commands.
+   */
+  @Test
+  fun testServeEndToEnd() {
+    val workspace = copyTestWorkspace("distance_metrics")
+    fun git(vararg args: String): String {
+      val proc =
+          ProcessBuilder(listOf("git") + args)
+              .directory(workspace)
+              .redirectErrorStream(true)
+              .start()
+      val output = proc.inputStream.readBytes().decodeToString()
+      check(proc.waitFor() == 0) { "git ${args.joinToString(" ")} failed: $output" }
+      return output.trim()
+    }
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "test")
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+    val fromSha = git("rev-parse", "HEAD")
+    File(workspace, "lib.sh").writeText("echo changed\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "change lib.sh")
+    val toSha = git("rev-parse", "HEAD")
+
+    val cacheDir = temp.newFolder()
+    val port = java.net.ServerSocket(0).use { it.localPort }
+
+    val serveThread =
+        Thread {
+              CommandLine(BazelDiff())
+                  .execute(
+                      "serve",
+                      "-w",
+                      workspace.absolutePath,
+                      "-b",
+                      "bazel",
+                      "--cacheDir",
+                      cacheDir.absolutePath,
+                      "--port",
+                      port.toString(),
+                      "--no-initial-fetch")
+            }
+            .apply {
+              isDaemon = true
+              start()
+            }
+
+    try {
+      awaitServeHealthy(port)
+      val (code, body) =
+          httpGetServe("http://localhost:$port/impacted_targets?from=$fromSha&to=$toSha")
+      assertThat(code).isEqualTo(200)
+
+      val parsed: Map<String, Any> =
+          Gson().fromJson(body, object : TypeToken<Map<String, Any>>() {}.type)
+      assertThat(parsed["from"]).isEqualTo(fromSha)
+      assertThat(parsed["to"]).isEqualTo(toSha)
+      @Suppress("UNCHECKED_CAST") val impacted = parsed["impactedTargets"] as List<String>
+      // Editing lib.sh must impact at least its own sh_library target.
+      assertThat(impacted.contains("//:lib")).isEqualTo(true)
+    } finally {
+      serveThread.interrupt()
+      serveThread.join(10_000)
+    }
+  }
+
+  /** Polls `/health` until it returns 200, up to ~30s, failing the test otherwise. */
+  private fun awaitServeHealthy(port: Int) {
+    repeat(60) {
+      try {
+        if (httpGetServe("http://localhost:$port/health").first == 200) return
+      } catch (_: Exception) {
+        // server not up yet
+      }
+      Thread.sleep(500)
+    }
+    throw AssertionError("serve /health never became ready on port $port")
+  }
+
+  private fun httpGetServe(url: String): Pair<Int, String> {
+    val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+    conn.requestMethod = "GET"
+    conn.connectTimeout = 5_000
+    // Generous read timeout: a cold /impacted_targets runs `bazel query` twice.
+    conn.readTimeout = 300_000
+    return try {
+      val code = conn.responseCode
+      val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+      val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+      code to text
+    } finally {
+      conn.disconnect()
+    }
+  }
+
   @Test
   fun testDetermineBazelVersion() {
     // E2E coverage for BazelQueryService.determineBazelVersion(): version is resolved lazily
@@ -1504,11 +1606,21 @@ class E2ETest {
     val cli = CommandLine(BazelDiff())
     assertThat(
             cli.execute(
-                "generate-hashes", "-w", machineX.absolutePath, "-b", "bazel", hashesX.absolutePath))
+                "generate-hashes",
+                "-w",
+                machineX.absolutePath,
+                "-b",
+                "bazel",
+                hashesX.absolutePath))
         .isEqualTo(0)
     assertThat(
             cli.execute(
-                "generate-hashes", "-w", machineY.absolutePath, "-b", "bazel", hashesY.absolutePath))
+                "generate-hashes",
+                "-w",
+                machineY.absolutePath,
+                "-b",
+                "bazel",
+                hashesY.absolutePath))
         .isEqualTo(0)
 
     val hashesMapX = parseHashesMap(hashesX)
@@ -2243,12 +2355,14 @@ class E2ETest {
   // and the "to" hashes on another. That requires generate-hashes to be hermetic: byte-identical
   // sources must hash identically regardless of the absolute workspace path or the per-workspace
   // Bazel output base (which Bazel derives from the workspace path and which, on real agents,
-  // embeds machine-specific directories like `/var/lib/buildkite-agent/builds/<agent>-<instance>/`).
+  // embeds machine-specific directories like
+  // `/var/lib/buildkite-agent/builds/<agent>-<instance>/`).
   //
   // This test exercises the FINE-GRAINED external-repo path specifically: with
   // `--fineGrainedHashExternalRepos @inner_repo`, the individual targets inside @inner_repo are
   // hashed -- including the source file @inner_repo//:data.txt, which flows through
-  // SourceFileHasher (the path made portable by #385). It checks out the same `wrapped_external_repo`
+  // SourceFileHasher (the path made portable by #385). It checks out the same
+  // `wrapped_external_repo`
   // fixture at two different absolute paths (each gets its own output base) and asserts the
   // fine-grained target hashes are identical.
   //

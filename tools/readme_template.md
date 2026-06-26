@@ -154,6 +154,10 @@ Notes and current limitations:
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
   so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.
+* Git operations run in-process via JGit by default (no `git` binary required). Pass
+  `--gitEngine=subprocess` to shell out to the `git` binary at `--gitPath` instead -- useful for
+  workspaces that depend on checkout filters or hooks that JGit does not run. Note that JGit only
+  moves the git plumbing in-process; the working tree is still materialized on disk for `bazel query`.
 * Hashes are cached on local disk via `--cacheDir` and survive restarts. The cache layer is
   pluggable behind a byte-oriented interface so a remote backend (e.g. S3) can be added without
   touching callers.

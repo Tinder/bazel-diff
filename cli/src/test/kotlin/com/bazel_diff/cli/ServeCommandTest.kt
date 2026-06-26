@@ -3,12 +3,15 @@ package com.bazel_diff.cli
 import assertk.assertThat
 import assertk.assertions.hasLength
 import assertk.assertions.isEqualTo
+import assertk.assertions.isInstanceOf
 import assertk.assertions.isNotEqualTo
 import com.bazel_diff.SilentLogger
 import com.bazel_diff.log.Logger
 import com.bazel_diff.server.GitClient
 import com.bazel_diff.server.GitClientException
 import com.bazel_diff.server.HashCacheStorage
+import com.bazel_diff.server.JGitClient
+import com.bazel_diff.server.ProcessGitClient
 import com.google.gson.GsonBuilder
 import java.net.HttpURLConnection
 import java.net.URL
@@ -126,6 +129,35 @@ class ServeCommandTest : KoinTest {
     cmd.seedFilepaths = seedFile
     assertThat(cmd.loadSeedFilepaths().map { it.toString() }.toSet())
         .isEqualTo(setOf("a/b.txt", "c/d.txt"))
+  }
+
+  @Test
+  fun createGitClientDefaultsToJGit() {
+    val cmd = command().apply { workspacePath = temp.newFolder().toPath() }
+    assertThat(cmd.createGitClient()).isInstanceOf(JGitClient::class)
+  }
+
+  @Test
+  fun createGitClientHonorsSubprocessEngine() {
+    val cmd =
+        command().apply {
+          workspacePath = temp.newFolder().toPath()
+          gitEngine = "subprocess"
+        }
+    assertThat(cmd.createGitClient()).isInstanceOf(ProcessGitClient::class)
+  }
+
+  @Test
+  fun createGitClientRejectsUnknownEngine() {
+    val cmd = ServeCommand()
+    // Wrapping in a CommandLine populates the @Spec field the ParameterException references.
+    picocli.CommandLine(cmd)
+    cmd.workspacePath = temp.newFolder().toPath()
+    cmd.cacheDir = temp.newFolder().toPath()
+    cmd.gitEngine = "bogus"
+    org.junit.Assert.assertThrows(picocli.CommandLine.ParameterException::class.java) {
+      cmd.createGitClient()
+    }
   }
 
   @Test

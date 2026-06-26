@@ -154,6 +154,10 @@ Notes and current limitations:
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
   so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.
+* Git operations run in-process via JGit by default (no `git` binary required). Pass
+  `--gitEngine=subprocess` to shell out to the `git` binary at `--gitPath` instead -- useful for
+  workspaces that depend on checkout filters or hooks that JGit does not run. Note that JGit only
+  moves the git plumbing in-process; the working tree is still materialized on disk for `bazel query`.
 * Hashes are cached on local disk via `--cacheDir` and survive restarts. The cache layer is
   pluggable behind a byte-oriented interface so a remote backend (e.g. S3) can be added without
   touching callers.
@@ -394,7 +398,8 @@ Usage: bazel-diff serve [-hkvV] [--[no-]excludeExternalTargets]
                         [-b=<bazelPath>] --cacheDir=<cacheDir>
                         [--cqueryExpression=<cqueryExpression>]
                         [--fineGrainedHashExternalReposFile=<fineGrainedHashExte
-                        rnalReposFile>] [--gitPath=<gitPath>] [--port=<port>]
+                        rnalReposFile>] [--gitEngine=<gitEngine>]
+                        [--gitPath=<gitPath>] [--port=<port>]
                         [-s=<seedFilepaths>] -w=<workspacePath>
                         [-co=<bazelCommandOptions>]...
                         [--cqueryCommandOptions=<cqueryCommandOptions>]...
@@ -429,7 +434,12 @@ targets between two git revisions, caching generated hashes per commit SHA.
                             A text file with a newline separated list of
                               external repos. Mutually exclusive with
                               --fineGrainedHashExternalRepos.
-      --gitPath=<gitPath>   Path to the git binary. Defaults to 'git' on the
+      --gitEngine=<gitEngine>
+                            Git backend: 'jgit' (in-process, no git binary
+                              required) or 'subprocess' (shells out to
+                              --gitPath). Defaults to 'jgit'.
+      --gitPath=<gitPath>   Path to the git binary, used only when
+                              --gitEngine=subprocess. Defaults to 'git' on the
                               PATH.
   -h, --help                Show this help message and exit.
       --ignoredRuleHashingAttributes=<ignoredRuleHashingAttributes>

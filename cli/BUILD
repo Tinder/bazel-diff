@@ -38,6 +38,7 @@ kt_jvm_library(
         "@bazel_diff_maven//:info_picocli_picocli",
         "@bazel_diff_maven//:io_insert_koin_koin_core_jvm",
         "@bazel_diff_maven//:org_apache_commons_commons_pool2",
+        "@bazel_diff_maven//:org_eclipse_jgit_org_eclipse_jgit",
         "@bazel_diff_maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core_jvm",
     ],
 )
@@ -227,6 +228,12 @@ kt_jvm_test(
 kt_jvm_test(
     name = "GitClientTest",
     test_class = "com.bazel_diff.server.GitClientTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "JGitClientTest",
+    test_class = "com.bazel_diff.server.JGitClientTest",
     runtime_deps = [":cli-test-lib"],
 )
 

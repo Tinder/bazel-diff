@@ -2426,6 +2426,112 @@ class E2ETest {
         .isEqualTo(true)
   }
 
+  // ------------------------------------------------------------------------
+  // Reproducer for https://github.com/Tinder/bazel-diff/issues/392
+  // ------------------------------------------------------------------------
+  // The user (ofats) asked for a way to filter targets out of the impacted-targets
+  // output:
+  //   1. Targets tagged `manual` -- bazel-diff calls `bazel query` under the hood and
+  //      surfaces manual targets like any other; there is no flag to drop them.
+  //   2. `test_suite` targets -- changing a single test inside a suite currently reports
+  //      the wrapping `test_suite` as impacted, with no way to exclude it.
+  //
+  // There is no correctness bug here -- including these targets is the current, intended
+  // behaviour. This test pins that behaviour so that whenever a filter flag is added
+  // (the maintainer floated `--excludeManual` / `--ignoredTargetLabels` / a raw
+  // `except`-query segment in the issue thread), there is a concrete starting point that
+  // documents what the output looks like today.
+  //
+  // The `manual_and_test_suite` fixture has:
+  //   - `//:lib`          (sh_library over lib.sh)
+  //   - `//:regular_test` (sh_test, deps = [:lib])
+  //   - `//:manual_test`  (sh_test, deps = [:lib], tags = ["manual"])
+  //   - `//:all_tests`    (test_suite wrapping :regular_test)
+  //
+  // Editing `lib.sh` impacts `:lib` and both tests; because `:regular_test` is impacted,
+  // the `:all_tests` test_suite is impacted too. The assertions below confirm the manual
+  // test and the test_suite are present in the default output -- i.e. there is currently
+  // no built-in way to exclude them.
+  //
+  // Requires Bazel 8.6.0+ (or 9.0.1+) for the bzlmod `mod graph` path, matching the
+  // convention used by the other bzlmod-based reproducers in this file.
+  @Test
+  fun testManualAndTestSuiteTargetsAppearInImpactedOutput_reproducerForIssue392() {
+    val version = getBazelVersion()
+    org.junit.Assume.assumeNotNull(version)
+    val v = version!!
+    val comparator =
+        compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+    val hasModShowRepo = comparator.compare(v, Triple(8, 6, 0)) >= 0 && v != Triple(9, 0, 0)
+    org.junit.Assume.assumeTrue(
+        "Requires Bazel 8.6.0+ or 9.0.1+ (current: ${v.first}.${v.second}.${v.third})",
+        hasModShowRepo)
+
+    val workspaceA = copyTestWorkspace("manual_and_test_suite")
+    val workspaceB = copyTestWorkspace("manual_and_test_suite")
+
+    // Change the shared library source in B. This impacts //:lib and every target that
+    // depends on it (both tests), and transitively the test_suite that wraps a changed test.
+    val libInB = File(workspaceB, "lib.sh")
+    libInB.writeText("#!/bin/sh\necho \"lib changed\"\n")
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceA.absolutePath,
+                "-b", "bazel",
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w", workspaceB.absolutePath,
+                "-b", "bazel",
+                "-sh", from.absolutePath,
+                "-fh", to.absolutePath,
+                "-o", impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+
+    // Sanity: the directly-changed library is impacted.
+    val libImpacted = impacted.any { it == "//:lib" || it == "@@//:lib" }
+    assertThat(libImpacted)
+        .transform("//:lib should be impacted when lib.sh changes; got: $impacted") { it }
+        .isEqualTo(true)
+
+    // #392 (1): the `manual`-tagged target is currently reported as impacted -- there is no
+    // flag to exclude it. When a filter is added, this is the line that should flip.
+    val manualImpacted = impacted.any { it == "//:manual_test" || it == "@@//:manual_test" }
+    assertThat(manualImpacted)
+        .transform(
+            "Documents #392: a `manual`-tagged target currently appears in the impacted-targets " +
+                "output with no way to exclude it. Got: $impacted") { it }
+        .isEqualTo(true)
+
+    // #392 (2): the wrapping `test_suite` is currently reported as impacted -- again with no
+    // flag to exclude it.
+    val suiteImpacted = impacted.any { it == "//:all_tests" || it == "@@//:all_tests" }
+    assertThat(suiteImpacted)
+        .transform(
+            "Documents #392: a `test_suite` wrapping a changed test currently appears in the " +
+                "impacted-targets output with no way to exclude it. Got: $impacted") { it }
+        .isEqualTo(true)
+  }
+
   private fun copyTestWorkspace(path: String): File {
     val testProject = temp.newFolder()
 

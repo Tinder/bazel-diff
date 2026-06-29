@@ -483,7 +483,7 @@ First, add the following snippet to your project:
 #### Bzlmod snippet
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "28.0.0")
+bazel_dep(name = "bazel-diff", version = "29.0.0")
 ```
 
 You can now run the tool with:

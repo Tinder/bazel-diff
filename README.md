@@ -107,6 +107,66 @@ This will produce an impacted targets json list with target label, target distan
 ]
 ```
 
+## Query Service (experimental)
+
+Instead of running `generate-hashes` from scratch on every CI invocation, you can run `bazel-diff` as
+a long-running HTTP service that answers affectedness queries between two git revisions and caches
+the generated hashes per commit SHA. This is the "bazel-diff as a service" model described in the
+[BazelCon talk](https://youtu.be/9Dk7mtIm7_A?t=1875) that inspired this repo (see
+[issue #29](https://github.com/Tinder/bazel-diff/issues/29)).
+
+Start the service against a dedicated git clone of your workspace:
+
+```bash
+bazel-diff serve \
+  --workspacePath /path/to/workspace-clone \
+  --bazelPath bazel \
+  --cacheDir /var/cache/bazel-diff \
+  --port 8080
+```
+
+On startup the service performs an initial `git fetch` and only then reports healthy. For each
+request it resolves the `from`/`to` revisions, generates (and caches, keyed by commit SHA) the hashes
+for each, and reuses the exact same affectedness logic as `get-impacted-targets`.
+
+Endpoints:
+
+* `GET /health` — returns `200 OK` once the initial fetch has completed, `503` otherwise. A load
+  balancer should use this to route only to ready instances. If a fatal git error occurs at startup
+  the instance "lame-ducks" itself by continuing to report `503` so the load balancer removes it.
+* `GET /impacted_targets?from=<rev>&to=<rev>` — returns the impacted targets as JSON. The optional
+  `targetType` parameter (e.g. `&targetType=Rule,SourceFile`) filters by target type.
+
+```bash
+curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
+```
+
+```json
+{
+  "from": "9a1c0e2…",
+  "to": "3f7b8d4…",
+  "impactedTargets": ["//foo:bar", "//foo:baz"]
+}
+```
+
+Notes and current limitations:
+
+* The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
+  working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
+  so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.
+* Git operations run in-process via JGit by default (no `git` binary required). Pass
+  `--gitEngine=subprocess` to shell out to the `git` binary at `--gitPath` instead -- useful for
+  workspaces that depend on checkout filters or hooks that JGit does not run. Note that JGit only
+  moves the git plumbing in-process; the working tree is still materialized on disk for `bazel query`.
+* Hashes are cached on local disk via `--cacheDir` and survive restarts. The cache layer is
+  pluggable behind a byte-oriented interface so a remote backend (e.g. S3) can be added without
+  touching callers.
+* Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
+  `generate-hashes`, and are folded into the cache key so a server started with different flags never
+  serves another configuration's cached hashes.
+* Containerization, multi-instance deployment manifests, and remote cache backends are not yet
+  included.
+
 <!-- BEGIN_SECTION: cli-help -->
 ## CLI Interface
 
@@ -133,6 +193,9 @@ Commands:
                           lock, .bazelrc, bazel-diff version, flag set) and
                           writes it as JSON. Used to decide whether a
                           Firecracker snapshot is safe to consume.
+  serve                 Runs bazel-diff as a long-running HTTP query service
+                          that returns the impacted targets between two git
+                          revisions, caching generated hashes per commit SHA.
 ```
 
 ### `generate-hashes` command
@@ -325,6 +388,81 @@ Command-line utility to analyze the state of the bazel build graph
   -w, --workspacePath=<workspacePath>
                          Path to Bazel workspace directory. Required for module
                            change detection.
+```
+
+### `serve` command
+
+```terminal
+Usage: bazel-diff serve [-hkvV] [--[no-]excludeExternalTargets]
+                        [--no-initial-fetch] [--[no-]useCquery]
+                        [-b=<bazelPath>] --cacheDir=<cacheDir>
+                        [--cqueryExpression=<cqueryExpression>]
+                        [--fineGrainedHashExternalReposFile=<fineGrainedHashExte
+                        rnalReposFile>] [--gitEngine=<gitEngine>]
+                        [--gitPath=<gitPath>] [--port=<port>]
+                        [-s=<seedFilepaths>] -w=<workspacePath>
+                        [-co=<bazelCommandOptions>]...
+                        [--cqueryCommandOptions=<cqueryCommandOptions>]...
+                        [--fineGrainedHashExternalRepos=<fineGrainedHashExternal
+                        Repos>]...
+                        [--ignoredRuleHashingAttributes=<ignoredRuleHashingAttri
+                        butes>]... [-so=<bazelStartupOptions>]...
+Runs bazel-diff as a long-running HTTP query service that returns the impacted
+targets between two git revisions, caching generated hashes per commit SHA.
+  -b, --bazelPath=<bazelPath>
+                            Path to Bazel binary. If not specified, the Bazel
+                              binary available in PATH will be used.
+      --cacheDir=<cacheDir> Directory where generated hashes are cached per
+                              commit SHA. Persists across restarts.
+      -co, --bazelCommandOptions=<bazelCommandOptions>
+                            Additional space separated Bazel command options
+                              used when invoking `bazel query`
+      --cqueryCommandOptions=<cqueryCommandOptions>
+                            Additional space separated Bazel command options
+                              used when invoking `bazel cquery`. No effect
+                              unless --useCquery is set.
+      --cqueryExpression=<cqueryExpression>
+                            Custom cquery expression to use instead of the
+                              default. No effect unless --useCquery.
+      --[no-]excludeExternalTargets
+                            If true, exclude external targets (do not query
+                              //external:all-targets).
+      --fineGrainedHashExternalRepos=<fineGrainedHashExternalRepos>
+                            Comma separated list of external repos for which
+                              fine-grained hashes are computed.
+      --fineGrainedHashExternalReposFile=<fineGrainedHashExternalReposFile>
+                            A text file with a newline separated list of
+                              external repos. Mutually exclusive with
+                              --fineGrainedHashExternalRepos.
+      --gitEngine=<gitEngine>
+                            Git backend: 'jgit' (in-process, no git binary
+                              required) or 'subprocess' (shells out to
+                              --gitPath). Defaults to 'jgit'.
+      --gitPath=<gitPath>   Path to the git binary, used only when
+                              --gitEngine=subprocess. Defaults to 'git' on the
+                              PATH.
+  -h, --help                Show this help message and exit.
+      --ignoredRuleHashingAttributes=<ignoredRuleHashingAttributes>
+                            Attributes that should be ignored when hashing rule
+                              targets.
+  -k, --[no-]keep_going     Run `bazel query` with --keep_going. Defaults to
+                              true.
+      --no-initial-fetch    Skip the initial 'git fetch' before reporting
+                              healthy. Useful for local/offline testing.
+      --port=<port>         Port to listen on. Defaults to 8080.
+  -s, --seed-filepaths=<seedFilepaths>
+                            A text file with a newline separated list of
+                              filepaths used as a SHA256 seed for all targets.
+      -so, --bazelStartupOptions=<bazelStartupOptions>
+                            Additional space separated Bazel client startup
+                              options used when invoking Bazel
+      --[no-]useCquery      If true, use cquery instead of query when
+                              generating dependency graphs.
+  -v, --verbose             Display query string, missing files and elapsed time
+  -V, --version             Print version information and exit.
+  -w, --workspacePath=<workspacePath>
+                            Path to the Bazel workspace git clone the service
+                              checks out and queries.
 ```
 <!-- END_SECTION: cli-help -->
 

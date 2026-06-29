@@ -20,8 +20,19 @@ class DeserialiseHashesInteractor : KoinComponent {
    * @return HashFileData containing hashes and optional module graph JSON
    */
   fun executeTargetHashWithMetadata(file: File): HashFileData {
-    val jsonObject = gson.fromJson(FileReader(file), JsonObject::class.java)
+    return parseHashFileData(gson.fromJson(FileReader(file), JsonObject::class.java))
+  }
 
+  /**
+   * Parses hash data from an in-memory JSON [json] string. Used by the query service to read cached
+   * hash JSON without round-tripping through a temp file. Accepts the same two shapes as
+   * [executeTargetHashWithMetadata] (new format with metadata, or the legacy flat map).
+   */
+  fun executeTargetHashWithMetadataFromString(json: String): HashFileData {
+    return parseHashFileData(gson.fromJson(json, JsonObject::class.java))
+  }
+
+  private fun parseHashFileData(jsonObject: JsonObject): HashFileData {
     // Check if this is the new format with metadata
     if (jsonObject.has("hashes") && jsonObject.has("metadata")) {
       // New format

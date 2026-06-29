@@ -107,6 +107,66 @@ This will produce an impacted targets json list with target label, target distan
 ]
 ```
 
+## Query Service (experimental)
+
+Instead of running `generate-hashes` from scratch on every CI invocation, you can run `bazel-diff` as
+a long-running HTTP service that answers affectedness queries between two git revisions and caches
+the generated hashes per commit SHA. This is the "bazel-diff as a service" model described in the
+[BazelCon talk](https://youtu.be/9Dk7mtIm7_A?t=1875) that inspired this repo (see
+[issue #29](https://github.com/Tinder/bazel-diff/issues/29)).
+
+Start the service against a dedicated git clone of your workspace:
+
+```bash
+bazel-diff serve \
+  --workspacePath /path/to/workspace-clone \
+  --bazelPath bazel \
+  --cacheDir /var/cache/bazel-diff \
+  --port 8080
+```
+
+On startup the service performs an initial `git fetch` and only then reports healthy. For each
+request it resolves the `from`/`to` revisions, generates (and caches, keyed by commit SHA) the hashes
+for each, and reuses the exact same affectedness logic as `get-impacted-targets`.
+
+Endpoints:
+
+* `GET /health` — returns `200 OK` once the initial fetch has completed, `503` otherwise. A load
+  balancer should use this to route only to ready instances. If a fatal git error occurs at startup
+  the instance "lame-ducks" itself by continuing to report `503` so the load balancer removes it.
+* `GET /impacted_targets?from=<rev>&to=<rev>` — returns the impacted targets as JSON. The optional
+  `targetType` parameter (e.g. `&targetType=Rule,SourceFile`) filters by target type.
+
+```bash
+curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
+```
+
+```json
+{
+  "from": "9a1c0e2…",
+  "to": "3f7b8d4…",
+  "impactedTargets": ["//foo:bar", "//foo:baz"]
+}
+```
+
+Notes and current limitations:
+
+* The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
+  working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
+  so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.
+* Git operations run in-process via JGit by default (no `git` binary required). Pass
+  `--gitEngine=subprocess` to shell out to the `git` binary at `--gitPath` instead -- useful for
+  workspaces that depend on checkout filters or hooks that JGit does not run. Note that JGit only
+  moves the git plumbing in-process; the working tree is still materialized on disk for `bazel query`.
+* Hashes are cached on local disk via `--cacheDir` and survive restarts. The cache layer is
+  pluggable behind a byte-oriented interface so a remote backend (e.g. S3) can be added without
+  touching callers.
+* Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
+  `generate-hashes`, and are folded into the cache key so a server started with different flags never
+  serves another configuration's cached hashes.
+* Containerization, multi-instance deployment manifests, and remote cache backends are not yet
+  included.
+
 <!-- BEGIN_SECTION: cli-help -->
 <!-- END_SECTION: cli-help -->
 

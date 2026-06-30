@@ -21,6 +21,9 @@ import org.koin.core.component.inject
  *   lame-ducked by a fatal git error.
  * - `GET /impacted_targets?from=<rev>&to=<rev>[&targetType=Rule,SourceFile]` -- returns `{"from":
  *   <sha>, "to": <sha>, "impactedTargets": [...]}`.
+ * - `GET /impacted_targets_with_distances?from=<rev>&to=<rev>[&targetType=...]` -- like above but
+ *   each impacted target is `{"label", "targetDistance", "packageDistance"}`. Requires the server
+ *   to have been started with `--trackDeps`; returns `400` otherwise.
  *
  * Built on the JDK's [HttpServer] so the service needs no new third-party dependency. The handler
  * pool is unbounded (cached) so that health checks are always served even while a long hash
@@ -47,6 +50,8 @@ class BazelDiffServer(
         }
     httpServer.createContext("/health", ::handleHealth)
     httpServer.createContext("/impacted_targets", ::handleImpactedTargets)
+    httpServer.createContext(
+        "/impacted_targets_with_distances", ::handleImpactedTargetsWithDistances)
     httpServer.start()
     server = httpServer
     logger.i { "bazel-diff query service listening on port ${boundPort()} " }
@@ -80,6 +85,24 @@ class BazelDiffServer(
       }
 
   private fun handleImpactedTargets(exchange: HttpExchange) =
+      handleQuery(exchange) { from, to, targetTypes ->
+        impactedTargetsProvider.getImpactedTargets(from, to, targetTypes)
+      }
+
+  private fun handleImpactedTargetsWithDistances(exchange: HttpExchange) =
+      handleQuery(exchange) { from, to, targetTypes ->
+        impactedTargetsProvider.getImpactedTargetsWithDistances(from, to, targetTypes)
+      }
+
+  /**
+   * Shared handling for the impacted-targets endpoints: enforces GET + readiness, parses and
+   * validates `from`/`to`/`targetType`, then serializes the result of [compute] as JSON, mapping
+   * the known failure modes to the appropriate status codes.
+   */
+  private fun handleQuery(
+      exchange: HttpExchange,
+      compute: (from: String, to: String, targetTypes: Set<String>?) -> Any
+  ) =
       withExchange(exchange) {
         if (!exchange.requestMethod.equals("GET", ignoreCase = true)) {
           respondJson(exchange, 405, mapOf("error" to "method not allowed, use GET"))
@@ -102,8 +125,9 @@ class BazelDiffServer(
             params["targetType"]?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet()
 
         try {
-          val result = impactedTargetsProvider.getImpactedTargets(from, to, targetTypes)
-          respondJson(exchange, 200, result)
+          respondJson(exchange, 200, compute(from, to, targetTypes))
+        } catch (e: DistancesUnavailableException) {
+          respondJson(exchange, 400, mapOf("error" to (e.message ?: "distances unavailable")))
         } catch (e: GitClientException) {
           logger.e(e) { "git error computing impacted targets" }
           respondJson(exchange, 400, mapOf("error" to "git error: ${e.message}"))

@@ -107,6 +107,15 @@ class ServeCommandTest : KoinTest {
   }
 
   @Test
+  fun configFingerprintChangesWithTrackDeps() {
+    // A deps-tracking server must never reuse deps-less cache entries, so the flag must affect the
+    // cache key.
+    val base = ServeCommand().computeConfigFingerprint()
+    val withTrackDeps = ServeCommand().apply { trackDeps = true }.computeConfigFingerprint()
+    assertThat(withTrackDeps).isNotEqualTo(base)
+  }
+
+  @Test
   fun configFingerprintIsOrderIndependentForSets() {
     val first =
         ServeCommand()

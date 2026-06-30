@@ -156,10 +156,12 @@ class E2ETest {
 
   /**
    * End-to-end coverage for the `serve` query service: builds a two-commit git repo from the
-   * shell-only `distance_metrics` workspace, runs `bazel-diff serve` in a background thread, then
-   * hits `/health` and `/impacted_targets` over real HTTP. Exercises the full
+   * shell-only `distance_metrics` workspace, runs `bazel-diff serve` (with `--trackDeps`) in a
+   * background thread, then hits `/health`, `/impacted_targets`, and
+   * `/impacted_targets_with_distances` over real HTTP. Exercises the full
    * [com.bazel_diff.cli.ServeCommand] path (Koin + hasher wiring, git checkout, real `bazel query`
-   * for both revisions, and the cache) the same way the other E2E tests cover the CLI commands.
+   * for both revisions, dep-edge tracking, distance computation, and the cache) the same way the
+   * other E2E tests cover the CLI commands.
    */
   @Test
   fun testServeEndToEnd() {
@@ -201,7 +203,8 @@ class E2ETest {
                       cacheDir.absolutePath,
                       "--port",
                       port.toString(),
-                      "--no-initial-fetch")
+                      "--no-initial-fetch",
+                      "--trackDeps")
             }
             .apply {
               isDaemon = true
@@ -221,6 +224,23 @@ class E2ETest {
       @Suppress("UNCHECKED_CAST") val impacted = parsed["impactedTargets"] as List<String>
       // Editing lib.sh must impact at least its own sh_library target.
       assertThat(impacted.contains("//:lib")).isEqualTo(true)
+
+      // The distances endpoint returns the same impacted targets, each annotated with build-graph
+      // distance metrics. //:lib is directly edited, so it sits at distance 0.
+      val (distCode, distBody) =
+          httpGetServe(
+              "http://localhost:$port/impacted_targets_with_distances?from=$fromSha&to=$toSha")
+      assertThat(distCode).isEqualTo(200)
+      val distParsed: Map<String, Any> =
+          Gson().fromJson(distBody, object : TypeToken<Map<String, Any>>() {}.type)
+      assertThat(distParsed["from"]).isEqualTo(fromSha)
+      assertThat(distParsed["to"]).isEqualTo(toSha)
+      @Suppress("UNCHECKED_CAST")
+      val withDistances = distParsed["impactedTargets"] as List<Map<String, Any>>
+      val libEntry = withDistances.single { it["label"] == "//:lib" }
+      // Gson decodes JSON numbers as Double.
+      assertThat(libEntry["targetDistance"]).isEqualTo(0.0)
+      assertThat(libEntry["packageDistance"]).isEqualTo(0.0)
     } finally {
       serveThread.interrupt()
       serveThread.join(10_000)

@@ -177,6 +177,16 @@ class ServeCommand : Callable<Int> {
       description = ["If true, exclude external targets (do not query //external:all-targets)."])
   var excludeExternalTargets = false
 
+  @CommandLine.Option(
+      names = ["--trackDeps"],
+      negatable = true,
+      description =
+          [
+              "Track dependency edges and persist them per commit SHA so build-graph distance " +
+                  "metrics can be served via /impacted_targets_with_distances. Increases cache " +
+                  "size and memory. Defaults to false."])
+  var trackDeps = false
+
   override fun call(): Int {
     org.koin.core.context.GlobalContext.stopKoin()
     startKoin {
@@ -191,7 +201,7 @@ class ServeCommand : Callable<Int> {
               useCquery,
               cqueryExpression,
               keepGoing,
-              false,
+              trackDeps,
               fineGrainedHashExternalRepos,
               fineGrainedHashExternalReposFile,
               excludeExternalTargets,
@@ -238,8 +248,10 @@ class ServeCommand : Callable<Int> {
             storage,
             computeConfigFingerprint(),
             loadSeedFilepaths(),
-            ignoredRuleHashingAttributes)
-    val impactedTargetsService = ImpactedTargetsService(gitClient, hashService)
+            ignoredRuleHashingAttributes,
+            trackDeps)
+    val impactedTargetsService =
+        ImpactedTargetsService(gitClient, hashService, depsTracked = trackDeps)
 
     val ready = AtomicBoolean(false)
     val server = BazelDiffServer(port, impactedTargetsService) { ready.get() }
@@ -316,6 +328,9 @@ class ServeCommand : Callable<Int> {
       append("ignoredRuleHashingAttributes=")
           .append(ignoredRuleHashingAttributes.sorted().joinToString(","))
           .append('\n')
+      // Distinct cache keys for deps-tracked vs deps-less runs: a deps-tracking server must never
+      // serve a deps-less cache entry (its distance queries would have no edges to traverse).
+      append("trackDeps=").append(trackDeps).append('\n')
       append("version=").append(VersionProvider().version.firstOrNull() ?: "unknown").append('\n')
     }
     return sha256 { putBytes(canonical.toByteArray()) }.toHexString().take(12)

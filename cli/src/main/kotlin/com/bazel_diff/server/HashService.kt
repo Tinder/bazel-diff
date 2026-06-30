@@ -40,6 +40,9 @@ interface HashProvider {
  *   server started with different flags never reads another configuration's cached hashes.
  * @param seedFilepaths seed files passed through to [BuildGraphHasher].
  * @param ignoredRuleHashingAttributes rule attributes ignored when hashing.
+ * @param trackDeps when true, persist each revision's dependency-edge adjacency list in the cache
+ *   so build-graph distance metrics can be served. Requires the hasher to have been built with
+ *   dep-tracking on (so [TargetHash.deps] is populated).
  */
 class HashService(
     private val gitClient: GitClient,
@@ -47,6 +50,7 @@ class HashService(
     private val configFingerprint: String,
     private val seedFilepaths: Set<Path>,
     private val ignoredRuleHashingAttributes: Set<String>,
+    private val trackDeps: Boolean = false,
 ) : HashProvider, KoinComponent {
   private val buildGraphHasher: BuildGraphHasher by inject()
   private val bazelModService: BazelModService by inject()
@@ -89,24 +93,42 @@ class HashService(
             buildGraphHasher.hashAllBazelTargetsAndSourcefiles(
                 seedFilepaths, ignoredRuleHashingAttributes)
         val moduleGraphJson = runBlocking { bazelModService.getModuleGraphJson() }
+        val depEdges = depEdgesOf(hashes)
         storage.put(
-            cacheKey(sha), serialize(hashes, moduleGraphJson).toByteArray(StandardCharsets.UTF_8))
-        HashFileData(hashes, moduleGraphJson)
+            cacheKey(sha),
+            serialize(hashes, moduleGraphJson, depEdges).toByteArray(StandardCharsets.UTF_8))
+        HashFileData(hashes, moduleGraphJson, depEdges)
       }
+
+  /**
+   * The dependency-edge adjacency list (label -> direct dep labels) when [trackDeps] is on, else
+   * empty. Derived from [TargetHash.deps], the same way `generate-hashes --depEdgesFile` derives
+   * it.
+   */
+  private fun depEdgesOf(hashes: Map<String, TargetHash>): Map<String, List<String>> =
+      if (trackDeps) hashes.mapValues { it.value.deps ?: emptyList() } else emptyMap()
 
   /**
    * Serializes hashes into the same JSON shape `generate-hashes` writes (see
    * [com.bazel_diff.interactor.GenerateHashesInteractor]), so cached entries are interchangeable
-   * with hashes produced by the CLI. Target type is always included for the richest data.
+   * with hashes produced by the CLI. Target type is always included for the richest data. When
+   * [depEdges] is non-empty (i.e. --trackDeps), it is persisted under `metadata.depEdges` so
+   * distance metrics can be served on a cache hit.
    */
-  private fun serialize(hashes: Map<String, TargetHash>, moduleGraphJson: String?): String {
+  private fun serialize(
+      hashes: Map<String, TargetHash>,
+      moduleGraphJson: String?,
+      depEdges: Map<String, List<String>>
+  ): String {
+    val serializedHashes = hashes.mapValues { it.value.toJson(true) }
     val output =
-        if (moduleGraphJson != null) {
-          mapOf(
-              "hashes" to hashes.mapValues { it.value.toJson(true) },
-              "metadata" to mapOf("moduleGraphJson" to moduleGraphJson))
+        if (moduleGraphJson != null || depEdges.isNotEmpty()) {
+          val metadata = mutableMapOf<String, Any>()
+          if (moduleGraphJson != null) metadata["moduleGraphJson"] = moduleGraphJson
+          if (depEdges.isNotEmpty()) metadata["depEdges"] = depEdges
+          mapOf("hashes" to serializedHashes, "metadata" to metadata)
         } else {
-          hashes.mapValues { it.value.toJson(true) }
+          serializedHashes
         }
     return gson.toJson(output)
   }

@@ -1,12 +1,14 @@
 package com.bazel_diff.server
 
 import assertk.assertThat
+import assertk.assertions.containsExactly
 import assertk.assertions.containsExactlyInAnyOrder
 import assertk.assertions.isEqualTo
 import com.bazel_diff.SilentLogger
 import com.bazel_diff.bazel.BazelModService
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.interactor.HashFileData
+import com.bazel_diff.interactor.ImpactedTargetWithDistance
 import com.bazel_diff.log.Logger
 import com.google.gson.GsonBuilder
 import org.junit.Rule
@@ -124,6 +126,74 @@ class ImpactedTargetsServiceTest : KoinTest {
     val result = service.getImpactedTargets("from-sha", "to-sha", null)
 
     assertThat(result.impactedTargets).isEqualTo(listOf("//:a"))
+    assertThat(provider.workspaceAtCalls).isEqualTo(listOf("to-sha"))
+  }
+
+  @Test
+  fun computesDistancesFromToRevisionDepEdges() {
+    // //a:lib changed its own content (directHash) -> DIRECT, distance 0.
+    // //b:lib only changed transitively (hash differs, directHash same) and depends on //a:lib ->
+    // INDIRECT, one hop across a package boundary -> targetDistance 1, packageDistance 1.
+    val from =
+        HashFileData(
+            mapOf(
+                "//a:lib" to TargetHash("Rule", "h1", "d1"),
+                "//b:lib" to TargetHash("Rule", "hb1", "db1")),
+            null)
+    val to =
+        HashFileData(
+            mapOf(
+                "//a:lib" to TargetHash("Rule", "h2", "d2"),
+                "//b:lib" to TargetHash("Rule", "hb2", "db1")),
+            null,
+            depEdges = mapOf("//b:lib" to listOf("//a:lib"), "//a:lib" to emptyList()))
+    val service =
+        ImpactedTargetsService(
+            IdentityGitClient(),
+            FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to)),
+            depsTracked = true)
+
+    val result = service.getImpactedTargetsWithDistances("from-sha", "to-sha", null)
+
+    assertThat(result.from).isEqualTo("from-sha")
+    assertThat(result.to).isEqualTo("to-sha")
+    assertThat(result.impactedTargets)
+        .containsExactly(
+            ImpactedTargetWithDistance("//a:lib", 0, 0),
+            ImpactedTargetWithDistance("//b:lib", 1, 1))
+  }
+
+  @Test
+  fun distancesThrowWhenDepsNotTracked() {
+    val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), null)
+    val to = HashFileData(mapOf("//:a" to TargetHash("Rule", "h2", "d2")), null)
+    val service =
+        ImpactedTargetsService(
+            IdentityGitClient(),
+            FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to)),
+            depsTracked = false)
+
+    org.junit.Assert.assertThrows(DistancesUnavailableException::class.java) {
+      service.getImpactedTargetsWithDistances("from-sha", "to-sha", null)
+    }
+  }
+
+  @Test
+  fun distancesModuleGraphChangePinsWorkspaceToTo() {
+    // Same forced live-query path as the non-distance test, but through the distances method.
+    val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), "graph-v1")
+    val to =
+        HashFileData(
+            mapOf("//:a" to TargetHash("Rule", "h2", "d2")),
+            "graph-v2",
+            depEdges = mapOf("//:a" to emptyList()))
+    val provider =
+        FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to), allowWorkspaceAt = true)
+    val service = ImpactedTargetsService(IdentityGitClient(), provider, depsTracked = true)
+
+    val result = service.getImpactedTargetsWithDistances("from-sha", "to-sha", null)
+
+    assertThat(result.impactedTargets).containsExactly(ImpactedTargetWithDistance("//:a", 0, 0))
     assertThat(provider.workspaceAtCalls).isEqualTo(listOf("to-sha"))
   }
 }

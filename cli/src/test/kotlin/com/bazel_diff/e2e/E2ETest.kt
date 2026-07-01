@@ -1276,6 +1276,67 @@ class E2ETest {
     assertThat(hashes.contains("failing_analysis_target")).isEqualTo(false)
   }
 
+  @Test
+  fun testKeepGoingSilentlyDropsTargetsOnRepoRuleFailure_reproducerForIssue398() {
+    // Reproducer for https://github.com/Tinder/bazel-diff/issues/398
+    //
+    // `--keep_going` defaults to `true`, and bazel-diff treats a partial
+    // `bazel query` (exit code 3) as success. When a repository rule fails to resolve --
+    // e.g. a transient network error fetching a remote dependency such as
+    //
+    //   fetch_repo: buf.build/go/protovalidate@v1.1.3:
+    //       Get "https://proxy.golang.org/...": net/http: TLS handshake timeout
+    //
+    // -- the package that references that repo silently disappears from the query results,
+    // and bazel-diff emits a hash set that is missing those targets WITHOUT any error. This
+    // makes hashes non-deterministic across runs (a target present when the fetch succeeds
+    // vanishes when it flakes). Setting `--no-keep_going` instead fails loudly, which keeps
+    // hashes deterministic.
+    //
+    // The `keep_going_repo_failure` workspace has two packages:
+    //   //good -- a plain genrule with no external deps (always resolvable)
+    //   //bad  -- loads a .bzl from @failing_dep, whose repository rule always fails to fetch
+    //
+    // This test pins the CURRENT (buggy) behavior so a future fix / default change is caught.
+    val workspace = copyTestWorkspace("keep_going_repo_failure")
+    val outputDir = temp.newFolder()
+
+    val cli = CommandLine(BazelDiff())
+
+    // Default behavior (--keep_going=true): generate-hashes SUCCEEDS despite the unresolvable
+    // repo, because bazel query returns exit code 3 (partial results) which bazel-diff allows.
+    val keepGoingOutput = File(outputDir, "hashes_keep_going.json")
+    val keepGoingExit =
+        cli.execute(
+            "generate-hashes",
+            "-w",
+            workspace.absolutePath,
+            "-b",
+            "bazel",
+            keepGoingOutput.absolutePath)
+    assertThat(keepGoingExit).isEqualTo(0)
+
+    // The healthy //good target is hashed, but //bad has been silently dropped -- this is the
+    // incorrect/non-deterministic hash set the bug produces.
+    val keepGoingHashes = keepGoingOutput.readText()
+    assertThat(keepGoingHashes.contains("//good:good")).isEqualTo(true)
+    assertThat(keepGoingHashes.contains("//bad:")).isEqualTo(false)
+
+    // With --no-keep_going, bazel query fails outright (non-zero, non-partial exit code) and
+    // bazel-diff surfaces the error instead of writing a truncated hash set.
+    val noKeepGoingOutput = File(outputDir, "hashes_no_keep_going.json")
+    val noKeepGoingExit =
+        cli.execute(
+            "generate-hashes",
+            "-w",
+            workspace.absolutePath,
+            "-b",
+            "bazel",
+            "--no-keep_going",
+            noKeepGoingOutput.absolutePath)
+    assertThat(noKeepGoingExit).isEqualTo(1)
+  }
+
   /**
    * Returns the Bazel version triple by running `bazel version`, or null if it cannot be
    * determined.

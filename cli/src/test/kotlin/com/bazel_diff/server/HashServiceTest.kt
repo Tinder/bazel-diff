@@ -1,6 +1,8 @@
 package com.bazel_diff.server
 
 import assertk.assertThat
+import assertk.assertions.contains
+import assertk.assertions.doesNotContain
 import assertk.assertions.hasSize
 import assertk.assertions.isEqualTo
 import assertk.assertions.isNull
@@ -66,8 +68,13 @@ class HashServiceTest : KoinTest {
 
   private val sampleHashes = mapOf("//:a" to TargetHash("Rule", "h", "d"))
 
-  private fun newService(git: GitClient, storage: HashCacheStorage) =
-      HashService(git, storage, "fp", emptySet(), emptySet())
+  private val sampleHashesWithDeps =
+      mapOf(
+          "//a:lib" to TargetHash("Rule", "ha", "da", deps = listOf("//b:lib")),
+          "//b:lib" to TargetHash("Rule", "hb", "db", deps = emptyList()))
+
+  private fun newService(git: GitClient, storage: HashCacheStorage, trackDeps: Boolean = false) =
+      HashService(git, storage, "fp", emptySet(), emptySet(), trackDeps)
 
   @Test
   fun cacheMissGeneratesAndStores() {
@@ -129,5 +136,36 @@ class HashServiceTest : KoinTest {
 
     assertThat(fromCache.hashes).isEqualTo(sampleHashes)
     assertThat(fromCache.moduleGraphJson).isEqualTo("""{"graph":1}""")
+  }
+
+  @Test
+  fun trackDepsPersistsAndRoundTripsDepEdges() {
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any()))
+        .thenReturn(sampleHashesWithDeps)
+    runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
+    val storage = InMemoryStorage()
+
+    val generated = newService(RecordingGitClient(), storage, trackDeps = true).getHashes("sha1")
+    // Cache JSON carries the dependency-edge adjacency list under metadata.depEdges.
+    assertThat(String(storage.entries.values.single())).contains("depEdges")
+    // Read back through a fresh service over the same storage (cache-hit path).
+    val fromCache = newService(RecordingGitClient(), storage, trackDeps = true).getHashes("sha1")
+
+    val expectedDepEdges = mapOf("//a:lib" to listOf("//b:lib"), "//b:lib" to emptyList())
+    assertThat(generated.depEdges).isEqualTo(expectedDepEdges)
+    assertThat(fromCache.depEdges).isEqualTo(expectedDepEdges)
+  }
+
+  @Test
+  fun withoutTrackDepsCacheHasNoDepEdges() {
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any()))
+        .thenReturn(sampleHashesWithDeps)
+    runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
+    val storage = InMemoryStorage()
+
+    val generated = newService(RecordingGitClient(), storage, trackDeps = false).getHashes("sha1")
+
+    assertThat(generated.depEdges).isEqualTo(emptyMap())
+    assertThat(String(storage.entries.values.single())).doesNotContain("depEdges")
   }
 }

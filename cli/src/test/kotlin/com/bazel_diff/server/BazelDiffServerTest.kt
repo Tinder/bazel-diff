@@ -5,6 +5,7 @@ import assertk.assertions.contains
 import assertk.assertions.containsExactly
 import assertk.assertions.isEqualTo
 import com.bazel_diff.SilentLogger
+import com.bazel_diff.interactor.ImpactedTargetWithDistance
 import com.bazel_diff.log.Logger
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
@@ -41,7 +42,15 @@ class BazelDiffServerTest : KoinTest {
   private class FixedProvider(
       var result: ImpactedTargetsResult =
           ImpactedTargetsResult("from-sha", "to-sha", listOf("//:a", "//:b")),
+      var distancesResult: ImpactedTargetsWithDistancesResult =
+          ImpactedTargetsWithDistancesResult(
+              "from-sha",
+              "to-sha",
+              listOf(
+                  ImpactedTargetWithDistance("//:a", 0, 0),
+                  ImpactedTargetWithDistance("//:b", 1, 1))),
       var error: Exception? = null,
+      var distancesError: Exception? = null,
       var lastTargetTypes: Set<String>? = null,
   ) : ImpactedTargetsProvider {
     override fun getImpactedTargets(
@@ -52,6 +61,16 @@ class BazelDiffServerTest : KoinTest {
       lastTargetTypes = targetTypes
       error?.let { throw it }
       return result
+    }
+
+    override fun getImpactedTargetsWithDistances(
+        fromRev: String,
+        toRev: String,
+        targetTypes: Set<String>?
+    ): ImpactedTargetsWithDistancesResult {
+      lastTargetTypes = targetTypes
+      distancesError?.let { throw it }
+      return distancesResult
     }
   }
 
@@ -72,6 +91,12 @@ class BazelDiffServerTest : KoinTest {
       object : ImpactedTargetsProvider {
         override fun getImpactedTargets(fromRev: String, toRev: String, targetTypes: Set<String>?) =
             provider.getImpactedTargets(fromRev, toRev, targetTypes)
+
+        override fun getImpactedTargetsWithDistances(
+            fromRev: String,
+            toRev: String,
+            targetTypes: Set<String>?
+        ) = provider.getImpactedTargetsWithDistances(fromRev, toRev, targetTypes)
       }
 
   private data class Response(val code: Int, val body: String)
@@ -161,5 +186,49 @@ class BazelDiffServerTest : KoinTest {
     val response = get("/impacted_targets?from=a&to=b")
     assertThat(response.code).isEqualTo(500)
     assertThat(response.body).contains("boom")
+  }
+
+  @Test
+  fun impactedTargetsWithDistancesReturnsJson() {
+    provider = FixedProvider()
+    val response = get("/impacted_targets_with_distances?from=main&to=feature")
+    assertThat(response.code).isEqualTo(200)
+    val parsed = gson.fromJson(response.body, ImpactedTargetsWithDistancesResult::class.java)
+    assertThat(parsed.from).isEqualTo("from-sha")
+    assertThat(parsed.to).isEqualTo("to-sha")
+    assertThat(parsed.impactedTargets)
+        .containsExactly(
+            ImpactedTargetWithDistance("//:a", 0, 0), ImpactedTargetWithDistance("//:b", 1, 1))
+  }
+
+  @Test
+  fun impactedTargetsWithDistancesPassesTargetTypeFilter() {
+    val fixed = FixedProvider()
+    provider = fixed
+    get("/impacted_targets_with_distances?from=a&to=b&targetType=Rule")
+    assertThat(fixed.lastTargetTypes).isEqualTo(setOf("Rule"))
+  }
+
+  @Test
+  fun impactedTargetsWithDistancesMissingParamsReturns400() {
+    assertThat(get("/impacted_targets_with_distances?from=main").code).isEqualTo(400)
+  }
+
+  @Test
+  fun impactedTargetsWithDistancesReturns503WhenNotReady() {
+    ready.set(false)
+    assertThat(get("/impacted_targets_with_distances?from=a&to=b").code).isEqualTo(503)
+  }
+
+  @Test
+  fun distancesUnavailableReturns400() {
+    provider =
+        FixedProvider(
+            distancesError =
+                DistancesUnavailableException(
+                    "distances unavailable: server started without --trackDeps"))
+    val response = get("/impacted_targets_with_distances?from=a&to=b")
+    assertThat(response.code).isEqualTo(400)
+    assertThat(response.body).contains("--trackDeps")
   }
 }

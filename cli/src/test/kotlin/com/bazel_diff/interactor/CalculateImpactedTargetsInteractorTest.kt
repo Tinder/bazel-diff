@@ -139,6 +139,47 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
   }
 
   @Test
+  fun testComputeImpactedTargetsWithDistancesReturnsOrderedList() {
+    val (depEdges, startHashes) = createTargetHashes("//:1 <- //:2 <- //:3")
+    val endHashes = startHashes.toMutableMap()
+    makeDirectlyChanged(endHashes, "//:1")
+    makeIndirectlyChanged(endHashes, "//:2", "//:3")
+
+    val interactor = CalculateImpactedTargetsInteractor()
+    val impacted =
+        interactor.computeImpactedTargetsWithDistances(startHashes, endHashes, depEdges, null)
+
+    assertThat(impacted)
+        .containsExactly(
+            ImpactedTargetWithDistance("//:1", 0, 0),
+            ImpactedTargetWithDistance("//:2", 1, 0),
+            ImpactedTargetWithDistance("//:3", 2, 0),
+        )
+  }
+
+  @Test
+  fun testExecuteWithDistancesWritesSameDataAsCompute() {
+    // The writer path must serialize exactly the structured compute result, so the CLI JSON output
+    // is unchanged by the refactor and matches what the query service returns.
+    val (depEdges, startHashes) = createTargetHashes("//A:1 <- //A:2 <- //B:3")
+    val endHashes = startHashes.toMutableMap()
+    makeDirectlyChanged(endHashes, "//A:1")
+    makeIndirectlyChanged(endHashes, "//A:2", "//B:3")
+
+    val interactor = CalculateImpactedTargetsInteractor()
+    val expected =
+        interactor.computeImpactedTargetsWithDistances(startHashes, endHashes, depEdges, null)
+
+    val writer = StringWriter()
+    interactor.executeWithDistances(startHashes, endHashes, depEdges, writer, null)
+
+    val gson = com.google.gson.Gson()
+    val parsed =
+        gson.fromJson(writer.toString(), Array<ImpactedTargetWithDistance>::class.java).toList()
+    assertThat(parsed).isEqualTo(expected)
+  }
+
+  @Test
   fun testPackageDistance() {
     var (depEdges, startHashes) = createTargetHashes("//A:1 <- //A:2 <- //B:3 <- //B:4 <- //C:5")
     val endHashes = startHashes.toMutableMap()

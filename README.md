@@ -149,7 +149,35 @@ curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
 }
 ```
 
+* `GET /impacted_targets_with_distances?from=<rev>&to=<rev>` — like `/impacted_targets`, but each
+  impacted target is annotated with its build-graph distance metrics: `targetDistance` (the number of
+  dependency hops to the nearest directly-changed target) and `packageDistance` (how many of those
+  hops cross a package boundary). Directly-changed targets sit at distance `0`. Requires the server
+  to have been started with `--trackDeps` (see below); otherwise this endpoint returns `400`. The
+  same optional `targetType` filter applies.
+
+```bash
+curl 'http://localhost:8080/impacted_targets_with_distances?from=main&to=my-feature-branch'
+```
+
+```json
+{
+  "from": "9a1c0e2…",
+  "to": "3f7b8d4…",
+  "impactedTargets": [
+    {"label": "//foo:bar", "targetDistance": 0, "packageDistance": 0},
+    {"label": "//foo:baz", "targetDistance": 1, "packageDistance": 1}
+  ]
+}
+```
+
 Notes and current limitations:
+
+* Distance metrics (`/impacted_targets_with_distances`) require the dependency-edge graph, which is
+  only tracked when the server is started with `--trackDeps`. Tracking deps grows each cached hash
+  entry, so it is opt-in. The flag is folded into the cache key, so enabling or disabling it never
+  reuses a previously cached entry of the other kind. This mirrors the `generate-hashes --depEdgesFile`
+  / `get-impacted-targets --depEdgesFile` flow used by the CLI.
 
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
@@ -394,8 +422,8 @@ Command-line utility to analyze the state of the bazel build graph
 
 ```terminal
 Usage: bazel-diff serve [-hkvV] [--[no-]excludeExternalTargets]
-                        [--no-initial-fetch] [--[no-]useCquery]
-                        [-b=<bazelPath>] --cacheDir=<cacheDir>
+                        [--no-initial-fetch] [--[no-]trackDeps] [--[no-]
+                        useCquery] [-b=<bazelPath>] --cacheDir=<cacheDir>
                         [--cqueryExpression=<cqueryExpression>]
                         [--fineGrainedHashExternalReposFile=<fineGrainedHashExte
                         rnalReposFile>] [--gitEngine=<gitEngine>]
@@ -456,6 +484,10 @@ targets between two git revisions, caching generated hashes per commit SHA.
       -so, --bazelStartupOptions=<bazelStartupOptions>
                             Additional space separated Bazel client startup
                               options used when invoking Bazel
+      --[no-]trackDeps      Track dependency edges and persist them per commit
+                              SHA so build-graph distance metrics can be served
+                              via /impacted_targets_with_distances. Increases
+                              cache size and memory. Defaults to false.
       --[no-]useCquery      If true, use cquery instead of query when
                               generating dependency graphs.
   -v, --verbose             Display query string, missing files and elapsed time

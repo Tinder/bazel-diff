@@ -48,4 +48,31 @@ class DeserialiseHashesInteractorTest : KoinTest {
                 "target-2" to TargetHash("Rule", "hash2", "direct2"),
                 "target-3" to TargetHash("SourceFile", "hash3", "direct3")))
   }
+
+  @Test
+  fun parsesDepEdgesFromMetadata() {
+    val json =
+        """{
+          |  "hashes": {"//a:lib":"Rule#h1~d1", "//b:lib":"Rule#h2~d2"},
+          |  "metadata": {
+          |    "moduleGraphJson": "{}",
+          |    "depEdges": {"//a:lib":["//b:lib"], "//b:lib":[]}
+          |  }
+          |}"""
+            .trimMargin()
+
+    val data = interactor.executeTargetHashWithMetadataFromString(json)
+
+    assertThat(data.depEdges)
+        .isEqualTo(mapOf("//a:lib" to listOf("//b:lib"), "//b:lib" to emptyList()))
+  }
+
+  @Test
+  fun depEdgesDefaultToEmptyWhenAbsent() {
+    val json = """{"hashes": {"//a:lib":"Rule#h1~d1"}, "metadata": {"moduleGraphJson": "{}"}}"""
+
+    val data = interactor.executeTargetHashWithMetadataFromString(json)
+
+    assertThat(data.depEdges).isEqualTo(emptyMap())
+  }
 }

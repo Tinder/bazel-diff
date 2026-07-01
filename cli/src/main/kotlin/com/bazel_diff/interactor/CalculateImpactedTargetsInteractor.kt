@@ -17,6 +17,13 @@ import org.koin.core.component.inject
 
 data class TargetDistanceMetrics(val targetDistance: Int, val packageDistance: Int) {}
 
+/** An impacted target paired with its build-graph distance metrics. */
+data class ImpactedTargetWithDistance(
+    val label: String,
+    val targetDistance: Int,
+    val packageDistance: Int
+)
+
 class CalculateImpactedTargetsInteractor : KoinComponent {
   private val gson: Gson by inject()
   private val logger: Logger by inject()
@@ -94,6 +101,33 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       toModuleGraphJson: String? = null,
       excludeExternalTargets: Boolean = false,
   ) {
+    val impactedTargets =
+        computeImpactedTargetsWithDistances(
+            from,
+            to,
+            depEdges,
+            targetTypes,
+            fromModuleGraphJson,
+            toModuleGraphJson,
+            excludeExternalTargets)
+    outputWriter.use { writer -> writer.write(gson.toJson(impactedTargets)) }
+  }
+
+  /**
+   * Computes the impacted targets between [from] and [to] together with their build-graph distance
+   * metrics, filtered by [targetTypes]/[excludeExternalTargets] and ordered the same way the
+   * non-distance path orders its output. Returned in-memory so both the CLI writer path
+   * ([executeWithDistances]) and the query service consume identical data without reparsing JSON.
+   */
+  fun computeImpactedTargetsWithDistances(
+      from: Map<String, TargetHash>,
+      to: Map<String, TargetHash>,
+      depEdges: Map<String, List<String>>,
+      targetTypes: Set<String>?,
+      fromModuleGraphJson: String? = null,
+      toModuleGraphJson: String? = null,
+      excludeExternalTargets: Boolean = false,
+  ): List<ImpactedTargetWithDistance> {
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
     // Quick check: if module graph JSON is identical, skip module change detection entirely
@@ -121,21 +155,12 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
         }
 
     val ordering = impactedTargetOrdering(to, from)
-    impactedTargets
+    return impactedTargets
         .filterKeys { typeFilter.accepts(it) }
         .filterKeys { !excludeExternalTargets || !it.startsWith("//external:") }
         .toSortedMap(ordering)
-        .let { filtered ->
-          outputWriter.use { writer ->
-            writer.write(
-                gson.toJson(
-                    filtered.map {
-                      mapOf(
-                          "label" to it.key,
-                          "targetDistance" to it.value.targetDistance,
-                          "packageDistance" to it.value.packageDistance)
-                    }))
-          }
+        .map {
+          ImpactedTargetWithDistance(it.key, it.value.targetDistance, it.value.packageDistance)
         }
   }
 

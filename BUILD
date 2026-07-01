@@ -20,7 +20,7 @@ license(
     name = "license",
     package_name = "bazel-diff",
     copyright_notice = "Copyright (c) 2020, Match Group, LLC",
-    license_kind = "@@//support/licenses:BSD-3-Clause",
+    license_kind = "@rules_license//licenses/spdx:BSD-3-Clause",
     license_text = "LICENSE",
     package_url = "https://github.com/Tinder/bazel-diff",
     package_version = "29.0.0",

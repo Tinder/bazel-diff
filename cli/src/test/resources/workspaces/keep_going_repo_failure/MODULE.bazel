@@ -1,0 +1,18 @@
+module(
+    name = "keep_going_repo_failure",
+    version = "0.0.0",
+)
+
+# A module extension that declares a repository whose fetch implementation always
+# fails. This simulates a repo rule that cannot be resolved at query time -- e.g. an
+# http_archive / go_deps repo that fails to download because of a network error like:
+#
+#   fetch_repo: buf.build/go/protovalidate@v1.1.3:
+#       Get "https://proxy.golang.org/...": net/http: TLS handshake timeout
+#
+# The extension itself resolves fine (so `bazel mod`/module resolution succeeds); only
+# fetching the `@failing_dep` repo fails, and that only happens when a package that
+# references it is loaded (see //bad:BUILD).
+failing_ext = use_extension("//:ext.bzl", "failing_ext")
+
+use_repo(failing_ext, "failing_dep")

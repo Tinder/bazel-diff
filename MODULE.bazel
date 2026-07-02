@@ -61,6 +61,12 @@ maven.install(
         "org.apache.commons:commons-pool2:2.11.1",
         "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.5.2",
         "org.mockito.kotlin:mockito-kotlin:5.4.0",
+        # SLF4J binding for JGit (serve command). JGit depends on slf4j-api but ships no binding, so
+        # without one SLF4J prints a "Failed to load class StaticLoggerBinder / Defaulting to NOP"
+        # warning to stderr on first use. slf4j-nop supplies the binding (silencing the warning) and
+        # discards JGit's internal logs, keeping the CLI's stderr clean. Version tracks the slf4j-api
+        # that JGit 5.13.x resolves (1.7.30).
+        "org.slf4j:slf4j-nop:1.7.30",
     ],
     fail_if_repin_required = True,
     lock_file = "//:maven_install.json",

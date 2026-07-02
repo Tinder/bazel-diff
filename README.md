@@ -322,10 +322,10 @@ workspace.
   -k, --[no-]keep_going   This flag controls if `bazel query` will be executed
                             with the `--keep_going` flag or not. Enabling this
                             flag lets `bazel query` tolerate failures in your
-                            Bazel graph, but may silently drop targets that fail
-                            to resolve and produce non-deterministic hashes.
-                            Disabling it catches configuration issues by failing
-                            loudly. Defaults to `false`
+                            Bazel graph, but may silently drop targets that
+                            fail to resolve and produce non-deterministic
+                            hashes. Disabling it catches configuration issues
+                            by failing loudly. Defaults to `false`
   -m, --modified-filepaths=<modifiedFilepaths>
                           Experimental: A text file containing a newline
                             separated list of filepaths (relative to the
@@ -517,7 +517,7 @@ First, add the following snippet to your project:
 #### Bzlmod snippet
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "30.0.0")
+bazel_dep(name = "bazel-diff", version = "31.0.0")
 ```
 
 You can now run the tool with:

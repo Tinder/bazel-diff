@@ -1338,6 +1338,75 @@ class E2ETest {
     assertThat(keepGoingHashes.contains("//bad:")).isEqualTo(false)
   }
 
+  @Test
+  fun testUndeclaredWorkspaceReadIsNotImpacted_reproducerForIssue401() {
+    // Reproducer for https://github.com/Tinder/bazel-diff/issues/401
+    //
+    // Feature request: "always-affected" hashing for targets that perform undeclared
+    // workspace reads (non-hermetic targets). bazel-diff derives a target's hash purely
+    // from its DECLARED graph -- srcs, deps, and attributes. A target that reads files it
+    // does not declare (e.g. a `buildifier_test` that scans every `.bzl` in the repo
+    // without listing them in `srcs`) therefore gets a STABLE hash even when one of those
+    // undeclared files changes, so `get-impacted-targets` skips it -- even though the test
+    // would fail if actually run.
+    //
+    // The `always_affected_external` workspace has two genrules:
+    //   //:scanner  -- tagged `external`, its action reads `scanned_data.txt` but does NOT
+    //                  declare it as a src (the undeclared / non-hermetic read).
+    //   //:hermetic -- a normal target that declares `declared_src.txt` as a src.
+    //
+    // Between the two checkouts we edit BOTH files. The hermetic target is correctly
+    // reported as impacted; the `external`-tagged scanner is NOT -- pinning the current
+    // behaviour that motivates the feature request. If an `--alwaysAffectedTags`
+    // (or similar) feature lands, the scanner should start appearing in the impacted set
+    // and this assertion will flag that the behaviour changed.
+    val workspaceA = copyTestWorkspace("always_affected_external")
+    val workspaceB = copyTestWorkspace("always_affected_external")
+
+    // Change the UNDECLARED read consumed by //:scanner and the DECLARED src of //:hermetic.
+    File(workspaceB, "scanned_data.txt").writeText("v2\n")
+    File(workspaceB, "declared_src.txt").writeText("goodbye\n")
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+
+    // The hermetic target declared its changed source, so it is correctly impacted.
+    assertThat(impacted.contains("//:hermetic")).isEqualTo(true)
+
+    // The `external`-tagged scanner read a file it never declared. Its hash is unchanged,
+    // so bazel-diff does NOT report it -- this is exactly the gap #401 asks to close.
+    assertThat(impacted.contains("//:scanner")).isEqualTo(false)
+  }
+
   /**
    * Returns the Bazel version triple by running `bazel version`, or null if it cannot be
    * determined.

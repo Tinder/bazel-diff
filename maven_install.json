@@ -12,6 +12,7 @@
     "org.eclipse.jgit:org.eclipse.jgit": -1935467463,
     "org.jetbrains.kotlinx:kotlinx-coroutines-core": -542524036,
     "org.mockito.kotlin:mockito-kotlin": 1836434344,
+    "org.slf4j:slf4j-nop": 1480452039,
     "repositories": -1949687017
   },
   "__RESOLVED_ARTIFACTS_HASH": {
@@ -52,7 +53,8 @@
     "org.mockito:mockito-core": -960687581,
     "org.objenesis:objenesis": 1798216877,
     "org.opentest4j:opentest4j": -1584531193,
-    "org.slf4j:slf4j-api": -801231047
+    "org.slf4j:slf4j-api": -801231047,
+    "org.slf4j:slf4j-nop": -2006403554
   },
   "conflict_resolution": {
     "io.insert-koin:koin-core-jvm:3.1.6": "io.insert-koin:koin-core-jvm:4.0.0"
@@ -285,6 +287,12 @@
         "jar": "cdba07964d1bb40a0761485c6b1e8c2f8fd9eb1d19c53928ac0d7f9510105c57"
       },
       "version": "1.7.30"
+    },
+    "org.slf4j:slf4j-nop": {
+      "shasums": {
+        "jar": "2d550dcefaea23d223b72027dbc7cbdb7327676ccefdd9cfe49cf9ea8e9ac8e0"
+      },
+      "version": "1.7.30"
     }
   },
   "dependencies": {
@@ -371,6 +379,9 @@
       "net.bytebuddy:byte-buddy",
       "net.bytebuddy:byte-buddy-agent",
       "org.objenesis:objenesis"
+    ],
+    "org.slf4j:slf4j-nop": [
+      "org.slf4j:slf4j-api"
     ]
   },
   "packages": {
@@ -887,6 +898,9 @@
       "org.slf4j.event",
       "org.slf4j.helpers",
       "org.slf4j.spi"
+    ],
+    "org.slf4j:slf4j-nop": [
+      "org.slf4j.impl"
     ]
   },
   "repositories": {
@@ -928,7 +942,8 @@
       "org.mockito:mockito-core",
       "org.objenesis:objenesis",
       "org.opentest4j:opentest4j",
-      "org.slf4j:slf4j-api"
+      "org.slf4j:slf4j-api",
+      "org.slf4j:slf4j-nop"
     ]
   },
   "services": {

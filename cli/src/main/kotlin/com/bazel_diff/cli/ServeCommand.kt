@@ -139,9 +139,9 @@ class ServeCommand : Callable<Int> {
   @CommandLine.Option(
       names = ["-k", "--keep_going"],
       negatable = true,
-      defaultValue = "true",
+      defaultValue = "false",
       fallbackValue = "true",
-      description = ["Run `bazel query` with --keep_going. Defaults to true."])
+      description = ["Run `bazel query` with --keep_going. Defaults to false."])
   var keepGoing = false
 
   @CommandLine.Option(

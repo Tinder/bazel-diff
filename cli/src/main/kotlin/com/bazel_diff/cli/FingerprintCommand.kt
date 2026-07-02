@@ -93,9 +93,9 @@ class FingerprintCommand : Callable<Int> {
   @CommandLine.Option(
       names = ["-k", "--keep_going"],
       negatable = true,
-      defaultValue = "true",
+      defaultValue = "false",
       fallbackValue = "true")
-  var keepGoing = true
+  var keepGoing = false
 
   @CommandLine.Option(
       names = ["-o", "--output"],

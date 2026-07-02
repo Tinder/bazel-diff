@@ -135,11 +135,11 @@ open class GenerateHashesCommand : Callable<Int> {
   @CommandLine.Option(
       names = ["-k", "--keep_going"],
       negatable = true,
-      defaultValue = "true",
+      defaultValue = "false",
       fallbackValue = "true",
       description =
           [
-              "This flag controls if `bazel query` will be executed with the `--keep_going` flag or not. Disabling this flag allows you to catch configuration issues in your Bazel graph, but may not work for some Bazel setups. Defaults to `true`"],
+              "This flag controls if `bazel query` will be executed with the `--keep_going` flag or not. Enabling this flag lets `bazel query` tolerate failures in your Bazel graph, but may silently drop targets that fail to resolve and produce non-deterministic hashes. Disabling it catches configuration issues by failing loudly. Defaults to `false`"],
       scope = CommandLine.ScopeType.INHERIT)
   var keepGoing = false
 

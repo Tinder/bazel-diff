@@ -17,10 +17,11 @@ import org.slf4j.LoggerFactory
  * SLF4J: Defaulting to no-operation (NOP) logger implementation
  * ```
  *
- * JGit (the serve command's in-process git engine) depends on `slf4j-api` but ships no binding. With
- * no `org.slf4j.impl.StaticLoggerBinder` on the classpath, SLF4J falls back to a NOP logger and
- * prints the warning above to stderr on first use. Shipping `slf4j-nop` as a runtime dep supplies the
- * binding, silencing the warning while discarding JGit's internal logs (keeping the CLI stderr clean).
+ * JGit (the serve command's in-process git engine) depends on `slf4j-api` but ships no binding.
+ * With no `org.slf4j.impl.StaticLoggerBinder` on the classpath, SLF4J falls back to a NOP logger
+ * and prints the warning above to stderr on first use. Shipping `slf4j-nop` as a runtime dep
+ * supplies the binding, silencing the warning while discarding JGit's internal logs (keeping the
+ * CLI stderr clean).
  */
 class Slf4jBindingTest {
   private val originalErr = System.err
@@ -48,7 +49,8 @@ class Slf4jBindingTest {
 
   @Test
   fun obtainingAndUsingALoggerDoesNotPrintNopFallbackWarning() {
-    // Exercises the same path JGit takes: resolve a logger and emit a record. With a binding present
+    // Exercises the same path JGit takes: resolve a logger and emit a record. With a binding
+    // present
     // this is silent; without one, SLF4J's static init prints the warning to stderr.
     val logger = LoggerFactory.getLogger(Slf4jBindingTest::class.java)
     assertThat(logger).isNotNull()

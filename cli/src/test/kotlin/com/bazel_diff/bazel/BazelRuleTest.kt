@@ -50,6 +50,32 @@ class BazelRuleTest {
         .isEqualTo(BazelRule(rule2Pb).digest(emptySet()))
   }
 
+  // Backs --alwaysAffectedTags (issue #401): the `tags` attribute is emitted as a STRING_LIST.
+  @Test
+  fun testTagsExtractedFromAttribute() {
+    val rulePb =
+        Rule.newBuilder()
+            .setRuleClass("sh_test")
+            .setName("//pkg:lint")
+            .addAttribute(
+                Attribute.newBuilder()
+                    .setType(Attribute.Discriminator.STRING_LIST)
+                    .setName("tags")
+                    .addStringListValue("external")
+                    .addStringListValue("no-cache")
+                    .build())
+            .build()
+
+    assertThat(BazelRule(rulePb).tags()).isEqualTo(setOf("external", "no-cache"))
+  }
+
+  @Test
+  fun testTagsEmptyWhenAttributeAbsent() {
+    val rulePb = Rule.newBuilder().setRuleClass("java_library").setName("//pkg:lib").build()
+
+    assertThat(BazelRule(rulePb).tags()).isEqualTo(emptySet<String>())
+  }
+
   // Fix for https://github.com/Tinder/bazel-diff/issues/359
   //
   // Under --useCquery, BazelRule.ruleInputList() now folds each ConfiguredRuleInput's

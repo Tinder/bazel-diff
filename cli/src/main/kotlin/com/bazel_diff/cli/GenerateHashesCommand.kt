@@ -191,6 +191,20 @@ open class GenerateHashesCommand : Callable<Int> {
       scope = CommandLine.ScopeType.INHERIT)
   var excludeExternalTargets = false
 
+  @CommandLine.Option(
+      names = ["--excludeTargetsQuery"],
+      description =
+          [
+              "A Bazel query expression whose matched targets are excluded from the generated " +
+                  "hashes via the `except` operator. Applied to the main target universe for both " +
+                  "`query` and `cquery`. Use this to drop targets you never want reported as " +
+                  "impacted, e.g. `manual`-tagged targets: " +
+                  "--excludeTargetsQuery='attr(\"tags\", \"[\\[ ]manual[,\\]]\", //...)'. " +
+                  "Excluded targets are absent from hashing, so a kept target that depended on one " +
+                  "no longer tracks changes to it."],
+      scope = CommandLine.ScopeType.INHERIT)
+  var excludeTargetsQuery: String? = null
+
   @CommandLine.Spec lateinit var spec: CommandLine.Model.CommandSpec
 
   override fun call(): Int {
@@ -214,6 +228,7 @@ open class GenerateHashesCommand : Callable<Int> {
               fineGrainedHashExternalRepos,
               fineGrainedHashExternalReposFile,
               excludeExternalTargets,
+              excludeTargetsQuery,
           ),
           loggingModule(parent.verbose),
           serialisationModule(),

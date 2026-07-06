@@ -352,6 +352,58 @@ class E2ETest {
   }
 
   @Test
+  fun testExcludeTargetsQueryFiltersManualTargets() {
+    // Reproducer + fix for https://github.com/Tinder/bazel-diff/issues/392: --excludeTargetsQuery
+    // lets users drop `manual`-tagged targets (or any query-matched targets) from generate-hashes
+    // output via Bazel's `except` operator. Reuses the locked `distance_metrics` workspace and
+    // appends a manual-tagged target to the *copied* BUILD so no new MODULE.bazel.lock is needed.
+    val workspace = copyTestWorkspace("distance_metrics")
+    File(workspace, "BUILD")
+        .appendText(
+            "\nsh_library(\n" +
+                "    name = \"manual_only\",\n" +
+                "    srcs = [\"lib.sh\"],\n" +
+                "    tags = [\"manual\"],\n" +
+                ")\n")
+
+    val outputDir = temp.newFolder()
+    val withoutFilter = File(outputDir, "without_filter.json")
+    val withFilter = File(outputDir, "with_filter.json")
+    val cli = CommandLine(BazelDiff())
+
+    // Baseline: the manual target is present when no filter is applied.
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w",
+                workspace.absolutePath,
+                "-b",
+                "bazel",
+                withoutFilter.absolutePath))
+        .isEqualTo(0)
+    val baseline = readTargetHashes(withoutFilter)
+    assertThat(baseline.containsKey("//:manual_only")).isEqualTo(true)
+    assertThat(baseline.containsKey("//:lib")).isEqualTo(true)
+
+    // With the filter, the manual target is gone but the normal target remains. The regex is
+    // Bazel's documented incantation for matching the `manual` element of a `tags` list.
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w",
+                workspace.absolutePath,
+                "-b",
+                "bazel",
+                "--excludeTargetsQuery",
+                """attr("tags", "[\[ ]manual[,\]]", //...)""",
+                withFilter.absolutePath))
+        .isEqualTo(0)
+    val filtered = readTargetHashes(withFilter)
+    assertThat(filtered.containsKey("//:manual_only")).isEqualTo(false)
+    assertThat(filtered.containsKey("//:lib")).isEqualTo(true)
+  }
+
+  @Test
   fun testFineGrainedHashExternalRepo() {
     // The difference between these two snapshots is simply upgrading the Guava version.
     // Following is the diff.
@@ -2689,6 +2741,18 @@ class E2ETest {
               it
             }
         .isEqualTo(true)
+  }
+
+  /**
+   * Reads a `generate-hashes` output file into a flat `target -> hash` map, tolerating both the
+   * bzlmod "new format" (`{"hashes": {...}, "metadata": {...}}`) and the legacy flat format
+   * (`{target: hash}`) emitted for non-bzlmod workspaces.
+   */
+  @Suppress("UNCHECKED_CAST")
+  private fun readTargetHashes(file: File): Map<String, Any> {
+    val root: Map<String, Any> =
+        Gson().fromJson(file.readText(), object : TypeToken<Map<String, Any>>() {}.type)
+    return (root["hashes"] as? Map<String, Any>) ?: root
   }
 
   private fun copyTestWorkspace(path: String): File {

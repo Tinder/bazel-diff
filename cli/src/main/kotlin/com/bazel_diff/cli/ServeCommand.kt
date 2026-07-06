@@ -178,6 +178,15 @@ class ServeCommand : Callable<Int> {
   var excludeExternalTargets = false
 
   @CommandLine.Option(
+      names = ["--excludeTargetsQuery"],
+      description =
+          [
+              "A Bazel query expression whose matched targets are excluded from the served hashes " +
+                  "via the `except` operator, e.g. `manual`-tagged targets: " +
+                  "--excludeTargetsQuery='attr(\"tags\", \"[\\[ ]manual[,\\]]\", //...)'."])
+  var excludeTargetsQuery: String? = null
+
+  @CommandLine.Option(
       names = ["--trackDeps"],
       negatable = true,
       description =
@@ -205,6 +214,7 @@ class ServeCommand : Callable<Int> {
               fineGrainedHashExternalRepos,
               fineGrainedHashExternalReposFile,
               excludeExternalTargets,
+              excludeTargetsQuery,
           ),
           loggingModule(parent.verbose),
           serialisationModule(),
@@ -316,6 +326,7 @@ class ServeCommand : Callable<Int> {
       append("cqueryExpression=").append(cqueryExpression ?: "").append('\n')
       append("keepGoing=").append(keepGoing).append('\n')
       append("excludeExternalTargets=").append(excludeExternalTargets).append('\n')
+      append("excludeTargetsQuery=").append(excludeTargetsQuery ?: "").append('\n')
       append("bazelCommandOptions=").append(bazelCommandOptions.joinToString(" ")).append('\n')
       append("cqueryCommandOptions=").append(cqueryCommandOptions.joinToString(" ")).append('\n')
       append("bazelStartupOptions=").append(bazelStartupOptions.joinToString(" ")).append('\n')

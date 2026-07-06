@@ -15,7 +15,7 @@ fun testModule(): Module = module {
   val workingDirectory = Paths.get("working-directory")
   val bazelPath = Paths.get("bazel")
   single<Logger> { SilentLogger }
-  single { BazelClient(false, null, emptySet(), false) }
+  single { BazelClient(false, null, emptySet(), false, null) }
   single { BuildGraphHasher(get()) }
   single { TargetHasher() }
   single { RuleHasher(false, true, emptySet()) }

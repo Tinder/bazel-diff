@@ -235,6 +235,7 @@ Usage: bazel-diff generate-hashes [-hkvV] [--[no-]excludeExternalTargets] [--
                                   [--contentHashPath=<contentHashPath>]
                                   [--cqueryExpression=<cqueryExpression>]
                                   [-d=<depsMappingJSONPath>]
+                                  [--excludeTargetsQuery=<excludeTargetsQuery>]
                                   [--fineGrainedHashExternalReposFile=<fineGrain
                                   edHashExternalReposFile>]
                                   [-m=<modifiedFilepaths>] [-s=<seedFilepaths>]
@@ -292,6 +293,16 @@ workspace.
                             are excluded automatically. Set this when using
                             Bazel with --enable_workspace=false in other
                             configurations. Defaults to false.
+      --excludeTargetsQuery=<excludeTargetsQuery>
+                          A Bazel query expression whose matched targets are
+                            excluded from the generated hashes via the `except`
+                            operator. Applied to the main target universe for
+                            both `query` and `cquery`. Use this to drop targets
+                            you never want reported as impacted, e.g.
+                            `manual`-tagged targets: --excludeTargetsQuery='attr
+                            ("tags", "[\[ ]manual[,\]]", //...)'. Excluded
+                            targets are absent from hashing, so a kept target
+                            that depended on one no longer tracks changes to it.
       --fineGrainedHashExternalRepos=<fineGrainedHashExternalRepos>
                           Comma separate list of external repos in which
                             fine-grained hashes are computed for the targets.
@@ -427,6 +438,7 @@ Usage: bazel-diff serve [-hkvV] [--[no-]excludeExternalTargets]
                         [--no-initial-fetch] [--[no-]trackDeps] [--[no-]
                         useCquery] [-b=<bazelPath>] --cacheDir=<cacheDir>
                         [--cqueryExpression=<cqueryExpression>]
+                        [--excludeTargetsQuery=<excludeTargetsQuery>]
                         [--fineGrainedHashExternalReposFile=<fineGrainedHashExte
                         rnalReposFile>] [--gitEngine=<gitEngine>]
                         [--gitPath=<gitPath>] [--port=<port>]
@@ -457,6 +469,12 @@ targets between two git revisions, caching generated hashes per commit SHA.
       --[no-]excludeExternalTargets
                             If true, exclude external targets (do not query
                               //external:all-targets).
+      --excludeTargetsQuery=<excludeTargetsQuery>
+                            A Bazel query expression whose matched targets are
+                              excluded from the served hashes via the `except`
+                              operator, e.g. `manual`-tagged targets:
+                              --excludeTargetsQuery='attr("tags", "[\[ ]manual[,
+                              \]]", //...)'.
       --fineGrainedHashExternalRepos=<fineGrainedHashExternalRepos>
                             Comma separated list of external repos for which
                               fine-grained hashes are computed.
@@ -638,9 +656,9 @@ bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
     <td align="center"><a href="https://github.com/tinder-maxwellelliott"><img src="https://avatars.githubusercontent.com/u/56700854?s=64" width="64" alt="Maxwell Elliott"/><br/><sub><b>Maxwell Elliott</b></sub></a></td>
     <td align="center"><a href="https://github.com/honnix"><img src="https://avatars.githubusercontent.com/u/158892?s=64" width="64" alt="Honnix"/><br/><sub><b>Honnix</b></sub></a></td>
     <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="eric wang"/><br/><sub><b>eric wang</b></sub></a></td>
+    <td align="center"><a href="https://github.com/github-actions[bot]"><img src="https://avatars.githubusercontent.com/in/15368?s=64" width="64" alt="github-actions[bot]"/><br/><sub><b>github-actions[bot]</b></sub></a></td>
     <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="Eric Wang"/><br/><sub><b>Eric Wang</b></sub></a></td>
     <td align="center"><a href="https://github.com/tgeng"><img src="https://avatars.githubusercontent.com/u/29584386?s=64" width="64" alt="Tianyu Geng"/><br/><sub><b>Tianyu Geng</b></sub></a></td>
-    <td align="center"><a href="https://github.com/github-actions[bot]"><img src="https://avatars.githubusercontent.com/in/15368?s=64" width="64" alt="github-actions[bot]"/><br/><sub><b>github-actions[bot]</b></sub></a></td>
   </tr>
   <tr>
     <td align="center"><a href="https://github.com/BalestraPatrick"><img src="https://avatars.githubusercontent.com/u/3658887?s=64" width="64" alt="Patrick Balestra"/><br/><sub><b>Patrick Balestra</b></sub></a></td>

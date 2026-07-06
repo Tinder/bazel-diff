@@ -56,7 +56,8 @@ class BazelClientTest : KoinTest {
               useCquery = false,
               cqueryExpression = null,
               fineGrainedHashExternalRepos = emptySet(),
-              excludeExternalTargets = false)
+              excludeExternalTargets = false,
+              excludeTargetsQuery = null)
 
       val targets = client.queryAllTargets()
 
@@ -80,7 +81,8 @@ class BazelClientTest : KoinTest {
               useCquery = false,
               cqueryExpression = null,
               fineGrainedHashExternalRepos = emptySet(),
-              excludeExternalTargets = false)
+              excludeExternalTargets = false,
+              excludeTargetsQuery = null)
 
       val targets = client.queryAllTargets()
 
@@ -104,7 +106,8 @@ class BazelClientTest : KoinTest {
               useCquery = false,
               cqueryExpression = null,
               fineGrainedHashExternalRepos = emptySet(),
-              excludeExternalTargets = false)
+              excludeExternalTargets = false,
+              excludeTargetsQuery = null)
 
       val targets = client.queryAllTargets()
 
@@ -130,7 +133,8 @@ class BazelClientTest : KoinTest {
               useCquery = true,
               cqueryExpression = null,
               fineGrainedHashExternalRepos = emptySet(),
-              excludeExternalTargets = false)
+              excludeExternalTargets = false,
+              excludeTargetsQuery = null)
 
       val targets = client.queryAllTargets()
 
@@ -156,11 +160,87 @@ class BazelClientTest : KoinTest {
               useCquery = false,
               cqueryExpression = null,
               fineGrainedHashExternalRepos = emptySet(),
-              excludeExternalTargets = false)
+              excludeExternalTargets = false,
+              excludeTargetsQuery = null)
 
       val targets = client.queryAllTargets()
 
       assertThat(targets).hasSize(1)
+    }
+  }
+
+  @Test
+  fun queryAllTargets_excludeTargetsQuery_wrapsNonCqueryQuery() {
+    runBlocking {
+      val mainTarget = mockRuleTarget("//src:lib")
+      val excludeQuery = "attr(\"tags\", \"manual\", //...)"
+      val wrapped = "('//external:all-targets' + '//...:all-targets') except ($excludeQuery)"
+
+      whenever(modService.isBzlmodEnabled).thenReturn(false)
+      whenever(queryService.query(wrapped)).thenReturn(listOf(mainTarget))
+
+      val client =
+          BazelClient(
+              useCquery = false,
+              cqueryExpression = null,
+              fineGrainedHashExternalRepos = emptySet(),
+              excludeExternalTargets = false,
+              excludeTargetsQuery = excludeQuery)
+
+      val targets = client.queryAllTargets()
+
+      assertThat(targets.map { it.name }).containsOnly("//src:lib")
+      verify(queryService).query(wrapped)
+    }
+  }
+
+  @Test
+  fun queryAllTargets_excludeTargetsQuery_wrapsCqueryExpression() {
+    runBlocking {
+      val mainTarget = mockRuleTarget("//src:lib")
+      val excludeQuery = "attr(\"tags\", \"manual\", //...)"
+      val wrapped = "(deps(//...:all-targets)) except ($excludeQuery)"
+
+      whenever(modService.isBzlmodEnabled).thenReturn(true)
+      whenever(queryService.canUseBzlmodShowRepo).thenReturn(false)
+      whenever(queryService.query(wrapped, useCquery = true)).thenReturn(listOf(mainTarget))
+
+      val client =
+          BazelClient(
+              useCquery = true,
+              cqueryExpression = null,
+              fineGrainedHashExternalRepos = emptySet(),
+              excludeExternalTargets = false,
+              excludeTargetsQuery = excludeQuery)
+
+      val targets = client.queryAllTargets()
+
+      assertThat(targets.map { it.name }).containsOnly("//src:lib")
+      verify(queryService).query(wrapped, useCquery = true)
+    }
+  }
+
+  @Test
+  fun queryAllTargets_blankExcludeTargetsQuery_doesNotWrapQuery() {
+    runBlocking {
+      val mainTarget = mockRuleTarget("//src:lib")
+
+      whenever(modService.isBzlmodEnabled).thenReturn(false)
+      whenever(queryService.query("'//external:all-targets' + '//...:all-targets'"))
+          .thenReturn(listOf(mainTarget))
+
+      val client =
+          BazelClient(
+              useCquery = false,
+              cqueryExpression = null,
+              fineGrainedHashExternalRepos = emptySet(),
+              excludeExternalTargets = false,
+              excludeTargetsQuery = "   ")
+
+      val targets = client.queryAllTargets()
+
+      assertThat(targets.map { it.name }).containsOnly("//src:lib")
+      verify(queryService).query("'//external:all-targets' + '//...:all-targets'")
     }
   }
 

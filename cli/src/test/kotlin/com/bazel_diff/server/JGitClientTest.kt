@@ -4,6 +4,7 @@ import assertk.assertThat
 import assertk.assertions.hasLength
 import assertk.assertions.isEqualTo
 import assertk.assertions.isNotEqualTo
+import assertk.assertions.messageContains
 import com.bazel_diff.SilentLogger
 import com.bazel_diff.log.Logger
 import java.io.File
@@ -26,9 +27,11 @@ class JGitClientTest : KoinTest {
   @get:Rule val temp: TemporaryFolder = TemporaryFolder()
 
   /** Runs git for test setup, returning trimmed stdout; fails the test on a non-zero exit. */
-  private fun git(vararg args: String): String {
-    val proc =
-        ProcessBuilder(listOf("git") + args).directory(temp.root).redirectErrorStream(true).start()
+  private fun git(vararg args: String): String = runGit(temp.root, *args)
+
+  /** Like [git] but in an explicit working directory (for multi-repo fetch tests). */
+  private fun runGit(dir: File, vararg args: String): String {
+    val proc = ProcessBuilder(listOf("git") + args).directory(dir).redirectErrorStream(true).start()
     val output = proc.inputStream.readBytes().decodeToString()
     val code = proc.waitFor()
     check(code == 0) { "git ${args.joinToString(" ")} failed ($code): $output" }
@@ -108,5 +111,52 @@ class JGitClientTest : KoinTest {
   fun checkoutThrowsOnUnknownRevision() {
     initRepoWithTwoCommits()
     assertThrows(GitClientException::class.java) { client().checkout("does-not-exist") }
+  }
+
+  @Test
+  fun resolveShaThrowsMissingRevisionForAbsentFullSha() {
+    initRepoWithTwoCommits()
+    // A well-formed 40-char SHA that is not in the object database. Repository.resolve() parses the
+    // hex without a DB lookup, so resolveSha must detect the absence itself and flag it retryable.
+    val absent = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    assertThrows(MissingRevisionException::class.java) { client().resolveSha(absent) }
+  }
+
+  @Test
+  fun resolveShaThrowsWhenRevisionIsNotACommit() {
+    initRepoWithTwoCommits()
+    // A tree object is present but is not a commit; resolveSha must reject it as a hard error, not
+    // as a retryable MissingRevisionException (a refetch would never make a tree checkoutable).
+    val treeSha = git("rev-parse", "HEAD^{tree}")
+    val ex = assertThrows(GitClientException::class.java) { client().resolveSha(treeSha) }
+    assertThat(ex).messageContains("does not refer to a commit")
+  }
+
+  @Test
+  fun resolveShaSeesCommitOnlyAfterFetch() {
+    // Reproduces the reported serve failure: a commit that lands on the remote AFTER the clone is
+    // absent locally, so resolveSha rejects it (rather than deferring an opaque checkout error)
+    // until an on-demand fetch brings it in.
+    val origin = File(temp.root, "origin").apply { mkdirs() }
+    runGit(origin, "init", "-q")
+    runGit(origin, "config", "user.email", "test@example.com")
+    runGit(origin, "config", "user.name", "test")
+    File(origin, "file.txt").writeText("one")
+    runGit(origin, "add", ".")
+    runGit(origin, "commit", "-q", "-m", "first")
+
+    val workspace = File(temp.root, "workspace")
+    runGit(temp.root, "clone", "-q", origin.absolutePath, workspace.absolutePath)
+
+    // A new commit lands in origin after the clone; the workspace has not fetched it yet.
+    File(origin, "file.txt").writeText("two")
+    runGit(origin, "add", ".")
+    runGit(origin, "commit", "-q", "-m", "second")
+    val sha2 = runGit(origin, "rev-parse", "HEAD")
+
+    val client = JGitClient(workspace.toPath())
+    assertThrows(MissingRevisionException::class.java) { client.resolveSha(sha2) }
+    client.fetch()
+    assertThat(client.resolveSha(sha2)).isEqualTo(sha2)
   }
 }

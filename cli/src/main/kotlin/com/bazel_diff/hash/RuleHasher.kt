@@ -13,7 +13,9 @@ import org.koin.core.component.inject
 class RuleHasher(
     private val useCquery: Boolean,
     private val trackDepLabels: Boolean,
-    private val fineGrainedHashExternalRepos: Set<String>
+    private val fineGrainedHashExternalRepos: Set<String>,
+    private val alwaysAffectedTags: Set<String> = emptySet(),
+    private val alwaysAffectedSeed: ByteArray = ByteArray(0),
 ) : KoinComponent {
   private val logger: Logger by inject()
   private val sourceFileHasher: SourceFileHasher by inject()
@@ -52,6 +54,15 @@ class RuleHasher(
       return it
     }
 
+    // issue #401: a target carrying an --alwaysAffectedTags tag (e.g. `external`) may read
+    // undeclared workspace state at execution time, so its *declared* inputs can't make its hash
+    // change when that state does, and target determination wrongly skips it. Mix a per-invocation
+    // sentinel into its digest so two generate-hashes runs never agree and a base/head diff always
+    // marks it impacted. Only tagged rules are touched -- every other target's hash stays
+    // byte-for-byte identical to a run without the flag.
+    val alwaysAffected =
+        alwaysAffectedTags.isNotEmpty() && rule.tags().any { it in alwaysAffectedTags }
+
     val finalHashValue =
         targetSha256(trackDepLabels) {
           putDirectBytes(rule.digest(ignoredAttrs))
@@ -61,6 +72,12 @@ class RuleHasher(
           // depth-first recursion below and a macro edit re-hashes only the packages that
           // `load()` it (issue #365).
           putDirectBytes(packageBzlSeeds[labelToPackage(rule.name)])
+          // Mixed into the *direct* digest (not transitively) so the tagged target is classified
+          // as DIRECT-impacted for distance metrics; it still bubbles into the overall digest, so
+          // any rdeps are conservatively re-hashed too.
+          if (alwaysAffected) {
+            putDirectBytes(alwaysAffectedSeed)
+          }
 
           for (ruleInput in rule.ruleInputList(useCquery, fineGrainedHashExternalRepos)) {
             // Under --useCquery, `ruleInput` may carry an embedded configurationChecksum (see

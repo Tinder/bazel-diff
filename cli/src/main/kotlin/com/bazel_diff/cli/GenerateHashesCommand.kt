@@ -192,18 +192,29 @@ open class GenerateHashesCommand : Callable<Int> {
   var excludeExternalTargets = false
 
   @CommandLine.Option(
-      names = ["--excludeTargetsQuery"],
-      description =
-          [
-              "A Bazel query expression whose matched targets are excluded from the generated " +
-                  "hashes via the `except` operator. Applied to the main target universe for both " +
-                  "`query` and `cquery`. Use this to drop targets you never want reported as " +
-                  "impacted, e.g. `manual`-tagged targets: " +
-                  "--excludeTargetsQuery='attr(\"tags\", \"[\\[ ]manual[,\\]]\", //...)'. " +
-                  "Excluded targets are absent from hashing, so a kept target that depended on one " +
-                  "no longer tracks changes to it."],
-      scope = CommandLine.ScopeType.INHERIT)
-  var excludeTargetsQuery: String? = null
+@CommandLine.Option(
+    names = ["--excludeTargetsQuery"],
+    description =
+        [
+            "A Bazel query expression whose matched targets are excluded from the generated " +
+                "hashes via the `except` operator. Applied to the main target universe for both " +
+                "`query` and `cquery`. Use this to drop targets you never want reported as " +
+                "impacted, e.g. `manual`-tagged targets: " +
+                "--excludeTargetsQuery='attr(\"tags\", \"[\\[ ]manual[,\\]]\", //...)'. " +
+                "Excluded targets are absent from hashing, so a kept target that depended on one " +
+                "no longer tracks changes to it."],
+    scope = CommandLine.ScopeType.INHERIT)
+var excludeTargetsQuery: String? = null
+
+@CommandLine.Option(
+    names = ["--alwaysAffectedTags"],
+    description =
+        [
+            "Comma separated list of Bazel target tags (e.g. `external`). Any target whose `tags` attribute contains one of these values is always reported as impacted: a per-invocation sentinel is mixed into its hash so a diff of two `generate-hashes` runs always marks it changed. Use this for non-hermetic targets that read undeclared workspace state at execution time (e.g. repo-scanning linters such as buildifier/gofmt/eslint tests) which would otherwise hash as unchanged and be wrongly skipped by target determination. This is the Bazel target `external` *tag* and is unrelated to --excludeExternalTargets / --fineGrainedHashExternalRepos, which concern external *repositories*."],
+    scope = CommandLine.ScopeType.INHERIT,
+    converter = [CommaSeparatedValueConverter::class],
+)
+var alwaysAffectedTags: Set<String> = emptySet()
 
   @CommandLine.Spec lateinit var spec: CommandLine.Model.CommandSpec
 
@@ -229,6 +240,7 @@ open class GenerateHashesCommand : Callable<Int> {
               fineGrainedHashExternalReposFile,
               excludeExternalTargets,
               excludeTargetsQuery,
+              alwaysAffectedTags,
           ),
           loggingModule(parent.verbose),
           serialisationModule(),

@@ -67,6 +67,29 @@ See https://github.com/aspect-extensions/impacted
 
 * We run `bazel-diff` on the starting and final JSON hash filepaths to get our impacted set of targets. This impacted set of targets is written to a file.
 
+## Always-affected targets (non-hermetic tags)
+
+`bazel-diff` hashes a target from its **declared** inputs (its rule attributes and the transitive
+deps in the query graph). A target that reads the workspace at execution time *without* declaring
+those files as inputs — a repo-scanning linter such as `buildifier_test`, `gofmt_test`, or
+`eslint_test`, for example — keeps a **stable hash** across commits that only change those
+undeclared files. Target determination then wrongly skips it even though it would fail if run.
+
+Pass `--alwaysAffectedTags` to `generate-hashes` with one or more [Bazel target
+tags](https://bazel.build/reference/be/common-definitions#common.tags) to opt such targets in:
+
+```bash
+bazel-diff generate-hashes --alwaysAffectedTags=external -w "$WORKSPACE" -b "$BAZEL" hashes.json
+```
+
+Any target whose `tags` attribute contains a listed value (e.g. `external`) gets a per-invocation
+sentinel mixed into its hash, so a diff of the base and head hash files **always** reports it as
+impacted. Every other target's hash is byte-for-byte identical to a run without the flag, so nothing
+else over-invalidates. The tag name is your convention — nothing is hardcoded.
+
+> This is unrelated to `--excludeExternalTargets` / `--fineGrainedHashExternalRepos`, which concern
+> external **repositories** (`@repo//…`), not the `external` **tag**.
+
 ## Build Graph Distance Metrics
 
 `bazel-diff` can optionally compute build graph distance metrics between two revisions. This is
@@ -240,6 +263,7 @@ Usage: bazel-diff generate-hashes [-hkvV] [--[no-]excludeExternalTargets] [--
                                   edHashExternalReposFile>]
                                   [-m=<modifiedFilepaths>] [-s=<seedFilepaths>]
                                   -w=<workspacePath>
+                                  [--alwaysAffectedTags=<alwaysAffectedTags>]...
                                   [-co=<bazelCommandOptions>]...
                                   [--cqueryCommandOptions=<cqueryCommandOptions>
                                   ]...
@@ -255,6 +279,22 @@ workspace.
       <outputPath>        The filepath to write the resulting JSON of
                             dictionary target => SHA-256 values. If not
                             specified, the JSON will be written to STDOUT.
+      --alwaysAffectedTags=<alwaysAffectedTags>
+                          Comma separated list of Bazel target tags (e.g.
+                            `external`). Any target whose `tags` attribute
+                            contains one of these values is always reported as
+                            impacted: a per-invocation sentinel is mixed into
+                            its hash so a diff of two `generate-hashes` runs
+                            always marks it changed. Use this for non-hermetic
+                            targets that read undeclared workspace state at
+                            execution time (e.g. repo-scanning linters such as
+                            buildifier/gofmt/eslint tests) which would
+                            otherwise hash as unchanged and be wrongly skipped
+                            by target determination. This is the Bazel target
+                            `external` *tag* and is unrelated to
+                            --excludeExternalTargets /
+                            --fineGrainedHashExternalRepos, which concern
+                            external *repositories*.
   -b, --bazelPath=<bazelPath>
                           Path to Bazel binary. If not specified, the Bazel
                             binary available in PATH will be used.

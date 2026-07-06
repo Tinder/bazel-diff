@@ -65,6 +65,12 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "RuleHasherAlwaysAffectedTagsTest",
+    test_class = "com.bazel_diff.hash.RuleHasherAlwaysAffectedTagsTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "SourceFileHasherTest",
     data = [
         ":src/test/kotlin/com/bazel_diff/hash/fixture/foo.ts",

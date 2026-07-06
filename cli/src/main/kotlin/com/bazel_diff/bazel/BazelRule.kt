@@ -89,6 +89,18 @@ class BazelRule(private val rule: Build.Rule) {
 
   val name: String = rule.name
 
+  /**
+   * The values of this rule's `tags` attribute, or an empty set when the attribute is absent. Bazel
+   * emits user-declared tags as a `STRING_LIST` attribute named `tags` in the query proto.
+   * bazel-diff reads them to honour `--alwaysAffectedTags`: a target carrying one of those tags is
+   * treated as always impacted, because it may read undeclared workspace state at execution time
+   * (issue #401). This is the Bazel target *tag* `external`, which is unrelated to the external
+   * *repository* handling behind `--excludeExternalTargets` / `--fineGrainedHashExternalRepos`.
+   */
+  fun tags(): Set<String> =
+      rule.attributeList.firstOrNull { it.name == "tags" }?.stringListValueList?.toSet()
+          ?: emptySet()
+
   private fun transformRuleInput(
       fineGrainedHashExternalRepos: Set<String>,
       ruleInput: String

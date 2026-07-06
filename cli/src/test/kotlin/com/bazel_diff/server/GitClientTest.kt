@@ -79,6 +79,16 @@ class GitClientTest : KoinTest {
   }
 
   @Test
+  fun resolveShaThrowsMissingRevisionForAbsentFullSha() {
+    initRepoWithTwoCommits()
+    val client = ProcessGitClient(temp.root.toPath())
+    // `git rev-parse <full-sha>` echoes any well-formed SHA back even when absent; resolveSha must
+    // use `--verify` so a commit that isn't in the clone is rejected as a retryable miss.
+    val absent = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    assertThrows(MissingRevisionException::class.java) { client.resolveSha(absent) }
+  }
+
+  @Test
   fun fetchDoesNotThrowWithoutRemotes() {
     initRepoWithTwoCommits()
     // `git fetch --all` is a no-op (exit 0) when there are no remotes, so it must not throw.

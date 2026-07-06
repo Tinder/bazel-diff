@@ -10,8 +10,20 @@ import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
 /** Thrown when a `git` subprocess exits non-zero or produces unusable output. */
-class GitClientException(message: String, cause: Throwable? = null) :
+open class GitClientException(message: String, cause: Throwable? = null) :
     RuntimeException(message, cause)
+
+/**
+ * Thrown when a revision cannot be found in the local clone -- either it did not resolve at all, or
+ * it resolved (a full 40-char SHA always parses to an ObjectId) but the underlying commit object is
+ * absent from the object database.
+ *
+ * The query service treats this as *retryable*: it only fetches at startup, so a commit that landed
+ * on the remote afterwards is simply not here yet. Callers refetch and retry once before surfacing
+ * the failure (see [com.bazel_diff.server.ImpactedTargetsService]).
+ */
+class MissingRevisionException(val revision: String, cause: Throwable? = null) :
+    GitClientException("revision '$revision' is missing from the local clone", cause)
 
 /**
  * Thin wrapper over a `git` binary (assumed on `$PATH`) scoped to a single workspace clone. The
@@ -25,8 +37,10 @@ interface GitClient {
   fun fetch()
 
   /**
-   * Resolves a revision (branch, tag, short or full SHA) to a full 40-char commit SHA. Throws
-   * [GitClientException] if the revision cannot be resolved.
+   * Resolves a revision (branch, tag, short or full SHA) to a full 40-char commit SHA, verifying
+   * that the commit actually exists in the local clone. Throws [MissingRevisionException] if the
+   * revision does not resolve or its object is absent (retryable via [fetch]); throws
+   * [GitClientException] for other failures (e.g. the revision names a non-commit object).
    */
   fun resolveSha(revision: String): String
 
@@ -50,9 +64,19 @@ class ProcessGitClient(
   }
 
   override fun resolveSha(revision: String): String {
-    val output = run("rev-parse", revision)
+    // `rev-parse --verify <rev>^{commit}` both resolves the revision to a commit SHA and confirms
+    // that commit is present in the local clone. A bare `rev-parse <full-sha>` echoes any
+    // well-formed 40-char SHA straight back without consulting the object database, so a commit
+    // that isn't here would "resolve" and only fail later at checkout. A non-zero exit means the
+    // revision is absent (or not a commit) locally -- retryable via a refetch.
+    val output =
+        try {
+          run("rev-parse", "--verify", "$revision^{commit}")
+        } catch (e: GitClientException) {
+          throw MissingRevisionException(revision, e)
+        }
     return output.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() }
-        ?: throw GitClientException("git rev-parse $revision produced no output")
+        ?: throw MissingRevisionException(revision)
   }
 
   override fun checkout(revision: String) {

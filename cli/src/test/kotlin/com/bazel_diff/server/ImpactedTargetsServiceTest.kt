@@ -45,6 +45,60 @@ class ImpactedTargetsServiceTest : KoinTest {
     override fun checkout(revision: String) = Unit
   }
 
+  /** [GitClient] whose [missingUntilFetch] revisions resolve only after [fetch] has run once. */
+  private class RefetchGitClient(private val missingUntilFetch: Set<String>) : GitClient {
+    var fetchCount = 0
+    private var fetched = false
+
+    override fun fetch() {
+      fetchCount++
+      fetched = true
+    }
+
+    override fun resolveSha(revision: String): String {
+      if (!fetched && revision in missingUntilFetch) throw MissingRevisionException(revision)
+      return revision
+    }
+
+    override fun checkout(revision: String) = Unit
+  }
+
+  /**
+   * [GitClient] that fails the first resolve of [flaky] and succeeds on the next WITHOUT a fetch --
+   * models another request having refetched while this one waited on the fetch lock.
+   */
+  private class ResolvesOnSecondAttemptGitClient(private val flaky: String) : GitClient {
+    var fetchCount = 0
+    private var attempts = 0
+
+    override fun fetch() {
+      fetchCount++
+    }
+
+    override fun resolveSha(revision: String): String {
+      if (revision == flaky && ++attempts == 1) throw MissingRevisionException(revision)
+      return revision
+    }
+
+    override fun checkout(revision: String) = Unit
+  }
+
+  /** [GitClient] whose [missing] revisions never resolve, even after a fetch. */
+  private class AlwaysMissingGitClient(private val missing: Set<String>) : GitClient {
+    var fetchCount = 0
+
+    override fun fetch() {
+      fetchCount++
+    }
+
+    override fun resolveSha(revision: String): String {
+      if (revision in missing) throw MissingRevisionException(revision)
+      return revision
+    }
+
+    override fun checkout(revision: String) = Unit
+  }
+
   /**
    * [HashProvider] returning canned data. By default the module-change workspace path is treated as
    * an error (the pure hash-diff path must not touch the workspace); set [allowWorkspaceAt] to
@@ -195,5 +249,52 @@ class ImpactedTargetsServiceTest : KoinTest {
 
     assertThat(result.impactedTargets).containsExactly(ImpactedTargetWithDistance("//:a", 0, 0))
     assertThat(provider.workspaceAtCalls).isEqualTo(listOf("to-sha"))
+  }
+
+  @Test
+  fun refetchesOnceWhenRevisionMissingThenResolves() {
+    // The `to` commit isn't in the local clone yet (it landed after the last fetch); the service
+    // must fetch on demand and retry rather than surfacing the miss as a 400.
+    val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), null)
+    val to = HashFileData(mapOf("//:a" to TargetHash("Rule", "h2", "d2")), null)
+    val git = RefetchGitClient(missingUntilFetch = setOf("to-sha"))
+    val service =
+        ImpactedTargetsService(git, FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to)))
+
+    val result = service.getImpactedTargets("from-sha", "to-sha", null)
+
+    assertThat(result.impactedTargets).isEqualTo(listOf("//:a"))
+    assertThat(git.fetchCount).isEqualTo(1)
+  }
+
+  @Test
+  fun skipsRefetchWhenRevisionAppearsUnderTheLock() {
+    // A concurrent request already refetched: the double-check re-resolve under the lock succeeds,
+    // so this request must not issue its own redundant fetch.
+    val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), null)
+    val to = HashFileData(mapOf("//:a" to TargetHash("Rule", "h2", "d2")), null)
+    val git = ResolvesOnSecondAttemptGitClient(flaky = "to-sha")
+    val service =
+        ImpactedTargetsService(git, FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to)))
+
+    val result = service.getImpactedTargets("from-sha", "to-sha", null)
+
+    assertThat(result.impactedTargets).isEqualTo(listOf("//:a"))
+    assertThat(git.fetchCount).isEqualTo(0)
+  }
+
+  @Test
+  fun propagatesMissingRevisionAfterRefetchStillFails() {
+    // A genuinely unknown revision: one refetch is attempted, then the miss propagates (the HTTP
+    // layer maps it to a 400).
+    val git = AlwaysMissingGitClient(missing = setOf("to-sha"))
+    val service = ImpactedTargetsService(git, FakeHashProvider(emptyMap()))
+
+    val ex =
+        org.junit.Assert.assertThrows(MissingRevisionException::class.java) {
+          service.getImpactedTargets("from-sha", "to-sha", null)
+        }
+    assertThat(ex.revision).isEqualTo("to-sha")
+    assertThat(git.fetchCount).isEqualTo(1)
   }
 }

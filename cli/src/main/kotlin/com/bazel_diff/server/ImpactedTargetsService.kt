@@ -72,13 +72,17 @@ class ImpactedTargetsService(
   private val bazelModService: BazelModService by inject()
   private val logger: Logger by inject()
 
+  // Serializes on-demand refetches so a burst of requests for a just-landed
+  // commit triggers at most one `git fetch` at a time (and skips it entirely
+  // once an earlier fetch has already brought the commit in).
+  private val fetchLock = Any()
+
   override fun getImpactedTargets(
       fromRev: String,
       toRev: String,
       targetTypes: Set<String>?
   ): ImpactedTargetsResult {
-    val fromSha = gitClient.resolveSha(fromRev)
-    val toSha = gitClient.resolveSha(toRev)
+    val (fromSha, toSha) = resolveBoth(fromRev, toRev)
     logger.i { "Computing impacted targets $fromSha -> $toSha" }
 
     val fromData = hashProvider.getHashes(fromSha)
@@ -110,8 +114,7 @@ class ImpactedTargetsService(
       throw DistancesUnavailableException(
           "distances unavailable: server started without --trackDeps")
     }
-    val fromSha = gitClient.resolveSha(fromRev)
-    val toSha = gitClient.resolveSha(toRev)
+    val (fromSha, toSha) = resolveBoth(fromRev, toRev)
     logger.i { "Computing impacted targets with distances $fromSha -> $toSha" }
 
     val fromData = hashProvider.getHashes(fromSha)
@@ -132,6 +135,35 @@ class ImpactedTargetsService(
               excludeExternalTargets())
         }
     return ImpactedTargetsWithDistancesResult(fromSha, toSha, impacted)
+  }
+
+  /**
+   * Resolves both revisions to commit SHAs, refetching once if either is missing from the local
+   * clone. The service only fetches at startup, so a commit that landed on the remote afterwards
+   * (or a branch this clone has not yet seen) would otherwise fail with a stale-clone
+   * [MissingRevisionException]; a single on-demand `git fetch` brings it in.
+   *
+   * Fetches are serialized and double-checked through [fetchLock]: concurrent requests for the same
+   * new commit wait on the lock, and whoever holds it re-resolves first, so an earlier fetch that
+   * already made the revision resolvable saves the rest a redundant fetch. A revision still missing
+   * after the refetch is genuinely unknown (bad SHA, or a ref this clone's refspec doesn't fetch)
+   * and propagates as [MissingRevisionException] -> HTTP 400.
+   */
+  private fun resolveBoth(fromRev: String, toRev: String): Pair<String, String> {
+    try {
+      return gitClient.resolveSha(fromRev) to gitClient.resolveSha(toRev)
+    } catch (missing: MissingRevisionException) {
+      logger.i { "Revision '${missing.revision}' not in local clone; refetching and retrying" }
+    }
+    synchronized(fetchLock) {
+      // A concurrent request may have refetched while we waited on the lock; retry before fetching.
+      try {
+        return gitClient.resolveSha(fromRev) to gitClient.resolveSha(toRev)
+      } catch (stillMissing: MissingRevisionException) {
+        gitClient.fetch()
+      }
+    }
+    return gitClient.resolveSha(fromRev) to gitClient.resolveSha(toRev)
   }
 
   // Synthetic //external:* labels are not buildable in bzlmod-only mode; mirror the

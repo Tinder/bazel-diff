@@ -3,6 +3,9 @@ package com.bazel_diff.server
 import com.bazel_diff.log.Logger
 import java.nio.file.Path
 import org.eclipse.jgit.api.Git
+import org.eclipse.jgit.errors.IncorrectObjectTypeException
+import org.eclipse.jgit.errors.MissingObjectException
+import org.eclipse.jgit.revwalk.RevWalk
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder
 import org.eclipse.jgit.transport.RemoteConfig
 import org.koin.core.component.KoinComponent
@@ -53,10 +56,22 @@ class JGitClient(private val workspacePath: Path) : GitClient, KoinComponent {
 
   override fun resolveSha(revision: String): String {
     open().use { git ->
-      val objectId =
-          git.repository.resolve(revision)
-              ?: throw GitClientException("could not resolve revision '$revision'")
-      return objectId.name
+      val objectId = git.repository.resolve(revision) ?: throw MissingRevisionException(revision)
+      // Repository.resolve() turns a full 40-char SHA into an ObjectId by parsing the
+      // hex WITHOUT consulting the object database, so a commit absent from this clone
+      // still "resolves". Parse it through a RevWalk to confirm the object is present
+      // (peeling annotated tags to their commit), so an absent commit becomes a
+      // retryable MissingRevisionException here instead of an opaque "Missing unknown
+      // <sha>" failure deferred to the later checkout.
+      val commit =
+          try {
+            RevWalk(git.repository).use { walk -> walk.parseCommit(objectId) }
+          } catch (e: MissingObjectException) {
+            throw MissingRevisionException(revision, e)
+          } catch (e: IncorrectObjectTypeException) {
+            throw GitClientException("revision '$revision' does not refer to a commit", e)
+          }
+      return commit.name
     }
   }
 

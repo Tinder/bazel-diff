@@ -35,6 +35,7 @@ fun hasherModule(
     fineGrainedHashExternalRepos: Set<String>,
     fineGrainedHashExternalReposFile: File?,
     excludeExternalTargets: Boolean,
+    excludeTargetsQuery: String? = null,
 ): Module = module {
   if (fineGrainedHashExternalReposFile != null && fineGrainedHashExternalRepos.isNotEmpty()) {
     System.err.println(
@@ -92,7 +93,11 @@ fun hasherModule(
   single { BazelModService(workingDirectory, bazelPath, startupOptions, debug) }
   single {
     BazelClient(
-        useCquery, cqueryExpression, updatedFineGrainedHashExternalRepos, excludeExternalTargets)
+        useCquery,
+        cqueryExpression,
+        updatedFineGrainedHashExternalRepos,
+        excludeExternalTargets,
+        excludeTargetsQuery)
   }
   single { BuildGraphHasher(get()) }
   single { TargetHasher() }

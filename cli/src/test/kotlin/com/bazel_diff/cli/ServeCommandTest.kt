@@ -102,8 +102,13 @@ class ServeCommandTest : KoinTest {
         ServeCommand()
             .apply { fineGrainedHashExternalRepos = setOf("@maven") }
             .computeConfigFingerprint()
+    val withExcludeQuery =
+        ServeCommand()
+            .apply { excludeTargetsQuery = "attr(\"tags\", \"manual\", //...)" }
+            .computeConfigFingerprint()
     assertThat(withCquery).isNotEqualTo(base)
     assertThat(withRepos).isNotEqualTo(base)
+    assertThat(withExcludeQuery).isNotEqualTo(base)
   }
 
   @Test

@@ -10,10 +10,23 @@ class BazelClient(
     private val cqueryExpression: String?,
     private val fineGrainedHashExternalRepos: Set<String>,
     private val excludeExternalTargets: Boolean,
+    private val excludeTargetsQuery: String?,
 ) : KoinComponent {
   private val logger: Logger by inject()
   private val queryService: BazelQueryService by inject()
   private val bazelModService: BazelModService by inject()
+
+  /**
+   * Wraps [query] so that every target matching the user-supplied [excludeTargetsQuery] is removed
+   * from the result set via Bazel's `except` operator. Returns [query] unchanged when no exclude
+   * query is configured. This is how callers drop, e.g., `manual`-tagged targets from the graph
+   * (issue #392): `--excludeTargetsQuery='attr("tags", "[\[ ]manual[,\]]", //...)'`. Excluded
+   * targets are simply absent from hashing; any kept target that depended on one logs an "Unable to
+   * calculate digest" warning and hashes without that input, which is the intended behavior for
+   * leaf targets like `manual`-tagged tests/binaries.
+   */
+  private fun withExcludeFilter(query: String): String =
+      excludeTargetsQuery?.takeIf { it.isNotBlank() }?.let { "($query) except ($it)" } ?: query
 
   suspend fun queryAllTargets(): List<BazelTarget> {
     val queryEpoch = Calendar.getInstance().getTimeInMillis()
@@ -57,7 +70,7 @@ class BazelClient(
           // In addition, we must include all source dependencies in this query in order for them to
           // show up in
           // `configuredRuleInput`. Hence, one must not filter them out with `kind(rule, deps(..))`.
-          val expression = cqueryExpression ?: "deps(//...:all-targets)"
+          val expression = withExcludeFilter(cqueryExpression ?: "deps(//...:all-targets)")
           val mainTargets = queryService.query(expression, useCquery = true)
           val repoTargets =
               if (repoTargetsQuery.isNotEmpty()) {
@@ -70,7 +83,9 @@ class BazelClient(
           val buildTargetsQuery =
               listOf("//...:all-targets") +
                   fineGrainedHashExternalRepos.map { "$it//...:all-targets" }
-          queryService.query((repoTargetsQuery + buildTargetsQuery).joinToString(" + ") { "'$it'" })
+          queryService.query(
+              withExcludeFilter(
+                  (repoTargetsQuery + buildTargetsQuery).joinToString(" + ") { "'$it'" }))
         }
     val allTargets = (targets + bzlmodRepoTargets).distinctBy { it.name }
     val queryDuration = Calendar.getInstance().getTimeInMillis() - queryEpoch

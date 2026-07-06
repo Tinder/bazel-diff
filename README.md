@@ -67,29 +67,6 @@ See https://github.com/aspect-extensions/impacted
 
 * We run `bazel-diff` on the starting and final JSON hash filepaths to get our impacted set of targets. This impacted set of targets is written to a file.
 
-## Always-affected targets (non-hermetic tags)
-
-`bazel-diff` hashes a target from its **declared** inputs (its rule attributes and the transitive
-deps in the query graph). A target that reads the workspace at execution time *without* declaring
-those files as inputs — a repo-scanning linter such as `buildifier_test`, `gofmt_test`, or
-`eslint_test`, for example — keeps a **stable hash** across commits that only change those
-undeclared files. Target determination then wrongly skips it even though it would fail if run.
-
-Pass `--alwaysAffectedTags` to `generate-hashes` with one or more [Bazel target
-tags](https://bazel.build/reference/be/common-definitions#common.tags) to opt such targets in:
-
-```bash
-bazel-diff generate-hashes --alwaysAffectedTags=external -w "$WORKSPACE" -b "$BAZEL" hashes.json
-```
-
-Any target whose `tags` attribute contains a listed value (e.g. `external`) gets a per-invocation
-sentinel mixed into its hash, so a diff of the base and head hash files **always** reports it as
-impacted. Every other target's hash is byte-for-byte identical to a run without the flag, so nothing
-else over-invalidates. The tag name is your convention — nothing is hardcoded.
-
-> This is unrelated to `--excludeExternalTargets` / `--fineGrainedHashExternalRepos`, which concern
-> external **repositories** (`@repo//…`), not the `external` **tag**.
-
 ## Build Graph Distance Metrics
 
 `bazel-diff` can optionally compute build graph distance metrics between two revisions. This is
@@ -264,7 +241,7 @@ Usage: bazel-diff generate-hashes [-hkvV] [--[no-]excludeExternalTargets] [--
                                   [-m=<modifiedFilepaths>] [-s=<seedFilepaths>]
                                   -w=<workspacePath>
                                   [--alwaysAffectedTags=<alwaysAffectedTags>]...
-                                  [-co=<bazelCommandOptions>]...
+                                   [-co=<bazelCommandOptions>]...
                                   [--cqueryCommandOptions=<cqueryCommandOptions>
                                   ]...
                                   [--fineGrainedHashExternalRepos=<fineGrainedHa
@@ -575,7 +552,7 @@ First, add the following snippet to your project:
 #### Bzlmod snippet
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "31.1.0")
+bazel_dep(name = "bazel-diff", version = "31.2.0")
 ```
 
 You can now run the tool with:

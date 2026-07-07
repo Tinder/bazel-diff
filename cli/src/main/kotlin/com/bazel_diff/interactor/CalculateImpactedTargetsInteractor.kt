@@ -80,7 +80,7 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       from: Map<String, TargetHash>,
       to: Map<String, TargetHash>
   ): Set<String> {
-    val difference = Maps.difference(to, from)
+    val difference = Maps.difference(hashIdentities(to), hashIdentities(from))
     val onlyInEnd: Set<String> = difference.entriesOnlyOnLeft().keys
     val changed: Set<String> = difference.entriesDiffering().keys
     val impactedTargets =
@@ -90,6 +90,21 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
         }
     return impactedTargets
   }
+
+  /**
+   * Projects each target to its hash identity (`type#hash~directHash`) for impactedness comparison.
+   *
+   * Impactedness is defined purely by a target's hash, so the comparison must not include
+   * [TargetHash.deps]: that field is auxiliary data used only to derive distance metrics. It is
+   * populated on freshly generated hashes (under `--trackDeps`) but is always null on hashes
+   * deserialised from cache/JSON ([TargetHash.fromJson] does not restore it). Diffing the full
+   * [TargetHash] data class -- whose generated `equals` includes `deps` -- would therefore report
+   * every dep-carrying target as changed whenever one side was generated and the other read from
+   * cache. That is precisely a query-service cache hit under `--trackDeps`, which spuriously
+   * inflated the impacted set for the cached `from` revision.
+   */
+  private fun hashIdentities(hashes: Map<String, TargetHash>): Map<String, String> =
+      hashes.mapValues { it.value.hashWithType }
 
   fun executeWithDistances(
       from: Map<String, TargetHash>,
@@ -188,7 +203,9 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       to: Map<String, TargetHash>,
       depEdges: Map<String, List<String>>
   ): Map<String, TargetDistanceMetrics> {
-    val difference = Maps.difference(to, from)
+    // Diff by hash identity, not the full TargetHash -- see [hashIdentities]. The keys still index
+    // the original `from`/`to` maps below for the directHash (DIRECT vs INDIRECT) check.
+    val difference = Maps.difference(hashIdentities(to), hashIdentities(from))
 
     val newLabels = difference.entriesOnlyOnLeft().keys
     val existingImpactedLabels = difference.entriesDiffering().keys

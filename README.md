@@ -186,6 +186,13 @@ Notes and current limitations:
   `--gitEngine=subprocess` to shell out to the `git` binary at `--gitPath` instead -- useful for
   workspaces that depend on checkout filters or hooks that JGit does not run. Note that JGit only
   moves the git plumbing in-process; the working tree is still materialized on disk for `bazel query`.
+  JGit cannot fetch some clone shapes native git handles fine -- notably shallow (`--depth`) and
+  partial (`--filter=blob:none`) clones, whose thin packs are delta-compressed against objects the
+  clone does not have ("Missing delta base"). When an in-process JGit fetch fails, the service
+  automatically falls back to the native `git` binary (at `--gitPath`) for that fetch and logs a
+  warning; point `--gitEngine=subprocess` at such workspaces to skip the in-process attempt (a
+  partial clone in particular needs the subprocess engine to *serve* queries, since JGit cannot
+  lazily fetch the missing blobs a checkout needs).
 * Hashes are cached on local disk via `--cacheDir` and survive restarts. The cache layer is
   pluggable behind a byte-oriented interface so a remote backend (e.g. S3) can be added without
   touching callers.

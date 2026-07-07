@@ -237,7 +237,7 @@ class ServeCommand : Callable<Int> {
    */
   fun createGitClient(): GitClient =
       when (gitEngine.lowercase()) {
-        "jgit" -> JGitClient(workspacePath)
+        "jgit" -> JGitClient(workspacePath, gitPath)
         "subprocess" -> ProcessGitClient(workspacePath, gitPath)
         else ->
             throw CommandLine.ParameterException(

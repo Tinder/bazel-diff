@@ -159,4 +159,67 @@ class JGitClientTest : KoinTest {
     client.fetch()
     assertThat(client.resolveSha(sha2)).isEqualTo(sha2)
   }
+
+  @Test
+  fun fetchWithoutFallbackSurfacesJGitFailure() {
+    initRepoWithTwoCommits()
+    // origin points at a directory that is not a git repository, so the in-process JGit fetch
+    // fails. With the native fallback disabled the failure surfaces directly (legacy behaviour).
+    val bogus = File(temp.root, "not-a-repo").apply { mkdirs() }
+    git("remote", "add", "origin", bogus.absolutePath)
+    val client = JGitClient(temp.root.toPath(), gitPath = "git", nativeFetchFallback = false)
+    assertThrows(GitClientException::class.java) { client.fetch() }
+  }
+
+  @Test
+  fun fetchFallbackErrorNamesNativeGitWhenBothFail() {
+    initRepoWithTwoCommits()
+    // JGit fetch fails (origin is not a repo) AND the native fallback fails (bogus git binary).
+    // The surfaced error must name the native fallback so neither cause is hidden.
+    val bogus = File(temp.root, "not-a-repo").apply { mkdirs() }
+    git("remote", "add", "origin", bogus.absolutePath)
+    val client =
+        JGitClient(
+            temp.root.toPath(), gitPath = "/nonexistent/git", nativeFetchFallback = true)
+    val ex = assertThrows(GitClientException::class.java) { client.fetch() }
+    assertThat(ex).messageContains("native git fallback")
+  }
+
+  @Test
+  fun fetchBringsInNewCommitForShallowClone() {
+    // A shallow clone is a shape JGit 5.13 may be unable to fetch (the remote's thin pack can be
+    // delta-compressed against a base object below the shallow boundary). The client must fall
+    // back to native git so a just-landed commit still arrives; whichever path succeeds, the end
+    // state must be the new commit present and resolvable.
+    val origin = File(temp.root, "origin").apply { mkdirs() }
+    runGit(origin, "init", "-q")
+    runGit(origin, "config", "user.email", "test@example.com")
+    runGit(origin, "config", "user.name", "test")
+    File(origin, "file.txt").writeText("one")
+    runGit(origin, "add", ".")
+    runGit(origin, "commit", "-q", "-m", "first")
+    File(origin, "file.txt").writeText("two")
+    runGit(origin, "add", ".")
+    runGit(origin, "commit", "-q", "-m", "second")
+
+    val workspace = File(temp.root, "workspace")
+    runGit(
+        temp.root,
+        "clone",
+        "-q",
+        "--depth=1",
+        "file://${origin.absolutePath}",
+        workspace.absolutePath)
+
+    // A new commit lands after the shallow clone; the workspace has not fetched it yet.
+    File(origin, "file.txt").writeText("three")
+    runGit(origin, "add", ".")
+    runGit(origin, "commit", "-q", "-m", "third")
+    val sha3 = runGit(origin, "rev-parse", "HEAD")
+
+    val client = JGitClient(workspace.toPath())
+    assertThrows(MissingRevisionException::class.java) { client.resolveSha(sha3) }
+    client.fetch()
+    assertThat(client.resolveSha(sha3)).isEqualTo(sha3)
+  }
 }

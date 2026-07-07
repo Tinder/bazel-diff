@@ -42,6 +42,50 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
   }
 
   @Test
+  fun computeSimpleImpactedTargetsIgnoresDepsAsymmetry() {
+    // Impactedness is defined by a target's hash, not its `deps` metadata. A query-service cache
+    // hit deserialises the `from` hashes (TargetHash.deps == null, fromJson never restores it),
+    // while a freshly generated `to` under --trackDeps has deps populated. A target whose hash is
+    // unchanged must therefore NOT be reported impacted just because its deps field differs
+    // (null vs a list). Regression test for the --trackDeps query-service over-reporting bug.
+    val from =
+        mapOf(
+            "//:unchanged" to TargetHash("Rule", "h", "h", deps = null),
+            "//:changed" to TargetHash("Rule", "old", "old", deps = null),
+        )
+    val to =
+        mapOf(
+            "//:unchanged" to TargetHash("Rule", "h", "h", deps = listOf("//:dep")),
+            "//:changed" to TargetHash("Rule", "new", "new", deps = listOf("//:dep")),
+        )
+
+    val impacted = CalculateImpactedTargetsInteractor().computeSimpleImpactedTargets(from, to)
+
+    assertThat(impacted).containsExactlyInAnyOrder("//:changed")
+  }
+
+  @Test
+  fun computeAllDistancesIgnoresDepsAsymmetry() {
+    // Same deps-asymmetry guard on the distance path (/impacted_targets_with_distances): an
+    // unchanged target must not surface merely because its deps field differs between a
+    // deserialised `from` and a freshly generated `to`.
+    val from =
+        mapOf(
+            "//:unchanged" to TargetHash("Rule", "h", "h", deps = null),
+            "//:changed" to TargetHash("Rule", "old", "old", deps = null),
+        )
+    val to =
+        mapOf(
+            "//:unchanged" to TargetHash("Rule", "h", "h", deps = listOf("//:changed")),
+            "//:changed" to TargetHash("Rule", "new", "new", deps = emptyList()),
+        )
+
+    val distances = CalculateImpactedTargetsInteractor().computeAllDistances(from, to, emptyMap())
+
+    assertThat(distances.keys).containsExactlyInAnyOrder("//:changed")
+  }
+
+  @Test
   fun testExecuteSortsByKindThenLabel() {
     val startHashes =
         mapOf(

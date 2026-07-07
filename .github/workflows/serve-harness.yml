@@ -1,0 +1,45 @@
+name: Serve Harness
+
+# Integration validation for the `bazel-diff serve` query service. Runs tools/serve_harness.py,
+# which builds //cli:bazel-diff and drives the real binary over HTTP against a live git:// remote
+# (git daemon) across both git engines x full/shallow/partial clones -- coverage the in-process
+# E2ETest cannot reach. See the harness module docstring for the scenario matrix.
+
+# Cron-only for now while we confirm the harness is stable on CI runners. Once it has a healthy
+# track record, add `pull_request` / `push` triggers (and/or make it a required status check) to
+# gate merges. `workflow_dispatch` allows on-demand runs from the Actions tab in the meantime.
+# Note: scheduled + dispatched workflows run from the default branch, so this must land on master
+# before the cron fires.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */12 * * *"
+
+jobs:
+  ServeHarness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        bazel: [ '8.x', '9.x' ]
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+        id: go
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
+      - uses: actions/checkout@v4
+      - name: Run serve harness
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+        # git daemon ships with git (preinstalled on the runner); python3 is preinstalled.
+        # --bazel points the harness (and the serve subprocesses it spawns) at bazelisk.
+        run: python3 tools/serve_harness.py --bazel "$HOME/go/bin/bazelisk"

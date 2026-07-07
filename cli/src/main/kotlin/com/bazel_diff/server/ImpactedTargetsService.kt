@@ -138,33 +138,68 @@ class ImpactedTargetsService(
   }
 
   /**
-   * Resolves both revisions to commit SHAs, refetching once if either is missing from the local
-   * clone. The service only fetches at startup, so a commit that landed on the remote afterwards
-   * (or a branch this clone has not yet seen) would otherwise fail with a stale-clone
-   * [MissingRevisionException]; a single on-demand `git fetch` brings it in.
+   * Resolves both revisions to commit SHAs, fetching on demand if either is missing from the local
+   * clone. The service only fetches at startup, so a revision that appeared on the remote
+   * afterwards would otherwise fail with a stale-clone [MissingRevisionException]. Recovery
+   * escalates in two steps: a broad [GitClient.fetch] (refreshes branch/tag tips -- the common
+   * "commit just landed" case), then, for a revision still missing because it is reachable from no
+   * ref this clone fetches (a GitHub PR-head SHA, or a commit force-pushed off its branch), a
+   * targeted [GitClient.fetchRevision] of that exact object.
    *
    * Fetches are serialized and double-checked through [fetchLock]: concurrent requests for the same
    * new commit wait on the lock, and whoever holds it re-resolves first, so an earlier fetch that
    * already made the revision resolvable saves the rest a redundant fetch. A revision still missing
-   * after the refetch is genuinely unknown (bad SHA, or a ref this clone's refspec doesn't fetch)
-   * and propagates as [MissingRevisionException] -> HTTP 400.
+   * after both steps is genuinely unknown (bad SHA, or an object the remote will not serve) and
+   * propagates as [MissingRevisionException] -> HTTP 400.
    */
   private fun resolveBoth(fromRev: String, toRev: String): Pair<String, String> {
-    try {
-      return gitClient.resolveSha(fromRev) to gitClient.resolveSha(toRev)
-    } catch (missing: MissingRevisionException) {
-      logger.i { "Revision '${missing.revision}' not in local clone; refetching and retrying" }
+    resolveBothOrNull(fromRev, toRev)?.let {
+      return it
     }
     synchronized(fetchLock) {
-      // A concurrent request may have refetched while we waited on the lock; retry before fetching.
-      try {
-        return gitClient.resolveSha(fromRev) to gitClient.resolveSha(toRev)
-      } catch (stillMissing: MissingRevisionException) {
-        gitClient.fetch()
+      // A concurrent request may have fetched while we waited on the lock; retry before fetching.
+      resolveBothOrNull(fromRev, toRev)?.let {
+        return it
+      }
+      // Broad fetch first: refreshes branch/tag tips, covering the common case of a commit that
+      // landed on the remote after startup.
+      logger.i { "Revision missing from local clone; fetching all refs and retrying" }
+      gitClient.fetch()
+      resolveBothOrNull(fromRev, toRev)?.let {
+        return it
+      }
+      // A broad fetch only downloads objects reachable from the refs this clone's refspec covers. A
+      // revision still missing is not among them -- a GitHub PR-head SHA (advertised under
+      // refs/pull/*), or a commit force-pushed off its branch. Ask the remote for each such object
+      // by SHA directly before giving up.
+      for (rev in linkedSetOf(fromRev, toRev)) {
+        if (!resolvable(rev)) {
+          logger.i { "Revision '$rev' unreachable via broad fetch; fetching it directly" }
+          gitClient.fetchRevision(rev)
+        }
       }
     }
+    // Authoritative: a revision still unresolved now is genuinely unknown and propagates as a
+    // MissingRevisionException -> HTTP 400.
     return gitClient.resolveSha(fromRev) to gitClient.resolveSha(toRev)
   }
+
+  /** Resolves both revisions, or null if either is still missing from the local clone. */
+  private fun resolveBothOrNull(fromRev: String, toRev: String): Pair<String, String>? =
+      try {
+        gitClient.resolveSha(fromRev) to gitClient.resolveSha(toRev)
+      } catch (missing: MissingRevisionException) {
+        null
+      }
+
+  /** True if [rev] resolves to a commit present in the local clone. */
+  private fun resolvable(rev: String): Boolean =
+      try {
+        gitClient.resolveSha(rev)
+        true
+      } catch (missing: MissingRevisionException) {
+        false
+      }
 
   // Synthetic //external:* labels are not buildable in bzlmod-only mode; mirror the
   // get-impacted-targets default of excluding them when Bzlmod is enabled (issue #326).

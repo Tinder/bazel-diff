@@ -3,7 +3,9 @@ package com.bazel_diff.server
 import assertk.assertThat
 import assertk.assertions.hasLength
 import assertk.assertions.isEqualTo
+import assertk.assertions.isFalse
 import assertk.assertions.isNotEqualTo
+import assertk.assertions.isTrue
 import com.bazel_diff.SilentLogger
 import com.bazel_diff.log.Logger
 import java.io.File
@@ -26,9 +28,11 @@ class GitClientTest : KoinTest {
   @get:Rule val temp: TemporaryFolder = TemporaryFolder()
 
   /** Runs git for test setup, returning trimmed stdout; fails the test on a non-zero exit. */
-  private fun git(vararg args: String): String {
-    val proc =
-        ProcessBuilder(listOf("git") + args).directory(temp.root).redirectErrorStream(true).start()
+  private fun git(vararg args: String): String = runGit(temp.root, *args)
+
+  /** Like [git] but in an explicit working directory (for multi-repo fetch tests). */
+  private fun runGit(dir: File, vararg args: String): String {
+    val proc = ProcessBuilder(listOf("git") + args).directory(dir).redirectErrorStream(true).start()
     val output = proc.inputStream.readBytes().decodeToString()
     val code = proc.waitFor()
     check(code == 0) { "git ${args.joinToString(" ")} failed ($code): $output" }
@@ -93,5 +97,61 @@ class GitClientTest : KoinTest {
     initRepoWithTwoCommits()
     // `git fetch --all` is a no-op (exit 0) when there are no remotes, so it must not throw.
     ProcessGitClient(temp.root.toPath()).fetch()
+  }
+
+  @Test
+  fun fetchRevisionBringsInACommitNoBranchReaches() {
+    // A commit advertised only under refs/pull/* (a GitHub PR head) is reachable from no branch, so
+    // a broad `fetch --all` never brings it in: resolveSha stays missing until fetchRevision pulls
+    // that exact object. file:// forces a real pack transfer (a local-path clone would hardlink
+    // every object and mask the miss).
+    val origin = File(temp.root, "origin").apply { mkdirs() }
+    runGit(origin, "init", "-q")
+    runGit(origin, "config", "user.email", "test@example.com")
+    runGit(origin, "config", "user.name", "test")
+    runGit(origin, "config", "uploadpack.allowReachableSHA1InWant", "true")
+    File(origin, "file.txt").writeText("one")
+    runGit(origin, "add", ".")
+    runGit(origin, "commit", "-q", "-m", "first")
+    val branch = runGit(origin, "rev-parse", "--abbrev-ref", "HEAD")
+
+    // A commit reachable only from refs/pull/7/head, not from any branch.
+    runGit(origin, "checkout", "-q", "--detach")
+    File(origin, "pr.txt").writeText("pr")
+    runGit(origin, "add", ".")
+    runGit(origin, "commit", "-q", "-m", "pr head")
+    val prHead = runGit(origin, "rev-parse", "HEAD")
+    runGit(origin, "update-ref", "refs/pull/7/head", prHead)
+    // Re-attach HEAD to the branch so the clone checks out the branch, not the detached PR commit.
+    runGit(origin, "checkout", "-q", branch)
+
+    val workspace = File(temp.root, "workspace")
+    runGit(temp.root, "clone", "-q", "file://${origin.absolutePath}", workspace.absolutePath)
+    val client = ProcessGitClient(workspace.toPath())
+
+    // A broad fetch does not reach the PR head; resolveSha must still report it missing.
+    client.fetch()
+    assertThrows(MissingRevisionException::class.java) { client.resolveSha(prHead) }
+
+    // The targeted fetch pulls the exact object, after which it resolves.
+    assertThat(client.fetchRevision(prHead)).isTrue()
+    assertThat(client.resolveSha(prHead)).isEqualTo(prHead)
+  }
+
+  @Test
+  fun fetchRevisionReturnsFalseForUnknownSha() {
+    initRepoWithTwoCommits()
+    git("remote", "add", "origin", temp.root.absolutePath)
+    // A SHA no remote can supply: the best-effort targeted fetch reports failure rather than
+    // throwing, leaving the authoritative miss to resolveSha.
+    val absent = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    assertThat(ProcessGitClient(temp.root.toPath()).fetchRevision(absent)).isFalse()
+  }
+
+  @Test
+  fun fetchRevisionReturnsFalseWithoutRemotes() {
+    initRepoWithTwoCommits()
+    // No remotes to ask -> nothing to fetch from -> false, and no throw.
+    assertThat(ProcessGitClient(temp.root.toPath()).fetchRevision("HEAD")).isFalse()
   }
 }

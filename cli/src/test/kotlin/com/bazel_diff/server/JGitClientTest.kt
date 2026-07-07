@@ -3,7 +3,9 @@ package com.bazel_diff.server
 import assertk.assertThat
 import assertk.assertions.hasLength
 import assertk.assertions.isEqualTo
+import assertk.assertions.isFalse
 import assertk.assertions.isNotEqualTo
+import assertk.assertions.isTrue
 import assertk.assertions.messageContains
 import com.bazel_diff.SilentLogger
 import com.bazel_diff.log.Logger
@@ -179,10 +181,53 @@ class JGitClientTest : KoinTest {
     val bogus = File(temp.root, "not-a-repo").apply { mkdirs() }
     git("remote", "add", "origin", bogus.absolutePath)
     val client =
-        JGitClient(
-            temp.root.toPath(), gitPath = "/nonexistent/git", nativeFetchFallback = true)
+        JGitClient(temp.root.toPath(), gitPath = "/nonexistent/git", nativeFetchFallback = true)
     val ex = assertThrows(GitClientException::class.java) { client.fetch() }
     assertThat(ex).messageContains("native git fallback")
+  }
+
+  @Test
+  fun fetchRevisionBringsInACommitNoBranchReachesViaNativeGit() {
+    // JGit routes by-SHA fetch through native git; a PR-head commit (reachable from no branch) is
+    // absent after a broad fetch and arrives only via the targeted fetchRevision. file:// forces a
+    // real pack transfer so the object is genuinely missing until then.
+    val origin = File(temp.root, "origin").apply { mkdirs() }
+    runGit(origin, "init", "-q")
+    runGit(origin, "config", "user.email", "test@example.com")
+    runGit(origin, "config", "user.name", "test")
+    runGit(origin, "config", "uploadpack.allowReachableSHA1InWant", "true")
+    File(origin, "file.txt").writeText("one")
+    runGit(origin, "add", ".")
+    runGit(origin, "commit", "-q", "-m", "first")
+    val branch = runGit(origin, "rev-parse", "--abbrev-ref", "HEAD")
+
+    // A commit reachable only from refs/pull/7/head, not from any branch.
+    runGit(origin, "checkout", "-q", "--detach")
+    File(origin, "pr.txt").writeText("pr")
+    runGit(origin, "add", ".")
+    runGit(origin, "commit", "-q", "-m", "pr head")
+    val prHead = runGit(origin, "rev-parse", "HEAD")
+    runGit(origin, "update-ref", "refs/pull/7/head", prHead)
+    // Re-attach HEAD to the branch so the clone checks out the branch, not the detached PR commit.
+    runGit(origin, "checkout", "-q", branch)
+
+    val workspace = File(temp.root, "workspace")
+    runGit(temp.root, "clone", "-q", "file://${origin.absolutePath}", workspace.absolutePath)
+    val client = JGitClient(workspace.toPath())
+
+    client.fetch()
+    assertThrows(MissingRevisionException::class.java) { client.resolveSha(prHead) }
+    assertThat(client.fetchRevision(prHead)).isTrue()
+    assertThat(client.resolveSha(prHead)).isEqualTo(prHead)
+  }
+
+  @Test
+  fun fetchRevisionReturnsFalseWhenNativeFallbackDisabled() {
+    initRepoWithTwoCommits()
+    // With the native fallback off, the in-process engine will not attempt an unreliable JGit
+    // by-SHA fetch; it reports failure so the caller surfaces the revision as missing.
+    val client = JGitClient(temp.root.toPath(), gitPath = "git", nativeFetchFallback = false)
+    assertThat(client.fetchRevision("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")).isFalse()
   }
 
   @Test

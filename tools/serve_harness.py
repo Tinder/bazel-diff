@@ -9,6 +9,7 @@ across the combinations that actually break in production:
   * both git engines            -- `--gitEngine=jgit` (default) and `--gitEngine=subprocess`
   * three clone shapes          -- full, shallow (`--depth=1`), partial (`--filter=blob:none`)
   * the on-demand refetch path  -- commits/branches that land on the remote *after* startup
+  * the targeted by-SHA path    -- a commit reachable only via refs/pull/* that a broad fetch misses
   * the startup fetch path       -- lame-duck vs. ready health semantics
 
 It then asserts a *parity* invariant: for every scenario, the in-process JGit engine must
@@ -240,6 +241,19 @@ class Remote:
         git(self.origin, "add", "-A")
         git(self.origin, "commit", "-q", "-m", msg)
         return git(self.origin, "rev-parse", "HEAD")
+
+    def pr_head_commit(self, msg: str, pr: int, base: str, core=None, mid=None, other=None) -> str:
+        """Create a commit advertised ONLY under refs/pull/<pr>/head (like a GitHub PR head),
+        reachable from no branch. A clone's default refspec covers only refs/heads/*, so a broad
+        `git fetch --all` cannot bring it in -- resolving it requires the targeted by-SHA fetch."""
+        tmp = f"_pr{pr}"
+        git(self.origin, "checkout", "-q", "-b", tmp, base)
+        sha = self.commit(msg, core=core, mid=mid, other=other)
+        git(self.origin, "update-ref", f"refs/pull/{pr}/head", sha)
+        # Drop the branch so only the pull ref reaches the commit; leave the tree on DEFAULT_BRANCH.
+        git(self.origin, "checkout", "-q", DEFAULT_BRANCH)
+        git(self.origin, "branch", "-q", "-D", tmp)
+        return sha
 
     def repack(self) -> None:
         # Aggressive repack so newer blobs are delta-compressed against the most similar base
@@ -546,6 +560,17 @@ def case_full(remote: Remote, clone: Path, root: Path, rep: Report, engine: str,
                   ok_detail=str(sorted(got)),
                   fail_detail=f"code={code} got={sorted(got)} raw={sorted(_iset(data))}\n{s.stderr_tail()}")
 
+        # On-demand targeted fetch of a commit reachable only via refs/pull/7/head (a GitHub PR
+        # head): a broad `git fetch --all` cannot bring it in, so this is the exact case that used to
+        # 400 with "revision ... is missing from the local clone". It must now resolve via the
+        # targeted by-SHA fetch and return the same set as the equivalent branch edit (C4).
+        code, body, data = _impacted(s, sh["C2"], sh["C5"])
+        got = _stable(data)
+        rep.check(case, "targeted fetch pr-head commit C2->C5 (refs/pull/*, edit other.txt)",
+                  code == 200 and got == {"//:other", "//:other.txt"},
+                  ok_detail=str(sorted(got)),
+                  fail_detail=f"code={code} got={sorted(got)} raw={sorted(_iset(data))}\n{s.stderr_tail()}")
+
         _full_extras(rep, case, s, remote, track_deps)
 
     _bazel_shutdown(clone)
@@ -745,6 +770,10 @@ def main() -> int:
         git(remote.origin, "checkout", "-q", "-b", "feature", remote.shas["C2"])
         remote.shas["C4"] = remote.commit("C4 edit other (feature)", other="other v1\n")
         git(remote.origin, "checkout", "-q", DEFAULT_BRANCH)
+        # C5: reachable only via refs/pull/7/head (a GitHub PR head), so a broad fetch cannot bring
+        # it in -- resolving it exercises the targeted by-SHA fetch fallback (the reported bug).
+        remote.shas["C5"] = remote.pr_head_commit(
+            "C5 edit other (pr head)", pr=7, base=remote.shas["C2"], other="other v2\n")
         remote.repack()  # force new blobs to delta against the most similar (possibly out-of-clone) base
         vlog(f"shas: {remote.shas}")
 

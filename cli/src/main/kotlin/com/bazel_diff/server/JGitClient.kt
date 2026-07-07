@@ -74,6 +74,21 @@ class JGitClient(
     }
   }
 
+  override fun fetchRevision(revision: String): Boolean {
+    // Fetching an object by SHA is a negotiation JGit 5.13 does not reliably perform (it resolves
+    // the ref spec against the remote's advertised refs, and a PR-head or force-pushed SHA is not
+    // advertised). Route it through native git -- the same reason fetch() falls back -- which
+    // supports `git fetch <remote> <sha>` against servers that allow reachable-SHA fetches.
+    // With the fallback disabled the in-process engine cannot supply it, so report that honestly.
+    if (!nativeFetchFallback) {
+      logger.i {
+        "JGit cannot fetch revision '$revision' by SHA and the native fallback is disabled"
+      }
+      return false
+    }
+    return nativeGit.fetchRevision(revision)
+  }
+
   /**
    * Retries a failed JGit fetch with the native `git` binary (unless [nativeFetchFallback] is off,
    * in which case the original JGit failure is surfaced). If native git also fails the two failures

@@ -83,16 +83,52 @@ class ImpactedTargetsServiceTest : KoinTest {
     override fun checkout(revision: String) = Unit
   }
 
-  /** [GitClient] whose [missing] revisions never resolve, even after a fetch. */
+  /** [GitClient] whose [missing] revisions never resolve, even after a broad or targeted fetch. */
   private class AlwaysMissingGitClient(private val missing: Set<String>) : GitClient {
     var fetchCount = 0
+    var fetchRevisionCount = 0
 
     override fun fetch() {
       fetchCount++
     }
 
+    override fun fetchRevision(revision: String): Boolean {
+      fetchRevisionCount++
+      return false
+    }
+
     override fun resolveSha(revision: String): String {
       if (revision in missing) throw MissingRevisionException(revision)
+      return revision
+    }
+
+    override fun checkout(revision: String) = Unit
+  }
+
+  /**
+   * [GitClient] modeling a PR-head SHA: a broad [fetch] never brings [prHead] in (it is on no
+   * fetched ref); only a targeted [fetchRevision] does.
+   */
+  private class DirectFetchGitClient(private val prHead: String) : GitClient {
+    var fetchCount = 0
+    var fetchRevisionCount = 0
+    private var directlyFetched = false
+
+    override fun fetch() {
+      fetchCount++
+    }
+
+    override fun fetchRevision(revision: String): Boolean {
+      fetchRevisionCount++
+      if (revision == prHead) {
+        directlyFetched = true
+        return true
+      }
+      return false
+    }
+
+    override fun resolveSha(revision: String): String {
+      if (revision == prHead && !directlyFetched) throw MissingRevisionException(revision)
       return revision
     }
 
@@ -285,8 +321,8 @@ class ImpactedTargetsServiceTest : KoinTest {
 
   @Test
   fun propagatesMissingRevisionAfterRefetchStillFails() {
-    // A genuinely unknown revision: one refetch is attempted, then the miss propagates (the HTTP
-    // layer maps it to a 400).
+    // A genuinely unknown revision: a broad refetch AND a targeted by-SHA fetch are both attempted,
+    // then the miss propagates (the HTTP layer maps it to a 400).
     val git = AlwaysMissingGitClient(missing = setOf("to-sha"))
     val service = ImpactedTargetsService(git, FakeHashProvider(emptyMap()))
 
@@ -296,5 +332,23 @@ class ImpactedTargetsServiceTest : KoinTest {
         }
     assertThat(ex.revision).isEqualTo("to-sha")
     assertThat(git.fetchCount).isEqualTo(1)
+    assertThat(git.fetchRevisionCount).isEqualTo(1)
+  }
+
+  @Test
+  fun fetchesUnreachableRevisionDirectlyWhenBroadFetchDoesNotBringItIn() {
+    // The `to` SHA is a PR-head commit reachable from no fetched ref, so a broad `git fetch --all`
+    // never brings it in. Rather than 400, the service must fall back to a targeted by-SHA fetch.
+    val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), null)
+    val to = HashFileData(mapOf("//:a" to TargetHash("Rule", "h2", "d2")), null)
+    val git = DirectFetchGitClient(prHead = "to-sha")
+    val service =
+        ImpactedTargetsService(git, FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to)))
+
+    val result = service.getImpactedTargets("from-sha", "to-sha", null)
+
+    assertThat(result.impactedTargets).isEqualTo(listOf("//:a"))
+    assertThat(git.fetchCount).isEqualTo(1) // broad fetch tried first
+    assertThat(git.fetchRevisionCount).isEqualTo(1) // then the targeted by-SHA fetch
   }
 }

@@ -19,8 +19,10 @@ open class GitClientException(message: String, cause: Throwable? = null) :
  * absent from the object database.
  *
  * The query service treats this as *retryable*: it only fetches at startup, so a commit that landed
- * on the remote afterwards is simply not here yet. Callers refetch and retry once before surfacing
- * the failure (see [com.bazel_diff.server.ImpactedTargetsService]).
+ * on the remote afterwards is simply not here yet. Callers refetch and retry before surfacing the
+ * failure -- first a broad [GitClient.fetch], then, for a commit not reachable from any fetched ref
+ * (e.g. a PR-head SHA), a targeted [GitClient.fetchRevision] (see
+ * [com.bazel_diff.server.ImpactedTargetsService]).
  */
 class MissingRevisionException(val revision: String, cause: Throwable? = null) :
     GitClientException("revision '$revision' is missing from the local clone", cause)
@@ -35,6 +37,21 @@ class MissingRevisionException(val revision: String, cause: Throwable? = null) :
 interface GitClient {
   /** Fetches the latest refs from all remotes. Throws [GitClientException] on failure. */
   fun fetch()
+
+  /**
+   * Best-effort targeted fetch of a single [revision] (a SHA or ref name) directly from the
+   * remote(s), for a commit a broad [fetch] does not bring in because it is reachable from no ref
+   * this clone fetches -- e.g. a GitHub PR-head SHA (advertised only under `refs/pull/<n>/head`),
+   * or a commit force-pushed off its branch. Works against servers that permit fetching a reachable
+   * object by SHA (`uploadpack.allowReachableSHA1InWant`, enabled by default on GitHub).
+   *
+   * Returns true if a fetch reported success, false if no remote could supply it (server disallows
+   * by-SHA fetch, or the revision is genuinely unknown). Never throws for an ordinary miss: callers
+   * re-run [resolveSha], the authoritative check, which raises [MissingRevisionException] if the
+   * object is still absent. Defaults to a no-op returning false for clients that cannot target an
+   * individual revision.
+   */
+  fun fetchRevision(revision: String): Boolean = false
 
   /**
    * Resolves a revision (branch, tag, short or full SHA) to a full 40-char commit SHA, verifying
@@ -62,6 +79,35 @@ class ProcessGitClient(
     logger.i { "git fetch in $workspacePath" }
     run("fetch", "--all", "--prune")
   }
+
+  override fun fetchRevision(revision: String): Boolean {
+    // A broad `fetch --all` only downloads objects reachable from the refs the refspec covers, so a
+    // commit named by a SHA that no fetched ref reaches -- a GitHub PR-head commit (advertised only
+    // under refs/pull/*), or a commit force-pushed off its branch -- never arrives. Ask each remote
+    // for that exact object: servers that allow reachable-SHA fetches
+    // (uploadpack.allowReachableSHA1InWant, GitHub's default) return it even though no local ref
+    // ends up pointing at it. Best-effort per remote; a refusal or unknown SHA moves on, and the
+    // authoritative miss is left to the caller's resolveSha.
+    for (remote in remoteNames()) {
+      try {
+        logger.i { "git fetch $remote $revision in $workspacePath" }
+        run("fetch", remote, revision)
+        return true
+      } catch (e: GitClientException) {
+        logger.i { "targeted fetch of '$revision' from '$remote' failed: ${e.message}" }
+      }
+    }
+    return false
+  }
+
+  /** Configured remote names (`git remote`); empty when none are configured or the query fails. */
+  private fun remoteNames(): List<String> =
+      try {
+        run("remote").map(String::trim).filter(String::isNotEmpty)
+      } catch (e: GitClientException) {
+        logger.i { "could not list git remotes in $workspacePath: ${e.message}" }
+        emptyList()
+      }
 
   override fun resolveSha(revision: String): String {
     // `rev-parse --verify <rev>^{commit}` both resolves the revision to a commit SHA and confirms

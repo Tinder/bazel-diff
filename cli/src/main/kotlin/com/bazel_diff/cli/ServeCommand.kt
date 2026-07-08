@@ -11,6 +11,7 @@ import com.bazel_diff.hash.sha256
 import com.bazel_diff.server.BazelDiffServer
 import com.bazel_diff.server.GitClient
 import com.bazel_diff.server.HashCacheStorage
+import com.bazel_diff.server.HashProvider
 import com.bazel_diff.server.HashService
 import com.bazel_diff.server.ImpactedTargetsService
 import com.bazel_diff.server.JGitClient
@@ -88,12 +89,35 @@ class ServeCommand : Callable<Int> {
   var port: Int = 8080
 
   @CommandLine.Option(
+      names = ["--requestTimeout"],
+      description =
+          [
+              "Maximum seconds an /impacted_targets(_with_distances) request may run before the " +
+                  "server abandons it and responds 504. 0 (the default) means no timeout. This " +
+                  "bounds the request the client waits on; an in-flight bazel query may keep " +
+                  "running in the background and still populate the per-SHA cache."],
+      defaultValue = "0")
+  var requestTimeoutSeconds: Long = 0
+
+  @CommandLine.Option(
       names = ["--cacheDir"],
       description =
           ["Directory where generated hashes are cached per commit SHA. Persists across restarts."],
       required = true,
       converter = [NormalisingPathConverter::class])
   lateinit var cacheDir: Path
+
+  @CommandLine.Option(
+      names = ["--warmupRevision"],
+      description =
+          [
+              "Comma separated git revisions (branch/tag/SHA) whose hashes are generated and cached " +
+                  "at startup, before the server reports healthy, so the first real request is warm " +
+                  "and the Bazel analysis server is primed. Best-effort: a revision that fails to " +
+                  "warm is logged and the server still becomes ready (serving it cold on demand). " +
+                  "Increases time-to-healthy, so size deploy/health-check timeouts accordingly."],
+      converter = [CommaSeparatedValueConverter::class])
+  var warmupRevisions: Set<String> = emptySet()
 
   @CommandLine.Option(
       names = ["--no-initial-fetch"],
@@ -264,9 +288,9 @@ class ServeCommand : Callable<Int> {
         ImpactedTargetsService(gitClient, hashService, depsTracked = trackDeps)
 
     val ready = AtomicBoolean(false)
-    val server = BazelDiffServer(port, impactedTargetsService) { ready.get() }
+    val server = BazelDiffServer(port, impactedTargetsService, requestTimeoutSeconds) { ready.get() }
     server.start()
-    performInitialFetch(gitClient, ready, server)
+    performInitialFetch(gitClient, hashService, ready, server)
     return server
   }
 
@@ -276,18 +300,49 @@ class ServeCommand : Callable<Int> {
    * so health checks report `503` and a load balancer removes the instance rather than us
    * attempting a risky in-place repair (RFC issue #29).
    */
-  fun performInitialFetch(gitClient: GitClient, ready: AtomicBoolean, server: BazelDiffServer) {
+  fun performInitialFetch(
+      gitClient: GitClient,
+      hashProvider: HashProvider,
+      ready: AtomicBoolean,
+      server: BazelDiffServer
+  ) {
     if (noInitialFetch) {
+      warmUpCache(gitClient, hashProvider)
       ready.set(true)
       return
     }
     try {
       gitClient.fetch()
+      // Warm up before flipping ready so the load balancer only routes to this instance once its
+      // configured baseline revisions are cached and the Bazel server is primed.
+      warmUpCache(gitClient, hashProvider)
       ready.set(true)
       System.err.println("[Info] initial git fetch complete; serving on port ${server.boundPort()}")
     } catch (e: Exception) {
       System.err.println(
           "[Error] initial git fetch failed; server is lame-ducked (health will report NOT_READY): ${e.message}")
+    }
+  }
+
+  /**
+   * Best-effort priming of the hash cache (and, as a side effect, the Bazel analysis server) for
+   * each `--warmupRevision` before readiness is reported. A revision that fails to warm (bad ref,
+   * transient bazel error) is logged and skipped rather than failing the deploy: warmup is an
+   * optimization, not a correctness requirement, so the server still becomes ready and serves that
+   * revision cold on demand. Never throws, so a bad `--warmupRevision` cannot lame-duck the
+   * instance.
+   */
+  fun warmUpCache(gitClient: GitClient, hashProvider: HashProvider) {
+    for (rev in warmupRevisions) {
+      try {
+        val sha = gitClient.resolveSha(rev)
+        System.err.println("[Info] warming hash cache for revision '$rev' ($sha)")
+        hashProvider.getHashes(sha)
+        System.err.println("[Info] warmed hash cache for revision '$rev' ($sha)")
+      } catch (e: Exception) {
+        System.err.println(
+            "[Warn] warmup for revision '$rev' failed; server will serve it cold on demand: ${e.message}")
+      }
     }
   }
 

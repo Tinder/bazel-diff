@@ -8,7 +8,12 @@ import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
@@ -32,12 +37,21 @@ import org.koin.core.component.inject
 class BazelDiffServer(
     private val port: Int,
     private val impactedTargetsProvider: ImpactedTargetsProvider,
+    private val requestTimeoutSeconds: Long = 0,
     private val readiness: () -> Boolean,
 ) : KoinComponent {
   private val logger: Logger by inject()
   private val gson: Gson by inject()
 
   @Volatile private var server: HttpServer? = null
+
+  // Runs the per-request query work when a timeout is configured, so the handler thread can abandon
+  // a query that overruns [requestTimeoutSeconds]. Left idle (no threads created) when the timeout
+  // is disabled, since the query then runs inline on the handler thread.
+  private val computeExecutor: ExecutorService =
+      Executors.newCachedThreadPool { runnable ->
+        Thread(runnable, "bazel-diff-compute").apply { isDaemon = true }
+      }
 
   /** Starts the server. Returns immediately; requests are served on background threads. */
   fun start() {
@@ -64,6 +78,7 @@ class BazelDiffServer(
   fun stop(delaySeconds: Int = 0) {
     server?.stop(delaySeconds)
     server = null
+    computeExecutor.shutdownNow()
   }
 
   // HttpExchange exposes close() but does not implement Closeable, so we close it explicitly.
@@ -125,7 +140,11 @@ class BazelDiffServer(
             params["targetType"]?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet()
 
         try {
-          respondJson(exchange, 200, compute(from, to, targetTypes))
+          respondJson(exchange, 200, computeWithTimeout { compute(from, to, targetTypes) })
+        } catch (e: TimeoutException) {
+          logger.w { "request exceeded ${requestTimeoutSeconds}s timeout, abandoning" }
+          respondJson(
+              exchange, 504, mapOf("error" to "request timed out after ${requestTimeoutSeconds}s"))
         } catch (e: DistancesUnavailableException) {
           respondJson(exchange, 400, mapOf("error" to (e.message ?: "distances unavailable")))
         } catch (e: GitClientException) {
@@ -136,6 +155,29 @@ class BazelDiffServer(
           respondJson(exchange, 500, mapOf("error" to (e.message ?: e.javaClass.simpleName)))
         }
       }
+
+  /**
+   * Runs [compute] bounded by [requestTimeoutSeconds]. When the budget is exceeded the in-flight
+   * task is interrupted and a [TimeoutException] is thrown so the caller can respond `504`. Note the
+   * underlying `bazel query` may not honor the interrupt and can keep running in the background —
+   * abandoning it frees the client and the handler thread, and the query will still populate the
+   * per-SHA cache so a retry is fast. A non-positive timeout (the default) runs [compute] inline on
+   * the handler thread with no bound, preserving the original behavior.
+   */
+  private fun <T> computeWithTimeout(compute: () -> T): T {
+    if (requestTimeoutSeconds <= 0) return compute()
+    val future = computeExecutor.submit(Callable { compute() })
+    try {
+      return future.get(requestTimeoutSeconds, TimeUnit.SECONDS)
+    } catch (e: TimeoutException) {
+      future.cancel(true)
+      throw e
+    } catch (e: ExecutionException) {
+      // Unwrap so the handler's per-type catch blocks (git error, distances unavailable, ...) see
+      // the original exception rather than an ExecutionException wrapper.
+      throw e.cause ?: e
+    }
+  }
 
   private fun respondJson(exchange: HttpExchange, status: Int, body: Any) {
     exchange.responseHeaders.add("Content-Type", "application/json")

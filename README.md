@@ -466,6 +466,7 @@ Usage: bazel-diff serve [-hkvV] [--[no-]excludeExternalTargets]
                         [--fineGrainedHashExternalReposFile=<fineGrainedHashExte
                         rnalReposFile>] [--gitEngine=<gitEngine>]
                         [--gitPath=<gitPath>] [--port=<port>]
+                        [--requestTimeout=<requestTimeoutSeconds>]
                         [-s=<seedFilepaths>] -w=<workspacePath>
                         [-co=<bazelCommandOptions>]...
                         [--cqueryCommandOptions=<cqueryCommandOptions>]...
@@ -473,6 +474,7 @@ Usage: bazel-diff serve [-hkvV] [--[no-]excludeExternalTargets]
                         Repos>]...
                         [--ignoredRuleHashingAttributes=<ignoredRuleHashingAttri
                         butes>]... [-so=<bazelStartupOptions>]...
+                        [--warmupRevision=<warmupRevisions>]...
 Runs bazel-diff as a long-running HTTP query service that returns the impacted
 targets between two git revisions, caching generated hashes per commit SHA.
   -b, --bazelPath=<bazelPath>
@@ -522,6 +524,14 @@ targets between two git revisions, caching generated hashes per commit SHA.
       --no-initial-fetch    Skip the initial 'git fetch' before reporting
                               healthy. Useful for local/offline testing.
       --port=<port>         Port to listen on. Defaults to 8080.
+      --requestTimeout=<requestTimeoutSeconds>
+                            Maximum seconds an /impacted_targets
+                              (_with_distances) request may run before the
+                              server abandons it and responds 504. 0 (the
+                              default) means no timeout. This bounds the
+                              request the client waits on; an in-flight bazel
+                              query may keep running in the background and
+                              still populate the per-SHA cache.
   -s, --seed-filepaths=<seedFilepaths>
                             A text file with a newline separated list of
                               filepaths used as a SHA256 seed for all targets.
@@ -539,6 +549,16 @@ targets between two git revisions, caching generated hashes per commit SHA.
   -w, --workspacePath=<workspacePath>
                             Path to the Bazel workspace git clone the service
                               checks out and queries.
+      --warmupRevision=<warmupRevisions>
+                            Comma separated git revisions (branch/tag/SHA)
+                              whose hashes are generated and cached at startup,
+                              before the server reports healthy, so the first
+                              real request is warm and the Bazel analysis
+                              server is primed. Best-effort: a revision that
+                              fails to warm is logged and the server still
+                              becomes ready (serving it cold on demand).
+                              Increases time-to-healthy, so size
+                              deploy/health-check timeouts accordingly.
 ```
 <!-- END_SECTION: cli-help -->
 

@@ -66,6 +66,34 @@ class ServeCommandTest : KoinTest {
     }
   }
 
+  /** Records which SHAs warmup asked for and optionally fails for a configured subset. */
+  private class RecordingHashProvider(private val failFor: Set<String> = emptySet()) :
+      com.bazel_diff.server.HashProvider {
+    val warmed = mutableListOf<String>()
+
+    override fun getHashes(sha: String): com.bazel_diff.interactor.HashFileData {
+      warmed += sha
+      if (sha in failFor) throw RuntimeException("boom for $sha")
+      return com.bazel_diff.interactor.HashFileData(emptyMap(), null)
+    }
+
+    override fun <T> withWorkspaceAt(sha: String, block: () -> T): T = block()
+  }
+
+  private object NoopImpactedTargets : com.bazel_diff.server.ImpactedTargetsProvider {
+    override fun getImpactedTargets(
+        fromRev: String,
+        toRev: String,
+        targetTypes: Set<String>?
+    ) = com.bazel_diff.server.ImpactedTargetsResult(fromRev, toRev, emptyList())
+
+    override fun getImpactedTargetsWithDistances(
+        fromRev: String,
+        toRev: String,
+        targetTypes: Set<String>?
+    ) = com.bazel_diff.server.ImpactedTargetsWithDistancesResult(fromRev, toRev, emptyList())
+  }
+
   /**
    * A serve command configured to bind an ephemeral port with a cache dir under the temp folder.
    */
@@ -191,6 +219,35 @@ class ServeCommandTest : KoinTest {
     val server = cmd.buildAndStartServer(git, InMemoryStorage()).also { startedServers += it }
 
     assertThat(git.fetched).isEqualTo(false)
+    assertThat(healthCode(server)).isEqualTo(200)
+  }
+
+  @Test
+  fun warmUpCacheGeneratesEachRevisionAndIsBestEffort() {
+    val cmd = command().apply { warmupRevisions = linkedSetOf("main", "release") }
+    val git = FakeGitClient() // resolveSha is identity, so warmup SHAs == revision names
+    val provider = RecordingHashProvider(failFor = setOf("release"))
+
+    // A failing revision must not throw or stop the others from warming.
+    cmd.warmUpCache(git, provider)
+
+    assertThat(provider.warmed).isEqualTo(listOf("main", "release"))
+  }
+
+  @Test
+  fun warmupFailureStillBecomesReady() {
+    val cmd = command().apply { warmupRevisions = linkedSetOf("bogus") }
+    val git = FakeGitClient()
+    val provider = RecordingHashProvider(failFor = setOf("bogus"))
+    val ready = java.util.concurrent.atomic.AtomicBoolean(false)
+    val server =
+        com.bazel_diff.server.BazelDiffServer(0, NoopImpactedTargets) { ready.get() }
+            .also { startedServers += it }
+    server.start()
+
+    cmd.performInitialFetch(git, provider, ready, server)
+
+    assertThat(ready.get()).isEqualTo(true)
     assertThat(healthCode(server)).isEqualTo(200)
   }
 

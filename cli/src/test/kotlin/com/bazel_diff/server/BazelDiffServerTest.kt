@@ -77,7 +77,7 @@ class BazelDiffServerTest : KoinTest {
   @Before
   fun setUp() {
     // Port 0 binds an ephemeral port so parallel test runs never collide.
-    server = BazelDiffServer(0, providerProxy(), { ready.get() })
+    server = BazelDiffServer(0, providerProxy()) { ready.get() }
     server.start()
   }
 
@@ -218,6 +218,46 @@ class BazelDiffServerTest : KoinTest {
   fun impactedTargetsWithDistancesReturns503WhenNotReady() {
     ready.set(false)
     assertThat(get("/impacted_targets_with_distances?from=a&to=b").code).isEqualTo(503)
+  }
+
+  @Test
+  fun slowRequestTimesOutWith504() {
+    // A provider that blocks longer than the server's 1s request budget must be abandoned with 504
+    // rather than making the client wait for the full compute.
+    val slowProvider =
+        object : ImpactedTargetsProvider {
+          override fun getImpactedTargets(
+              fromRev: String,
+              toRev: String,
+              targetTypes: Set<String>?
+          ): ImpactedTargetsResult {
+            Thread.sleep(10_000)
+            return ImpactedTargetsResult(fromRev, toRev, emptyList())
+          }
+
+          override fun getImpactedTargetsWithDistances(
+              fromRev: String,
+              toRev: String,
+              targetTypes: Set<String>?
+          ) = throw UnsupportedOperationException()
+        }
+    val slowServer = BazelDiffServer(0, slowProvider, requestTimeoutSeconds = 1) { true }
+    slowServer.start()
+    try {
+      val conn =
+          URL("http://localhost:${slowServer.boundPort()}/impacted_targets?from=a&to=b")
+              .openConnection() as HttpURLConnection
+      val code = conn.responseCode
+      val body =
+          (conn.errorStream ?: conn.inputStream)?.let {
+            BufferedReader(InputStreamReader(it, StandardCharsets.UTF_8)).readText()
+          } ?: ""
+      conn.disconnect()
+      assertThat(code).isEqualTo(504)
+      assertThat(body).contains("timed out")
+    } finally {
+      slowServer.stop()
+    }
   }
 
   @Test

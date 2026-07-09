@@ -9,12 +9,26 @@ import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.runBlocking
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
 private val versionComparator =
     compareBy<Triple<Int, Int, Int>> { it.first }.thenBy { it.second }.thenBy { it.third }
+
+/**
+ * Thrown by [BazelQueryService.query] when a `bazel query` fails specifically because the
+ * `//external` package is unavailable. Bazel reports `no such package 'external'` once the
+ * WORKSPACE file is deprecated (bzlmod-only mode -- e.g. Bazel 8/9 with
+ * `--enable_workspace=false`).
+ *
+ * [BazelClient] catches this to transparently drop `//external:all-targets` and retry, self-healing
+ * the case where bzlmod auto-detection via `bazel mod graph` returned a false negative (e.g. a
+ * restricted deploy environment where `bazel mod graph` cannot resolve the module graph, so the
+ * `//external`-availability prediction disagrees with what Bazel actually does).
+ */
+class ExternalPackageUnavailableException(message: String) : RuntimeException(message)
 
 class BazelQueryService(
     private val workingDirectory: Path,
@@ -220,22 +234,49 @@ class BazelQueryService(
 
     logger.i { "Executing Query: $query" }
     logger.i { "Command: ${cmd.toTypedArray().joinToString()}" }
+    // Tee Bazel's stderr to our own stderr (preserving the live progress/error output the user
+    // expects) while also capturing it, so a failure can be classified. Specifically, this lets us
+    // recognise the "//external package is not available" error and raise it as a typed
+    // [ExternalPackageUnavailableException] the caller can recover from, instead of an opaque
+    // "exit code 7". The captured lines are fully populated by the time [process] returns.
+    val stderrLines = mutableListOf<String>()
     val result =
         process(
             *cmd.toTypedArray(),
             stdout = if (canUseOutputFile) Redirect.SILENT else Redirect.ToFile(outputFile),
             workingDirectory = workingDirectory.toFile(),
-            stderr = Redirect.PRINT,
+            stderr =
+                Redirect.Consume { flow ->
+                  flow.collect { line ->
+                    System.err.println(line)
+                    stderrLines.add(line)
+                  }
+                },
             destroyForcibly = true,
         )
 
     if (!allowedExitCodes.contains(result.resultCode)) {
-      logger.w { "Bazel query failed, output: ${result.output.joinToString("\n")}" }
+      val stderrText = stderrLines.joinToString("\n")
+      logger.w { "Bazel query failed with exit code ${result.resultCode}" }
+      if (indicatesExternalPackageUnavailable(stderrText)) {
+        throw ExternalPackageUnavailableException(
+            "Bazel query failed because the //external package is unavailable " +
+                "(WORKSPACE deprecated / bzlmod-only), exit code ${result.resultCode}")
+      }
       throw RuntimeException(
           "Bazel query failed, exit code ${result.resultCode}, allowed exit codes: ${allowedExitCodes.joinToString()}")
     }
     return outputFile
   }
+
+  /**
+   * True if [stderr] from a failed `bazel query` indicates the `//external` package is unavailable
+   * because the WORKSPACE file is deprecated (bzlmod-only mode). Matches the stable fragments of
+   * Bazel's error message: `no such package 'external'` / `//external package is not available`.
+   */
+  private fun indicatesExternalPackageUnavailable(stderr: String): Boolean =
+      stderr.contains("no such package 'external'") ||
+          stderr.contains("//external package is not available")
 
   /**
    * Queries bzlmod-managed external repo definitions using `bazel mod show_repo`. Requires Bazel

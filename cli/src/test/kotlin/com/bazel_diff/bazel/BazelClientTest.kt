@@ -15,6 +15,7 @@ import org.koin.dsl.module
 import org.koin.test.KoinTest
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.never
+import org.mockito.kotlin.times
 import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
 
@@ -166,6 +167,87 @@ class BazelClientTest : KoinTest {
       val targets = client.queryAllTargets()
 
       assertThat(targets).hasSize(1)
+    }
+  }
+
+  @Test
+  fun queryAllTargets_retriesWithoutExternal_whenExternalPackageUnavailable() {
+    runBlocking {
+      val mainTarget = mockRuleTarget("//src:lib")
+
+      // Bzlmod probe false-negatives (reports disabled), so //external:all-targets is included, but
+      // the combined query fails because //external is not actually available. The retry without it
+      // succeeds.
+      whenever(modService.isBzlmodEnabled).thenReturn(false)
+      whenever(queryService.query("'//external:all-targets' + '//...:all-targets'"))
+          .thenThrow(ExternalPackageUnavailableException("no such package 'external'"))
+      whenever(queryService.query("'//...:all-targets'")).thenReturn(listOf(mainTarget))
+
+      val client =
+          BazelClient(
+              useCquery = false,
+              cqueryExpression = null,
+              fineGrainedHashExternalRepos = emptySet(),
+              excludeExternalTargets = false,
+              excludeTargetsQuery = null)
+
+      val targets = client.queryAllTargets()
+
+      assertThat(targets.map { it.name }).containsOnly("//src:lib")
+      verify(queryService).query("'//...:all-targets'")
+    }
+  }
+
+  @Test
+  fun queryAllTargets_cquery_dropsExternalRepoTargets_whenExternalPackageUnavailable() {
+    runBlocking {
+      val mainTarget = mockRuleTarget("//src:lib")
+
+      whenever(modService.isBzlmodEnabled).thenReturn(false)
+      whenever(queryService.query("deps(//...:all-targets)", useCquery = true))
+          .thenReturn(listOf(mainTarget))
+      whenever(queryService.query("'//external:all-targets'"))
+          .thenThrow(ExternalPackageUnavailableException("no such package 'external'"))
+
+      val client =
+          BazelClient(
+              useCquery = true,
+              cqueryExpression = null,
+              fineGrainedHashExternalRepos = emptySet(),
+              excludeExternalTargets = false,
+              excludeTargetsQuery = null)
+
+      val targets = client.queryAllTargets()
+
+      assertThat(targets.map { it.name }).containsOnly("//src:lib")
+    }
+  }
+
+  @Test
+  fun queryAllTargets_skipsExternalOnSubsequentCalls_afterUnavailable() {
+    runBlocking {
+      val mainTarget = mockRuleTarget("//src:lib")
+
+      whenever(modService.isBzlmodEnabled).thenReturn(false)
+      whenever(queryService.query("'//external:all-targets' + '//...:all-targets'"))
+          .thenThrow(ExternalPackageUnavailableException("no such package 'external'"))
+      whenever(queryService.query("'//...:all-targets'")).thenReturn(listOf(mainTarget))
+
+      val client =
+          BazelClient(
+              useCquery = false,
+              cqueryExpression = null,
+              fineGrainedHashExternalRepos = emptySet(),
+              excludeExternalTargets = false,
+              excludeTargetsQuery = null)
+
+      client.queryAllTargets() // learns //external is unavailable
+      client.queryAllTargets() // should skip //external up front now
+
+      // The combined (with-//external) query is attempted only on the first call; both calls fall
+      // back to the //external-free query.
+      verify(queryService, times(1)).query("'//external:all-targets' + '//...:all-targets'")
+      verify(queryService, times(2)).query("'//...:all-targets'")
     }
   }
 

@@ -69,6 +69,32 @@ class LocalDiskHashCacheStorageTest {
   }
 
   @Test
+  fun statsCountsEntriesAndTotalBytes() {
+    val storage = storage()
+    storage.put("a", ByteArray(100))
+    storage.put("b", ByteArray(50))
+
+    val stats = storage.stats()
+
+    assertThat(stats.entryCount).isEqualTo(2L)
+    assertThat(stats.totalBytes).isEqualTo(150L)
+  }
+
+  @Test
+  fun statsIsEmptyWithNoEntriesAndIgnoresNonJsonFiles() {
+    val dir = temp.root.toPath()
+    val storage = LocalDiskHashCacheStorage(dir)
+    assertThat(storage.stats()).isEqualTo(CacheStorageStats(0, 0))
+
+    Files.write(dir.resolve("notes.txt"), "hello".toByteArray(StandardCharsets.UTF_8))
+    storage.put("k", ByteArray(10))
+
+    val stats = storage.stats()
+    assertThat(stats.entryCount).isEqualTo(1L) // the .txt file is not counted
+    assertThat(stats.totalBytes).isEqualTo(10L)
+  }
+
+  @Test
   fun pruneWithNoLimitsRemovesNothing() {
     val storage = storage()
     storage.put("a", bytes("a"))

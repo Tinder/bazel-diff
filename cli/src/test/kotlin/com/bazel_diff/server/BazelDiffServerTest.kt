@@ -37,7 +37,21 @@ class BazelDiffServerTest : KoinTest {
   private val gson = Gson()
   private val ready = AtomicBoolean(true)
   private var provider: ImpactedTargetsProvider = FixedProvider()
+  private val metrics: MetricsProvider = FixedMetrics()
   private lateinit var server: BazelDiffServer
+
+  private class FixedMetrics : MetricsProvider {
+    override fun snapshot() =
+        ServerMetrics(
+            version = "9.9.9",
+            uptimeSeconds = 42,
+            ready = true,
+            gitEngine = "jgit",
+            trackDeps = false,
+            cache = CacheMetrics("/cache", 2, 2048, "2.0 KB"),
+            jvm = JvmMetrics(1000, 2000),
+        )
+  }
 
   private class FixedProvider(
       var result: ImpactedTargetsResult =
@@ -77,7 +91,7 @@ class BazelDiffServerTest : KoinTest {
   @Before
   fun setUp() {
     // Port 0 binds an ephemeral port so parallel test runs never collide.
-    server = BazelDiffServer(0, providerProxy()) { ready.get() }
+    server = BazelDiffServer(0, providerProxy(), metricsProvider = metrics) { ready.get() }
     server.start()
   }
 
@@ -270,5 +284,42 @@ class BazelDiffServerTest : KoinTest {
     val response = get("/impacted_targets_with_distances?from=a&to=b")
     assertThat(response.code).isEqualTo(400)
     assertThat(response.body).contains("--trackDeps")
+  }
+
+  @Test
+  fun metricsReturnsSnapshotJson() {
+    val response = get("/metrics")
+    assertThat(response.code).isEqualTo(200)
+    val parsed = gson.fromJson(response.body, ServerMetrics::class.java)
+    assertThat(parsed.version).isEqualTo("9.9.9")
+    assertThat(parsed.cache.entries).isEqualTo(2L)
+    assertThat(parsed.jvm.maxBytes).isEqualTo(2000L)
+  }
+
+  @Test
+  fun metricsIsServedEvenWhenNotReady() {
+    // Metrics must be scrapeable on an un-ready/lame-ducked instance, so it is not gated on
+    // readiness.
+    ready.set(false)
+    assertThat(get("/metrics").code).isEqualTo(200)
+  }
+
+  @Test
+  fun metricsRejectsNonGetWith405() {
+    assertThat(request("/metrics", "POST").code).isEqualTo(405)
+  }
+
+  @Test
+  fun metricsReturns404WhenNoProviderWired() {
+    val bare = BazelDiffServer(0, providerProxy()) { ready.get() }
+    bare.start()
+    try {
+      val conn =
+          URL("http://localhost:${bare.boundPort()}/metrics").openConnection() as HttpURLConnection
+      assertThat(conn.responseCode).isEqualTo(404)
+      conn.disconnect()
+    } finally {
+      bare.stop()
+    }
   }
 }

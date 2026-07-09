@@ -28,6 +28,18 @@ interface HashCacheStorage {
   fun contains(key: String): Boolean = get(key) != null
 }
 
+/** Footprint of a cache: how many entries are stored and their total size in bytes. */
+data class CacheStorageStats(val entryCount: Long, val totalBytes: Long)
+
+/**
+ * A [HashCacheStorage] that can cheaply report its footprint, surfaced by the `/metrics` endpoint
+ * so callers can watch cache growth. Backends where size is not cheaply knowable in-process (e.g. a
+ * remote store) simply do not implement this, and metrics report the size as unavailable.
+ */
+interface MeasurableHashCacheStorage : HashCacheStorage {
+  fun stats(): CacheStorageStats
+}
+
 /**
  * Bounds a [PrunableHashCacheStorage] may be pruned down to. Each dimension is independent; a null
  * field means "no limit on that dimension", and a value of all-null disables pruning entirely (see
@@ -75,7 +87,8 @@ interface PrunableHashCacheStorage : HashCacheStorage {
  * age since generation -- a base revision queried every CI run stays warm and is not expired out
  * from under active traffic.
  */
-class LocalDiskHashCacheStorage(private val directory: Path) : PrunableHashCacheStorage {
+class LocalDiskHashCacheStorage(private val directory: Path) :
+    MeasurableHashCacheStorage, PrunableHashCacheStorage {
   init {
     Files.createDirectories(directory)
   }
@@ -111,6 +124,27 @@ class LocalDiskHashCacheStorage(private val directory: Path) : PrunableHashCache
   }
 
   override fun contains(key: String): Boolean = Files.isRegularFile(pathFor(key))
+
+  override fun stats(): CacheStorageStats {
+    if (!Files.isDirectory(directory)) return CacheStorageStats(0, 0)
+    var entryCount = 0L
+    var totalBytes = 0L
+    // Only the `<key>.json` cache entries count -- in-progress `.tmp` writes are excluded, matching
+    // what a cache read would ever see.
+    Files.newDirectoryStream(directory, "*.json").use { stream ->
+      for (path in stream) {
+        try {
+          if (Files.isRegularFile(path)) {
+            entryCount++
+            totalBytes += Files.size(path)
+          }
+        } catch (e: IOException) {
+          // An entry that vanished mid-scan just doesn't count; keep tallying the rest.
+        }
+      }
+    }
+    return CacheStorageStats(entryCount, totalBytes)
+  }
 
   override fun prune(limits: CachePruneLimits): CachePruneResult {
     if (!limits.hasAny) return CachePruneResult(0, 0, 0)

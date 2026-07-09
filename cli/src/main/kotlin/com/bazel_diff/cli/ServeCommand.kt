@@ -20,6 +20,7 @@ import com.bazel_diff.server.HashService
 import com.bazel_diff.server.ImpactedTargetsService
 import com.bazel_diff.server.JGitClient
 import com.bazel_diff.server.LocalDiskHashCacheStorage
+import com.bazel_diff.server.MetricsService
 import com.bazel_diff.server.ProcessGitClient
 import com.bazel_diff.server.PrunableHashCacheStorage
 import java.io.File
@@ -336,8 +337,20 @@ class ServeCommand : Callable<Int> {
         ImpactedTargetsService(gitClient, hashService, depsTracked = trackDeps)
 
     val ready = AtomicBoolean(false)
+    val metrics =
+        MetricsService(
+            version = VersionProvider().version.firstOrNull() ?: "unknown",
+            startedAtMillis = System.currentTimeMillis(),
+            gitEngine = gitEngine,
+            trackDeps = trackDeps,
+            cacheDir = cacheDir.toString(),
+            storage = storage,
+            readiness = { ready.get() },
+        )
     val server =
-        BazelDiffServer(port, impactedTargetsService, requestTimeoutSeconds) { ready.get() }
+        BazelDiffServer(port, impactedTargetsService, requestTimeoutSeconds, metrics) {
+          ready.get()
+        }
     server.start()
     performInitialFetch(gitClient, hashService, ready, server)
     // Start sweeping only after warmup, so the immediate first pass evaluates an already-warm

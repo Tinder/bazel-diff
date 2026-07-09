@@ -171,6 +171,28 @@ curl 'http://localhost:8080/impacted_targets_with_distances?from=main&to=my-feat
 }
 ```
 
+* `GET /metrics` — returns a JSON snapshot of the instance so callers and monitoring can see its
+  identity, liveness, and cache size usage without scraping logs. Unlike the query endpoints it is
+  never gated on readiness, so it still responds on an un-ready or lame-ducked instance (the `ready`
+  field reports the current state). The `cache` size fields are populated for the local-disk backend
+  and are `null` for a backend whose size is not cheaply knowable in-process.
+
+```bash
+curl 'http://localhost:8080/metrics'
+```
+
+```json
+{
+  "version": "31.4.0",
+  "uptimeSeconds": 3600,
+  "ready": true,
+  "gitEngine": "jgit",
+  "trackDeps": false,
+  "cache": {"directory": "/var/cache/bazel-diff", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB"},
+  "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
+}
+```
+
 Notes and current limitations:
 
 * Distance metrics (`/impacted_targets_with_distances`) require the dependency-edge graph, which is

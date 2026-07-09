@@ -262,6 +262,12 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "MetricsServiceTest",
+    test_class = "com.bazel_diff.server.MetricsServiceTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "GitClientTest",
     test_class = "com.bazel_diff.server.GitClientTest",
     runtime_deps = [":cli-test-lib"],

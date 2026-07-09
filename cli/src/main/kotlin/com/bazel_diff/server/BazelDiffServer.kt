@@ -29,6 +29,9 @@ import org.koin.core.component.inject
  * - `GET /impacted_targets_with_distances?from=<rev>&to=<rev>[&targetType=...]` -- like above but
  *   each impacted target is `{"label", "targetDistance", "packageDistance"}`. Requires the server
  *   to have been started with `--trackDeps`; returns `400` otherwise.
+ * - `GET /metrics` -- a JSON snapshot of the instance (version, uptime, readiness, git engine,
+ *   cache size usage, JVM heap) when a [metricsProvider] is wired. Intentionally not gated on
+ *   readiness, so a scrape of an un-ready or lame-ducked instance still returns data.
  *
  * Built on the JDK's [HttpServer] so the service needs no new third-party dependency. The handler
  * pool is unbounded (cached) so that health checks are always served even while a long hash
@@ -38,6 +41,7 @@ class BazelDiffServer(
     private val port: Int,
     private val impactedTargetsProvider: ImpactedTargetsProvider,
     private val requestTimeoutSeconds: Long = 0,
+    private val metricsProvider: MetricsProvider? = null,
     private val readiness: () -> Boolean,
 ) : KoinComponent {
   private val logger: Logger by inject()
@@ -66,6 +70,7 @@ class BazelDiffServer(
     httpServer.createContext("/impacted_targets", ::handleImpactedTargets)
     httpServer.createContext(
         "/impacted_targets_with_distances", ::handleImpactedTargetsWithDistances)
+    httpServer.createContext("/metrics", ::handleMetrics)
     httpServer.start()
     server = httpServer
     logger.i { "bazel-diff query service listening on port ${boundPort()} " }
@@ -97,6 +102,21 @@ class BazelDiffServer(
         } else {
           respond(exchange, 503, "NOT_READY\n")
         }
+      }
+
+  private fun handleMetrics(exchange: HttpExchange) =
+      withExchange(exchange) {
+        if (!exchange.requestMethod.equals("GET", ignoreCase = true)) {
+          respondJson(exchange, 405, mapOf("error" to "method not allowed, use GET"))
+          return@withExchange
+        }
+        val provider = metricsProvider
+        if (provider == null) {
+          respondJson(exchange, 404, mapOf("error" to "metrics unavailable"))
+          return@withExchange
+        }
+        // Deliberately not gated on readiness: metrics must be scrapeable even when un-ready.
+        respondJson(exchange, 200, provider.snapshot())
       }
 
   private fun handleImpactedTargets(exchange: HttpExchange) =
@@ -158,9 +178,9 @@ class BazelDiffServer(
 
   /**
    * Runs [compute] bounded by [requestTimeoutSeconds]. When the budget is exceeded the in-flight
-   * task is interrupted and a [TimeoutException] is thrown so the caller can respond `504`. Note the
-   * underlying `bazel query` may not honor the interrupt and can keep running in the background —
-   * abandoning it frees the client and the handler thread, and the query will still populate the
+   * task is interrupted and a [TimeoutException] is thrown so the caller can respond `504`. Note
+   * the underlying `bazel query` may not honor the interrupt and can keep running in the background
+   * — abandoning it frees the client and the handler thread, and the query will still populate the
    * per-SHA cache so a retry is fast. A non-positive timeout (the default) runs [compute] inline on
    * the handler thread with no bound, preserving the original behavior.
    */

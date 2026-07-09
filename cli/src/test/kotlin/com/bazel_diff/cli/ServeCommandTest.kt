@@ -3,18 +3,23 @@ package com.bazel_diff.cli
 import assertk.assertThat
 import assertk.assertions.hasLength
 import assertk.assertions.isEqualTo
+import assertk.assertions.isFalse
 import assertk.assertions.isInstanceOf
 import assertk.assertions.isNotEqualTo
+import assertk.assertions.isNotNull
+import assertk.assertions.isNull
 import com.bazel_diff.SilentLogger
 import com.bazel_diff.log.Logger
 import com.bazel_diff.server.GitClient
 import com.bazel_diff.server.GitClientException
 import com.bazel_diff.server.HashCacheStorage
 import com.bazel_diff.server.JGitClient
+import com.bazel_diff.server.LocalDiskHashCacheStorage
 import com.bazel_diff.server.ProcessGitClient
 import com.google.gson.GsonBuilder
 import java.net.HttpURLConnection
 import java.net.URL
+import java.time.Duration
 import org.junit.After
 import org.junit.Rule
 import org.junit.Test
@@ -81,11 +86,8 @@ class ServeCommandTest : KoinTest {
   }
 
   private object NoopImpactedTargets : com.bazel_diff.server.ImpactedTargetsProvider {
-    override fun getImpactedTargets(
-        fromRev: String,
-        toRev: String,
-        targetTypes: Set<String>?
-    ) = com.bazel_diff.server.ImpactedTargetsResult(fromRev, toRev, emptyList())
+    override fun getImpactedTargets(fromRev: String, toRev: String, targetTypes: Set<String>?) =
+        com.bazel_diff.server.ImpactedTargetsResult(fromRev, toRev, emptyList())
 
     override fun getImpactedTargetsWithDistances(
         fromRev: String,
@@ -241,7 +243,8 @@ class ServeCommandTest : KoinTest {
     val provider = RecordingHashProvider(failFor = setOf("bogus"))
     val ready = java.util.concurrent.atomic.AtomicBoolean(false)
     val server =
-        com.bazel_diff.server.BazelDiffServer(0, NoopImpactedTargets) { ready.get() }
+        com.bazel_diff.server
+            .BazelDiffServer(0, NoopImpactedTargets) { ready.get() }
             .also { startedServers += it }
     server.start()
 
@@ -249,6 +252,66 @@ class ServeCommandTest : KoinTest {
 
     assertThat(ready.get()).isEqualTo(true)
     assertThat(healthCode(server)).isEqualTo(200)
+  }
+
+  @Test
+  fun parsesCachePruningFlagsIncludingTheIntervalDefault() {
+    val cmd = ServeCommand()
+    picocli
+        .CommandLine(cmd)
+        .parseArgs(
+            "--workspacePath",
+            "/tmp/ws",
+            "--cacheDir",
+            "/tmp/cache",
+            "--cacheMaxAge",
+            "7d",
+            "--cacheMaxSize",
+            "10gb",
+            "--cacheMaxEntries",
+            "500")
+
+    assertThat(cmd.cacheMaxAge).isEqualTo(Duration.ofDays(7))
+    assertThat(cmd.cacheMaxSize).isEqualTo(10L * 1024 * 1024 * 1024)
+    assertThat(cmd.cacheMaxEntries).isEqualTo(500)
+    // The default is a duration string parsed through the same converter.
+    assertThat(cmd.cachePruneInterval).isEqualTo(Duration.ofHours(1))
+  }
+
+  @Test
+  fun cachePruneLimitsReflectsFlags() {
+    val cmd = ServeCommand()
+    assertThat(cmd.cachePruneLimits().hasAny).isFalse()
+
+    cmd.cacheMaxAge = Duration.ofDays(7)
+    cmd.cacheMaxEntries = 100
+    cmd.cacheMaxSize = 1024L
+    val limits = cmd.cachePruneLimits()
+
+    assertThat(limits.maxAge).isEqualTo(Duration.ofDays(7))
+    assertThat(limits.maxEntries).isEqualTo(100)
+    assertThat(limits.maxBytes).isEqualTo(1024L)
+  }
+
+  @Test
+  fun buildCachePrunerIsNullWhenNoLimitsAreSet() {
+    assertThat(command().buildCachePruner(InMemoryStorage())).isNull()
+  }
+
+  @Test
+  fun buildCachePrunerIsNullWhenTheBackendCannotPrune() {
+    // A limit is set, but InMemoryStorage is not a PrunableHashCacheStorage: ignored (with a
+    // warning)
+    // rather than silently pretending the cache is bounded.
+    val cmd = command().apply { cacheMaxEntries = 10 }
+    assertThat(cmd.buildCachePruner(InMemoryStorage())).isNull()
+  }
+
+  @Test
+  fun buildCachePrunerIsBuiltForAPrunableBackendWithLimits() {
+    val cmd = command().apply { cacheMaxEntries = 10 }
+    val storage = LocalDiskHashCacheStorage(temp.newFolder().toPath())
+    assertThat(cmd.buildCachePruner(storage)).isNotNull()
   }
 
   @Test

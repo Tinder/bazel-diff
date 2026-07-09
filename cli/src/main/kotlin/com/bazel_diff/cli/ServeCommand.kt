@@ -1,6 +1,8 @@
 package com.bazel_diff.cli
 
+import com.bazel_diff.cli.converter.ByteSizeConverter
 import com.bazel_diff.cli.converter.CommaSeparatedValueConverter
+import com.bazel_diff.cli.converter.DurationConverter
 import com.bazel_diff.cli.converter.NormalisingPathConverter
 import com.bazel_diff.cli.converter.OptionsConverter
 import com.bazel_diff.di.hasherModule
@@ -9,6 +11,8 @@ import com.bazel_diff.di.serialisationModule
 import com.bazel_diff.extensions.toHexString
 import com.bazel_diff.hash.sha256
 import com.bazel_diff.server.BazelDiffServer
+import com.bazel_diff.server.CachePruneLimits
+import com.bazel_diff.server.CachePruner
 import com.bazel_diff.server.GitClient
 import com.bazel_diff.server.HashCacheStorage
 import com.bazel_diff.server.HashProvider
@@ -18,8 +22,10 @@ import com.bazel_diff.server.JGitClient
 import com.bazel_diff.server.LocalDiskHashCacheStorage
 import com.bazel_diff.server.MetricsService
 import com.bazel_diff.server.ProcessGitClient
+import com.bazel_diff.server.PrunableHashCacheStorage
 import java.io.File
 import java.nio.file.Path
+import java.time.Duration
 import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
@@ -107,6 +113,44 @@ class ServeCommand : Callable<Int> {
       required = true,
       converter = [NormalisingPathConverter::class])
   lateinit var cacheDir: Path
+
+  @CommandLine.Option(
+      names = ["--cacheMaxAge"],
+      description =
+          [
+              "Evict cached hashes not read or written within this window, so the cache does not " +
+                  "grow without bound over time. Duration like 7d, 36h, 90m (units d/h/m/s). Unset " +
+                  "means no age limit. Enforced by a background sweeper (see --cachePruneInterval)."],
+      converter = [DurationConverter::class])
+  var cacheMaxAge: Duration? = null
+
+  @CommandLine.Option(
+      names = ["--cacheMaxEntries"],
+      description =
+          [
+              "Keep at most this many cached commit-SHA entries, evicting the least-recently-used " +
+                  "first. Unset means no count limit."])
+  var cacheMaxEntries: Int? = null
+
+  @CommandLine.Option(
+      names = ["--cacheMaxSize"],
+      description =
+          [
+              "Keep the cache's total on-disk size at or below this, evicting the " +
+                  "least-recently-used entries first. Size like 10GB, 500MB, or a bare byte count " +
+                  "(base 1024). Unset means no size limit."],
+      converter = [ByteSizeConverter::class])
+  var cacheMaxSize: Long? = null
+
+  @CommandLine.Option(
+      names = ["--cachePruneInterval"],
+      description =
+          [
+              "How often the background sweeper enforces the --cacheMax* limits. Duration like 1h, " +
+                  "30m. Defaults to 1h. No effect unless a --cacheMax* limit is set."],
+      converter = [DurationConverter::class],
+      defaultValue = "1h")
+  var cachePruneInterval: Duration = Duration.ofHours(1)
 
   @CommandLine.Option(
       names = ["--warmupRevision"],
@@ -221,6 +265,10 @@ class ServeCommand : Callable<Int> {
                   "size and memory. Defaults to false."])
   var trackDeps = false
 
+  // The background cache sweeper, when a --cacheMax* limit is configured. Held so the shutdown path
+  // can stop it; null when pruning is disabled or the backend manages its own retention.
+  private var cachePruner: CachePruner? = null
+
   override fun call(): Int {
     org.koin.core.context.GlobalContext.stopKoin()
     startKoin {
@@ -305,7 +353,35 @@ class ServeCommand : Callable<Int> {
         }
     server.start()
     performInitialFetch(gitClient, hashService, ready, server)
+    // Start sweeping only after warmup, so the immediate first pass evaluates an already-warm
+    // cache.
+    cachePruner = buildCachePruner(storage)?.also { it.start() }
     return server
+  }
+
+  /**
+   * The cache-pruning limits requested via the `--cacheMax*` flags (all-null = pruning disabled).
+   */
+  fun cachePruneLimits(): CachePruneLimits =
+      CachePruneLimits(maxAge = cacheMaxAge, maxEntries = cacheMaxEntries, maxBytes = cacheMaxSize)
+
+  /**
+   * Builds the background [CachePruner] for [storage], or null when no `--cacheMax*` limit is set
+   * or the backend manages its own retention. Only a [PrunableHashCacheStorage] can be swept
+   * in-process -- a remote backend (e.g. S3) would instead rely on a bucket lifecycle policy, so a
+   * limit set against a non-prunable backend is reported and ignored rather than silently
+   * pretended-to.
+   */
+  fun buildCachePruner(storage: HashCacheStorage): CachePruner? {
+    val limits = cachePruneLimits()
+    if (!limits.hasAny) return null
+    if (storage !is PrunableHashCacheStorage) {
+      System.err.println(
+          "[Warn] --cacheMax* is set but the cache backend does not support in-process pruning; " +
+              "ignoring (rely on the backend's own retention policy instead)")
+      return null
+    }
+    return CachePruner(storage, limits, cachePruneInterval)
   }
 
   /**
@@ -371,6 +447,7 @@ class ServeCommand : Callable<Int> {
     Runtime.getRuntime()
         .addShutdownHook(
             Thread {
+              cachePruner?.stop()
               server.stop(1)
               latch.countDown()
             })
@@ -378,6 +455,7 @@ class ServeCommand : Callable<Int> {
       latch.await()
     } catch (e: InterruptedException) {
       // Treated as a shutdown signal: stop serving and restore the interrupt flag.
+      cachePruner?.stop()
       server.stop(1)
       Thread.currentThread().interrupt()
     }

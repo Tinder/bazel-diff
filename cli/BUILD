@@ -110,6 +110,18 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "DurationConverterTest",
+    test_class = "com.bazel_diff.cli.converter.DurationConverterTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "ByteSizeConverterTest",
+    test_class = "com.bazel_diff.cli.converter.ByteSizeConverterTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "DeserialiseHashesInteractorTest",
     test_class = "com.bazel_diff.interactor.DeserialiseHashesInteractorTest",
     runtime_deps = [":cli-test-lib"],
@@ -240,6 +252,12 @@ kt_jvm_test(
 kt_jvm_test(
     name = "LocalDiskHashCacheStorageTest",
     test_class = "com.bazel_diff.server.LocalDiskHashCacheStorageTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "CachePrunerTest",
+    test_class = "com.bazel_diff.server.CachePrunerTest",
     runtime_deps = [":cli-test-lib"],
 )
 

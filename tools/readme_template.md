@@ -193,9 +193,17 @@ Notes and current limitations:
   warning; point `--gitEngine=subprocess` at such workspaces to skip the in-process attempt (a
   partial clone in particular needs the subprocess engine to *serve* queries, since JGit cannot
   lazily fetch the missing blobs a checkout needs).
-* Hashes are cached on local disk via `--cacheDir` and survive restarts. The cache layer is
-  pluggable behind a byte-oriented interface so a remote backend (e.g. S3) can be added without
-  touching callers.
+* Hashes are cached on local disk via `--cacheDir` and survive restarts. Left unbounded the cache
+  grows by one entry per distinct commit SHA queried, so a long-running server can bound it with any
+  combination of `--cacheMaxAge` (expire entries not read or written within a window, e.g. `7d`),
+  `--cacheMaxEntries`, and `--cacheMaxSize` (e.g. `10GB`, `500MB`, or a bare byte count). A background
+  sweeper enforces the limits once at startup and then every `--cachePruneInterval` (default `1h`),
+  evicting least-recently-used entries first — a cache hit refreshes an entry's recency, so revisions
+  under active query are not expired out from under live traffic. With no `--cacheMax*` flag set the
+  cache is never pruned (the previous behavior). The cache layer is pluggable behind a byte-oriented
+  interface so a remote backend (e.g. S3) can be added without touching callers; such a backend
+  manages its own retention (e.g. a bucket lifecycle policy), and the in-process `--cacheMax*` flags
+  do not apply to it.
 * Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
   `generate-hashes`, and are folded into the cache key so a server started with different flags never
   serves another configuration's cached hashes.

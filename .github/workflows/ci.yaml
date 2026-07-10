@@ -35,6 +35,14 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
+      - name: Free disk space on Ubuntu
+        if: runner.os == 'Linux'
+        run: |
+          # //cli:E2ETest plus coverage can exhaust the default ubuntu-latest image.
+          # Reclaim space from preinstalled toolchains this job does not use.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo docker image prune --all --force || true
+          df -h /
       - name: Run bazel-diff tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}

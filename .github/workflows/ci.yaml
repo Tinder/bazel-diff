@@ -40,13 +40,25 @@ jobs:
         run: |
           # //cli:E2ETest plus coverage can exhaust the default ubuntu-latest image.
           # Reclaim space from preinstalled toolchains this job does not use.
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          # Keep /usr/local/lib/android: rules_android resolves ANDROID_HOME there.
+          sudo rm -rf /usr/share/dotnet /opt/ghc
           sudo docker image prune --all --force || true
-          df -h /
+          # /mnt has more headroom than / on hosted runners; keep Bazel outputs off root.
+          if [ -d /mnt ]; then
+            sudo mkdir -p /mnt/bazel-output
+            sudo chown "$USER" /mnt/bazel-output
+            echo "BAZEL_OUTPUT_USER_ROOT=/mnt/bazel-output" >> "$GITHUB_ENV"
+          fi
+          df -h / /mnt 2>/dev/null || df -h /
       - name: Run bazel-diff tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/go/... --enable_bzlmod=true --enable_workspace=false
+        run: |
+          BAZEL_STARTUP=()
+          if [ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]; then
+            BAZEL_STARTUP=(--output_user_root="${BAZEL_OUTPUT_USER_ROOT}")
+          fi
+          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/go/... --enable_bzlmod=true --enable_workspace=false
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         if: always()
@@ -62,7 +74,12 @@ jobs:
           # (seen flaking on macos-latest x bazel 9.x).
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           COVERAGE_THRESHOLD: '90'
-        run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+        run: |
+          BAZEL_STARTUP=()
+          if [ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]; then
+            BAZEL_STARTUP=(--output_user_root="${BAZEL_OUTPUT_USER_ROOT}")
+          fi
+          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
       - name: Enforce Go coverage threshold (>= 90% line coverage under tools/go/)
         env:
           # Must match the `Run bazel-diff tests` step above; see the note on the
@@ -71,7 +88,12 @@ jobs:
         # Gate Go independently of the Kotlin overall so thin Go coverage can't hide
         # behind well-covered Kotlin (and vice versa). --include scopes the report to
         # Go production source only (tools/go/, which excludes tools/coverage_check.py).
-        run: ~/go/bin/bazelisk run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
+        run: |
+          BAZEL_STARTUP=()
+          if [ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]; then
+            BAZEL_STARTUP=(--output_user_root="${BAZEL_OUTPUT_USER_ROOT}")
+          fi
+          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()

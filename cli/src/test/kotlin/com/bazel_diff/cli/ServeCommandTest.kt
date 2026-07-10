@@ -13,7 +13,6 @@ import com.bazel_diff.log.Logger
 import com.bazel_diff.server.GitClient
 import com.bazel_diff.server.GitClientException
 import com.bazel_diff.server.HashCacheStorage
-import com.bazel_diff.server.JGitClient
 import com.bazel_diff.server.LocalDiskHashCacheStorage
 import com.bazel_diff.server.ProcessGitClient
 import com.bazel_diff.server.ServerMetrics
@@ -178,32 +177,9 @@ class ServeCommandTest : KoinTest {
   }
 
   @Test
-  fun createGitClientDefaultsToJGit() {
+  fun createGitClientUsesSubprocessEngine() {
     val cmd = command().apply { workspacePath = temp.newFolder().toPath() }
-    assertThat(cmd.createGitClient()).isInstanceOf(JGitClient::class)
-  }
-
-  @Test
-  fun createGitClientHonorsSubprocessEngine() {
-    val cmd =
-        command().apply {
-          workspacePath = temp.newFolder().toPath()
-          gitEngine = "subprocess"
-        }
     assertThat(cmd.createGitClient()).isInstanceOf(ProcessGitClient::class)
-  }
-
-  @Test
-  fun createGitClientRejectsUnknownEngine() {
-    val cmd = ServeCommand()
-    // Wrapping in a CommandLine populates the @Spec field the ParameterException references.
-    picocli.CommandLine(cmd)
-    cmd.workspacePath = temp.newFolder().toPath()
-    cmd.cacheDir = temp.newFolder().toPath()
-    cmd.gitEngine = "bogus"
-    org.junit.Assert.assertThrows(picocli.CommandLine.ParameterException::class.java) {
-      cmd.createGitClient()
-    }
   }
 
   @Test

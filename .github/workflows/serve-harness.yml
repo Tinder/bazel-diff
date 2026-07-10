@@ -2,8 +2,8 @@ name: Serve Harness
 
 # Integration validation for the `bazel-diff serve` query service. Runs tools/serve_harness.py,
 # which builds //cli:bazel-diff and drives the real binary over HTTP against a live git:// remote
-# (git daemon) across both git engines x full/shallow/partial clones -- coverage the in-process
-# E2ETest cannot reach. See the harness module docstring for the scenario matrix.
+# (git daemon) across full/shallow/partial clones -- coverage the in-process E2ETest cannot reach.
+# See the harness module docstring for the scenario matrix.
 
 # Cron-only for now while we confirm the harness is stable on CI runners. Once it has a healthy
 # track record, add `pull_request` / `push` triggers (and/or make it a required status check) to

@@ -46,7 +46,7 @@ class BazelDiffServerTest : KoinTest {
             version = "9.9.9",
             uptimeSeconds = 42,
             ready = true,
-            gitEngine = "jgit",
+            gitEngine = "subprocess",
             trackDeps = false,
             cache = CacheMetrics("/cache", 2, 2048, "2.0 KB"),
             jvm = JvmMetrics(1000, 2000),

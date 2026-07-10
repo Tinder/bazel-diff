@@ -9,10 +9,8 @@
     "io.insert-koin:koin-test-junit4": 1815996592,
     "junit:junit": -744267592,
     "org.apache.commons:commons-pool2": -501602100,
-    "org.eclipse.jgit:org.eclipse.jgit": -1935467463,
     "org.jetbrains.kotlinx:kotlinx-coroutines-core": -542524036,
     "org.mockito.kotlin:mockito-kotlin": 1836434344,
-    "org.slf4j:slf4j-nop": 1480452039,
     "repositories": -1949687017
   },
   "__RESOLVED_ARTIFACTS_HASH": {
@@ -26,7 +24,6 @@
     "com.google.guava:guava": 1410177884,
     "com.google.guava:listenablefuture": 1079558157,
     "com.google.j2objc:j2objc-annotations": 880287147,
-    "com.googlecode.javaewah:JavaEWAH": -1970338061,
     "com.willowtreeapps.assertk:assertk-jvm": -1267698986,
     "com.willowtreeapps.opentest4k:opentest4k-jvm": -1883118923,
     "info.picocli:picocli": -1901351180,
@@ -38,7 +35,6 @@
     "net.bytebuddy:byte-buddy-agent": 1903046347,
     "org.apache.commons:commons-pool2": -1200630144,
     "org.checkerframework:checker-qual": -1034954841,
-    "org.eclipse.jgit:org.eclipse.jgit": 607222344,
     "org.hamcrest:hamcrest-core": 649657847,
     "org.jetbrains.kotlin:kotlin-reflect": -1150430934,
     "org.jetbrains.kotlin:kotlin-stdlib": 1585233745,
@@ -52,9 +48,7 @@
     "org.mockito.kotlin:mockito-kotlin": 2123507963,
     "org.mockito:mockito-core": -960687581,
     "org.objenesis:objenesis": 1798216877,
-    "org.opentest4j:opentest4j": -1584531193,
-    "org.slf4j:slf4j-api": -801231047,
-    "org.slf4j:slf4j-nop": -2006403554
+    "org.opentest4j:opentest4j": -1584531193
   },
   "conflict_resolution": {
     "io.insert-koin:koin-core-jvm:3.1.6": "io.insert-koin:koin-core-jvm:4.0.0"
@@ -119,12 +113,6 @@
         "jar": "21af30c92267bd6122c0e0b4d20cccb6641a37eaf956c6540ec471d584e64a7b"
       },
       "version": "1.3"
-    },
-    "com.googlecode.javaewah:JavaEWAH": {
-      "shasums": {
-        "jar": "4c0fda2b1d317750d7ea324e36c70b2bc48310c0aaae67b98df0915d696d7111"
-      },
-      "version": "1.1.13"
     },
     "com.willowtreeapps.assertk:assertk-jvm": {
       "shasums": {
@@ -191,12 +179,6 @@
         "jar": "ff10785ac2a357ec5de9c293cb982a2cbb605c0309ea4cc1cb9b9bc6dbe7f3cb"
       },
       "version": "3.12.0"
-    },
-    "org.eclipse.jgit:org.eclipse.jgit": {
-      "shasums": {
-        "jar": "dacb74c28b089bc378f8c2a1dcda5110c20f52124f5a020aef2684d70ef7f1bb"
-      },
-      "version": "5.13.3.202401111512-r"
     },
     "org.hamcrest:hamcrest-core": {
       "shasums": {
@@ -281,18 +263,6 @@
         "jar": "58812de60898d976fb81ef3b62da05c6604c18fd4a249f5044282479fc286af2"
       },
       "version": "1.2.0"
-    },
-    "org.slf4j:slf4j-api": {
-      "shasums": {
-        "jar": "cdba07964d1bb40a0761485c6b1e8c2f8fd9eb1d19c53928ac0d7f9510105c57"
-      },
-      "version": "1.7.30"
-    },
-    "org.slf4j:slf4j-nop": {
-      "shasums": {
-        "jar": "2d550dcefaea23d223b72027dbc7cbdb7327676ccefdd9cfe49cf9ea8e9ac8e0"
-      },
-      "version": "1.7.30"
     }
   },
   "dependencies": {
@@ -344,10 +314,6 @@
     "junit:junit": [
       "org.hamcrest:hamcrest-core"
     ],
-    "org.eclipse.jgit:org.eclipse.jgit": [
-      "com.googlecode.javaewah:JavaEWAH",
-      "org.slf4j:slf4j-api"
-    ],
     "org.jetbrains.kotlin:kotlin-reflect": [
       "org.jetbrains.kotlin:kotlin-stdlib"
     ],
@@ -379,9 +345,6 @@
       "net.bytebuddy:byte-buddy",
       "net.bytebuddy:byte-buddy-agent",
       "org.objenesis:objenesis"
-    ],
-    "org.slf4j:slf4j-nop": [
-      "org.slf4j:slf4j-api"
     ]
   },
   "packages": {
@@ -439,13 +402,6 @@
     ],
     "com.google.j2objc:j2objc-annotations": [
       "com.google.j2objc.annotations"
-    ],
-    "com.googlecode.javaewah:JavaEWAH": [
-      "com.googlecode.javaewah",
-      "com.googlecode.javaewah.datastructure",
-      "com.googlecode.javaewah.symmetric",
-      "com.googlecode.javaewah32",
-      "com.googlecode.javaewah32.symmetric"
     ],
     "com.willowtreeapps.assertk:assertk-jvm": [
       "assertk",
@@ -605,58 +561,6 @@
       "org.checkerframework.common.value.qual",
       "org.checkerframework.dataflow.qual",
       "org.checkerframework.framework.qual"
-    ],
-    "org.eclipse.jgit:org.eclipse.jgit": [
-      "org.eclipse.jgit.annotations",
-      "org.eclipse.jgit.api",
-      "org.eclipse.jgit.api.errors",
-      "org.eclipse.jgit.attributes",
-      "org.eclipse.jgit.blame",
-      "org.eclipse.jgit.diff",
-      "org.eclipse.jgit.dircache",
-      "org.eclipse.jgit.errors",
-      "org.eclipse.jgit.events",
-      "org.eclipse.jgit.fnmatch",
-      "org.eclipse.jgit.gitrepo",
-      "org.eclipse.jgit.gitrepo.internal",
-      "org.eclipse.jgit.hooks",
-      "org.eclipse.jgit.ignore",
-      "org.eclipse.jgit.ignore.internal",
-      "org.eclipse.jgit.internal",
-      "org.eclipse.jgit.internal.fsck",
-      "org.eclipse.jgit.internal.revwalk",
-      "org.eclipse.jgit.internal.storage.dfs",
-      "org.eclipse.jgit.internal.storage.file",
-      "org.eclipse.jgit.internal.storage.io",
-      "org.eclipse.jgit.internal.storage.pack",
-      "org.eclipse.jgit.internal.storage.reftable",
-      "org.eclipse.jgit.internal.submodule",
-      "org.eclipse.jgit.internal.transport.connectivity",
-      "org.eclipse.jgit.internal.transport.http",
-      "org.eclipse.jgit.internal.transport.parser",
-      "org.eclipse.jgit.internal.transport.ssh",
-      "org.eclipse.jgit.lib",
-      "org.eclipse.jgit.lib.internal",
-      "org.eclipse.jgit.logging",
-      "org.eclipse.jgit.merge",
-      "org.eclipse.jgit.nls",
-      "org.eclipse.jgit.notes",
-      "org.eclipse.jgit.patch",
-      "org.eclipse.jgit.revplot",
-      "org.eclipse.jgit.revwalk",
-      "org.eclipse.jgit.revwalk.filter",
-      "org.eclipse.jgit.storage.file",
-      "org.eclipse.jgit.storage.pack",
-      "org.eclipse.jgit.submodule",
-      "org.eclipse.jgit.transport",
-      "org.eclipse.jgit.transport.http",
-      "org.eclipse.jgit.transport.resolver",
-      "org.eclipse.jgit.treewalk",
-      "org.eclipse.jgit.treewalk.filter",
-      "org.eclipse.jgit.util",
-      "org.eclipse.jgit.util.io",
-      "org.eclipse.jgit.util.sha1",
-      "org.eclipse.jgit.util.time"
     ],
     "org.hamcrest:hamcrest-core": [
       "org.hamcrest",
@@ -892,15 +796,6 @@
     ],
     "org.opentest4j:opentest4j": [
       "org.opentest4j"
-    ],
-    "org.slf4j:slf4j-api": [
-      "org.slf4j",
-      "org.slf4j.event",
-      "org.slf4j.helpers",
-      "org.slf4j.spi"
-    ],
-    "org.slf4j:slf4j-nop": [
-      "org.slf4j.impl"
     ]
   },
   "repositories": {
@@ -915,7 +810,6 @@
       "com.google.guava:guava",
       "com.google.guava:listenablefuture",
       "com.google.j2objc:j2objc-annotations",
-      "com.googlecode.javaewah:JavaEWAH",
       "com.willowtreeapps.assertk:assertk-jvm",
       "com.willowtreeapps.opentest4k:opentest4k-jvm",
       "info.picocli:picocli",
@@ -927,7 +821,6 @@
       "net.bytebuddy:byte-buddy-agent",
       "org.apache.commons:commons-pool2",
       "org.checkerframework:checker-qual",
-      "org.eclipse.jgit:org.eclipse.jgit",
       "org.hamcrest:hamcrest-core",
       "org.jetbrains.kotlin:kotlin-reflect",
       "org.jetbrains.kotlin:kotlin-stdlib",
@@ -941,9 +834,7 @@
       "org.mockito.kotlin:mockito-kotlin",
       "org.mockito:mockito-core",
       "org.objenesis:objenesis",
-      "org.opentest4j:opentest4j",
-      "org.slf4j:slf4j-api",
-      "org.slf4j:slf4j-nop"
+      "org.opentest4j:opentest4j"
     ]
   },
   "services": {

@@ -6,20 +6,16 @@ single full, local, `--no-initial-fetch` repo), this harness drives the *real* b
 `bazel-diff` binary as a subprocess against a *live git remote* served over `git://`,
 across the combinations that actually break in production:
 
-  * both git engines            -- `--gitEngine=jgit` (default) and `--gitEngine=subprocess`
   * three clone shapes          -- full, shallow (`--depth=1`), partial (`--filter=blob:none`)
   * the on-demand refetch path  -- commits/branches that land on the remote *after* startup
   * the targeted by-SHA path    -- a commit reachable only via refs/pull/* that a broad fetch misses
   * the startup fetch path       -- lame-duck vs. ready health semantics
 
-It then asserts a *parity* invariant: for every scenario, the in-process JGit engine must
-succeed wherever the native-git subprocess engine succeeds. A violation is exactly the class
-of bug behind reports like:
+The `serve` command runs every git operation by shelling out to the native `git` binary, so the
+shallow and partial clones here -- whose thin packs are delta-compressed against objects the clone
+does not have -- fetch and serve correctly rather than failing like:
 
-    400 git error: JGit fetch origin failed: Missing delta base <sha>
-
-which happens when JGit fetches a thin pack whose delta base is not present in a shallow or
-partial clone -- a case native git handles but JGit 5.13 does not.
+    400 git error: revision ... is missing from the local clone
 
 Usage:
     tools/serve_harness.py                 # build, then run the full matrix
@@ -340,7 +336,6 @@ class Serve:
     port: int
     workspace: Path
     stderr_path: Path
-    engine: str
 
     def stderr_tail(self, n: int = 25) -> str:
         try:
@@ -362,7 +357,6 @@ class Serve:
 def serve(
     workspace: Path,
     cache: Path,
-    engine: str,
     *,
     initial_fetch: bool,
     track_deps: bool,
@@ -373,7 +367,7 @@ def serve(
     health is one of: "ready" (200), "lameduck" (up but stuck 503), "down" (never bound).
     """
     port = free_port()
-    stderr_path = workspace.parent / f"serve.{engine}.stderr.log"
+    stderr_path = workspace.parent / f"serve.{workspace.name}.stderr.log"
     args = [
         str(LAUNCHER),
         "serve",
@@ -385,15 +379,13 @@ def serve(
         str(cache),
         "--port",
         str(port),
-        "--gitEngine",
-        engine,
     ]
     if not initial_fetch:
         args.append("--no-initial-fetch")
     if track_deps:
         args.append("--trackDeps")
 
-    vlog(f"launch serve[{engine}] on :{port}  ws={workspace.name}  initial_fetch={initial_fetch}")
+    vlog(f"launch serve on :{port}  ws={workspace.name}  initial_fetch={initial_fetch}")
     with open(stderr_path, "w") as errf:
         proc = subprocess.Popen(
             args,
@@ -401,7 +393,7 @@ def serve(
             stdout=(None if VERBOSE else subprocess.DEVNULL),
             stderr=(errf if not VERBOSE else None),
         )
-        s = Serve(proc=proc, port=port, workspace=workspace, stderr_path=stderr_path, engine=engine)
+        s = Serve(proc=proc, port=port, workspace=workspace, stderr_path=stderr_path)
         try:
             health = _await_health(s, ready_timeout)
             yield s, health
@@ -505,8 +497,8 @@ def _stable(data) -> set:
 
     A generated file's hash equals its generating rule's hash, yet whether it surfaces as a
     distinct impacted target fluctuates with Bazel's incremental analysis state across the
-    service's sequential checkouts (observed identically under both git engines). Rules and
-    source files are stable, so scenario assertions compare only that deterministic subset.
+    service's sequential checkouts. Rules and source files are stable, so scenario assertions
+    compare only that deterministic subset.
     """
     return {label for label in _iset(data) if not label.endswith(".out")}
 
@@ -516,15 +508,13 @@ def _stable(data) -> set:
 # ----------------------------------------------------------------------------------------------
 
 
-def case_full(remote: Remote, clone: Path, root: Path, rep: Report, engine: str, track_deps: bool) -> None:
-    """The broad functional suite on a full clone, run identically for both git engines so any
-    divergence is attributable to the engine alone."""
-    case = f"full/{engine}" + ("+deps" if track_deps else "")
+def case_full(remote: Remote, clone: Path, root: Path, rep: Report, track_deps: bool) -> None:
+    """The broad functional suite on a full clone."""
+    case = "full" + ("+deps" if track_deps else "")
     log(f"\n{C.BOLD}== case {case} =={C.RESET}")
     sh = remote.shas
-    cache = root / f"cache-full-{engine}-{int(track_deps)}"
-    track = track_deps
-    with serve(clone, cache, engine, initial_fetch=False, track_deps=track, ready_timeout=30) as (s, health):
+    cache = root / f"cache-{clone.name}"
+    with serve(clone, cache, initial_fetch=False, track_deps=track_deps, ready_timeout=30) as (s, health):
         if not rep.check(case, "health becomes ready", health == "ready",
                          fail_detail=f"health={health}\n{s.stderr_tail()}"):
             return
@@ -645,18 +635,16 @@ def _full_extras(rep: Report, case: str, s: Serve, remote: Remote, track_deps: b
               ok_detail=f"codes={codes}", fail_detail=f"codes={codes} distinct_sets={len(sets)}")
 
 
-def case_shallow(remote: Remote, clone: Path, root: Path, rep: Report, engine: str) -> None:
-    """Fetch-parity gate on a shallow (--depth=1) clone: a just-landed commit must be servable via
-    on-demand refetch under BOTH engines. This is the clone shape behind production
-    'JGit fetch ... Missing delta base' failures (the remote's thin pack is delta-compressed against
-    an object below the shallow boundary). A cooperative local git-daemon negotiates it cleanly, so
-    in-process JGit usually succeeds here; the native-git fetch fallback is what keeps the default
-    engine at parity on the nastier real-world remotes where JGit's in-process fetch cannot."""
-    case = f"shallow/{engine}"
+def case_shallow(remote: Remote, clone: Path, root: Path, rep: Report) -> None:
+    """Fetch gate on a shallow (--depth=1) clone: a just-landed commit must be servable via
+    on-demand refetch. This is the clone shape behind production 'Missing delta base' failures (the
+    remote's thin pack is delta-compressed against an object below the shallow boundary); native git
+    negotiates it cleanly."""
+    case = "shallow"
     log(f"\n{C.BOLD}== case {case} =={C.RESET}")
     sh = remote.shas
-    cache = root / f"cache-shallow-{engine}"
-    with serve(clone, cache, engine, initial_fetch=False, track_deps=False, ready_timeout=30) as (s, health):
+    cache = root / f"cache-{clone.name}"
+    with serve(clone, cache, initial_fetch=False, track_deps=False, ready_timeout=30) as (s, health):
         if not rep.check(case, "health becomes ready", health == "ready",
                          fail_detail=f"health={health}\n{s.stderr_tail()}"):
             return
@@ -671,17 +659,15 @@ def case_shallow(remote: Remote, clone: Path, root: Path, rep: Report, engine: s
     _bazel_shutdown(clone)
 
 
-def case_partial(remote: Remote, clone: Path, root: Path, rep: Report, engine: str) -> None:
-    """Fetch-parity gate on a partial (--filter=blob:none) clone, exercised through the *startup*
-    fetch: with an initial fetch enabled the instance must reach ready under both engines. A partial
-    clone's thin pack can be delta-compressed against an absent promised blob, which JGit cannot
-    fetch in-process; the native-git fallback keeps it ready. Health-only (no requests) so JGit's
-    separate lack of lazy-blob checkout support is not conflated with the fetch path under test --
-    a partial clone still needs --gitEngine=subprocess to actually *serve* queries."""
-    case = f"partial/{engine}"
+def case_partial(remote: Remote, clone: Path, root: Path, rep: Report) -> None:
+    """Fetch gate on a partial (--filter=blob:none) clone, exercised through the *startup* fetch:
+    with an initial fetch enabled the instance must reach ready. A partial clone's thin pack can be
+    delta-compressed against an absent promised blob; native git fetches it correctly. Health-only
+    (no requests), since the startup fetch path is what is under test here."""
+    case = "partial"
     log(f"\n{C.BOLD}== case {case} =={C.RESET}")
-    cache = root / f"cache-partial-{engine}"
-    with serve(clone, cache, engine, initial_fetch=True, track_deps=False, ready_timeout=25) as (s, health):
+    cache = root / f"cache-{clone.name}"
+    with serve(clone, cache, initial_fetch=True, track_deps=False, ready_timeout=25) as (s, health):
         rep.check(case, "startup fetch on partial clone -> ready",
                   health == "ready",
                   ok_detail="ready",
@@ -704,28 +690,23 @@ VARIANTS = {
     "partial": ["--filter=blob:none"],
 }
 
-# (name, variant, engine, track_deps). The full clone runs the 2x2 of engine x trackDeps so any
-# divergence is attributable to a single variable; shallow/partial exercise the fetch paths.
-# Native (subprocess) rows run before their jgit twins so the correct baseline prints first.
+# (name, variant, track_deps). The full clone runs with and without --trackDeps; shallow and
+# partial exercise the on-demand and startup fetch paths.
 CASES = [
-    ("full/subprocess", "full", "subprocess", False),
-    ("full/jgit", "full", "jgit", False),
-    ("full/subprocess+deps", "full", "subprocess", True),
-    ("full/jgit+deps", "full", "jgit", True),
-    ("shallow/subprocess", "shallow", "subprocess", None),
-    ("shallow/jgit", "shallow", "jgit", None),
-    ("partial/subprocess", "partial", "subprocess", None),
-    ("partial/jgit", "partial", "jgit", None),
+    ("full", "full", False),
+    ("full+deps", "full", True),
+    ("shallow", "shallow", None),
+    ("partial", "partial", None),
 ]
 
 
-def _run_case(name, variant, engine, td, remote, clone, root, rep) -> None:
+def _run_case(name, variant, td, remote, clone, root, rep) -> None:
     if variant == "full":
-        case_full(remote, clone, root, rep, engine, td)
+        case_full(remote, clone, root, rep, td)
     elif variant == "shallow":
-        case_shallow(remote, clone, root, rep, engine)
+        case_shallow(remote, clone, root, rep)
     else:
-        case_partial(remote, clone, root, rep, engine)
+        case_partial(remote, clone, root, rep)
 
 
 def main() -> int:
@@ -761,7 +742,7 @@ def main() -> int:
         # land, so those commits genuinely require an on-demand fetch. Each case gets its own clone
         # + cache so sequential checkouts never cross-contaminate.
         selected = [c for c in CASES if not args.only or args.only in c[0]]
-        for name, variant, engine, td in selected:
+        for name, variant, td in selected:
             slug = name.replace("/", "-").replace("+", "-")
             clones[name] = remote.clone(root / f"clone-{slug}", *VARIANTS[variant])
 
@@ -777,9 +758,9 @@ def main() -> int:
         remote.repack()  # force new blobs to delta against the most similar (possibly out-of-clone) base
         vlog(f"shas: {remote.shas}")
 
-        for name, variant, engine, td in selected:
+        for name, variant, td in selected:
             try:
-                _run_case(name, variant, engine, td, remote, clones[name], root, rep)
+                _run_case(name, variant, td, remote, clones[name], root, rep)
             except Exception:
                 rep.add(name, "case crashed", FAIL, traceback.format_exc().splitlines()[-1])
                 vlog(traceback.format_exc())

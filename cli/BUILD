@@ -30,12 +30,6 @@ kt_jvm_library(
     name = "cli-lib",
     srcs = glob(["src/main/kotlin/**/*.kt"]),
     resources = [":version_file"],
-    # SLF4J binding for JGit. Not referenced by bazel-diff code (JGit uses it internally), so it is a
-    # pure runtime dep: it supplies org.slf4j.impl.StaticLoggerBinder, silencing the "Defaulting to
-    # NOP logger" warning SLF4J prints to stderr when no binding is on the classpath.
-    runtime_deps = [
-        "@bazel_diff_maven//:org_slf4j_slf4j_nop",
-    ],
     deps = [
         "//proto:analysis_v2_java_proto",
         "//proto:build_java_proto",
@@ -44,7 +38,6 @@ kt_jvm_library(
         "@bazel_diff_maven//:info_picocli_picocli",
         "@bazel_diff_maven//:io_insert_koin_koin_core_jvm",
         "@bazel_diff_maven//:org_apache_commons_commons_pool2",
-        "@bazel_diff_maven//:org_eclipse_jgit_org_eclipse_jgit",
         "@bazel_diff_maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core_jvm",
     ],
 )
@@ -194,12 +187,6 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
-    name = "Slf4jBindingTest",
-    test_class = "com.bazel_diff.log.Slf4jBindingTest",
-    runtime_deps = [":cli-test-lib"],
-)
-
-kt_jvm_test(
     name = "BazelModServiceTest",
     test_class = "com.bazel_diff.bazel.BazelModServiceTest",
     runtime_deps = [":cli-test-lib"],
@@ -274,12 +261,6 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
-    name = "JGitClientTest",
-    test_class = "com.bazel_diff.server.JGitClientTest",
-    runtime_deps = [":cli-test-lib"],
-)
-
-kt_jvm_test(
     name = "HashServiceTest",
     jvm_flags = [
         "-Dnet.bytebuddy.experimental=true",
@@ -315,8 +296,6 @@ kt_jvm_library(
         "@bazel_diff_maven//:io_insert_koin_koin_test_jvm",
         "@bazel_diff_maven//:junit_junit",
         "@bazel_diff_maven//:org_mockito_kotlin_mockito_kotlin",
-        # Compile-time API for Slf4jBindingTest; the runtime binding (slf4j-nop) comes via cli-lib.
-        "@bazel_diff_maven//:org_slf4j_slf4j_api",
     ],
 )
 

@@ -186,7 +186,7 @@ curl 'http://localhost:8080/metrics'
   "version": "31.4.0",
   "uptimeSeconds": 3600,
   "ready": true,
-  "gitEngine": "jgit",
+  "gitEngine": "subprocess",
   "trackDeps": false,
   "cache": {"directory": "/var/cache/bazel-diff", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB"},
   "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
@@ -204,17 +204,11 @@ Notes and current limitations:
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
   so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.
-* Git operations run in-process via JGit by default (no `git` binary required). Pass
-  `--gitEngine=subprocess` to shell out to the `git` binary at `--gitPath` instead -- useful for
-  workspaces that depend on checkout filters or hooks that JGit does not run. Note that JGit only
-  moves the git plumbing in-process; the working tree is still materialized on disk for `bazel query`.
-  JGit cannot fetch some clone shapes native git handles fine -- notably shallow (`--depth`) and
-  partial (`--filter=blob:none`) clones, whose thin packs are delta-compressed against objects the
-  clone does not have ("Missing delta base"). When an in-process JGit fetch fails, the service
-  automatically falls back to the native `git` binary (at `--gitPath`) for that fetch and logs a
-  warning; point `--gitEngine=subprocess` at such workspaces to skip the in-process attempt (a
-  partial clone in particular needs the subprocess engine to *serve* queries, since JGit cannot
-  lazily fetch the missing blobs a checkout needs).
+* Git operations (fetch and checkout) shell out to the `git` binary at `--gitPath` (default `git`
+  on the `PATH`), so a `git` binary must be available on the host. The working tree is checked out
+  on disk for `bazel query` to read. Because native git performs every fetch, all clone shapes are
+  supported -- including shallow (`--depth`) and partial (`--filter=blob:none`) clones, whose thin
+  packs are delta-compressed against objects the clone does not have.
 * Hashes are cached on local disk via `--cacheDir` and survive restarts. Left unbounded the cache
   grows by one entry per distinct commit SHA queried, so a long-running server can bound it with any
   combination of `--cacheMaxAge` (expire entries not read or written within a window, e.g. `7d`),

@@ -31,7 +31,7 @@ class MetricsServiceTest {
       MetricsService(
           version = "1.2.3",
           startedAtMillis = startedAtMillis,
-          gitEngine = "jgit",
+          gitEngine = "subprocess",
           trackDeps = true,
           cacheDir = "/var/cache/bazel-diff",
           storage = storage,
@@ -47,7 +47,7 @@ class MetricsServiceTest {
     assertThat(snap.version).isEqualTo("1.2.3")
     assertThat(snap.uptimeSeconds).isEqualTo(6) // (10000 - 4000) / 1000
     assertThat(snap.ready).isTrue()
-    assertThat(snap.gitEngine).isEqualTo("jgit")
+    assertThat(snap.gitEngine).isEqualTo("subprocess")
     assertThat(snap.trackDeps).isTrue()
     assertThat(snap.cache.directory).isEqualTo("/var/cache/bazel-diff")
     assertThat(snap.cache.entries).isEqualTo(3L)

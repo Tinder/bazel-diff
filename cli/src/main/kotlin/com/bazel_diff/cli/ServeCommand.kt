@@ -18,7 +18,6 @@ import com.bazel_diff.server.HashCacheStorage
 import com.bazel_diff.server.HashProvider
 import com.bazel_diff.server.HashService
 import com.bazel_diff.server.ImpactedTargetsService
-import com.bazel_diff.server.JGitClient
 import com.bazel_diff.server.LocalDiskHashCacheStorage
 import com.bazel_diff.server.MetricsService
 import com.bazel_diff.server.ProcessGitClient
@@ -56,8 +55,6 @@ import picocli.CommandLine
 class ServeCommand : Callable<Int> {
   @CommandLine.ParentCommand private lateinit var parent: BazelDiff
 
-  @CommandLine.Spec lateinit var spec: CommandLine.Model.CommandSpec
-
   @CommandLine.Option(
       names = ["-w", "--workspacePath"],
       description = ["Path to the Bazel workspace git clone the service checks out and queries."],
@@ -77,17 +74,9 @@ class ServeCommand : Callable<Int> {
       names = ["--gitPath"],
       description =
           [
-              "Path to the git binary, used only when --gitEngine=subprocess. Defaults to 'git' on the PATH."],
+              "Path to the git binary used for fetch/checkout operations. Defaults to 'git' on the PATH."],
       defaultValue = "git")
   var gitPath: String = "git"
-
-  @CommandLine.Option(
-      names = ["--gitEngine"],
-      description =
-          [
-              "Git backend: 'jgit' (in-process, no git binary required) or 'subprocess' (shells out to --gitPath). Defaults to 'jgit'."],
-      defaultValue = "jgit")
-  var gitEngine: String = "jgit"
 
   @CommandLine.Option(
       names = ["--port"],
@@ -304,19 +293,10 @@ class ServeCommand : Callable<Int> {
   }
 
   /**
-   * Builds the [GitClient] for the configured [gitEngine]. Defaults to the in-process JGit engine;
-   * `subprocess` falls back to shelling out to [gitPath] (matching C-git behavior exactly, useful
-   * for workspaces relying on checkout filters/hooks JGit does not run).
+   * Builds the [GitClient]. Git fetch/checkout operations shell out to the `git` binary at
+   * [gitPath], so a `git` binary must be available on the host.
    */
-  fun createGitClient(): GitClient =
-      when (gitEngine.lowercase()) {
-        "jgit" -> JGitClient(workspacePath, gitPath)
-        "subprocess" -> ProcessGitClient(workspacePath, gitPath)
-        else ->
-            throw CommandLine.ParameterException(
-                spec.commandLine(),
-                "Unknown --gitEngine '$gitEngine' (expected 'jgit' or 'subprocess')")
-      }
+  fun createGitClient(): GitClient = ProcessGitClient(workspacePath, gitPath)
 
   /**
    * Wires the services, starts the HTTP server, and performs the initial git fetch + readiness
@@ -341,7 +321,7 @@ class ServeCommand : Callable<Int> {
         MetricsService(
             version = VersionProvider().version.firstOrNull() ?: "unknown",
             startedAtMillis = System.currentTimeMillis(),
-            gitEngine = gitEngine,
+            gitEngine = "subprocess",
             trackDeps = trackDeps,
             cacheDir = cacheDir.toString(),
             storage = storage,

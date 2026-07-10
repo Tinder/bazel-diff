@@ -76,6 +76,35 @@ class GitClientTest : KoinTest {
   }
 
   @Test
+  fun checkoutClearsOrphanedIndexLockAndSucceeds() {
+    val (sha1, _) = initRepoWithTwoCommits()
+    val client = ProcessGitClient(temp.root.toPath())
+    val file = File(temp.root, "file.txt")
+    val indexLock = File(temp.root, ".git/index.lock")
+
+    // The lock a force-killed `git checkout` leaves behind: git uses O_CREAT|O_EXCL, so an existing
+    // index.lock makes every checkout fail with exit 128 until it is removed. Without recovery this
+    // wedges the service permanently.
+    indexLock.writeText("")
+    assertThat(indexLock.exists()).isTrue()
+
+    client.checkout(sha1)
+
+    // The stale lock was cleared and the checkout completed.
+    assertThat(file.readText()).isEqualTo("one")
+    assertThat(indexLock.exists()).isFalse()
+  }
+
+  @Test
+  fun checkoutStillThrowsOnGenuinelyBadRevision() {
+    initRepoWithTwoCommits()
+    val client = ProcessGitClient(temp.root.toPath())
+    // No stale lock to clear, so a real checkout failure (unknown revision) must still surface
+    // rather than being swallowed by the recovery path.
+    assertThrows(GitClientException::class.java) { client.checkout("no-such-revision") }
+  }
+
+  @Test
   fun resolveShaThrowsOnUnknownRevision() {
     initRepoWithTwoCommits()
     val client = ProcessGitClient(temp.root.toPath())

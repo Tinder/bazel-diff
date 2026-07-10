@@ -3,6 +3,8 @@ package com.bazel_diff.server
 import com.bazel_diff.log.Logger
 import com.bazel_diff.process.Redirect
 import com.bazel_diff.process.process
+import java.io.IOException
+import java.nio.file.Files
 import java.nio.file.Path
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
@@ -137,7 +139,66 @@ class ProcessGitClient(
 
   override fun checkout(revision: String) {
     logger.i { "git checkout $revision in $workspacePath" }
-    run("checkout", "--force", revision)
+    try {
+      runCheckout(revision)
+    } catch (e: GitClientException) {
+      // A `git checkout` force-killed mid-flight leaves `<git-dir>/index.lock` behind: git
+      // removes it on a clean exit but cannot on SIGKILL (a --requestTimeout cancellation
+      // forcibly destroys the subprocess; likewise JVM shutdown or an OOM kill). Every later
+      // checkout then fails "Unable to create index.lock: File exists" (exit 128), so one killed
+      // checkout wedges the service until the workspace is rebuilt. HashService serializes every
+      // workspace-mutating git op, so no live in-process checkout holds the lock -- one present
+      // now is orphaned. Clear it and retry once, the recovery git's own message advises.
+      if (!removeStaleIndexLock()) throw e
+      logger.w { "cleared stale git index.lock in $workspacePath; retrying checkout of $revision" }
+      runCheckout(revision)
+    }
+  }
+
+  private fun runCheckout(revision: String) {
+    // `-c gc.auto=0`: the service checks out on nearly every cache-missing request. Letting each
+    // one fork a background `git gc --auto` ("Auto packing the repository in the background")
+    // spawns unsynchronized repacks that contend for disk/CPU with the next checkout -- slowing
+    // it and, when a --requestTimeout is set, making a mid-checkout kill (and the orphaned
+    // index.lock above) more likely. The service does not rely on git's background maintenance,
+    // so disable it here; fetches still trigger gc, keeping fetch-created loose objects packed.
+    run("-c", "gc.auto=0", "checkout", "--force", revision)
+  }
+
+  /**
+   * Deletes a leftover `<git-dir>/index.lock` if present, returning true when a file was removed.
+   * Sound only because every index-mutating git operation is serialized upstream (see
+   * [com.bazel_diff.server.HashService]): with no concurrent in-process checkout, a lock here was
+   * orphaned by a killed `git checkout`, not held by a live one.
+   */
+  private fun removeStaleIndexLock(): Boolean {
+    val lock = gitDir().resolve("index.lock")
+    return try {
+      Files.deleteIfExists(lock).also { removed ->
+        if (!removed) logger.i { "no stale git index.lock to clear at $lock" }
+      }
+    } catch (e: IOException) {
+      logger.w { "failed to remove stale git index.lock $lock: ${e.message}" }
+      false
+    }
+  }
+
+  /**
+   * Absolute path to this clone's git directory. `git rev-parse --git-dir` reads no locks, so it
+   * still answers while a stale `index.lock` is wedging checkouts; it prints a path relative to the
+   * workspace for an ordinary clone, which we resolve against [workspacePath]. Falls back to
+   * `<workspace>/.git` if the query fails.
+   */
+  private fun gitDir(): Path {
+    val raw =
+        try {
+          run("rev-parse", "--git-dir").map(String::trim).firstOrNull { it.isNotEmpty() }
+        } catch (e: GitClientException) {
+          logger.w { "could not resolve git dir in $workspacePath: ${e.message}" }
+          null
+        }
+    val dir = raw?.let { Path.of(it) } ?: Path.of(".git")
+    return if (dir.isAbsolute) dir else workspacePath.resolve(dir)
   }
 
   @OptIn(ExperimentalCoroutinesApi::class)

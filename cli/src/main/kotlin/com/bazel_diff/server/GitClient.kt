@@ -68,6 +68,9 @@ interface GitClient {
   fun checkout(revision: String)
 }
 
+/** A full 40-char lowercase hex commit SHA as printed by `git rev-parse`. */
+private val COMMIT_SHA = Regex("^[0-9a-f]{40}$")
+
 /** [GitClient] backed by the `git` binary at [gitPath], run inside [workspacePath]. */
 class ProcessGitClient(
     private val workspacePath: Path,
@@ -121,9 +124,16 @@ class ProcessGitClient(
         } catch (e: GitClientException) {
           throw MissingRevisionException(revision, e)
         }
-    return output.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() }
-        ?: throw MissingRevisionException(revision)
+    return parseCommitShaOutput(output) ?: throw MissingRevisionException(revision)
   }
+
+  /**
+   * Picks the commit SHA out of `git rev-parse` stdout. Git may concurrently write informational
+   * messages to stderr (e.g. "Auto packing the repository in background for optimum performance.");
+   * [run] captures stdout only, but matching the SHA shape is an extra guard.
+   */
+  private fun parseCommitShaOutput(output: List<String>): String? =
+      output.asSequence().map { it.trim() }.firstOrNull { COMMIT_SHA.matches(it) }
 
   override fun checkout(revision: String) {
     logger.i { "git checkout $revision in $workspacePath" }
@@ -136,17 +146,22 @@ class ProcessGitClient(
     val result = runBlocking {
       process(
           *cmd.toTypedArray(),
-          // Merge stdout+stderr so a failure's diagnostics are captured in one place.
+          // Capture stdout only: git writes informational messages (e.g. background auto-pack) to
+          // stderr that must not be parsed as command output. Failures still surface on stderr via
+          // PRINT so they appear in the service logs.
           stdout = Redirect.CAPTURE,
-          stderr = Redirect.CAPTURE,
+          stderr = Redirect.PRINT,
           workingDirectory = workspacePath.toFile(),
           destroyForcibly = true,
       )
     }
     if (result.resultCode != 0) {
+      val stdout = result.output.joinToString("\n").trim()
       throw GitClientException(
-          "git ${args.joinToString(" ")} failed (exit ${result.resultCode}): " +
-              result.output.joinToString("\n"))
+          buildString {
+            append("git ${args.joinToString(" ")} failed (exit ${result.resultCode})")
+            if (stdout.isNotEmpty()) append(": ").append(stdout)
+          })
     }
     return result.output
   }

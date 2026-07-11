@@ -5,6 +5,7 @@ import com.bazel_diff.interactor.CalculateImpactedTargetsInteractor
 import com.bazel_diff.interactor.ImpactedTargetWithDistance
 import com.bazel_diff.log.Logger
 import java.io.StringWriter
+import java.nio.file.Path
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
@@ -40,11 +41,16 @@ interface ImpactedTargetsProvider {
    * @param fromRev starting revision (branch, tag, or SHA)
    * @param toRev final revision (branch, tag, or SHA)
    * @param targetTypes optional set of target types to filter (e.g. {"Rule"}); null means all.
+   * @param modifiedFilepaths optional set of workspace-relative paths changed between the
+   *   revisions. When non-empty, source-file *content* hashing is scoped to just these paths on
+   *   both revisions (a large-monorepo speedup); it must be a superset of what actually changed or
+   *   impacted targets are missed. Empty (the default) is the full-content hash.
    */
   fun getImpactedTargets(
       fromRev: String,
       toRev: String,
-      targetTypes: Set<String>?
+      targetTypes: Set<String>?,
+      modifiedFilepaths: Set<Path> = emptySet(),
   ): ImpactedTargetsResult
 
   /**
@@ -55,7 +61,8 @@ interface ImpactedTargetsProvider {
   fun getImpactedTargetsWithDistances(
       fromRev: String,
       toRev: String,
-      targetTypes: Set<String>?
+      targetTypes: Set<String>?,
+      modifiedFilepaths: Set<Path> = emptySet(),
   ): ImpactedTargetsWithDistancesResult
 }
 
@@ -80,13 +87,16 @@ class ImpactedTargetsService(
   override fun getImpactedTargets(
       fromRev: String,
       toRev: String,
-      targetTypes: Set<String>?
+      targetTypes: Set<String>?,
+      modifiedFilepaths: Set<Path>,
   ): ImpactedTargetsResult {
     val (fromSha, toSha) = resolveBoth(fromRev, toRev)
     logger.i { "Computing impacted targets $fromSha -> $toSha" }
 
-    val fromData = hashProvider.getHashes(fromSha)
-    val toData = hashProvider.getHashes(toSha)
+    // The same scope on both revisions is what makes a scoped diff correct: an unchanged file is
+    // content-skipped on both sides and so hashes identically; a listed file is read on both.
+    val fromData = hashProvider.getHashes(fromSha, modifiedFilepaths)
+    val toData = hashProvider.getHashes(toSha, modifiedFilepaths)
 
     val writer = StringWriter()
     val interactor = CalculateImpactedTargetsInteractor()
@@ -108,7 +118,8 @@ class ImpactedTargetsService(
   override fun getImpactedTargetsWithDistances(
       fromRev: String,
       toRev: String,
-      targetTypes: Set<String>?
+      targetTypes: Set<String>?,
+      modifiedFilepaths: Set<Path>,
   ): ImpactedTargetsWithDistancesResult {
     if (!depsTracked) {
       throw DistancesUnavailableException(
@@ -117,8 +128,8 @@ class ImpactedTargetsService(
     val (fromSha, toSha) = resolveBoth(fromRev, toRev)
     logger.i { "Computing impacted targets with distances $fromSha -> $toSha" }
 
-    val fromData = hashProvider.getHashes(fromSha)
-    val toData = hashProvider.getHashes(toSha)
+    val fromData = hashProvider.getHashes(fromSha, modifiedFilepaths)
+    val toData = hashProvider.getHashes(toSha, modifiedFilepaths)
 
     val interactor = CalculateImpactedTargetsInteractor()
     val impacted =

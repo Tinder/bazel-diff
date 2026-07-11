@@ -2,12 +2,15 @@ package com.bazel_diff.server
 
 import com.bazel_diff.log.Logger
 import com.google.gson.Gson
+import com.google.gson.JsonSyntaxException
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
+import java.io.File
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
+import java.nio.file.Path
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
@@ -26,9 +29,15 @@ import org.koin.core.component.inject
  *   lame-ducked by a fatal git error.
  * - `GET /impacted_targets?from=<rev>&to=<rev>[&targetType=Rule,SourceFile]` -- returns `{"from":
  *   <sha>, "to": <sha>, "impactedTargets": [...]}`.
- * - `GET /impacted_targets_with_distances?from=<rev>&to=<rev>[&targetType=...]` -- like above but
- *   each impacted target is `{"label", "targetDistance", "packageDistance"}`. Requires the server
- *   to have been started with `--trackDeps`; returns `400` otherwise.
+ * - `POST /impacted_targets` with a JSON body `{"from", "to", "targetType"?: [...],
+ *   "modifiedFilepaths"?: [...]}` -- same result as the GET form, but additionally accepts
+ *   `modifiedFilepaths` (workspace-relative paths changed between the revisions) to scope content
+ *   hashing (see [ImpactedTargetsService]/[HashService]). A changed-file list is too large for a
+ *   URL, so it rides in the body; a GET is always the full-content hash.
+ * - `GET /impacted_targets_with_distances?from=<rev>&to=<rev>[&targetType=...]` (and its `POST`
+ *   form) -- like above but each impacted target is `{"label", "targetDistance",
+ *   "packageDistance"}`. Requires the server to have been started with `--trackDeps`; returns `400`
+ *   otherwise.
  * - `GET /metrics` -- a JSON snapshot of the instance (version, uptime, readiness, git engine,
  *   cache size usage, JVM heap) when a [metricsProvider] is wired. Intentionally not gated on
  *   readiness, so a scrape of an un-ready or lame-ducked instance still returns data.
@@ -120,27 +129,53 @@ class BazelDiffServer(
       }
 
   private fun handleImpactedTargets(exchange: HttpExchange) =
-      handleQuery(exchange) { from, to, targetTypes ->
-        impactedTargetsProvider.getImpactedTargets(from, to, targetTypes)
+      handleQuery(exchange) { from, to, targetTypes, modifiedFilepaths ->
+        impactedTargetsProvider.getImpactedTargets(from, to, targetTypes, modifiedFilepaths)
       }
 
   private fun handleImpactedTargetsWithDistances(exchange: HttpExchange) =
-      handleQuery(exchange) { from, to, targetTypes ->
-        impactedTargetsProvider.getImpactedTargetsWithDistances(from, to, targetTypes)
+      handleQuery(exchange) { from, to, targetTypes, modifiedFilepaths ->
+        impactedTargetsProvider.getImpactedTargetsWithDistances(
+            from, to, targetTypes, modifiedFilepaths)
       }
 
+  /** Normalized inputs for a query, parsed from either a GET query string or a POST JSON body. */
+  private data class QueryInputs(
+      val from: String,
+      val to: String,
+      val targetTypes: Set<String>?,
+      val modifiedFilepaths: Set<Path>,
+  )
+
   /**
-   * Shared handling for the impacted-targets endpoints: enforces GET + readiness, parses and
-   * validates `from`/`to`/`targetType`, then serializes the result of [compute] as JSON, mapping
-   * the known failure modes to the appropriate status codes.
+   * JSON body accepted on `POST /impacted_targets(_with_distances)`. All fields optional here so a
+   * missing one becomes a clear `400` rather than a Gson failure.
+   */
+  private data class ImpactedTargetsRequestBody(
+      val from: String? = null,
+      val to: String? = null,
+      val targetType: List<String>? = null,
+      val modifiedFilepaths: List<String>? = null,
+  )
+
+  /** Local signal that request parsing failed; [handleQuery] maps it to a `400`. */
+  private class BadRequestException(message: String) : Exception(message)
+
+  /**
+   * Shared handling for the impacted-targets endpoints: enforces GET/POST + readiness, parses and
+   * validates the request, then serializes the result of [compute] as JSON, mapping the known
+   * failure modes to the appropriate status codes.
    */
   private fun handleQuery(
       exchange: HttpExchange,
-      compute: (from: String, to: String, targetTypes: Set<String>?) -> Any
+      compute:
+          (from: String, to: String, targetTypes: Set<String>?, modifiedFilepaths: Set<Path>) -> Any
   ) =
       withExchange(exchange) {
-        if (!exchange.requestMethod.equals("GET", ignoreCase = true)) {
-          respondJson(exchange, 405, mapOf("error" to "method not allowed, use GET"))
+        val isGet = exchange.requestMethod.equals("GET", ignoreCase = true)
+        val isPost = exchange.requestMethod.equals("POST", ignoreCase = true)
+        if (!isGet && !isPost) {
+          respondJson(exchange, 405, mapOf("error" to "method not allowed, use GET or POST"))
           return@withExchange
         }
         if (!readiness()) {
@@ -148,19 +183,21 @@ class BazelDiffServer(
           return@withExchange
         }
 
-        val params = parseQuery(exchange.requestURI.rawQuery)
-        val from = params["from"]
-        val to = params["to"]
-        if (from.isNullOrEmpty() || to.isNullOrEmpty()) {
-          respondJson(
-              exchange, 400, mapOf("error" to "missing required query parameters 'from' and 'to'"))
-          return@withExchange
-        }
-        val targetTypes =
-            params["targetType"]?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet()
+        val inputs =
+            try {
+              if (isPost) parsePostBody(exchange) else parseGetQuery(exchange)
+            } catch (e: BadRequestException) {
+              respondJson(exchange, 400, mapOf("error" to (e.message ?: "bad request")))
+              return@withExchange
+            }
 
         try {
-          respondJson(exchange, 200, computeWithTimeout { compute(from, to, targetTypes) })
+          respondJson(
+              exchange,
+              200,
+              computeWithTimeout {
+                compute(inputs.from, inputs.to, inputs.targetTypes, inputs.modifiedFilepaths)
+              })
         } catch (e: TimeoutException) {
           logger.w { "request exceeded ${requestTimeoutSeconds}s timeout, abandoning" }
           respondJson(
@@ -212,6 +249,58 @@ class BazelDiffServer(
     } catch (e: IOException) {
       logger.w { "failed to write response: ${e.message}" }
     }
+  }
+
+  /**
+   * Parses a GET request's `from`/`to`/`targetType` from the query string. A GET never carries
+   * modified filepaths (a changed-file list is too large for a URL), so it is always the
+   * full-content hash. Throws [BadRequestException] when `from`/`to` are missing.
+   */
+  private fun parseGetQuery(exchange: HttpExchange): QueryInputs {
+    val params = parseQuery(exchange.requestURI.rawQuery)
+    val from = params["from"]
+    val to = params["to"]
+    if (from.isNullOrEmpty() || to.isNullOrEmpty()) {
+      throw BadRequestException("missing required query parameters 'from' and 'to'")
+    }
+    val targetTypes =
+        params["targetType"]?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet()
+    return QueryInputs(from, to, targetTypes, emptySet())
+  }
+
+  /**
+   * Parses a POST request's JSON body into [QueryInputs], including the optional
+   * `modifiedFilepaths` scope (converted to workspace-relative [Path]s the same way
+   * `--seed-filepaths` reads them). Throws [BadRequestException] for a malformed/empty body or a
+   * missing `from`/`to`. An empty or all-blank `targetType` collapses to null (no filter, i.e. all
+   * types).
+   */
+  private fun parsePostBody(exchange: HttpExchange): QueryInputs {
+    val raw = exchange.requestBody.readBytes().toString(StandardCharsets.UTF_8)
+    val body =
+        try {
+          gson.fromJson(raw, ImpactedTargetsRequestBody::class.java)
+        } catch (e: JsonSyntaxException) {
+          throw BadRequestException("invalid JSON body: ${e.message}")
+        } ?: throw BadRequestException("missing JSON body with 'from' and 'to'")
+    val from = body.from
+    val to = body.to
+    if (from.isNullOrEmpty() || to.isNullOrEmpty()) {
+      throw BadRequestException("missing required fields 'from' and 'to'")
+    }
+    val targetTypes =
+        body.targetType
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.toSet()
+            ?.takeIf { it.isNotEmpty() }
+    val modifiedFilepaths =
+        body.modifiedFilepaths
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.map { File(it).toPath() }
+            ?.toSet() ?: emptySet()
+    return QueryInputs(from, to, targetTypes, modifiedFilepaths)
   }
 
   private fun parseQuery(rawQuery: String?): Map<String, String> {

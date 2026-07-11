@@ -1,8 +1,10 @@
 package com.bazel_diff.server
 
 import com.bazel_diff.bazel.BazelModService
+import com.bazel_diff.extensions.toHexString
 import com.bazel_diff.hash.BuildGraphHasher
 import com.bazel_diff.hash.TargetHash
+import com.bazel_diff.hash.sha256
 import com.bazel_diff.interactor.DeserialiseHashesInteractor
 import com.bazel_diff.interactor.HashFileData
 import com.bazel_diff.log.Logger
@@ -20,8 +22,17 @@ import org.koin.core.component.inject
  * Split behind an interface so [ImpactedTargetsService] can be unit-tested with a fake.
  */
 interface HashProvider {
-  /** Returns hash data for [sha] (a fully-resolved commit SHA), generating + caching on miss. */
-  fun getHashes(sha: String): HashFileData
+  /**
+   * Returns hash data for [sha] (a fully-resolved commit SHA), generating + caching on miss.
+   *
+   * [modifiedFilepaths], when non-empty, scopes source-file *content* hashing to just those
+   * workspace-relative paths (see [BuildGraphHasher.hashAllBazelTargetsAndSourcefiles]) and is
+   * folded into the cache key, so a content-scoped entry is never served to -- or mixed with -- a
+   * request using a different set. Empty (the default) is the full-content hash and today's per-SHA
+   * cache key. Correctness requires the caller to apply the *same* set to both revisions of a
+   * comparison and for it to be a superset of what actually changed (see [ImpactedTargetsService]).
+   */
+  fun getHashes(sha: String, modifiedFilepaths: Set<Path> = emptySet()): HashFileData
 
   /**
    * Runs [block] with the workspace checked out at [sha], holding the workspace lock for the
@@ -61,16 +72,37 @@ class HashService(
   // Guards every workspace-mutating operation: only one checkout + query may run at a time.
   private val generationLock = Any()
 
-  /** Cache key for [sha]: the SHA plus the config fingerprint, both filename-safe. */
-  fun cacheKey(sha: String): String = "$sha.$configFingerprint"
+  /**
+   * Cache key for [sha]: the SHA plus the config fingerprint, both filename-safe. A non-empty
+   * [modifiedFilepaths] appends a short digest of the (sorted) set so a content-scoped hash is only
+   * ever compared against another hash scoped by the same set -- never the full-content entry, nor
+   * a differently-scoped one. Empty (the common path) keeps the original `<sha>.<fingerprint>` key
+   * so GET requests and warmup keep sharing entries. The digest is order-independent (paths are
+   * sorted) and hex, so the on-disk `<key>.json` mapping stays filename-safe.
+   */
+  fun cacheKey(sha: String, modifiedFilepaths: Set<Path> = emptySet()): String {
+    val base = "$sha.$configFingerprint"
+    if (modifiedFilepaths.isEmpty()) return base
+    val digest =
+        sha256 {
+              for (path in modifiedFilepaths.map { it.toString() }.sorted()) {
+                putBytes(path.toByteArray())
+                putBytes(byteArrayOf(0x0a))
+              }
+            }
+            .toHexString()
+            .take(12)
+    return "$base.$digest"
+  }
 
-  override fun getHashes(sha: String): HashFileData {
-    storage.get(cacheKey(sha))?.let { bytes ->
+  override fun getHashes(sha: String, modifiedFilepaths: Set<Path>): HashFileData {
+    val key = cacheKey(sha, modifiedFilepaths)
+    storage.get(key)?.let { bytes ->
       logger.i { "Hash cache hit for $sha" }
       return deserialiser.executeTargetHashWithMetadataFromString(
           String(bytes, StandardCharsets.UTF_8))
     }
-    return generate(sha)
+    return generate(sha, modifiedFilepaths, key)
   }
 
   override fun <T> withWorkspaceAt(sha: String, block: () -> T): T =
@@ -79,10 +111,10 @@ class HashService(
         block()
       }
 
-  private fun generate(sha: String): HashFileData =
+  private fun generate(sha: String, modifiedFilepaths: Set<Path>, key: String): HashFileData =
       synchronized(generationLock) {
         // Re-check under the lock: another thread may have generated this revision while we waited.
-        storage.get(cacheKey(sha))?.let {
+        storage.get(key)?.let {
           logger.i { "Hash cache hit for $sha (after lock)" }
           return deserialiser.executeTargetHashWithMetadataFromString(
               String(it, StandardCharsets.UTF_8))
@@ -91,12 +123,11 @@ class HashService(
         gitClient.checkout(sha)
         val hashes =
             buildGraphHasher.hashAllBazelTargetsAndSourcefiles(
-                seedFilepaths, ignoredRuleHashingAttributes)
+                seedFilepaths, ignoredRuleHashingAttributes, modifiedFilepaths)
         val moduleGraphJson = runBlocking { bazelModService.getModuleGraphJson() }
         val depEdges = depEdgesOf(hashes)
         storage.put(
-            cacheKey(sha),
-            serialize(hashes, moduleGraphJson, depEdges).toByteArray(StandardCharsets.UTF_8))
+            key, serialize(hashes, moduleGraphJson, depEdges).toByteArray(StandardCharsets.UTF_8))
         HashFileData(hashes, moduleGraphJson, depEdges)
       }
 

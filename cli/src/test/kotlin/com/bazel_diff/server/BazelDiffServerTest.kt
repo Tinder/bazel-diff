@@ -4,6 +4,7 @@ import assertk.assertThat
 import assertk.assertions.contains
 import assertk.assertions.containsExactly
 import assertk.assertions.isEqualTo
+import assertk.assertions.isNull
 import com.bazel_diff.SilentLogger
 import com.bazel_diff.interactor.ImpactedTargetWithDistance
 import com.bazel_diff.log.Logger
@@ -14,6 +15,7 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.After
 import org.junit.Before
@@ -65,14 +67,18 @@ class BazelDiffServerTest : KoinTest {
                   ImpactedTargetWithDistance("//:b", 1, 1))),
       var error: Exception? = null,
       var distancesError: Exception? = null,
+      var lastFrom: String? = null,
+      var lastTo: String? = null,
       var lastTargetTypes: Set<String>? = null,
+      var lastModifiedFilepaths: Set<Path> = emptySet(),
   ) : ImpactedTargetsProvider {
     override fun getImpactedTargets(
         fromRev: String,
         toRev: String,
-        targetTypes: Set<String>?
+        targetTypes: Set<String>?,
+        modifiedFilepaths: Set<Path>,
     ): ImpactedTargetsResult {
-      lastTargetTypes = targetTypes
+      record(fromRev, toRev, targetTypes, modifiedFilepaths)
       error?.let { throw it }
       return result
     }
@@ -80,11 +86,24 @@ class BazelDiffServerTest : KoinTest {
     override fun getImpactedTargetsWithDistances(
         fromRev: String,
         toRev: String,
-        targetTypes: Set<String>?
+        targetTypes: Set<String>?,
+        modifiedFilepaths: Set<Path>,
     ): ImpactedTargetsWithDistancesResult {
-      lastTargetTypes = targetTypes
+      record(fromRev, toRev, targetTypes, modifiedFilepaths)
       distancesError?.let { throw it }
       return distancesResult
+    }
+
+    private fun record(
+        fromRev: String,
+        toRev: String,
+        targetTypes: Set<String>?,
+        modifiedFilepaths: Set<Path>
+    ) {
+      lastFrom = fromRev
+      lastTo = toRev
+      lastTargetTypes = targetTypes
+      lastModifiedFilepaths = modifiedFilepaths
     }
   }
 
@@ -103,14 +122,19 @@ class BazelDiffServerTest : KoinTest {
   // Indirection so a test can swap `provider` after the server has been constructed.
   private fun providerProxy() =
       object : ImpactedTargetsProvider {
-        override fun getImpactedTargets(fromRev: String, toRev: String, targetTypes: Set<String>?) =
-            provider.getImpactedTargets(fromRev, toRev, targetTypes)
+        override fun getImpactedTargets(
+            fromRev: String,
+            toRev: String,
+            targetTypes: Set<String>?,
+            modifiedFilepaths: Set<Path>
+        ) = provider.getImpactedTargets(fromRev, toRev, targetTypes, modifiedFilepaths)
 
         override fun getImpactedTargetsWithDistances(
             fromRev: String,
             toRev: String,
-            targetTypes: Set<String>?
-        ) = provider.getImpactedTargetsWithDistances(fromRev, toRev, targetTypes)
+            targetTypes: Set<String>?,
+            modifiedFilepaths: Set<Path>
+        ) = provider.getImpactedTargetsWithDistances(fromRev, toRev, targetTypes, modifiedFilepaths)
       }
 
   private data class Response(val code: Int, val body: String)
@@ -128,6 +152,22 @@ class BazelDiffServerTest : KoinTest {
             ?: ""
     conn.disconnect()
     return Response(code, body)
+  }
+
+  private fun post(path: String, body: String): Response {
+    val conn =
+        URL("http://localhost:${server.boundPort()}$path").openConnection() as HttpURLConnection
+    conn.requestMethod = "POST"
+    conn.doOutput = true
+    conn.setRequestProperty("Content-Type", "application/json")
+    conn.outputStream.use { it.write(body.toByteArray(StandardCharsets.UTF_8)) }
+    val code = conn.responseCode
+    val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+    val respBody =
+        stream?.let { BufferedReader(InputStreamReader(it, StandardCharsets.UTF_8)).readText() }
+            ?: ""
+    conn.disconnect()
+    return Response(code, respBody)
   }
 
   @Test
@@ -184,8 +224,69 @@ class BazelDiffServerTest : KoinTest {
   }
 
   @Test
-  fun nonGetMethodReturns405() {
-    assertThat(request("/impacted_targets?from=a&to=b", "POST").code).isEqualTo(405)
+  fun unsupportedMethodReturns405() {
+    // GET and POST are both valid now; anything else is 405.
+    assertThat(request("/impacted_targets?from=a&to=b", "PUT").code).isEqualTo(405)
+    assertThat(request("/impacted_targets?from=a&to=b", "DELETE").code).isEqualTo(405)
+  }
+
+  @Test
+  fun postScopedRequestParsesBodyAndPassesModifiedFilepaths() {
+    val fixed = FixedProvider()
+    provider = fixed
+    val body =
+        """{"from":"main","to":"feature","targetType":["Rule"],""" +
+            """"modifiedFilepaths":["pkg/A.kt","pkg/B.kt"]}"""
+    val response = post("/impacted_targets", body)
+
+    assertThat(response.code).isEqualTo(200)
+    val parsed = gson.fromJson(response.body, ImpactedTargetsResult::class.java)
+    assertThat(parsed.impactedTargets).containsExactly("//:a", "//:b")
+    assertThat(fixed.lastFrom).isEqualTo("main")
+    assertThat(fixed.lastTo).isEqualTo("feature")
+    assertThat(fixed.lastTargetTypes).isEqualTo(setOf("Rule"))
+    assertThat(fixed.lastModifiedFilepaths)
+        .isEqualTo(setOf(Path.of("pkg/A.kt"), Path.of("pkg/B.kt")))
+  }
+
+  @Test
+  fun postWithoutModifiedFilepathsIsAFullHash() {
+    val fixed = FixedProvider()
+    provider = fixed
+    val response = post("/impacted_targets", """{"from":"a","to":"b"}""")
+
+    assertThat(response.code).isEqualTo(200)
+    // Absent modifiedFilepaths/targetType behave exactly like the GET path: full hash, no filter.
+    assertThat(fixed.lastModifiedFilepaths).isEqualTo(emptySet())
+    assertThat(fixed.lastTargetTypes).isNull()
+  }
+
+  @Test
+  fun postMalformedBodyReturns400() {
+    assertThat(post("/impacted_targets", "{not json").code).isEqualTo(400)
+  }
+
+  @Test
+  fun postMissingFromOrEmptyBodyReturns400() {
+    assertThat(post("/impacted_targets", """{"to":"b"}""").code).isEqualTo(400)
+    assertThat(post("/impacted_targets", "").code).isEqualTo(400)
+  }
+
+  @Test
+  fun postScopedDistancesRequestPassesModifiedFilepaths() {
+    val fixed = FixedProvider()
+    provider = fixed
+    val body = """{"from":"main","to":"feature","modifiedFilepaths":["pkg/A.kt"]}"""
+    val response = post("/impacted_targets_with_distances", body)
+
+    assertThat(response.code).isEqualTo(200)
+    assertThat(fixed.lastModifiedFilepaths).isEqualTo(setOf(Path.of("pkg/A.kt")))
+  }
+
+  @Test
+  fun postReturns503WhenNotReady() {
+    ready.set(false)
+    assertThat(post("/impacted_targets", """{"from":"a","to":"b"}""").code).isEqualTo(503)
   }
 
   @Test
@@ -243,7 +344,8 @@ class BazelDiffServerTest : KoinTest {
           override fun getImpactedTargets(
               fromRev: String,
               toRev: String,
-              targetTypes: Set<String>?
+              targetTypes: Set<String>?,
+              modifiedFilepaths: Set<Path>
           ): ImpactedTargetsResult {
             Thread.sleep(10_000)
             return ImpactedTargetsResult(fromRev, toRev, emptyList())
@@ -252,7 +354,8 @@ class BazelDiffServerTest : KoinTest {
           override fun getImpactedTargetsWithDistances(
               fromRev: String,
               toRev: String,
-              targetTypes: Set<String>?
+              targetTypes: Set<String>?,
+              modifiedFilepaths: Set<Path>
           ) = throw UnsupportedOperationException()
         }
     val slowServer = BazelDiffServer(0, slowProvider, requestTimeoutSeconds = 1) { true }

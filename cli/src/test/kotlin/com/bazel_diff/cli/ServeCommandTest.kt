@@ -77,7 +77,10 @@ class ServeCommandTest : KoinTest {
       com.bazel_diff.server.HashProvider {
     val warmed = mutableListOf<String>()
 
-    override fun getHashes(sha: String): com.bazel_diff.interactor.HashFileData {
+    override fun getHashes(
+        sha: String,
+        modifiedFilepaths: Set<java.nio.file.Path>
+    ): com.bazel_diff.interactor.HashFileData {
       warmed += sha
       if (sha in failFor) throw RuntimeException("boom for $sha")
       return com.bazel_diff.interactor.HashFileData(emptyMap(), null)
@@ -87,13 +90,18 @@ class ServeCommandTest : KoinTest {
   }
 
   private object NoopImpactedTargets : com.bazel_diff.server.ImpactedTargetsProvider {
-    override fun getImpactedTargets(fromRev: String, toRev: String, targetTypes: Set<String>?) =
-        com.bazel_diff.server.ImpactedTargetsResult(fromRev, toRev, emptyList())
+    override fun getImpactedTargets(
+        fromRev: String,
+        toRev: String,
+        targetTypes: Set<String>?,
+        modifiedFilepaths: Set<java.nio.file.Path>
+    ) = com.bazel_diff.server.ImpactedTargetsResult(fromRev, toRev, emptyList())
 
     override fun getImpactedTargetsWithDistances(
         fromRev: String,
         toRev: String,
-        targetTypes: Set<String>?
+        targetTypes: Set<String>?,
+        modifiedFilepaths: Set<java.nio.file.Path>
     ) = com.bazel_diff.server.ImpactedTargetsWithDistancesResult(fromRev, toRev, emptyList())
   }
 

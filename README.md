@@ -149,6 +149,24 @@ curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
 }
 ```
 
+* `POST /impacted_targets` — the same query as a JSON body, which additionally accepts a
+  `modifiedFilepaths` list to speed up cold hashing on large repositories. Body fields: `from` and
+  `to` (required), `targetType` (optional array), and `modifiedFilepaths` (optional array of
+  workspace-relative paths that changed between the two revisions, e.g. from
+  `git diff --name-only <from> <to>`). When `modifiedFilepaths` is present the server reads and
+  hashes the *content* of only those files on **both** revisions and treats every other source file
+  as unchanged, turning an O(all source files) content read into O(changed files) — the same
+  optimization as `generate-hashes --modified-filepaths`. The list must be a **superset** of what
+  actually changed: a truly-changed file left off it is content-skipped on both sides and its
+  impacted targets are missed (hence experimental). Omit it (or send `[]`) for the full-content hash,
+  identical to the GET form. `POST /impacted_targets_with_distances` accepts the same body.
+
+```bash
+curl -X POST http://localhost:8080/impacted_targets \
+  -H 'Content-Type: application/json' \
+  -d '{"from":"main","to":"my-feature-branch","modifiedFilepaths":["foo/BUILD.bazel","foo/bar.py"]}'
+```
+
 * `GET /impacted_targets_with_distances?from=<rev>&to=<rev>` — like `/impacted_targets`, but each
   impacted target is annotated with its build-graph distance metrics: `targetDistance` (the number of
   dependency hops to the nearest directly-changed target) and `packageDistance` (how many of those
@@ -223,6 +241,13 @@ Notes and current limitations:
 * Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
   `generate-hashes`, and are folded into the cache key so a server started with different flags never
   serves another configuration's cached hashes.
+* `modifiedFilepaths` (POST only) is scoped per request, not a server flag. A scoped hash of a
+  revision is only comparable to another revision hashed with the *same* set, so cached scoped
+  entries are keyed by `<sha>.<fingerprint>.<digest-of-the-set>` — never mixed with, or served in
+  place of, the full-content `<sha>.<fingerprint>` entry. The trade-off: on the scoped path the
+  shared-base full-hash cache is not reused (each distinct changed-set re-hashes the base), but each
+  such hash is cheaper because it skips reading unchanged files. The extra entries are bounded by the
+  same LRU `--cacheMax*` pruning as everything else.
 * Containerization, multi-instance deployment manifests, and remote cache backends are not yet
   included.
 

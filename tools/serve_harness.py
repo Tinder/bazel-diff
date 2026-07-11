@@ -145,10 +145,13 @@ def wait_port(port: int, timeout: float) -> bool:
 # ----------------------------------------------------------------------------------------------
 
 
-def http(port: int, path: str, method: str = "GET", timeout: float = 300.0):
-    """Returns (status_code_or_None, body_text). status is None on a transport error."""
+def http(port: int, path: str, method: str = "GET", timeout: float = 300.0, body: str | None = None):
+    """Returns (status_code_or_None, body_text). status is None on a transport error. A non-None
+    [body] is sent as a JSON request body (used by the POST endpoints)."""
     url = f"http://127.0.0.1:{port}{path}"
-    req = urllib.request.Request(url, method=method)
+    data = body.encode("utf-8") if body is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(url, method=method, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8", "replace")
@@ -486,6 +489,23 @@ def _impacted(s: Serve, frm: str, to: str, target_type: str | None = None, timeo
     return code, body, data
 
 
+def _impacted_post(s: Serve, frm: str, to: str, modified: list[str] | None = None,
+                   target_type: str | None = None, timeout: float = 300.0):
+    """POST /impacted_targets with an optional `modifiedFilepaths` scope (the content-hashing
+    optimization). `modified` is a list of workspace-relative paths; None omits it (full hash)."""
+    payload: dict = {"from": frm, "to": to}
+    if modified is not None:
+        payload["modifiedFilepaths"] = modified
+    if target_type:
+        payload["targetType"] = target_type.split(",")
+    code, body = http(s.port, "/impacted_targets", method="POST", body=json.dumps(payload), timeout=timeout)
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        data = None
+    return code, body, data
+
+
 def _iset(data) -> set:
     if not data or not isinstance(data.get("impactedTargets"), list):
         return set()
@@ -589,9 +609,21 @@ def _full_extras(rep: Report, case: str, s: Serve, remote: Remote, track_deps: b
               code == 400 and "missing required query parameters" in body,
               fail_detail=f"code={code} body={body[:160]}")
 
-    # Wrong method.
-    code, body = http(s.port, f"/impacted_targets?from={sh['C1']}&to={sh['C2']}", method="POST")
-    rep.check(case, "POST -> 405", code == 405, fail_detail=f"code={code}")
+    # Wrong method: GET and POST are both valid now, so an unsupported verb (PUT) is the 405 case.
+    code, body = http(s.port, f"/impacted_targets?from={sh['C1']}&to={sh['C2']}", method="PUT")
+    rep.check(case, "PUT -> 405", code == 405, fail_detail=f"code={code}")
+
+    # POST parity: the same C1->C2 query as a JSON body (no modifiedFilepaths) matches the GET set.
+    pc, pbody, pdata = _impacted_post(s, sh["C1"], sh["C2"])
+    rep.check(case, "POST body (full) parity with GET",
+              pc == 200 and _stable(pdata) == {"//:core", "//:core.txt", "//:mid"},
+              ok_detail=str(sorted(_stable(pdata))),
+              fail_detail=f"code={pc} got={sorted(_stable(pdata))} body={pbody[:160]}")
+
+    # Malformed JSON body -> 400.
+    code, body = http(s.port, "/impacted_targets", method="POST", body="{not json")
+    rep.check(case, "malformed POST body -> 400", code == 400,
+              fail_detail=f"code={code} body={body[:120]}")
 
     # Distances endpoint: with --trackDeps, core is directly changed (d0), mid depends on core
     # (d>=1); without it, the endpoint 400s.
@@ -675,6 +707,48 @@ def case_partial(remote: Remote, clone: Path, root: Path, rep: Report) -> None:
     _bazel_shutdown(clone)
 
 
+def case_scoped(remote: Remote, clone: Path, root: Path, rep: Report) -> None:
+    """POST /impacted_targets with a `modifiedFilepaths` scope (the content-hashing optimization).
+    Proves both halves of the contract: (1) parity -- scoping to the genuinely-changed file returns
+    the same set as the full GET; and (2) that the scope actually gates content hashing -- an
+    *incomplete* set (omitting the changed file) content-skips it on both revisions, so its impacted
+    targets are correctly missed. This is the documented 'must be a superset' caveat, demonstrated as
+    a deliberate false negative. A pure hashing concern (independent of clone shape / fetch path), so
+    it runs once on a full clone."""
+    case = "scoped"
+    log(f"\n{C.BOLD}== case {case} =={C.RESET}")
+    sh = remote.shas
+    cache = root / "cache-scoped"
+    core_edit = {"//:core", "//:core.txt", "//:mid"}  # C1->C2 edits core.txt only
+    with serve(clone, cache, initial_fetch=False, track_deps=False, ready_timeout=30) as (s, health):
+        if not rep.check(case, "health becomes ready", health == "ready",
+                         fail_detail=f"health={health}\n{s.stderr_tail()}"):
+            return
+
+        # Baseline: the full GET set the scoped query must match.
+        _, _, gdata = _impacted(s, sh["C1"], sh["C2"])
+        full = _stable(gdata)
+
+        # (1) Scope to the actually-changed file -> identical impacted set as the full hash.
+        pc, pbody, pdata = _impacted_post(s, sh["C1"], sh["C2"], modified=["core.txt"])
+        rep.check(case, "scope to changed file == full set",
+                  pc == 200 and _stable(pdata) == full == core_edit,
+                  ok_detail=str(sorted(_stable(pdata))),
+                  fail_detail=f"code={pc} scoped={sorted(_stable(pdata))} "
+                              f"full={sorted(full)} body={pbody[:160]}")
+
+        # (2) Negative control: omit the changed file. It is content-skipped on both revisions, so
+        # the change is invisible and its targets are missed -- proving the scope really gates
+        # hashing (and why the caller must pass a superset of what changed).
+        nc, nbody, ndata = _impacted_post(s, sh["C1"], sh["C2"], modified=["other.txt"])
+        rep.check(case, "incomplete scope misses the change (superset contract)",
+                  nc == 200 and _stable(ndata) == set(),
+                  ok_detail="missed as expected",
+                  fail_detail=f"code={nc} got={sorted(_stable(ndata))} body={nbody[:160]}")
+
+    _bazel_shutdown(clone)
+
+
 def _bazel_shutdown(clone: Path) -> None:
     with contextlib.suppress(Exception):
         run([BAZEL, "shutdown"], cwd=clone, check=False)
@@ -695,13 +769,16 @@ VARIANTS = {
 CASES = [
     ("full", "full", False),
     ("full+deps", "full", True),
+    ("scoped", "full", False),
     ("shallow", "shallow", None),
     ("partial", "partial", None),
 ]
 
 
 def _run_case(name, variant, td, remote, clone, root, rep) -> None:
-    if variant == "full":
+    if name.startswith("scoped"):
+        case_scoped(remote, clone, root, rep)
+    elif variant == "full":
         case_full(remote, clone, root, rep, td)
     elif variant == "shallow":
         case_shallow(remote, clone, root, rep)

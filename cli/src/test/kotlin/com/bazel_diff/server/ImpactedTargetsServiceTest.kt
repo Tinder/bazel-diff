@@ -11,6 +11,7 @@ import com.bazel_diff.interactor.HashFileData
 import com.bazel_diff.interactor.ImpactedTargetWithDistance
 import com.bazel_diff.log.Logger
 import com.google.gson.GsonBuilder
+import java.nio.file.Path
 import org.junit.Rule
 import org.junit.Test
 import org.koin.dsl.module
@@ -146,9 +147,12 @@ class ImpactedTargetsServiceTest : KoinTest {
       private val allowWorkspaceAt: Boolean = false,
   ) : HashProvider {
     val workspaceAtCalls = mutableListOf<String>()
+    val modifiedFilepathsByRev = mutableMapOf<String, Set<Path>>()
 
-    override fun getHashes(sha: String): HashFileData =
-        byRev[sha] ?: error("no canned hashes for $sha")
+    override fun getHashes(sha: String, modifiedFilepaths: Set<Path>): HashFileData {
+      modifiedFilepathsByRev[sha] = modifiedFilepaths
+      return byRev[sha] ?: error("no canned hashes for $sha")
+    }
 
     override fun <T> withWorkspaceAt(sha: String, block: () -> T): T {
       if (!allowWorkspaceAt)
@@ -198,6 +202,42 @@ class ImpactedTargetsServiceTest : KoinTest {
     val result = service.getImpactedTargets("a", "b", setOf("Rule"))
 
     assertThat(result.impactedTargets).isEqualTo(listOf("//:r"))
+  }
+
+  @Test
+  fun scopesBothRevisionsWithTheSameModifiedFilepaths() {
+    // The identical modified-filepaths scope must reach BOTH revisions -- that symmetry is what
+    // keeps
+    // a content-scoped diff correct (an unchanged, unlisted file is content-skipped on both sides).
+    val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), null)
+    val to = HashFileData(mapOf("//:a" to TargetHash("Rule", "h2", "d2")), null)
+    val provider = FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to))
+    val service = ImpactedTargetsService(IdentityGitClient(), provider)
+    val modified = setOf(Path.of("pkg/A.kt"), Path.of("pkg/B.kt"))
+
+    val result = service.getImpactedTargets("from-sha", "to-sha", null, modified)
+
+    assertThat(result.impactedTargets).isEqualTo(listOf("//:a"))
+    assertThat(provider.modifiedFilepathsByRev["from-sha"]).isEqualTo(modified)
+    assertThat(provider.modifiedFilepathsByRev["to-sha"]).isEqualTo(modified)
+  }
+
+  @Test
+  fun scopesBothRevisionsForDistancesToo() {
+    val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), null)
+    val to =
+        HashFileData(
+            mapOf("//:a" to TargetHash("Rule", "h2", "d2")),
+            null,
+            depEdges = mapOf("//:a" to emptyList()))
+    val provider = FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to))
+    val service = ImpactedTargetsService(IdentityGitClient(), provider, depsTracked = true)
+    val modified = setOf(Path.of("pkg/A.kt"))
+
+    service.getImpactedTargetsWithDistances("from-sha", "to-sha", null, modified)
+
+    assertThat(provider.modifiedFilepathsByRev["from-sha"]).isEqualTo(modified)
+    assertThat(provider.modifiedFilepathsByRev["to-sha"]).isEqualTo(modified)
   }
 
   @Test

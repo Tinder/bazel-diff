@@ -5,13 +5,16 @@ import assertk.assertions.contains
 import assertk.assertions.doesNotContain
 import assertk.assertions.hasSize
 import assertk.assertions.isEqualTo
+import assertk.assertions.isNotEqualTo
 import assertk.assertions.isNull
+import assertk.assertions.startsWith
 import com.bazel_diff.SilentLogger
 import com.bazel_diff.bazel.BazelModService
 import com.bazel_diff.hash.BuildGraphHasher
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.log.Logger
 import com.google.gson.GsonBuilder
+import java.nio.file.Path
 import kotlinx.coroutines.runBlocking
 import org.junit.Rule
 import org.junit.Test
@@ -92,6 +95,38 @@ class HashServiceTest : KoinTest {
     assertThat(storage.entries).hasSize(1)
     // The cache key combines the SHA and the config fingerprint.
     assertThat(storage.entries.keys.single()).isEqualTo("sha1.fp")
+  }
+
+  @Test
+  fun scopedRequestUsesADistinctCacheKeyAndPassesTheSetToTheHasher() {
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any()))
+        .thenReturn(sampleHashes)
+    runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
+    val storage = InMemoryStorage()
+    val modified = setOf(Path.of("pkg/A.kt"), Path.of("pkg/B.kt"))
+
+    newService(RecordingGitClient(), storage).getHashes("sha1", modified)
+
+    // A content-scoped entry is keyed <sha>.<fingerprint>.<digest>, so it never mixes with (or is
+    // served in place of) the full-content `sha1.fp` entry.
+    val key = storage.entries.keys.single()
+    assertThat(key).startsWith("sha1.fp.")
+    assertThat(key).isNotEqualTo("sha1.fp")
+    // The scope reaches the hasher (3rd arg) so unchanged files skip content reads.
+    verify(buildGraphHasher).hashAllBazelTargetsAndSourcefiles(emptySet(), emptySet(), modified)
+  }
+
+  @Test
+  fun scopedCacheKeyIsOrderIndependentAndDiffersFromBase() {
+    val service = newService(RecordingGitClient(), InMemoryStorage())
+
+    val base = service.cacheKey("sha1")
+    val ab = service.cacheKey("sha1", setOf(Path.of("a"), Path.of("b")))
+    val ba = service.cacheKey("sha1", setOf(Path.of("b"), Path.of("a")))
+
+    assertThat(base).isEqualTo("sha1.fp")
+    assertThat(ab).isEqualTo(ba) // digest is over the sorted set, so ordering can't matter
+    assertThat(ab).isNotEqualTo(base)
   }
 
   @Test

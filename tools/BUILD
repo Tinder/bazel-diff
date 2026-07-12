@@ -55,7 +55,8 @@ py_test(
     deps = [":coverage_check_lib"],
 )
 
-# Note: the serve integration harness (serve_harness.py) is intentionally NOT wrapped in a
-# py_binary. It shells out to `bazel build //cli:bazel-diff`, which would deadlock on the output-base
-# lock if it were itself launched via `bazel run` (nested bazel, same output base). Run it directly:
-# `python3 tools/serve_harness.py` (see its module docstring). It uses only the Python stdlib.
+# Note: the serve integration harnesses (serve_harness.py, serve_stress.py) are intentionally NOT
+# wrapped in py_binary targets. They shell out to `bazel build //cli:bazel-diff`, which would
+# deadlock on the output-base lock if they were themselves launched via `bazel run` (nested bazel,
+# same output base). Run them directly: `python3 tools/serve_harness.py` /
+# `python3 tools/serve_stress.py` (see their module docstrings). They use only the Python stdlib.

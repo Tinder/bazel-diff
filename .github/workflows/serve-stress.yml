@@ -1,0 +1,66 @@
+name: Serve Stress
+
+# Operational stress validation for the `bazel-diff serve` query service. Runs
+# tools/serve_stress.py, which drives the real binary over HTTP against a live git:// remote
+# under concurrent load and injected faults (orphaned git index.lock checkouts, an index.lock
+# storm, a git-remote outage, lame-duck startup) and captures throughput / response-time
+# metrics for every phase. Complements the functional matrix in serve-harness.yml.
+#
+# Scheduled runs use the full profile; on-demand runs from the Actions tab can select the
+# reduced quick profile. Note: scheduled + dispatched workflows run from the default branch,
+# so this must land on master before the cron fires.
+on:
+  workflow_dispatch:
+    inputs:
+      quick:
+        description: "Run the reduced quick profile"
+        type: boolean
+        default: false
+  schedule:
+    # Daily, offset from the serve-harness cron (0 */12) so the two never contend for runners.
+    - cron: "30 6 * * *"
+
+jobs:
+  ServeStress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+        id: go
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
+      - uses: actions/checkout@v4
+      - name: Run serve stress harness
+        # git daemon ships with git (preinstalled on the runner); python3 is preinstalled.
+        # --bazel points the harness (and the serve subprocesses it spawns) at bazelisk; the
+        # bazel version comes from .bazelversion, which the harness copies into its workspaces.
+        run: >
+          python3 tools/serve_stress.py
+          --bazel "$HOME/go/bin/bazelisk"
+          --metrics-out serve-stress-metrics.json
+          --summary-out serve-stress-summary.md
+          ${{ inputs.quick && '--quick' || '' }}
+      - name: Publish step summary
+        if: always()
+        run: |
+          if [ -f serve-stress-summary.md ]; then
+            cat serve-stress-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serve-stress-metrics-${{ github.run_id }}
+          path: |
+            serve-stress-metrics.json
+            serve-stress-summary.md
+          if-no-files-found: warn
+          retention-days: 90

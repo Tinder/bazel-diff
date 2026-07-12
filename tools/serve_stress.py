@@ -35,16 +35,28 @@ Every request is timed. The run emits per-phase throughput (req/s) and latency p
 (p50/p90/p95/p99/max), plus /metrics snapshots at phase boundaries, as JSON (--metrics-out)
 and a GitHub-flavored markdown summary (--summary-out) for a CI step summary.
 
+There are two modes. The default (above) fabricates a hermetic genrule workspace so impacted-target
+values are known exactly. Real-repo mode (`--real-repo-url`) instead points serve at a clone of an
+actual repo and drives it over real commit SHAs -- exercising real large-tree checkouts (real
+index.lock timing) and a real `bazel query` (real generation latency), with invariant checks
+(200s / cross-request consistency / self-heal) rather than a hardcoded impacted set. It runs the
+real_cold / real_hot / real_lock_heal / real_lock_storm phases; the fetch, outage, and lame-duck
+phases stay hermetic-only (they need a controllable remote). Cold checkouts are forced with the
+target's real ancestry commits, so the clone must be deep enough (`--real-clone-args --depth=N`).
+
 Usage:
-    tools/serve_stress.py                       # build, then run every phase
+    tools/serve_stress.py                       # build, then run every hermetic phase
     tools/serve_stress.py --skip-build          # reuse an existing bazel-bin/cli/bazel-diff
     tools/serve_stress.py --quick               # reduced request counts (sanity profile)
     tools/serve_stress.py --only lock           # run only phases whose name contains "lock"
     tools/serve_stress.py --metrics-out m.json --summary-out s.md
     tools/serve_stress.py --bazel ~/go/bin/bazelisk    # specific bazel binary (CI)
+    # real-repo mode: stress serve against an actual repo over two real revisions
+    tools/serve_stress.py --real-repo-url https://github.com/bazelbuild/bazel.git \
+        --real-from HEAD~1 --real-to HEAD --real-clone-args '--depth=50'
 
 Exit code is non-zero if any gating check fails. Pure Python stdlib; requires git (with
-`git daemon`) and a bazel binary, same as the functional harness.
+`git daemon` for the hermetic mode) and a bazel binary, same as the functional harness.
 """
 
 from __future__ import annotations
@@ -345,6 +357,13 @@ class Profile:
         return Profile(hot_requests=16, hot_workers=4, cold_pairs=2, cold_fanout=3,
                        error_batch=12, lock_heal_rounds=2, storm_commits=2, outage_probes=2)
 
+    @staticmethod
+    def real() -> "Profile":
+        # Each real generation is a full checkout + `bazel query` on the target repo, so keep the
+        # cold-checkout counts low; the hot burst is cheap (cache hits) so it can stay larger.
+        return Profile(hot_requests=16, hot_workers=4, cold_fanout=3,
+                       lock_heal_rounds=1, storm_commits=1)
+
 
 # ----------------------------------------------------------------------------------------------
 # The stress run
@@ -356,14 +375,15 @@ OTHER_EDIT = {"//:other", "//:other.txt"}
 
 @dataclass
 class Ctx:
-    remote: base.Remote
+    remote: base.Remote  # None in real-repo mode (no git daemon there)
     clone: Path
-    lameduck_clone: Path
+    lameduck_clone: Path  # None in real-repo mode
     root: Path
     rep: base.Report
     metrics: Metrics
     profile: Profile
     serve: base.Serve = None  # set once the instance is up
+    meta_extra: dict = None  # merged into the metrics-JSON meta block (mode, repo, revs)
 
 
 def build_history(remote: base.Remote, profile: Profile) -> None:
@@ -697,23 +717,31 @@ def phase_final(ctx: Ctx) -> None:
 # Output: metrics JSON + markdown summary
 # ----------------------------------------------------------------------------------------------
 
-PHASES = ["warm", "hot", "cold", "error_mix", "lock_heal", "lock_storm", "remote_outage",
-          "lameduck"]
+def _ordered_phases(metrics: Metrics) -> list:
+    """Phase names in first-appearance order. The background health series is excluded (it is
+    summarized separately via health_stats). Works for both the hermetic and real-repo phase sets."""
+    seen: list = []
+    for s in metrics.samples:
+        if s.phase != "background" and s.phase not in seen:
+            seen.append(s.phase)
+    return seen
 
 
 def build_metrics_json(ctx: Ctx, wall_seconds: float, quick: bool, failures: int) -> dict:
+    meta = {
+        "harness": "serve_stress",
+        "started_epoch": int(time.time() - wall_seconds),
+        "wall_seconds": round(wall_seconds, 1),
+        "quick": quick,
+        "bazel": base.BAZEL,
+        "python": sys.version.split()[0],
+    }
+    if ctx.meta_extra:
+        meta.update(ctx.meta_extra)
     return {
-        "meta": {
-            "harness": "serve_stress",
-            "started_epoch": int(time.time() - wall_seconds),
-            "wall_seconds": round(wall_seconds, 1),
-            "quick": quick,
-            "bazel": base.BAZEL,
-            "python": sys.version.split()[0],
-        },
+        "meta": meta,
         "time_to_ready_seconds": ctx.metrics.time_to_ready_seconds,
-        "phases": [ctx.metrics.phase_stats(p) for p in PHASES
-                   if any(s.phase == p for s in ctx.metrics.samples)],
+        "phases": [ctx.metrics.phase_stats(p) for p in _ordered_phases(ctx.metrics)],
         "health": ctx.metrics.health_stats(),
         "server_metrics": ctx.metrics.server_snapshots,
         "checks": [
@@ -727,11 +755,21 @@ def build_summary_md(data: dict) -> str:
     lines = ["# `bazel-diff serve` stress run", ""]
     meta = data["meta"]
     verdict = "✅ all checks passed" if data["failures"] == 0 else f"❌ {data['failures']} check(s) failed"
+    profile_label = "real-repo" if meta.get("mode") == "real" else (
+        "quick" if meta["quick"] else "full")
     lines += [
         f"**{verdict}** — wall time {meta['wall_seconds']}s, "
         f"time-to-ready {data['time_to_ready_seconds']}s, "
-        f"profile {'quick' if meta['quick'] else 'full'}",
+        f"profile {profile_label}",
         "",
+    ]
+    if meta.get("mode") == "real":
+        lines += [
+            f"Real-repo target: `{meta.get('repo', '')}` — "
+            f"`{str(meta.get('from', ''))[:12]}` → `{str(meta.get('to', ''))[:12]}`",
+            "",
+        ]
+    lines += [
         "## Throughput & response times",
         "",
         "| phase | requests | ok | statuses | wall (s) | req/s | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) |",
@@ -767,6 +805,225 @@ def build_summary_md(data: dict) -> str:
             detail = (c["detail"] or "").strip()
             lines += [f"### [{c['case']}] {c['name']}", "", "```", detail[:2000], "```", ""]
     return "\n".join(lines) + "\n"
+
+
+# ----------------------------------------------------------------------------------------------
+# Real-repo mode
+# ----------------------------------------------------------------------------------------------
+#
+# The phases above fabricate a hermetic genrule workspace so impacted-target *values* are known
+# exactly. Real-repo mode instead points serve at a clone of an actual git repo (any Bazel
+# workspace) and drives it across real commit SHAs. It exercises what the synthetic workspace
+# cannot: real packfile checkouts of large trees (real index.lock timing), and a real `bazel query`
+# on a non-trivial graph (real generation latency / throughput). Because the answer is
+# repo-specific, the checks assert *invariants* -- 200s, cross-request consistency, and the same
+# self-heal behavior -- rather than a hardcoded impacted set. No git daemon: serve runs with
+# --no-initial-fetch against the clone, and cold checkouts are forced with real ancestry commits
+# (so no fetch is in the way -- the checkout path is what is under test), mirroring the hermetic
+# lock phases. Fetch/outage/lame-duck phases stay hermetic-only (they need a controllable remote).
+
+REAL_REQ_TIMEOUT = 1800.0  # a first cold `bazel query` on a large real repo can take many minutes
+
+
+def setup_real_clone(root: Path, url: str, clone_args: str) -> Path:
+    """Clones [url] (any git URL or local path) into the workdir and returns the clone path. Extra
+    `git clone` args (e.g. `--depth=50`) come from [clone_args]; gc is disabled so a background
+    repack never races the checkouts, exactly as the hermetic clones do."""
+    dest = root / "real-clone"
+    extra = clone_args.split() if clone_args else []
+    base.run(["git", "clone", "-q", *extra, url, str(dest)])
+    base.git(dest, "config", "gc.auto", "0")
+    base.git(dest, "config", "user.name", "serve-harness")
+    base.git(dest, "config", "user.email", "serve-harness@example.com")
+    return dest
+
+
+def resolve_rev(clone: Path, rev: str) -> str:
+    """Resolves a user-supplied revision (SHA, branch, tag, `HEAD~1`, ...) to a full commit SHA in
+    the clone, so a cron can pass `HEAD~1`/`HEAD` and always test the latest commit."""
+    return base.git(clone, "rev-parse", "--verify", f"{rev}^{{commit}}")
+
+
+def derive_ancestry_pairs(clone: Path, tip: str, count: int) -> list:
+    """Up to [count] consecutive (older -> newer) real pairs walking back from [tip]: (tip~1, tip),
+    (tip~2, tip~1), ... Each introduces one deeper, still-uncached ancestor, so serving it forces a
+    real checkout (its newer side is cached by the preceding request). Returns fewer than [count]
+    when the clone's history is too shallow (a warning is left to the caller)."""
+    revs: list = []
+    for i in range(count + 1):
+        try:
+            revs.append(base.git(clone, "rev-parse", "--verify", f"{tip}~{i}^{{commit}}"))
+        except Exception:
+            break
+    return [(revs[i + 1], revs[i]) for i in range(len(revs) - 1)]
+
+
+def phase_real_cold(ctx: Ctx, frm: str, to: str) -> None:
+    """The headline real generation: [cold_fanout] identical concurrent (frm->to) requests. The
+    first triggers a real checkout + `bazel query` + hash of each revision; the workspace lock
+    collapses them to one generation and every caller gets the identical impacted set."""
+    case = "real_cold"
+    outcomes: list = []
+    lock = threading.Lock()
+
+    def one(_: int) -> None:
+        code, text, ms = impacted_get(ctx.serve, frm, to, timeout=REAL_REQ_TIMEOUT)
+        ctx.metrics.record(case, "impacted_cold", code, ms, code == 200)
+        with lock:
+            outcomes.append((code, stable_set(text)))
+
+    with ctx.metrics.phase(case):
+        with ThreadPoolExecutor(max_workers=ctx.profile.cold_fanout) as pool:
+            list(pool.map(one, range(ctx.profile.cold_fanout)))
+    codes = {c for c, _ in outcomes}
+    sets = {fs for _, fs in outcomes}
+    size = len(next(iter(sets))) if len(sets) == 1 else -1
+    ctx.rep.check(case, f"{ctx.profile.cold_fanout} concurrent cold requests agree (200)",
+                  codes == {200} and len(sets) == 1,
+                  ok_detail=f"{size} impacted targets",
+                  fail_detail=f"codes={codes} distinct_sets={len(sets)}\n{ctx.serve.stderr_tail()}")
+    if codes == {200} and size == 0:
+        ctx.rep.add(case, "impacted set is empty (the diff touches no build-relevant files)", base.INFO)
+    ctx.metrics.snapshot_server(case, ctx.serve.port)
+
+
+def phase_real_hot(ctx: Ctx, frm: str, to: str) -> None:
+    """Concurrent cache-hit throughput for the now-cached (frm->to) pair (GET + POST body form)."""
+    case = "real_hot"
+    codes: set = set()
+    lock = threading.Lock()
+
+    def one(i: int) -> None:
+        fn = impacted_post if i % 3 == 0 else impacted_get
+        code, _, ms = fn(ctx.serve, frm, to, timeout=REAL_REQ_TIMEOUT)
+        ctx.metrics.record(case, "impacted_hot", code, ms, code == 200)
+        with lock:
+            codes.add(code)
+
+    with ctx.metrics.phase(case):
+        with ThreadPoolExecutor(max_workers=ctx.profile.hot_workers) as pool:
+            list(pool.map(one, range(ctx.profile.hot_requests)))
+    ctx.rep.check(case, f"{ctx.profile.hot_requests} concurrent cache-hit requests all 200",
+                  codes == {200}, ok_detail=f"codes={codes}",
+                  fail_detail=f"codes={codes}\n{ctx.serve.stderr_tail()}")
+    ctx.metrics.snapshot_server(case, ctx.serve.port)
+
+
+def phase_real_lock_heal(ctx: Ctx, pairs: list) -> None:
+    """Plant an orphaned index.lock before each real ancestry checkout: the service must clear it,
+    retry, and answer 200 -- the #425 self-heal path, on a real (large) index."""
+    case = "real_lock_heal"
+    if not pairs:
+        ctx.rep.add(case, "no ancestry pairs (clone too shallow); skipped", base.SKIP)
+        return
+    with ctx.metrics.phase(case):
+        for frm, to in pairs:
+            lock_path = plant_index_lock(ctx.clone)
+            code, text, ms = impacted_get(ctx.serve, frm, to, timeout=REAL_REQ_TIMEOUT)
+            healed = code == 200 and not lock_path.exists()
+            ctx.metrics.record(case, "impacted_cold_locked", code, ms, healed)
+            ctx.rep.check(case, f"{frm[:8]}->{to[:8]}: orphaned index.lock self-heals -> 200", healed,
+                          ok_detail=f"{ms/1000:.1f}s",
+                          fail_detail=f"code={code} lock_still_there={lock_path.exists()} "
+                                      f"body={text[:160]}\n{ctx.serve.stderr_tail()}")
+    heals = ctx.serve.stderr_path.read_text("utf-8", "replace").count("cleared stale git index.lock")
+    ctx.rep.check(case, "self-heal path logged for each planted lock", heals >= len(pairs),
+                  ok_detail=f"{heals} heals logged",
+                  fail_detail=f"expected >= {len(pairs)}, got {heals}")
+    ctx.metrics.snapshot_server(case, ctx.serve.port)
+
+
+def phase_real_lock_storm(ctx: Ctx, pairs: list) -> None:
+    """Re-plant index.lock every ~30ms while real ancestry checkouts run: every response must be a
+    clean 200/400, and once the storm stops any failure must succeed on retry (self-healing a final
+    orphaned lock)."""
+    case = "real_lock_storm"
+    if not pairs:
+        ctx.rep.add(case, "no ancestry pairs (clone too shallow); skipped", base.SKIP)
+        return
+    attempted: list = []
+    with ctx.metrics.phase(case):
+        with LockStorm(ctx.clone) as storm:
+            for frm, to in pairs:
+                code, text, ms = impacted_get(ctx.serve, frm, to, timeout=REAL_REQ_TIMEOUT)
+                acceptable = code in (200, 400)
+                ctx.metrics.record(case, "impacted_cold_storm", code, ms, acceptable,
+                                   detail="" if acceptable else text[:120])
+                attempted.append((frm, to, code))
+        plants = storm.plants
+        retry_bad: list = []
+        for frm, to, code in attempted:
+            if code == 200:
+                continue
+            rcode, rtext, rms = impacted_get(ctx.serve, frm, to, timeout=REAL_REQ_TIMEOUT)
+            ctx.metrics.record(case, "impacted_retry_after_storm", rcode, rms, rcode == 200)
+            if rcode != 200:
+                retry_bad.append(f"{frm[:8]}->{to[:8]}: {rcode} {rtext[:100]}")
+    codes = {c for _, _, c in attempted}
+    ctx.rep.check(case, f"storm responses all clean 200/400 ({plants} locks planted)",
+                  codes <= {200, 400}, ok_detail=f"codes={codes}",
+                  fail_detail=f"codes={codes}\n{ctx.serve.stderr_tail()}")
+    ctx.rep.check(case, "every storm failure succeeds on post-storm retry", not retry_bad,
+                  fail_detail="; ".join(retry_bad) + "\n" + ctx.serve.stderr_tail())
+    ctx.metrics.snapshot_server(case, ctx.serve.port)
+
+
+def run_real(args, profile: Profile, root: Path, rep: base.Report, metrics: Metrics) -> Ctx:
+    """Clone a real repo, stand up serve against it, and run the real-repo phases. Manages its own
+    serve + health-prober lifecycle; returns the Ctx so main() can emit metrics and tear down."""
+    url, frm_rev, to_rev = args.real_repo_url, args.real_from, args.real_to
+    base.log(f"{base.C.BOLD}Cloning real repo {url} ({args.real_clone_args or 'full'}) ...{base.C.RESET}")
+    clone = setup_real_clone(root, url, args.real_clone_args)
+    frm, to = resolve_rev(clone, frm_rev), resolve_rev(clone, to_rev)
+    base.log(f"{base.C.DIM}from {frm_rev}={frm[:12]}  to {to_rev}={to[:12]}{base.C.RESET}")
+
+    # Walk back from `frm` (not `to`): real_cold/real_hot cache both `frm` and `to`, so a pair
+    # anchored at `to` would start with (to~1, to) -- which equals (frm, to) in the common HEAD~1..
+    # HEAD case and would be a pure cache hit (no checkout, nothing for the lock to wedge). Commits
+    # below `frm` are guaranteed uncached, so each forces a real checkout.
+    need = profile.lock_heal_rounds + profile.storm_commits
+    anc = derive_ancestry_pairs(clone, frm, need)
+    if len(anc) < need:
+        base.log(f"{base.C.YELLOW}only {len(anc)}/{need} ancestry pairs available "
+                 f"(shallow clone?); lock phases will use what exists{base.C.RESET}")
+    heal_pairs = anc[:profile.lock_heal_rounds]
+    storm_pairs = anc[profile.lock_heal_rounds:]
+
+    # Start the worktree at `from` for a deterministic initial state before serve takes over.
+    base.git(clone, "checkout", "-q", "--force", frm)
+
+    ctx = Ctx(remote=None, clone=clone, lameduck_clone=None, root=root, rep=rep, metrics=metrics,
+              profile=profile, meta_extra={"mode": "real", "repo": url, "from": frm, "to": to})
+
+    ordered = [
+        ("real_cold", lambda c: phase_real_cold(c, frm, to)),
+        ("real_hot", lambda c: phase_real_hot(c, frm, to)),
+        ("real_lock_heal", lambda c: phase_real_lock_heal(c, heal_pairs)),
+        ("real_lock_storm", lambda c: phase_real_lock_storm(c, storm_pairs)),
+    ]
+
+    base.log(f"\n{base.C.BOLD}== phase startup =={base.C.RESET}")
+    t0 = time.perf_counter()
+    prober = None
+    with base.serve(clone, root / "cache-real", initial_fetch=False, track_deps=False,
+                    ready_timeout=600, verbose_server=True) as (s, health):
+        ctx.serve = s
+        if phase_startup(ctx, health, time.perf_counter() - t0):
+            prober = HealthProber(s.port, metrics).start()
+            try:
+                for name, fn in ordered:
+                    if args.only and args.only not in name:
+                        continue
+                    base.log(f"\n{base.C.BOLD}== phase {name} =={base.C.RESET}")
+                    try:
+                        fn(ctx)
+                    except Exception:
+                        rep.add(name, "phase crashed", FAIL, traceback.format_exc().splitlines()[-1])
+                        base.vlog(traceback.format_exc())
+                phase_final(ctx)
+            finally:
+                prober.stop()
+    return ctx
 
 
 # ----------------------------------------------------------------------------------------------
@@ -806,9 +1063,28 @@ def main() -> int:
     ap.add_argument("--summary-out", default="", help="write a markdown summary to this path")
     ap.add_argument("--bazel", default="bazel", help="bazel binary (e.g. a bazelisk path on CI)")
     ap.add_argument("-v", "--verbose", action="store_true", help="stream serve/git output")
+    real = ap.add_argument_group(
+        "real-repo mode",
+        "Point serve at a clone of a real git repo instead of the hermetic workspace. Enabled by "
+        "--real-repo-url; runs the real_* phases (real checkouts + `bazel query`) with invariant "
+        "checks. Fetch/outage/lame-duck phases are hermetic-only.")
+    real.add_argument("--real-repo-url", default="",
+                      help="git URL or local path to clone and stress serve against")
+    real.add_argument("--real-from", default="",
+                      help="base revision, resolved in the clone (SHA/branch/tag/`HEAD~1`)")
+    real.add_argument("--real-to", default="",
+                      help="target revision, resolved in the clone (SHA/branch/tag/`HEAD`)")
+    real.add_argument("--real-clone-args", default="",
+                      help="extra `git clone` args, e.g. '--depth=50' (deep enough for the lock "
+                           "phases' ancestry walk)")
     args = ap.parse_args()
     base.VERBOSE = args.verbose
     base.BAZEL = args.bazel
+
+    real_mode = bool(args.real_repo_url)
+    if real_mode and not (args.real_from and args.real_to):
+        base.log(f"{base.C.RED}--real-repo-url requires --real-from and --real-to{base.C.RESET}")
+        return 2
 
     if not args.skip_build:
         base.log(f"{base.C.BOLD}Building //cli:bazel-diff ...{base.C.RESET}")
@@ -817,7 +1093,7 @@ def main() -> int:
         base.log(f"{base.C.RED}launcher not found at {base.LAUNCHER}; run without --skip-build{base.C.RESET}")
         return 2
 
-    profile = Profile.quick() if args.quick else Profile()
+    profile = Profile.real() if real_mode else (Profile.quick() if args.quick else Profile())
     root = Path(tempfile.mkdtemp(prefix="serve-stress-"))
     base.log(f"{base.C.DIM}workdir: {root}{base.C.RESET}")
     rep = base.Report()
@@ -827,31 +1103,37 @@ def main() -> int:
     prober = None
     ctx = None
     try:
-        base.log(f"{base.C.BOLD}Setting up git remote (git daemon) + history ...{base.C.RESET}")
-        remote = base.build_remote(root)
-        build_history(remote, profile)
-        clone = remote.clone(root / "clone-stress")
-        lameduck_clone = remote.clone(root / "clone-lameduck")
-        ctx = Ctx(remote=remote, clone=clone, lameduck_clone=lameduck_clone, root=root,
-                  rep=rep, metrics=metrics, profile=profile)
+        if real_mode:
+            ctx = run_real(args, profile, root, rep, metrics)  # manages its own serve + prober
+        else:
+            base.log(f"{base.C.BOLD}Setting up git remote (git daemon) + history ...{base.C.RESET}")
+            remote = base.build_remote(root)
+            build_history(remote, profile)
+            clone = remote.clone(root / "clone-stress")
+            lameduck_clone = remote.clone(root / "clone-lameduck")
+            ctx = Ctx(remote=remote, clone=clone, lameduck_clone=lameduck_clone, root=root,
+                      rep=rep, metrics=metrics, profile=profile)
 
-        base.log(f"\n{base.C.BOLD}== phase startup =={base.C.RESET}")
-        t0 = time.perf_counter()
-        with base.serve(clone, root / "cache-stress", initial_fetch=True, track_deps=False,
-                        ready_timeout=60) as (s, health):
-            ctx.serve = s
-            if phase_startup(ctx, health, time.perf_counter() - t0):
-                prober = HealthProber(s.port, metrics).start()
-                run_phases(ctx, args.only)
-                # Stop probing while the instance is still up: teardown 503s/refusals must not
-                # pollute the health series in the emitted metrics.
-                prober.stop()
+            base.log(f"\n{base.C.BOLD}== phase startup =={base.C.RESET}")
+            t0 = time.perf_counter()
+            # verbose_server=True so the subprocess logs checkouts and the "cleared stale git
+            # index.lock" self-heal to stderr; phase_lock_heal / phase_final assert on those lines.
+            with base.serve(clone, root / "cache-stress", initial_fetch=True, track_deps=False,
+                            ready_timeout=60, verbose_server=True) as (s, health):
+                ctx.serve = s
+                if phase_startup(ctx, health, time.perf_counter() - t0):
+                    prober = HealthProber(s.port, metrics).start()
+                    run_phases(ctx, args.only)
+                    # Stop probing while the instance is still up: teardown 503s/refusals must not
+                    # pollute the health series in the emitted metrics.
+                    prober.stop()
     finally:
         if prober:
             prober.stop()
         if ctx:
             base._bazel_shutdown(ctx.clone)
-            base._bazel_shutdown(ctx.lameduck_clone)
+            if ctx.lameduck_clone:
+                base._bazel_shutdown(ctx.lameduck_clone)
         if remote:
             remote.stop()
         if args.keep_artifacts:

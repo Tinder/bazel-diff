@@ -1,0 +1,87 @@
+name: Serve Stress (real repos)
+
+# Operational stress + performance-trend validation for `bazel-diff serve` against REAL repos of
+# three sizes, complementing the hermetic serve-stress.yml. Each matrix leg runs
+# tools/serve_stress.py in --real-repo-url mode against its target: it clones the repo, stands serve
+# up against it, and drives real commit SHAs (HEAD~1..HEAD) through concurrent cold/hot load plus the
+# index.lock self-heal / storm phases -- exercising real large-tree checkouts and a real `bazel
+# query` that the fabricated genrule workspace cannot. Checks are invariants (200s / cross-request
+# consistency / self-heal), not a hardcoded impacted set.
+#
+# The three legs (small / medium / bazel) each emit a per-size metrics JSON + markdown summary as a
+# 90-day artifact, so throughput / latency / time-to-ready can be compared *across sizes* and *across
+# runs over time*. Runs daily alongside the other serve crons; each leg gets a 90-min timeout and
+# fail-fast:false because the `bazel` leg's full `bazel query` on bazelbuild/bazel is minutes-scale
+# and network-heavy. If a daily run of the large leg is more runner cost than the trend data is
+# worth, dial the cron below back to weekly (e.g. "30 8 * * 1").
+#
+# The targets are wired here, not in code (the harness is preset-free). Swap a repo by editing its
+# matrix row; from/to default to HEAD~1..HEAD so every run tests each repo's latest commit.
+# Note: scheduled runs execute from the default branch, so this must land on master to fire.
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily at 08:30 UTC, offset from serve-stress (30 6) and serve-harness (0 */12) so the jobs
+    # never contend for runners. Change to "30 8 * * 1" for a weekly cadence on the heavy legs.
+    - cron: "30 8 * * *"
+
+jobs:
+  ServeStressReal:
+    strategy:
+      fail-fast: false  # a slow/broken leg must not cancel the others' comparison data
+      matrix:
+        include:
+          - size: small
+            repo: "https://github.com/bazelbuild/bazel-skylib.git"
+            clone_args: "--depth=50"
+          - size: medium
+            repo: "https://github.com/abseil/abseil-cpp.git"
+            clone_args: "--depth=50"
+          - size: bazel
+            repo: "https://github.com/bazelbuild/bazel.git"
+            clone_args: "--depth=50"
+    name: ServeStressReal (${{ matrix.size }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+        id: go
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
+      - uses: actions/checkout@v4
+      - name: Run serve stress harness (${{ matrix.size }})
+        # --bazel points the harness (and the serve subprocess) at bazelisk; the bazel version for
+        # the CLONED repo comes from that repo's own .bazelversion, which bazelisk honors.
+        run: >
+          python3 tools/serve_stress.py
+          --bazel "$HOME/go/bin/bazelisk"
+          --real-repo-url "${{ matrix.repo }}"
+          --real-from HEAD~1
+          --real-to HEAD
+          --real-clone-args "${{ matrix.clone_args }}"
+          --metrics-out "serve-stress-real-${{ matrix.size }}-metrics.json"
+          --summary-out "serve-stress-real-${{ matrix.size }}-summary.md"
+      - name: Publish step summary
+        if: always()
+        run: |
+          if [ -f "serve-stress-real-${{ matrix.size }}-summary.md" ]; then
+            cat "serve-stress-real-${{ matrix.size }}-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serve-stress-real-${{ matrix.size }}-${{ github.run_id }}
+          path: |
+            serve-stress-real-${{ matrix.size }}-metrics.json
+            serve-stress-real-${{ matrix.size }}-summary.md
+          if-no-files-found: warn
+          retention-days: 90

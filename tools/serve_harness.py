@@ -364,15 +364,23 @@ def serve(
     initial_fetch: bool,
     track_deps: bool,
     ready_timeout: float,
+    verbose_server: bool = False,
 ):
     """Launches serve, waits for a health verdict, yields (Serve, health) then tears down.
 
     health is one of: "ready" (200), "lameduck" (up but stuck 503), "down" (never bound).
+
+    [verbose_server] launches the subprocess with `-v` so its StderrLogger emits the `[Info]` /
+    `[Warning]` git lines (checkouts, the "cleared stale git index.lock" self-heal) to the captured
+    stderr; without it only `[Error]` lines appear. The stress harness asserts on those lines.
     """
     port = free_port()
     stderr_path = workspace.parent / f"serve.{workspace.name}.stderr.log"
     args = [
         str(LAUNCHER),
+        # `-v` is a parent-command option with INHERIT scope, so it applies to the `serve`
+        # subcommand whether it precedes or follows it.
+        *(["-v"] if verbose_server else []),
         "serve",
         "-w",
         str(workspace),

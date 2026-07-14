@@ -1053,7 +1053,37 @@ def run_phases(ctx: Ctx, only: str) -> None:
     phase_final(ctx)
 
 
-def main() -> int:
+# Options whose value is itself flag-shaped, which argparse cannot take in the space-separated
+# spelling. See fold_flag_values.
+FLAG_VALUED_OPTS = ("--real-clone-args",)
+
+
+def fold_flag_values(argv: list, opts: tuple = FLAG_VALUED_OPTS) -> list:
+    """Rewrites `--opt <value>` into `--opt=<value>` for each of [opts], returning a new argv.
+
+    argparse treats *any* token starting with `-` as an option, so an option whose value is itself a
+    flag dies at parse time: `--real-clone-args --depth=50` fails with a bare "expected one
+    argument", and no amount of shell quoting saves it, because the quotes are long gone by the time
+    argparse sees the token. Only the `=` spelling survives. The space-separated spelling is the
+    natural one -- it is what this module's own usage examples show, and what a CI matrix
+    interpolates -- so fold it into the `=` form up front and let both work. For a value that is not
+    flag-shaped the two spellings are already equivalent, so this is a no-op.
+    """
+    out: list = []
+    i = 0
+    while i < len(argv):
+        # A trailing `--opt` with no value is passed through untouched, so argparse still reports it
+        # as missing rather than swallowing the next option.
+        if argv[i] in opts and i + 1 < len(argv):
+            out.append(f"{argv[i]}={argv[i + 1]}")
+            i += 2
+        else:
+            out.append(argv[i])
+            i += 1
+    return out
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Stress `bazel-diff serve` and capture metrics.")
     ap.add_argument("--skip-build", action="store_true", help="reuse existing bazel-bin launcher")
     ap.add_argument("--quick", action="store_true", help="reduced request counts")
@@ -1077,7 +1107,17 @@ def main() -> int:
     real.add_argument("--real-clone-args", default="",
                       help="extra `git clone` args, e.g. '--depth=50' (deep enough for the lock "
                            "phases' ancestry walk)")
-    args = ap.parse_args()
+    return ap
+
+
+def parse_args(argv: list) -> argparse.Namespace:
+    """Parses [argv] (without the program name), accepting either spelling of the flag-valued
+    options -- `--real-clone-args --depth=50` or `--real-clone-args=--depth=50`."""
+    return build_parser().parse_args(fold_flag_values(argv))
+
+
+def main() -> int:
+    args = parse_args(sys.argv[1:])
     base.VERBOSE = args.verbose
     base.BAZEL = args.bazel
 

@@ -31,8 +31,15 @@ interface HashProvider {
    * request using a different set. Empty (the default) is the full-content hash and today's per-SHA
    * cache key. Correctness requires the caller to apply the *same* set to both revisions of a
    * comparison and for it to be a superset of what actually changed (see [ImpactedTargetsService]).
+   *
+   * [profiler], when non-null, receives a [HashRetrievalProfile] for this call (cache hit/miss and
+   * duration).
    */
-  fun getHashes(sha: String, modifiedFilepaths: Set<Path> = emptySet()): HashFileData
+  fun getHashes(
+      sha: String,
+      modifiedFilepaths: Set<Path> = emptySet(),
+      profiler: QueryProfiler? = null,
+  ): HashFileData
 
   /**
    * Runs [block] with the workspace checked out at [sha], holding the workspace lock for the
@@ -95,12 +102,28 @@ class HashService(
     return "$base.$digest"
   }
 
-  override fun getHashes(sha: String, modifiedFilepaths: Set<Path>): HashFileData {
+  override fun getHashes(
+      sha: String,
+      modifiedFilepaths: Set<Path>,
+      profiler: QueryProfiler?
+  ): HashFileData {
+    val startNanos = System.nanoTime()
+    val (data, cacheHit) = retrieve(sha, modifiedFilepaths)
+    profiler?.recordHashRetrieval(sha, cacheHit, (System.nanoTime() - startNanos) / 1_000_000)
+    return data
+  }
+
+  /**
+   * Returns the hash data plus whether it was served from the cache. "Hit" includes the
+   * waited-behind-another-generation case (the after-lock re-check): this request itself ran no
+   * checkout/query, though its duration then includes the lock wait.
+   */
+  private fun retrieve(sha: String, modifiedFilepaths: Set<Path>): Pair<HashFileData, Boolean> {
     val key = cacheKey(sha, modifiedFilepaths)
     storage.get(key)?.let { bytes ->
       logger.i { "Hash cache hit for $sha" }
       return deserialiser.executeTargetHashWithMetadataFromString(
-          String(bytes, StandardCharsets.UTF_8))
+          String(bytes, StandardCharsets.UTF_8)) to true
     }
     return generate(sha, modifiedFilepaths, key)
   }
@@ -111,13 +134,17 @@ class HashService(
         block()
       }
 
-  private fun generate(sha: String, modifiedFilepaths: Set<Path>, key: String): HashFileData =
+  private fun generate(
+      sha: String,
+      modifiedFilepaths: Set<Path>,
+      key: String
+  ): Pair<HashFileData, Boolean> =
       synchronized(generationLock) {
         // Re-check under the lock: another thread may have generated this revision while we waited.
         storage.get(key)?.let {
           logger.i { "Hash cache hit for $sha (after lock)" }
           return deserialiser.executeTargetHashWithMetadataFromString(
-              String(it, StandardCharsets.UTF_8))
+              String(it, StandardCharsets.UTF_8)) to true
         }
         logger.i { "Hash cache miss for $sha - generating hashes" }
         gitClient.checkout(sha)
@@ -128,7 +155,7 @@ class HashService(
         val depEdges = depEdgesOf(hashes)
         storage.put(
             key, serialize(hashes, moduleGraphJson, depEdges).toByteArray(StandardCharsets.UTF_8))
-        HashFileData(hashes, moduleGraphJson, depEdges)
+        HashFileData(hashes, moduleGraphJson, depEdges) to false
       }
 
   /**

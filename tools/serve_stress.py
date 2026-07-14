@@ -35,6 +35,15 @@ Every request is timed. The run emits per-phase throughput (req/s) and latency p
 (p50/p90/p95/p99/max), plus /metrics snapshots at phase boundaries, as JSON (--metrics-out)
 and a GitHub-flavored markdown summary (--summary-out) for a CI step summary.
 
+Server-side query profiling (`profile=true`) is woven through the load phases: cold/lock
+requests and a sample of hot requests carry the flag, and the server-reported breakdown
+(revision resolution, per-side hash retrieval with cache hit/miss, diff, heap/GC movement)
+is aggregated per phase into the same JSON + summary alongside the client-observed numbers.
+It also gates two invariants the client cannot see on its own: hot responses must report
+cache hits on both sides, and a concurrent cold fan-out must report *exactly one* generation
+per new SHA (everyone else a cache hit) -- the server's own accounting of the workspace-lock
+collapse.
+
 There are two modes. The default (above) fabricates a hermetic genrule workspace so impacted-target
 values are known exactly. Real-repo mode (`--real-repo-url`) instead points serve at a clone of an
 actual repo and drives it over real commit SHAs -- exercising real large-tree checkouts (real
@@ -101,12 +110,29 @@ class Sample:
     detail: str = ""
 
 
+@dataclass
+class ProfileSample:
+    """The server-reported breakdown of one profiled (`profile=true`) request, paired with the
+    client-observed latency so the harness can also report the transport/dispatch overhead."""
+
+    phase: str
+    client_ms: float
+    total_ms: float
+    resolve_ms: float
+    diff_ms: float
+    retrievals: list  # [{sha, cacheHit, durationMillis}] -- one per side of the diff
+    heap_delta_bytes: int
+    gc_collections: int
+    gc_time_ms: int
+
+
 class Metrics:
     """Thread-safe request-sample sink plus phase wall-clock windows."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.samples: list[Sample] = []
+        self.profiles: list[ProfileSample] = []
         self.phase_wall: dict[str, float] = {}
         self.server_snapshots: list[dict] = []
         self.time_to_ready_seconds: float | None = None
@@ -115,6 +141,29 @@ class Metrics:
                detail: str = "") -> None:
         with self._lock:
             self.samples.append(Sample(phase, op, status, latency_ms, ok, detail))
+
+    def record_profile(self, phase: str, client_ms: float, profile: dict | None,
+                       memory: dict | None) -> None:
+        """Stores one server-reported profile. A None [profile] (unprofiled or non-200 response)
+        is silently skipped so callers can pass whatever extract_profiles() returned."""
+        if not profile:
+            return
+        mem = memory or {}
+        sample = ProfileSample(
+            phase=phase,
+            client_ms=client_ms,
+            total_ms=float(profile.get("totalDurationMillis", 0)),
+            resolve_ms=float(profile.get("resolveRevisionsDurationMillis", 0)),
+            diff_ms=float(profile.get("diffDurationMillis", 0)),
+            retrievals=[{"sha": r.get("sha", ""), "cacheHit": bool(r.get("cacheHit")),
+                         "durationMillis": float(r.get("durationMillis", 0))}
+                        for r in profile.get("hashRetrievals") or []],
+            heap_delta_bytes=int(mem.get("heapUsedDeltaBytes", 0)),
+            gc_collections=int(mem.get("gcCollections", 0)),
+            gc_time_ms=int(mem.get("gcTimeMillis", 0)),
+        )
+        with self._lock:
+            self.profiles.append(sample)
 
     @contextlib.contextmanager
     def phase(self, name: str):
@@ -169,6 +218,41 @@ class Metrics:
             "latency_ms": _latency_summary(lat),
         }
 
+    def profile_stats(self, phase: str) -> dict:
+        """Aggregates the server-reported profiles captured in [phase]; {} when none were."""
+        with self._lock:
+            samples = [p for p in self.profiles if p.phase == phase]
+        if not samples:
+            return {}
+        hit_ms = sorted(r["durationMillis"] for p in samples for r in p.retrievals
+                        if r["cacheHit"])
+        miss_ms = sorted(r["durationMillis"] for p in samples for r in p.retrievals
+                         if not r["cacheHit"])
+        heap_deltas = [p.heap_delta_bytes for p in samples]
+        return {
+            "name": phase,
+            "profiled_requests": len(samples),
+            "cache_hits": len(hit_ms),
+            "cache_misses": len(miss_ms),
+            "server_total_ms": _latency_summary(sorted(p.total_ms for p in samples)),
+            "resolve_ms": _latency_summary(sorted(p.resolve_ms for p in samples)),
+            "diff_ms": _latency_summary(sorted(p.diff_ms for p in samples)),
+            "hit_retrieval_ms": _latency_summary(hit_ms),
+            "miss_retrieval_ms": _latency_summary(miss_ms),
+            # Client wall-clock minus server-reported total: transport + dispatch + JSON cost.
+            "client_overhead_ms": _latency_summary(
+                sorted(max(p.client_ms - p.total_ms, 0.0) for p in samples)),
+            "heap_delta_bytes": {
+                "min": min(heap_deltas),
+                "mean": round(statistics.fmean(heap_deltas)),
+                "max": max(heap_deltas),
+            },
+            "gc": {
+                "collections": sum(p.gc_collections for p in samples),
+                "time_ms": sum(p.gc_time_ms for p in samples),
+            },
+        }
+
 
 def _latency_summary(sorted_ms: list[float]) -> dict:
     if not sorted_ms:
@@ -206,15 +290,20 @@ def timed_http(port: int, path: str, method: str = "GET", body: str | None = Non
     return code, text, (time.perf_counter() - t0) * 1000.0
 
 
-def impacted_get(s: base.Serve, frm: str, to: str, timeout: float = 600.0):
-    code, text, ms = timed_http(s.port, f"/impacted_targets?from={frm}&to={to}", timeout=timeout)
+def impacted_get(s: base.Serve, frm: str, to: str, timeout: float = 600.0,
+                 profile: bool = False):
+    q = f"/impacted_targets?from={frm}&to={to}" + ("&profile=true" if profile else "")
+    code, text, ms = timed_http(s.port, q, timeout=timeout)
     return code, text, ms
 
 
-def impacted_post(s: base.Serve, frm: str, to: str, timeout: float = 600.0):
-    body = json.dumps({"from": frm, "to": to})
-    code, text, ms = timed_http(s.port, "/impacted_targets", method="POST", body=body,
-                                timeout=timeout)
+def impacted_post(s: base.Serve, frm: str, to: str, timeout: float = 600.0,
+                  profile: bool = False):
+    payload: dict = {"from": frm, "to": to}
+    if profile:
+        payload["profile"] = True
+    code, text, ms = timed_http(s.port, "/impacted_targets", method="POST",
+                                body=json.dumps(payload), timeout=timeout)
     return code, text, ms
 
 
@@ -225,6 +314,23 @@ def stable_set(text: str) -> frozenset:
     except (ValueError, TypeError):
         return frozenset()
     return frozenset(base._stable(data))
+
+
+def extract_profiles(text: str) -> tuple:
+    """(profile, memoryProfile) from a profiled response body; (None, None) when absent (an
+    unprofiled request, an error body, or non-JSON)."""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    return data.get("profile"), data.get("memoryProfile")
+
+
+# Sample every Nth hot request with profile=true: enough coverage to gate on and aggregate,
+# while the unprofiled majority keeps the throughput numbers comparable with earlier runs.
+PROFILE_EVERY = 4
 
 
 # ----------------------------------------------------------------------------------------------
@@ -422,9 +528,10 @@ def phase_warm(ctx: Ctx) -> None:
     sh = ctx.remote.shas
     with ctx.metrics.phase(case):
         for frm, to, expect in ((sh["C0"], sh["C1"], CORE_EDIT), (sh["C1"], sh["C2"], CORE_EDIT)):
-            code, text, ms = impacted_get(ctx.serve, frm, to)
+            code, text, ms = impacted_get(ctx.serve, frm, to, profile=True)
             good = code == 200 and stable_set(text) == frozenset(expect)
             ctx.metrics.record(case, "impacted_cold", code, ms, good)
+            ctx.metrics.record_profile(case, ms, *extract_profiles(text))
             ctx.rep.check(case, f"cold generation {frm[:8]}->{to[:8]}", good,
                           ok_detail=f"{ms/1000:.1f}s",
                           fail_detail=f"code={code} got={sorted(stable_set(text))} "
@@ -433,21 +540,39 @@ def phase_warm(ctx: Ctx) -> None:
 
 
 def phase_hot(ctx: Ctx) -> None:
-    """Concurrent GET/POST bursts against the two already-cached pairs."""
+    """Concurrent GET/POST bursts against the two already-cached pairs. Every [PROFILE_EVERY]th
+    request carries profile=true: the server's own accounting must report a cache hit on both
+    sides of every one of them (a reported miss here means the cache is being bypassed)."""
     case = "hot"
     sh = ctx.remote.shas
     pairs = [(sh["C0"], sh["C1"]), (sh["C1"], sh["C2"])]
     results: list[tuple[int | None, frozenset]] = []
+    prof_problems: list[str] = []
+    profiled = 0
     lock = threading.Lock()
 
     def one(i: int) -> None:
+        nonlocal profiled
         frm, to = pairs[i % len(pairs)]
         fn = impacted_post if i % 3 == 0 else impacted_get  # mix in the POST body form
-        code, text, ms = fn(ctx.serve, frm, to)
+        with_profile = i % PROFILE_EVERY == 0
+        code, text, ms = fn(ctx.serve, frm, to, profile=with_profile)
         good = code == 200
         ctx.metrics.record(case, "impacted_hot", code, ms, good)
+        problem = ""
+        if with_profile and good:
+            prof, mem = extract_profiles(text)
+            ctx.metrics.record_profile(case, ms, prof, mem)
+            if not prof or not mem:
+                problem = f"req{i}: profile/memoryProfile missing from 200 response"
+            elif any(not r.get("cacheHit") for r in prof.get("hashRetrievals", [])):
+                problem = f"req{i}: server reported a cache miss on a cached pair"
         with lock:
             results.append((code, stable_set(text)))
+            if with_profile and good:
+                profiled += 1
+            if problem:
+                prof_problems.append(problem)
 
     with ctx.metrics.phase(case):
         with ThreadPoolExecutor(max_workers=ctx.profile.hot_workers) as pool:
@@ -460,12 +585,19 @@ def phase_hot(ctx: Ctx) -> None:
                   fail_detail=f"codes={codes}\n{ctx.serve.stderr_tail()}")
     ctx.rep.check(case, "hot responses consistent", len(sets) == 1 and next(iter(sets)) == frozenset(CORE_EDIT),
                   fail_detail=f"distinct_sets={[sorted(s) for s in sets]}")
+    ctx.rep.check(case, "profiled hot responses all report cache hits on both sides",
+                  profiled > 0 and not prof_problems,
+                  ok_detail=f"{profiled} profiled",
+                  fail_detail=f"profiled={profiled}; " + "; ".join(prof_problems[:5]))
     ctx.metrics.snapshot_server(case, ctx.serve.port)
 
 
 def phase_cold_concurrent(ctx: Ctx) -> None:
     """For each uncached pair, [cold_fanout] identical concurrent requests: the workspace lock
-    plus the per-key double-check must yield one generation and identical 200s for all."""
+    plus the per-key double-check must yield one generation and identical 200s for all. Every
+    request carries profile=true, and the server's own accounting must agree: across the fan-out,
+    exactly one response reports cacheHit=false for the new SHA (the request that generated it);
+    everyone else waited and got a hit."""
     case = "cold"
     sh = ctx.remote.shas
     with ctx.metrics.phase(case):
@@ -473,13 +605,17 @@ def phase_cold_concurrent(ctx: Ctx) -> None:
         for i in range(ctx.profile.cold_pairs):
             to = sh[f"S{i}"]
             outcomes: list[tuple[int | None, frozenset]] = []
+            profs: list = []
             lock = threading.Lock()
 
             def one(_: int, frm: str = prev, dst: str = to) -> None:
-                code, text, ms = impacted_get(ctx.serve, frm, dst)
+                code, text, ms = impacted_get(ctx.serve, frm, dst, profile=True)
                 ctx.metrics.record(case, "impacted_cold", code, ms, code == 200)
+                prof, mem = extract_profiles(text)
+                ctx.metrics.record_profile(case, ms, prof, mem)
                 with lock:
                     outcomes.append((code, stable_set(text)))
+                    profs.append(prof)
 
             with ThreadPoolExecutor(max_workers=ctx.profile.cold_fanout) as pool:
                 list(pool.map(one, range(ctx.profile.cold_fanout)))
@@ -489,6 +625,14 @@ def phase_cold_concurrent(ctx: Ctx) -> None:
                           codes == {200} and len(sets) == 1,
                           ok_detail=f"{sorted(next(iter(sets)))}",
                           fail_detail=f"codes={codes} sets={len(sets)}\n{ctx.serve.stderr_tail()}")
+            generations = sum(1 for p in profs if p
+                              for r in p.get("hashRetrievals", [])
+                              if r.get("sha") == to and not r.get("cacheHit"))
+            ctx.rep.check(case, f"S{i}: server profiles report exactly one generation",
+                          codes == {200} and all(profs) and generations == 1,
+                          ok_detail=f"1 miss + {ctx.profile.cold_fanout - 1} hits",
+                          fail_detail=f"generations={generations} "
+                                      f"missing_profiles={sum(1 for p in profs if not p)}")
             prev = to
     ctx.metrics.snapshot_server(case, ctx.serve.port)
 
@@ -563,9 +707,12 @@ def phase_lock_heal(ctx: Ctx) -> None:
         for i in range(ctx.profile.lock_heal_rounds):
             to = sh[f"L{i}"]
             lock_path = plant_index_lock(ctx.clone)
-            code, text, ms = impacted_get(ctx.serve, prev, to)
+            # profile=true here surfaces what the heal costs: the retry lands inside the new
+            # SHA's hashRetrieval duration, visible in the aggregated miss_retrieval_ms.
+            code, text, ms = impacted_get(ctx.serve, prev, to, profile=True)
             healed = code == 200 and not lock_path.exists()
             ctx.metrics.record(case, "impacted_cold_locked", code, ms, healed)
+            ctx.metrics.record_profile(case, ms, *extract_profiles(text))
             ctx.rep.check(case, f"L{i}: orphaned index.lock self-heals -> 200",
                           healed,
                           ok_detail=f"{ms/1000:.1f}s",
@@ -593,10 +740,12 @@ def phase_lock_storm(ctx: Ctx) -> None:
         with LockStorm(ctx.clone) as storm:
             for i in range(ctx.profile.storm_commits):
                 to = sh[f"T{i}"]
-                code, text, ms = impacted_get(ctx.serve, prev, to)
+                code, text, ms = impacted_get(ctx.serve, prev, to, profile=True)
                 acceptable = code in (200, 400)
                 ctx.metrics.record(case, "impacted_cold_storm", code, ms, acceptable,
                                    detail="" if acceptable else text[:120])
+                # Only a 200 carries a profile; a mid-storm 400's body is just the error.
+                ctx.metrics.record_profile(case, ms, *extract_profiles(text))
                 attempted.append((prev, to, code))
                 prev = to
         plants = storm.plants
@@ -742,6 +891,10 @@ def build_metrics_json(ctx: Ctx, wall_seconds: float, quick: bool, failures: int
         "meta": meta,
         "time_to_ready_seconds": ctx.metrics.time_to_ready_seconds,
         "phases": [ctx.metrics.phase_stats(p) for p in _ordered_phases(ctx.metrics)],
+        "server_profiles": [
+            ps for ps in (ctx.metrics.profile_stats(p) for p in _ordered_phases(ctx.metrics))
+            if ps
+        ],
         "health": ctx.metrics.health_stats(),
         "server_metrics": ctx.metrics.server_snapshots,
         "checks": [
@@ -788,6 +941,38 @@ def build_summary_md(data: dict) -> str:
         "",
         f"Health prober: {health['probes']} probes, {health['non_200']} non-200, "
         f"p99 {hlat.get('p99', '—')} ms.",
+    ]
+    server_profiles = data.get("server_profiles") or []
+    if server_profiles:
+        lines += [
+            "",
+            "## Server-side query profiles (`profile=true`)",
+            "",
+            "Server-reported breakdown of the profiled requests: hash-retrieval cache "
+            "hits/misses, total time as measured inside the service, retrieval latency by "
+            "hit/miss, client-vs-server overhead (transport + dispatch), and heap/GC movement.",
+            "",
+            "| phase | profiled | hits / misses | server total p50/p95 (ms) | hit p95 (ms) "
+            "| miss p95 (ms) | overhead p50 (ms) | heap Δ max | GC (n / ms) |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+        for ps in server_profiles:
+            total = ps.get("server_total_ms") or {}
+            hit = ps.get("hit_retrieval_ms") or {}
+            miss = ps.get("miss_retrieval_ms") or {}
+            over = ps.get("client_overhead_ms") or {}
+            heap = ps.get("heap_delta_bytes") or {}
+            gc = ps.get("gc") or {}
+            heap_max = heap.get("max")
+            heap_h = f"{heap_max / 1048576:.1f} MB" if heap_max is not None else "—"
+            lines.append(
+                f"| {ps['name']} | {ps['profiled_requests']} "
+                f"| {ps['cache_hits']} / {ps['cache_misses']} "
+                f"| {total.get('p50', '—')} / {total.get('p95', '—')} "
+                f"| {hit.get('p95', '—')} | {miss.get('p95', '—')} "
+                f"| {over.get('p50', '—')} | {heap_h} "
+                f"| {gc.get('collections', '—')} / {gc.get('time_ms', '—')} |")
+    lines += [
         "",
         "## Checks",
         "",
@@ -861,16 +1046,22 @@ def derive_ancestry_pairs(clone: Path, tip: str, count: int) -> list:
 def phase_real_cold(ctx: Ctx, frm: str, to: str) -> None:
     """The headline real generation: [cold_fanout] identical concurrent (frm->to) requests. The
     first triggers a real checkout + `bazel query` + hash of each revision; the workspace lock
-    collapses them to one generation and every caller gets the identical impacted set."""
+    collapses them to one generation and every caller gets the identical impacted set. All
+    requests carry profile=true: both revisions are uncached, so across the fan-out the server
+    must report exactly one generation (cacheHit=false) per revision."""
     case = "real_cold"
     outcomes: list = []
+    profs: list = []
     lock = threading.Lock()
 
     def one(_: int) -> None:
-        code, text, ms = impacted_get(ctx.serve, frm, to, timeout=REAL_REQ_TIMEOUT)
+        code, text, ms = impacted_get(ctx.serve, frm, to, timeout=REAL_REQ_TIMEOUT, profile=True)
         ctx.metrics.record(case, "impacted_cold", code, ms, code == 200)
+        prof, mem = extract_profiles(text)
+        ctx.metrics.record_profile(case, ms, prof, mem)
         with lock:
             outcomes.append((code, stable_set(text)))
+            profs.append(prof)
 
     with ctx.metrics.phase(case):
         with ThreadPoolExecutor(max_workers=ctx.profile.cold_fanout) as pool:
@@ -884,21 +1075,49 @@ def phase_real_cold(ctx: Ctx, frm: str, to: str) -> None:
                   fail_detail=f"codes={codes} distinct_sets={len(sets)}\n{ctx.serve.stderr_tail()}")
     if codes == {200} and size == 0:
         ctx.rep.add(case, "impacted set is empty (the diff touches no build-relevant files)", base.INFO)
+    generations = {
+        rev: sum(1 for p in profs if p
+                 for r in p.get("hashRetrievals", [])
+                 if r.get("sha") == rev and not r.get("cacheHit"))
+        for rev in (frm, to)
+    }
+    ctx.rep.check(case, "server profiles report exactly one generation per revision",
+                  codes == {200} and all(profs) and set(generations.values()) == {1},
+                  ok_detail=f"{{frm: {generations[frm]}, to: {generations[to]}}}",
+                  fail_detail=f"generations={generations} "
+                              f"missing_profiles={sum(1 for p in profs if not p)}")
     ctx.metrics.snapshot_server(case, ctx.serve.port)
 
 
 def phase_real_hot(ctx: Ctx, frm: str, to: str) -> None:
-    """Concurrent cache-hit throughput for the now-cached (frm->to) pair (GET + POST body form)."""
+    """Concurrent cache-hit throughput for the now-cached (frm->to) pair (GET + POST body form).
+    Every [PROFILE_EVERY]th request is profiled and must report cache hits on both sides."""
     case = "real_hot"
     codes: set = set()
+    prof_problems: list = []
+    profiled = 0
     lock = threading.Lock()
 
     def one(i: int) -> None:
+        nonlocal profiled
         fn = impacted_post if i % 3 == 0 else impacted_get
-        code, _, ms = fn(ctx.serve, frm, to, timeout=REAL_REQ_TIMEOUT)
+        with_profile = i % PROFILE_EVERY == 0
+        code, text, ms = fn(ctx.serve, frm, to, timeout=REAL_REQ_TIMEOUT, profile=with_profile)
         ctx.metrics.record(case, "impacted_hot", code, ms, code == 200)
+        problem = ""
+        if with_profile and code == 200:
+            prof, mem = extract_profiles(text)
+            ctx.metrics.record_profile(case, ms, prof, mem)
+            if not prof or not mem:
+                problem = f"req{i}: profile/memoryProfile missing from 200 response"
+            elif any(not r.get("cacheHit") for r in prof.get("hashRetrievals", [])):
+                problem = f"req{i}: server reported a cache miss on a cached pair"
         with lock:
             codes.add(code)
+            if with_profile and code == 200:
+                profiled += 1
+            if problem:
+                prof_problems.append(problem)
 
     with ctx.metrics.phase(case):
         with ThreadPoolExecutor(max_workers=ctx.profile.hot_workers) as pool:
@@ -906,6 +1125,10 @@ def phase_real_hot(ctx: Ctx, frm: str, to: str) -> None:
     ctx.rep.check(case, f"{ctx.profile.hot_requests} concurrent cache-hit requests all 200",
                   codes == {200}, ok_detail=f"codes={codes}",
                   fail_detail=f"codes={codes}\n{ctx.serve.stderr_tail()}")
+    ctx.rep.check(case, "profiled hot responses all report cache hits on both sides",
+                  profiled > 0 and not prof_problems,
+                  ok_detail=f"{profiled} profiled",
+                  fail_detail=f"profiled={profiled}; " + "; ".join(prof_problems[:5]))
     ctx.metrics.snapshot_server(case, ctx.serve.port)
 
 

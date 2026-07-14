@@ -135,7 +135,8 @@ Endpoints:
   balancer should use this to route only to ready instances. If a fatal git error occurs at startup
   the instance "lame-ducks" itself by continuing to report `503` so the load balancer removes it.
 * `GET /impacted_targets?from=<rev>&to=<rev>` — returns the impacted targets as JSON. The optional
-  `targetType` parameter (e.g. `&targetType=Rule,SourceFile`) filters by target type.
+  `targetType` parameter (e.g. `&targetType=Rule,SourceFile`) filters by target type. The optional
+  `profile=true` parameter additionally returns per-request profiling data (see below).
 
 ```bash
 curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
@@ -151,7 +152,8 @@ curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
 
 * `POST /impacted_targets` — the same query as a JSON body, which additionally accepts a
   `modifiedFilepaths` list to speed up cold hashing on large repositories. Body fields: `from` and
-  `to` (required), `targetType` (optional array), and `modifiedFilepaths` (optional array of
+  `to` (required), `targetType` (optional array), `profile` (optional boolean, same as the GET
+  parameter), and `modifiedFilepaths` (optional array of
   workspace-relative paths that changed between the two revisions, e.g. from
   `git diff --name-only <from> <to>`). When `modifiedFilepaths` is present the server reads and
   hashes the *content* of only those files on **both** revisions and treats every other source file
@@ -188,6 +190,51 @@ curl 'http://localhost:8080/impacted_targets_with_distances?from=main&to=my-feat
   ]
 }
 ```
+
+* Per-request profiling — adding `profile=true` (GET parameter or POST body field) to
+  `/impacted_targets` or `/impacted_targets_with_distances` attaches two extra objects to the
+  response so callers can feed per-request latency, cache effectiveness, and memory pressure into
+  their metrics and monitoring: `profile` (a wall-clock breakdown of the query) and `memoryProfile`
+  (JVM heap/GC movement over the query). Without the flag the response shape is unchanged.
+
+```bash
+curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch&profile=true'
+```
+
+```json
+{
+  "from": "9a1c0e2…",
+  "to": "3f7b8d4…",
+  "impactedTargets": ["//foo:bar", "//foo:baz"],
+  "profile": {
+    "totalDurationMillis": 1843,
+    "resolveRevisionsDurationMillis": 12,
+    "hashRetrievals": [
+      {"sha": "9a1c0e2…", "cacheHit": true, "durationMillis": 95},
+      {"sha": "3f7b8d4…", "cacheHit": false, "durationMillis": 1701}
+    ],
+    "diffDurationMillis": 21
+  },
+  "memoryProfile": {
+    "heapUsedBeforeBytes": 231452416,
+    "heapUsedAfterBytes": 512665600,
+    "heapUsedDeltaBytes": 281213184,
+    "heapMaxBytes": 4294967296,
+    "gcCollections": 3,
+    "gcTimeMillis": 41
+  }
+}
+```
+
+  Field notes: `hashRetrievals` reports each side's hash fetch — `cacheHit: false` means this
+  request ran the git checkout + `bazel query` itself (typically orders of magnitude slower than a
+  hit), while a hit includes the case where the request waited for a concurrent generation of the
+  same revision to finish. `totalDurationMillis` spans dispatch to response assembly (including any
+  wait for the workspace lock), so it can exceed the sum of the phases;
+  `resolveRevisionsDurationMillis` includes any on-demand `git fetch`; `diffDurationMillis` includes
+  the live `rdeps` query issued when the module graph changed between the revisions. Heap and GC
+  numbers are process-wide, so concurrent requests bleed into each other's deltas — treat them as
+  indicative, not exact.
 
 * `GET /metrics` — returns a JSON snapshot of the instance so callers and monitoring can see its
   identity, liveness, and cache size usage without scraping logs. Unlike the query endpoints it is

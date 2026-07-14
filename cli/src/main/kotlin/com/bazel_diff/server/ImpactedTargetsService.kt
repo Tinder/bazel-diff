@@ -9,21 +9,30 @@ import java.nio.file.Path
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
-/** Result of an impacted-targets request: the resolved SHAs and the impacted labels. */
+/**
+ * Result of an impacted-targets request: the resolved SHAs and the impacted labels. [profile] and
+ * [memoryProfile] are only populated when the request opted in with `profile=true` (Gson omits the
+ * null fields, keeping the default response shape unchanged).
+ */
 data class ImpactedTargetsResult(
     val from: String,
     val to: String,
     val impactedTargets: List<String>,
+    val profile: QueryProfile? = null,
+    val memoryProfile: MemoryProfile? = null,
 )
 
 /**
  * Result of an impacted-targets-with-distances request: the resolved SHAs and the impacted targets
- * each paired with their build-graph distance metrics.
+ * each paired with their build-graph distance metrics. [profile]/[memoryProfile] behave as in
+ * [ImpactedTargetsResult].
  */
 data class ImpactedTargetsWithDistancesResult(
     val from: String,
     val to: String,
     val impactedTargets: List<ImpactedTargetWithDistance>,
+    val profile: QueryProfile? = null,
+    val memoryProfile: MemoryProfile? = null,
 )
 
 /**
@@ -45,12 +54,16 @@ interface ImpactedTargetsProvider {
    *   revisions. When non-empty, source-file *content* hashing is scoped to just these paths on
    *   both revisions (a large-monorepo speedup); it must be a superset of what actually changed or
    *   impacted targets are missed. Empty (the default) is the full-content hash.
+   * @param profiler when non-null, per-phase timings and memory movement are recorded into it and
+   *   attached to the result as
+   *   [ImpactedTargetsResult.profile]/[ImpactedTargetsResult.memoryProfile].
    */
   fun getImpactedTargets(
       fromRev: String,
       toRev: String,
       targetTypes: Set<String>?,
       modifiedFilepaths: Set<Path> = emptySet(),
+      profiler: QueryProfiler? = null,
   ): ImpactedTargetsResult
 
   /**
@@ -63,6 +76,7 @@ interface ImpactedTargetsProvider {
       toRev: String,
       targetTypes: Set<String>?,
       modifiedFilepaths: Set<Path> = emptySet(),
+      profiler: QueryProfiler? = null,
   ): ImpactedTargetsWithDistancesResult
 }
 
@@ -89,17 +103,19 @@ class ImpactedTargetsService(
       toRev: String,
       targetTypes: Set<String>?,
       modifiedFilepaths: Set<Path>,
+      profiler: QueryProfiler?,
   ): ImpactedTargetsResult {
-    val (fromSha, toSha) = resolveBoth(fromRev, toRev)
+    val (fromSha, toSha) = resolveBothProfiled(fromRev, toRev, profiler)
     logger.i { "Computing impacted targets $fromSha -> $toSha" }
 
     // The same scope on both revisions is what makes a scoped diff correct: an unchanged file is
     // content-skipped on both sides and so hashes identically; a listed file is read on both.
-    val fromData = hashProvider.getHashes(fromSha, modifiedFilepaths)
-    val toData = hashProvider.getHashes(toSha, modifiedFilepaths)
+    val fromData = hashProvider.getHashes(fromSha, modifiedFilepaths, profiler)
+    val toData = hashProvider.getHashes(toSha, modifiedFilepaths, profiler)
 
     val writer = StringWriter()
     val interactor = CalculateImpactedTargetsInteractor()
+    val diffStartNanos = System.nanoTime()
     runOnGraph(fromData.moduleGraphJson, toData.moduleGraphJson, toSha) {
       interactor.execute(
           fromData.hashes,
@@ -110,9 +126,11 @@ class ImpactedTargetsService(
           toData.moduleGraphJson,
           excludeExternalTargets())
     }
+    profiler?.recordDiff(elapsedMillis(diffStartNanos))
 
     val impacted = writer.toString().split("\n").filter { it.isNotBlank() }
-    return ImpactedTargetsResult(fromSha, toSha, impacted)
+    return ImpactedTargetsResult(
+        fromSha, toSha, impacted, profiler?.queryProfile(), profiler?.memoryProfile())
   }
 
   override fun getImpactedTargetsWithDistances(
@@ -120,18 +138,20 @@ class ImpactedTargetsService(
       toRev: String,
       targetTypes: Set<String>?,
       modifiedFilepaths: Set<Path>,
+      profiler: QueryProfiler?,
   ): ImpactedTargetsWithDistancesResult {
     if (!depsTracked) {
       throw DistancesUnavailableException(
           "distances unavailable: server started without --trackDeps")
     }
-    val (fromSha, toSha) = resolveBoth(fromRev, toRev)
+    val (fromSha, toSha) = resolveBothProfiled(fromRev, toRev, profiler)
     logger.i { "Computing impacted targets with distances $fromSha -> $toSha" }
 
-    val fromData = hashProvider.getHashes(fromSha, modifiedFilepaths)
-    val toData = hashProvider.getHashes(toSha, modifiedFilepaths)
+    val fromData = hashProvider.getHashes(fromSha, modifiedFilepaths, profiler)
+    val toData = hashProvider.getHashes(toSha, modifiedFilepaths, profiler)
 
     val interactor = CalculateImpactedTargetsInteractor()
+    val diffStartNanos = System.nanoTime()
     val impacted =
         runOnGraph(fromData.moduleGraphJson, toData.moduleGraphJson, toSha) {
           // Use the `to` revision's dependency edges: distances are measured by traversing the
@@ -145,8 +165,26 @@ class ImpactedTargetsService(
               toData.moduleGraphJson,
               excludeExternalTargets())
         }
-    return ImpactedTargetsWithDistancesResult(fromSha, toSha, impacted)
+    profiler?.recordDiff(elapsedMillis(diffStartNanos))
+    return ImpactedTargetsWithDistancesResult(
+        fromSha, toSha, impacted, profiler?.queryProfile(), profiler?.memoryProfile())
   }
+
+  /** [resolveBoth], recording its duration (including any on-demand fetches) into [profiler]. */
+  private fun resolveBothProfiled(
+      fromRev: String,
+      toRev: String,
+      profiler: QueryProfiler?
+  ): Pair<String, String> {
+    val startNanos = System.nanoTime()
+    try {
+      return resolveBoth(fromRev, toRev)
+    } finally {
+      profiler?.recordResolveRevisions(elapsedMillis(startNanos))
+    }
+  }
+
+  private fun elapsedMillis(startNanos: Long): Long = (System.nanoTime() - startNanos) / 1_000_000
 
   /**
    * Resolves both revisions to commit SHAs, fetching on demand if either is missing from the local

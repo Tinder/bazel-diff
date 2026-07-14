@@ -60,13 +60,19 @@ jobs:
       - name: Run serve stress harness (${{ matrix.size }})
         # --bazel points the harness (and the serve subprocess) at bazelisk; the bazel version for
         # the CLONED repo comes from that repo's own .bazelversion, which bazelisk honors.
+        #
+        # --real-clone-args must keep the `=` spelling: its value is itself a flag (`--depth=50`),
+        # and argparse reads a space-separated `--real-clone-args --depth=50` as two options, not an
+        # option and its value ("expected one argument" -- quoting does not help, the shell strips
+        # the quotes before argparse sees the token). The harness also folds the space spelling, but
+        # keeping `=` here means the matrix parses under plain argparse rules regardless.
         run: >
           python3 tools/serve_stress.py
           --bazel "$HOME/go/bin/bazelisk"
           --real-repo-url "${{ matrix.repo }}"
           --real-from HEAD~1
           --real-to HEAD
-          --real-clone-args "${{ matrix.clone_args }}"
+          --real-clone-args="${{ matrix.clone_args }}"
           --metrics-out "serve-stress-real-${{ matrix.size }}-metrics.json"
           --summary-out "serve-stress-real-${{ matrix.size }}-summary.md"
       - name: Publish step summary

@@ -148,6 +148,27 @@ class HashServiceTest : KoinTest {
   }
 
   @Test
+  fun profilerRecordsCacheMissThenHit() {
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any()))
+        .thenReturn(sampleHashes)
+    runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
+    val service = newService(RecordingGitClient(), InMemoryStorage())
+
+    val missProfiler = QueryProfiler()
+    service.getHashes("sha1", profiler = missProfiler)
+    val hitProfiler = QueryProfiler()
+    service.getHashes("sha1", profiler = hitProfiler)
+
+    val miss = missProfiler.queryProfile().hashRetrievals.single()
+    assertThat(miss.sha).isEqualTo("sha1")
+    assertThat(miss.cacheHit).isEqualTo(false)
+    assertThat(miss.durationMillis >= 0).isEqualTo(true)
+    val hit = hitProfiler.queryProfile().hashRetrievals.single()
+    assertThat(hit.sha).isEqualTo("sha1")
+    assertThat(hit.cacheHit).isEqualTo(true)
+  }
+
+  @Test
   fun withWorkspaceAtChecksOutThenRunsBlock() {
     val git = RecordingGitClient()
     val service = newService(git, InMemoryStorage())

@@ -27,13 +27,17 @@ import org.koin.core.component.inject
  * - `GET /health` -- `200 OK` once [readiness] reports ready, `503` otherwise. A load balancer uses
  *   this to route only to instances that have completed their initial git fetch and have not been
  *   lame-ducked by a fatal git error.
- * - `GET /impacted_targets?from=<rev>&to=<rev>[&targetType=Rule,SourceFile]` -- returns `{"from":
- *   <sha>, "to": <sha>, "impactedTargets": [...]}`.
+ * - `GET /impacted_targets?from=<rev>&to=<rev>[&targetType=Rule,SourceFile][&profile=true]` --
+ *   returns `{"from": <sha>, "to": <sha>, "impactedTargets": [...]}`. With `profile=true` the
+ *   response additionally carries `profile` (per-phase wall-clock breakdown, including per-side
+ *   cache hit/miss -- see [QueryProfile]) and `memoryProfile` (JVM heap/GC movement -- see
+ *   [MemoryProfile]) so callers can feed per-request metrics into their monitoring.
  * - `POST /impacted_targets` with a JSON body `{"from", "to", "targetType"?: [...],
- *   "modifiedFilepaths"?: [...]}` -- same result as the GET form, but additionally accepts
- *   `modifiedFilepaths` (workspace-relative paths changed between the revisions) to scope content
- *   hashing (see [ImpactedTargetsService]/[HashService]). A changed-file list is too large for a
- *   URL, so it rides in the body; a GET is always the full-content hash.
+ *   "modifiedFilepaths"?: [...], "profile"?: bool}` -- same result as the GET form, but
+ *   additionally accepts `modifiedFilepaths` (workspace-relative paths changed between the
+ *   revisions) to scope content hashing (see [ImpactedTargetsService]/[HashService]). A
+ *   changed-file list is too large for a URL, so it rides in the body; a GET is always the
+ *   full-content hash.
  * - `GET /impacted_targets_with_distances?from=<rev>&to=<rev>[&targetType=...]` (and its `POST`
  *   form) -- like above but each impacted target is `{"label", "targetDistance",
  *   "packageDistance"}`. Requires the server to have been started with `--trackDeps`; returns `400`
@@ -129,14 +133,15 @@ class BazelDiffServer(
       }
 
   private fun handleImpactedTargets(exchange: HttpExchange) =
-      handleQuery(exchange) { from, to, targetTypes, modifiedFilepaths ->
-        impactedTargetsProvider.getImpactedTargets(from, to, targetTypes, modifiedFilepaths)
+      handleQuery(exchange) { from, to, targetTypes, modifiedFilepaths, profiler ->
+        impactedTargetsProvider.getImpactedTargets(
+            from, to, targetTypes, modifiedFilepaths, profiler)
       }
 
   private fun handleImpactedTargetsWithDistances(exchange: HttpExchange) =
-      handleQuery(exchange) { from, to, targetTypes, modifiedFilepaths ->
+      handleQuery(exchange) { from, to, targetTypes, modifiedFilepaths, profiler ->
         impactedTargetsProvider.getImpactedTargetsWithDistances(
-            from, to, targetTypes, modifiedFilepaths)
+            from, to, targetTypes, modifiedFilepaths, profiler)
       }
 
   /** Normalized inputs for a query, parsed from either a GET query string or a POST JSON body. */
@@ -145,6 +150,7 @@ class BazelDiffServer(
       val to: String,
       val targetTypes: Set<String>?,
       val modifiedFilepaths: Set<Path>,
+      val profile: Boolean,
   )
 
   /**
@@ -156,6 +162,7 @@ class BazelDiffServer(
       val to: String? = null,
       val targetType: List<String>? = null,
       val modifiedFilepaths: List<String>? = null,
+      val profile: Boolean? = null,
   )
 
   /** Local signal that request parsing failed; [handleQuery] maps it to a `400`. */
@@ -169,7 +176,12 @@ class BazelDiffServer(
   private fun handleQuery(
       exchange: HttpExchange,
       compute:
-          (from: String, to: String, targetTypes: Set<String>?, modifiedFilepaths: Set<Path>) -> Any
+          (
+              from: String,
+              to: String,
+              targetTypes: Set<String>?,
+              modifiedFilepaths: Set<Path>,
+              profiler: QueryProfiler?) -> Any
   ) =
       withExchange(exchange) {
         val isGet = exchange.requestMethod.equals("GET", ignoreCase = true)
@@ -191,12 +203,16 @@ class BazelDiffServer(
               return@withExchange
             }
 
+        // Created before dispatch so the profile's total also covers any wait for a compute slot /
+        // the workspace lock -- the parts of latency a caller most wants visible.
+        val profiler = if (inputs.profile) QueryProfiler() else null
         try {
           respondJson(
               exchange,
               200,
               computeWithTimeout {
-                compute(inputs.from, inputs.to, inputs.targetTypes, inputs.modifiedFilepaths)
+                compute(
+                    inputs.from, inputs.to, inputs.targetTypes, inputs.modifiedFilepaths, profiler)
               })
         } catch (e: TimeoutException) {
           logger.w { "request exceeded ${requestTimeoutSeconds}s timeout, abandoning" }
@@ -252,8 +268,8 @@ class BazelDiffServer(
   }
 
   /**
-   * Parses a GET request's `from`/`to`/`targetType` from the query string. A GET never carries
-   * modified filepaths (a changed-file list is too large for a URL), so it is always the
+   * Parses a GET request's `from`/`to`/`targetType`/`profile` from the query string. A GET never
+   * carries modified filepaths (a changed-file list is too large for a URL), so it is always the
    * full-content hash. Throws [BadRequestException] when `from`/`to` are missing.
    */
   private fun parseGetQuery(exchange: HttpExchange): QueryInputs {
@@ -265,7 +281,7 @@ class BazelDiffServer(
     }
     val targetTypes =
         params["targetType"]?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet()
-    return QueryInputs(from, to, targetTypes, emptySet())
+    return QueryInputs(from, to, targetTypes, emptySet(), profile = params["profile"].toBoolean())
   }
 
   /**
@@ -300,7 +316,7 @@ class BazelDiffServer(
             ?.filter { it.isNotEmpty() }
             ?.map { File(it).toPath() }
             ?.toSet() ?: emptySet()
-    return QueryInputs(from, to, targetTypes, modifiedFilepaths)
+    return QueryInputs(from, to, targetTypes, modifiedFilepaths, profile = body.profile ?: false)
   }
 
   private fun parseQuery(rawQuery: String?): Map<String, String> {

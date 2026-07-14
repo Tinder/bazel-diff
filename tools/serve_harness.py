@@ -633,6 +633,32 @@ def _full_extras(rep: Report, case: str, s: Serve, remote: Remote, track_deps: b
     rep.check(case, "malformed POST body -> 400", code == 400,
               fail_detail=f"code={code} body={body[:120]}")
 
+    # profile=true attaches the timing + memory breakdown; both C1/C2 sides are cached by the
+    # earlier checks, so the hash retrievals must report cache hits.
+    code, body = http(s.port, f"/impacted_targets?from={sh['C1']}&to={sh['C2']}&profile=true")
+    try:
+        pd = json.loads(body)
+    except ValueError:
+        pd = {}
+    prof, mem = pd.get("profile", {}), pd.get("memoryProfile", {})
+    retrievals = prof.get("hashRetrievals", [])
+    rep.check(case, "profile=true returns profile + memoryProfile",
+              code == 200
+              and prof.get("totalDurationMillis", -1) >= 0
+              and len(retrievals) == 2
+              and all(r.get("cacheHit") for r in retrievals)
+              and mem.get("heapMaxBytes", 0) > 0
+              and mem.get("gcCollections", -1) >= 0,
+              ok_detail=f"total={prof.get('totalDurationMillis')}ms "
+                        f"hits={[r.get('cacheHit') for r in retrievals]}",
+              fail_detail=f"code={code} body={body[:300]}")
+
+    # Without the flag the response shape is unchanged (no profile keys leak in).
+    code, body, _ = _impacted(s, sh["C1"], sh["C2"])
+    rep.check(case, "no profile keys without profile=true",
+              code == 200 and "memoryProfile" not in body,
+              fail_detail=f"code={code} body={body[:200]}")
+
     # Distances endpoint: with --trackDeps, core is directly changed (d0), mid depends on core
     # (d>=1); without it, the endpoint 400s.
     code, body = http(s.port, f"/impacted_targets_with_distances?from={sh['C1']}&to={sh['C2']}")

@@ -22,7 +22,10 @@ import com.bazel_diff.server.LocalDiskHashCacheStorage
 import com.bazel_diff.server.MetricsService
 import com.bazel_diff.server.ProcessGitClient
 import com.bazel_diff.server.PrunableHashCacheStorage
+import com.bazel_diff.server.S3HashCacheStorage
+import com.bazel_diff.server.TieredHashCacheStorage
 import java.io.File
+import java.net.URI
 import java.nio.file.Path
 import java.time.Duration
 import java.util.concurrent.Callable
@@ -140,6 +143,51 @@ class ServeCommand : Callable<Int> {
       converter = [DurationConverter::class],
       defaultValue = "1h")
   var cachePruneInterval: Duration = Duration.ofHours(1)
+
+  @CommandLine.Option(
+      names = ["--s3Bucket"],
+      description =
+          [
+              "S3 bucket used as a shared hash cache behind the local --cacheDir tier. Generated " +
+                  "hashes are published to the bucket and local cache misses fall back to it, so " +
+                  "replicas behind a load balancer share one cache. Credentials and region come " +
+                  "from the AWS default provider chains (env vars, profile, IRSA, IMDS). Unset " +
+                  "(the default) means local-disk caching only."])
+  var s3Bucket: String? = null
+
+  @CommandLine.Option(
+      names = ["--s3Prefix"],
+      description =
+          [
+              "Key prefix for cache objects in --s3Bucket, e.g. 'bazel-diff/my-repo'. Defaults to " +
+                  "no prefix (objects at the bucket root)."],
+      defaultValue = "")
+  var s3Prefix: String = ""
+
+  @CommandLine.Option(
+      names = ["--s3Region"],
+      description =
+          [
+              "AWS region of --s3Bucket. Defaults to the SDK's default region chain (env vars, " +
+                  "profile, IMDS)."])
+  var s3Region: String? = null
+
+  @CommandLine.Option(
+      names = ["--s3Endpoint"],
+      description =
+          [
+              "Custom S3 endpoint URL for S3-compatible stores (MinIO, LocalStack). Usually " +
+                  "combined with --s3ForcePathStyle."])
+  var s3Endpoint: URI? = null
+
+  @CommandLine.Option(
+      names = ["--s3ForcePathStyle"],
+      negatable = true,
+      description =
+          [
+              "Use path-style S3 addressing (bucket in the URL path, not the hostname), required " +
+                  "by most S3-compatible stores. Defaults to false."])
+  var s3ForcePathStyle = false
 
   @CommandLine.Option(
       names = ["--warmupRevision"],
@@ -284,13 +332,36 @@ class ServeCommand : Callable<Int> {
     }
 
     return try {
-      val server = buildAndStartServer(createGitClient(), LocalDiskHashCacheStorage(cacheDir))
+      val server = buildAndStartServer(createGitClient(), createStorage())
       awaitShutdown(server)
       CommandLine.ExitCode.OK
     } finally {
       stopKoin()
     }
   }
+
+  /**
+   * Builds the cache storage stack: the local `--cacheDir` tier, backed by the shared [remote] tier
+   * when one is configured. [remote] is injectable for tests; the default builds the S3 tier from
+   * the `--s3*` flags (null -- local-only -- when `--s3Bucket` is unset).
+   */
+  fun createStorage(remote: HashCacheStorage? = createS3Storage()): HashCacheStorage {
+    val local = LocalDiskHashCacheStorage(cacheDir)
+    return if (remote == null) local else TieredHashCacheStorage(local, remote)
+  }
+
+  /** The S3 remote cache tier from the `--s3*` flags, or null when `--s3Bucket` is unset. */
+  fun createS3Storage(): S3HashCacheStorage? =
+      s3Bucket?.let { bucket ->
+        S3HashCacheStorage(
+            S3HashCacheStorage.buildClient(s3Region, s3Endpoint, s3ForcePathStyle),
+            bucket,
+            s3Prefix)
+      }
+
+  /** Human-readable location of the shared remote cache tier for `/metrics`; null when unset. */
+  fun remoteCacheLocation(): String? =
+      s3Bucket?.let { "s3://$it/${S3HashCacheStorage.normalizePrefix(s3Prefix)}" }
 
   /**
    * Builds the [GitClient]. Git fetch/checkout operations shell out to the `git` binary at
@@ -324,6 +395,7 @@ class ServeCommand : Callable<Int> {
             gitEngine = "subprocess",
             trackDeps = trackDeps,
             cacheDir = cacheDir.toString(),
+            remoteCache = remoteCacheLocation(),
             storage = storage,
             readiness = { ready.get() },
         )

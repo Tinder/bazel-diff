@@ -206,10 +206,40 @@ curl 'http://localhost:8080/metrics'
   "ready": true,
   "gitEngine": "subprocess",
   "trackDeps": false,
-  "cache": {"directory": "/var/cache/bazel-diff", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB"},
+  "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB"},
   "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
 }
 ```
+
+### Shared S3 cache for multi-instance deployments
+
+A single instance caches hashes on local disk only. When you run several replicas behind a load
+balancer (e.g. a Kubernetes Deployment behind a Service, with the readiness probe on `/health`),
+give them a shared S3 cache tier so a revision is cold-hashed once fleet-wide instead of once per
+pod:
+
+```bash
+bazel-diff serve \
+  --workspacePath /path/to/workspace-clone \
+  --cacheDir /var/cache/bazel-diff \
+  --s3Bucket my-hash-cache-bucket \
+  --s3Prefix bazel-diff/my-repo
+```
+
+With `--s3Bucket` set the cache becomes two-tiered: reads check local disk first and fall back to
+the bucket (backfilling local disk on a hit), and every generated entry is published to both, so
+any replica can serve a revision another replica already hashed. Credentials and region resolve
+through the standard AWS default provider chains (environment variables, profile, IRSA web
+identity on EKS, IMDS), or pin the region with `--s3Region`. `--s3Endpoint` plus
+`--s3ForcePathStyle` point the client at an S3-compatible store (MinIO, LocalStack) for local
+testing.
+
+S3 errors never fail a request: a failed read is treated as a cache miss (the revision is
+regenerated — slower, but correct) and a failed write leaves the entry local-only, so an S3 outage
+degrades throughput rather than availability. Concurrent replicas racing to hash the same
+revision are also harmless — entries are deterministic per key, so last-write-wins over identical
+content. The `--cacheMax*` pruning flags bound the *local* tier only; bound the bucket with an S3
+lifecycle policy instead.
 
 Notes and current limitations:
 
@@ -234,10 +264,8 @@ Notes and current limitations:
   sweeper enforces the limits once at startup and then every `--cachePruneInterval` (default `1h`),
   evicting least-recently-used entries first — a cache hit refreshes an entry's recency, so revisions
   under active query are not expired out from under live traffic. With no `--cacheMax*` flag set the
-  cache is never pruned (the previous behavior). The cache layer is pluggable behind a byte-oriented
-  interface so a remote backend (e.g. S3) can be added without touching callers; such a backend
-  manages its own retention (e.g. a bucket lifecycle policy), and the in-process `--cacheMax*` flags
-  do not apply to it.
+  cache is never pruned (the previous behavior). The `--cacheMax*` flags always bound the local-disk
+  tier only; the shared S3 tier (see above) manages its own retention via a bucket lifecycle policy.
 * Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
   `generate-hashes`, and are folded into the cache key so a server started with different flags never
   serves another configuration's cached hashes.
@@ -248,8 +276,8 @@ Notes and current limitations:
   shared-base full-hash cache is not reused (each distinct changed-set re-hashes the base), but each
   such hash is cheaper because it skips reading unchanged files. The extra entries are bounded by the
   same LRU `--cacheMax*` pruning as everything else.
-* Containerization, multi-instance deployment manifests, and remote cache backends are not yet
-  included.
+* Containerization and multi-instance deployment manifests are not yet included; the shared S3
+  cache tier above is the building block for running replicas behind a load balancer.
 
 <!-- BEGIN_SECTION: cli-help -->
 ## CLI Interface
@@ -508,9 +536,9 @@ Command-line utility to analyze the state of the bazel build graph
 
 ```terminal
 Usage: bazel-diff serve [-hkvV] [--[no-]excludeExternalTargets]
-                        [--no-initial-fetch] [--[no-]trackDeps] [--[no-]
-                        useCquery] [-b=<bazelPath>] --cacheDir=<cacheDir>
-                        [--cacheMaxAge=<cacheMaxAge>]
+                        [--no-initial-fetch] [--[no-]s3ForcePathStyle] [--[no-]
+                        trackDeps] [--[no-]useCquery] [-b=<bazelPath>]
+                        --cacheDir=<cacheDir> [--cacheMaxAge=<cacheMaxAge>]
                         [--cacheMaxEntries=<cacheMaxEntries>]
                         [--cacheMaxSize=<cacheMaxSize>]
                         [--cachePruneInterval=<cachePruneInterval>]
@@ -519,7 +547,9 @@ Usage: bazel-diff serve [-hkvV] [--[no-]excludeExternalTargets]
                         [--fineGrainedHashExternalReposFile=<fineGrainedHashExte
                         rnalReposFile>] [--gitPath=<gitPath>] [--port=<port>]
                         [--requestTimeout=<requestTimeoutSeconds>]
-                        [-s=<seedFilepaths>] -w=<workspacePath>
+                        [-s=<seedFilepaths>] [--s3Bucket=<s3Bucket>]
+                        [--s3Endpoint=<s3Endpoint>] [--s3Prefix=<s3Prefix>]
+                        [--s3Region=<s3Region>] -w=<workspacePath>
                         [-co=<bazelCommandOptions>]...
                         [--cqueryCommandOptions=<cqueryCommandOptions>]...
                         [--fineGrainedHashExternalRepos=<fineGrainedHashExternal
@@ -602,6 +632,27 @@ targets between two git revisions, caching generated hashes per commit SHA.
   -s, --seed-filepaths=<seedFilepaths>
                             A text file with a newline separated list of
                               filepaths used as a SHA256 seed for all targets.
+      --s3Bucket=<s3Bucket> S3 bucket used as a shared hash cache behind the
+                              local --cacheDir tier. Generated hashes are
+                              published to the bucket and local cache misses
+                              fall back to it, so replicas behind a load
+                              balancer share one cache. Credentials and region
+                              come from the AWS default provider chains (env
+                              vars, profile, IRSA, IMDS). Unset (the default)
+                              means local-disk caching only.
+      --s3Endpoint=<s3Endpoint>
+                            Custom S3 endpoint URL for S3-compatible stores
+                              (MinIO, LocalStack). Usually combined with
+                              --s3ForcePathStyle.
+      --[no-]s3ForcePathStyle
+                            Use path-style S3 addressing (bucket in the URL
+                              path, not the hostname), required by most
+                              S3-compatible stores. Defaults to false.
+      --s3Prefix=<s3Prefix> Key prefix for cache objects in --s3Bucket, e.g.
+                              'bazel-diff/my-repo'. Defaults to no prefix
+                              (objects at the bucket root).
+      --s3Region=<s3Region> AWS region of --s3Bucket. Defaults to the SDK's
+                              default region chain (env vars, profile, IMDS).
       -so, --bazelStartupOptions=<bazelStartupOptions>
                             Additional space separated Bazel client startup
                               options used when invoking Bazel
@@ -766,8 +817,8 @@ bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
   <tr>
     <td align="center"><a href="https://github.com/tinder-maxwellelliott"><img src="https://avatars.githubusercontent.com/u/56700854?s=64" width="64" alt="Maxwell Elliott"/><br/><sub><b>Maxwell Elliott</b></sub></a></td>
     <td align="center"><a href="https://github.com/honnix"><img src="https://avatars.githubusercontent.com/u/158892?s=64" width="64" alt="Honnix"/><br/><sub><b>Honnix</b></sub></a></td>
-    <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="eric wang"/><br/><sub><b>eric wang</b></sub></a></td>
     <td align="center"><a href="https://github.com/github-actions[bot]"><img src="https://avatars.githubusercontent.com/in/15368?s=64" width="64" alt="github-actions[bot]"/><br/><sub><b>github-actions[bot]</b></sub></a></td>
+    <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="eric wang"/><br/><sub><b>eric wang</b></sub></a></td>
     <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="Eric Wang"/><br/><sub><b>Eric Wang</b></sub></a></td>
     <td align="center"><a href="https://github.com/tgeng"><img src="https://avatars.githubusercontent.com/u/29584386?s=64" width="64" alt="Tianyu Geng"/><br/><sub><b>Tianyu Geng</b></sub></a></td>
   </tr>

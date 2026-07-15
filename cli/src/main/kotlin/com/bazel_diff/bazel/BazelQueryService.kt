@@ -310,7 +310,17 @@ class BazelQueryService(
     }
 
     // Step 2: Fetch repo definitions via `mod show_repo @@<canonical>... --output=streamed_proto`.
-    val canonicalNames = canonicalToApparent.keys.map { "@@$it" }
+    //
+    // Ask only for repos `bazel mod` can resolve. A workspace running Bzlmod alongside WORKSPACE
+    // maps its WORKSPACE repos into the root repo mapping too, and show_repo fails the whole batch
+    // on the first one it does not know -- leaving every Bzlmod repo unhashed. A Bzlmod canonical
+    // name carries the module separator ('+', or '~' before Bazel 7.1); //external covers the rest.
+    val canonicalNames =
+        canonicalToApparent.keys.filter { it.contains('+') || it.contains('~') }.map { "@@$it" }
+    if (canonicalNames.isEmpty()) {
+      logger.w { "No bzlmod-canonical repos in the repo mapping, skipping mod show_repo" }
+      return emptyList()
+    }
     val outputFile = Files.createTempFile(null, ".bin").toFile()
     outputFile.deleteOnExit()
 

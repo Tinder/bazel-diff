@@ -156,10 +156,12 @@ class E2ETest {
 
   /**
    * End-to-end coverage for the `serve` query service: builds a two-commit git repo from the
-   * shell-only `distance_metrics` workspace, runs `bazel-diff serve` in a background thread, then
-   * hits `/health` and `/impacted_targets` over real HTTP. Exercises the full
+   * shell-only `distance_metrics` workspace, runs `bazel-diff serve` (with `--trackDeps`) in a
+   * background thread, then hits `/health`, `/impacted_targets`, and
+   * `/impacted_targets_with_distances` over real HTTP. Exercises the full
    * [com.bazel_diff.cli.ServeCommand] path (Koin + hasher wiring, git checkout, real `bazel query`
-   * for both revisions, and the cache) the same way the other E2E tests cover the CLI commands.
+   * for both revisions, dep-edge tracking, distance computation, and the cache) the same way the
+   * other E2E tests cover the CLI commands.
    */
   @Test
   fun testServeEndToEnd() {
@@ -201,7 +203,8 @@ class E2ETest {
                       cacheDir.absolutePath,
                       "--port",
                       port.toString(),
-                      "--no-initial-fetch")
+                      "--no-initial-fetch",
+                      "--trackDeps")
             }
             .apply {
               isDaemon = true
@@ -221,6 +224,23 @@ class E2ETest {
       @Suppress("UNCHECKED_CAST") val impacted = parsed["impactedTargets"] as List<String>
       // Editing lib.sh must impact at least its own sh_library target.
       assertThat(impacted.contains("//:lib")).isEqualTo(true)
+
+      // The distances endpoint returns the same impacted targets, each annotated with build-graph
+      // distance metrics. //:lib is directly edited, so it sits at distance 0.
+      val (distCode, distBody) =
+          httpGetServe(
+              "http://localhost:$port/impacted_targets_with_distances?from=$fromSha&to=$toSha")
+      assertThat(distCode).isEqualTo(200)
+      val distParsed: Map<String, Any> =
+          Gson().fromJson(distBody, object : TypeToken<Map<String, Any>>() {}.type)
+      assertThat(distParsed["from"]).isEqualTo(fromSha)
+      assertThat(distParsed["to"]).isEqualTo(toSha)
+      @Suppress("UNCHECKED_CAST")
+      val withDistances = distParsed["impactedTargets"] as List<Map<String, Any>>
+      val libEntry = withDistances.single { it["label"] == "//:lib" }
+      // Gson decodes JSON numbers as Double.
+      assertThat(libEntry["targetDistance"]).isEqualTo(0.0)
+      assertThat(libEntry["packageDistance"]).isEqualTo(0.0)
     } finally {
       serveThread.interrupt()
       serveThread.join(10_000)
@@ -329,6 +349,58 @@ class E2ETest {
     val hashes: Map<String, Any> =
         Gson().fromJson(output.readText(), object : TypeToken<Map<String, Any>>() {}.type)
     assertThat(hashes.isNotEmpty()).isEqualTo(true)
+  }
+
+  @Test
+  fun testExcludeTargetsQueryFiltersManualTargets() {
+    // Reproducer + fix for https://github.com/Tinder/bazel-diff/issues/392: --excludeTargetsQuery
+    // lets users drop `manual`-tagged targets (or any query-matched targets) from generate-hashes
+    // output via Bazel's `except` operator. Reuses the locked `distance_metrics` workspace and
+    // appends a manual-tagged target to the *copied* BUILD so no new MODULE.bazel.lock is needed.
+    val workspace = copyTestWorkspace("distance_metrics")
+    File(workspace, "BUILD")
+        .appendText(
+            "\nsh_library(\n" +
+                "    name = \"manual_only\",\n" +
+                "    srcs = [\"lib.sh\"],\n" +
+                "    tags = [\"manual\"],\n" +
+                ")\n")
+
+    val outputDir = temp.newFolder()
+    val withoutFilter = File(outputDir, "without_filter.json")
+    val withFilter = File(outputDir, "with_filter.json")
+    val cli = CommandLine(BazelDiff())
+
+    // Baseline: the manual target is present when no filter is applied.
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w",
+                workspace.absolutePath,
+                "-b",
+                "bazel",
+                withoutFilter.absolutePath))
+        .isEqualTo(0)
+    val baseline = readTargetHashes(withoutFilter)
+    assertThat(baseline.containsKey("//:manual_only")).isEqualTo(true)
+    assertThat(baseline.containsKey("//:lib")).isEqualTo(true)
+
+    // With the filter, the manual target is gone but the normal target remains. The regex is
+    // Bazel's documented incantation for matching the `manual` element of a `tags` list.
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w",
+                workspace.absolutePath,
+                "-b",
+                "bazel",
+                "--excludeTargetsQuery",
+                """attr("tags", "[\[ ]manual[,\]]", //...)""",
+                withFilter.absolutePath))
+        .isEqualTo(0)
+    val filtered = readTargetHashes(withFilter)
+    assertThat(filtered.containsKey("//:manual_only")).isEqualTo(false)
+    assertThat(filtered.containsKey("//:lib")).isEqualTo(true)
   }
 
   @Test
@@ -1209,7 +1281,7 @@ class E2ETest {
             outputNoKeepGoing.absolutePath)
     assertThat(exitCodeWithNoKeepGoing).isEqualTo(1)
 
-    // Test with --keep_going enabled (default behavior)
+    // Test with --keep_going explicitly enabled (no longer the default)
     // With keep_going, cquery returns partial results but still exits with code 1
     // The current implementation allows exit codes 0 and 3, but cquery with keep_going
     // returns exit code 1 when some targets fail analysis
@@ -1254,6 +1326,137 @@ class E2ETest {
     assertThat(hashes.contains("dependent_target")).isEqualTo(true)
     // The failing target should not be in the hashes since it wasn't included in the query
     assertThat(hashes.contains("failing_analysis_target")).isEqualTo(false)
+  }
+
+  @Test
+  fun testKeepGoingSilentlyDropsTargetsOnRepoRuleFailure_reproducerForIssue398() {
+    // Reproducer for https://github.com/Tinder/bazel-diff/issues/398
+    //
+    // When `--keep_going` is enabled, bazel-diff treats a partial
+    // `bazel query` (exit code 3) as success. When a repository rule fails to resolve --
+    // e.g. a transient network error fetching a remote dependency such as
+    //
+    //   fetch_repo: buf.build/go/protovalidate@v1.1.3:
+    //       Get "https://proxy.golang.org/...": net/http: TLS handshake timeout
+    //
+    // -- the package that references that repo silently disappears from the query results,
+    // and bazel-diff emits a hash set that is missing those targets WITHOUT any error. This
+    // makes hashes non-deterministic across runs (a target present when the fetch succeeds
+    // vanishes when it flakes). `--keep_going` now defaults to `false`, so the default behavior
+    // fails loudly and keeps hashes deterministic.
+    //
+    // The `keep_going_repo_failure` workspace has two packages:
+    //   //good -- a plain genrule with no external deps (always resolvable)
+    //   //bad  -- loads a .bzl from @failing_dep, whose repository rule always fails to fetch
+    //
+    // This test locks in the default (`--no-keep_going`) fail-loud behavior and documents the
+    // opt-in `--keep_going` behavior that silently drops targets.
+    val workspace = copyTestWorkspace("keep_going_repo_failure")
+    val outputDir = temp.newFolder()
+
+    val cli = CommandLine(BazelDiff())
+
+    // Default behavior (--keep_going=false): bazel query fails outright (non-zero, non-partial
+    // exit code) and bazel-diff surfaces the error instead of writing a truncated hash set.
+    val defaultOutput = File(outputDir, "hashes_default.json")
+    val defaultExit =
+        cli.execute(
+            "generate-hashes",
+            "-w",
+            workspace.absolutePath,
+            "-b",
+            "bazel",
+            defaultOutput.absolutePath)
+    assertThat(defaultExit).isEqualTo(1)
+
+    // Opt-in --keep_going: generate-hashes SUCCEEDS despite the unresolvable repo, because
+    // bazel query returns exit code 3 (partial results) which bazel-diff allows. The healthy
+    // //good target is hashed, but //bad has been silently dropped -- this is the
+    // incorrect/non-deterministic hash set that motivated flipping the default.
+    val keepGoingOutput = File(outputDir, "hashes_keep_going.json")
+    val keepGoingExit =
+        cli.execute(
+            "generate-hashes",
+            "-w",
+            workspace.absolutePath,
+            "-b",
+            "bazel",
+            "--keep_going",
+            keepGoingOutput.absolutePath)
+    assertThat(keepGoingExit).isEqualTo(0)
+
+    val keepGoingHashes = keepGoingOutput.readText()
+    assertThat(keepGoingHashes.contains("//good:good")).isEqualTo(true)
+    assertThat(keepGoingHashes.contains("//bad:")).isEqualTo(false)
+  }
+
+  @Test
+  fun testUndeclaredWorkspaceReadIsNotImpacted_reproducerForIssue401() {
+    // Reproducer for https://github.com/Tinder/bazel-diff/issues/401
+    //
+    // Feature request: "always-affected" hashing for targets that perform undeclared
+    // workspace reads (non-hermetic targets). bazel-diff derives a target's hash purely
+    // from its DECLARED graph -- srcs, deps, and attributes. A target that reads files it
+    // does not declare (e.g. a `buildifier_test` that scans every `.bzl` in the repo
+    // without listing them in `srcs`) therefore gets a STABLE hash even when one of those
+    // undeclared files changes, so `get-impacted-targets` skips it -- even though the test
+    // would fail if actually run.
+    //
+    // The `always_affected_external` workspace has two genrules:
+    //   //:scanner  -- tagged `external`, its action reads `scanned_data.txt` but does NOT
+    //                  declare it as a src (the undeclared / non-hermetic read).
+    //   //:hermetic -- a normal target that declares `declared_src.txt` as a src.
+    //
+    // Between the two checkouts we edit BOTH files. The hermetic target is correctly
+    // reported as impacted; the `external`-tagged scanner is NOT -- pinning the current
+    // behaviour that motivates the feature request. If an `--alwaysAffectedTags`
+    // (or similar) feature lands, the scanner should start appearing in the impacted set
+    // and this assertion will flag that the behaviour changed.
+    val workspaceA = copyTestWorkspace("always_affected_external")
+    val workspaceB = copyTestWorkspace("always_affected_external")
+
+    // Change the UNDECLARED read consumed by //:scanner and the DECLARED src of //:hermetic.
+    File(workspaceB, "scanned_data.txt").writeText("v2\n")
+    File(workspaceB, "declared_src.txt").writeText("goodbye\n")
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+
+    // The hermetic target declared its changed source, so it is correctly impacted.
+    assertThat(impacted.contains("//:hermetic")).isEqualTo(true)
+
+    // The `external`-tagged scanner read a file it never declared. Its hash is unchanged,
+    // so bazel-diff does NOT report it -- this is exactly the gap #401 asks to close.
+    assertThat(impacted.contains("//:scanner")).isEqualTo(false)
   }
 
   /**
@@ -2538,6 +2741,18 @@ class E2ETest {
               it
             }
         .isEqualTo(true)
+  }
+
+  /**
+   * Reads a `generate-hashes` output file into a flat `target -> hash` map, tolerating both the
+   * bzlmod "new format" (`{"hashes": {...}, "metadata": {...}}`) and the legacy flat format
+   * (`{target: hash}`) emitted for non-bzlmod workspaces.
+   */
+  @Suppress("UNCHECKED_CAST")
+  private fun readTargetHashes(file: File): Map<String, Any> {
+    val root: Map<String, Any> =
+        Gson().fromJson(file.readText(), object : TypeToken<Map<String, Any>>() {}.type)
+    return (root["hashes"] as? Map<String, Any>) ?: root
   }
 
   private fun copyTestWorkspace(path: String): File {

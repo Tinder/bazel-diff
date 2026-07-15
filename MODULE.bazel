@@ -1,6 +1,6 @@
 module(
     name = "bazel-diff",
-    version = "29.0.0",
+    version = "34.0.0",
     compatibility_level = 0,
 )
 
@@ -51,9 +51,6 @@ maven.install(
     artifacts = [
         "com.google.code.gson:gson:2.9.0@jar",
         "com.google.guava:guava:31.1-jre",
-        # JGit powers the `serve` command's in-process git engine. Pinned to the 5.13.x line, the
-        # last release series that still targets Java 8 (matching bazel-diff's documented minimum).
-        "org.eclipse.jgit:org.eclipse.jgit:5.13.3.202401111512-r",
         "com.willowtreeapps.assertk:assertk-jvm:0.25",
         "info.picocli:picocli:4.6.3@jar",
         "io.insert-koin:koin-core-jvm:3.1.6",

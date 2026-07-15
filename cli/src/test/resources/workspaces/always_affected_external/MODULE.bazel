@@ -1,0 +1,4 @@
+module(
+    name = "always_affected_external",
+    version = "0.0.0",
+)

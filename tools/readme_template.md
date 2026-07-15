@@ -149,21 +149,105 @@ curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
 }
 ```
 
+* `POST /impacted_targets` — the same query as a JSON body, which additionally accepts a
+  `modifiedFilepaths` list to speed up cold hashing on large repositories. Body fields: `from` and
+  `to` (required), `targetType` (optional array), and `modifiedFilepaths` (optional array of
+  workspace-relative paths that changed between the two revisions, e.g. from
+  `git diff --name-only <from> <to>`). When `modifiedFilepaths` is present the server reads and
+  hashes the *content* of only those files on **both** revisions and treats every other source file
+  as unchanged, turning an O(all source files) content read into O(changed files) — the same
+  optimization as `generate-hashes --modified-filepaths`. The list must be a **superset** of what
+  actually changed: a truly-changed file left off it is content-skipped on both sides and its
+  impacted targets are missed (hence experimental). Omit it (or send `[]`) for the full-content hash,
+  identical to the GET form. `POST /impacted_targets_with_distances` accepts the same body.
+
+```bash
+curl -X POST http://localhost:8080/impacted_targets \
+  -H 'Content-Type: application/json' \
+  -d '{"from":"main","to":"my-feature-branch","modifiedFilepaths":["foo/BUILD.bazel","foo/bar.py"]}'
+```
+
+* `GET /impacted_targets_with_distances?from=<rev>&to=<rev>` — like `/impacted_targets`, but each
+  impacted target is annotated with its build-graph distance metrics: `targetDistance` (the number of
+  dependency hops to the nearest directly-changed target) and `packageDistance` (how many of those
+  hops cross a package boundary). Directly-changed targets sit at distance `0`. Requires the server
+  to have been started with `--trackDeps` (see below); otherwise this endpoint returns `400`. The
+  same optional `targetType` filter applies.
+
+```bash
+curl 'http://localhost:8080/impacted_targets_with_distances?from=main&to=my-feature-branch'
+```
+
+```json
+{
+  "from": "9a1c0e2…",
+  "to": "3f7b8d4…",
+  "impactedTargets": [
+    {"label": "//foo:bar", "targetDistance": 0, "packageDistance": 0},
+    {"label": "//foo:baz", "targetDistance": 1, "packageDistance": 1}
+  ]
+}
+```
+
+* `GET /metrics` — returns a JSON snapshot of the instance so callers and monitoring can see its
+  identity, liveness, and cache size usage without scraping logs. Unlike the query endpoints it is
+  never gated on readiness, so it still responds on an un-ready or lame-ducked instance (the `ready`
+  field reports the current state). The `cache` size fields are populated for the local-disk backend
+  and are `null` for a backend whose size is not cheaply knowable in-process.
+
+```bash
+curl 'http://localhost:8080/metrics'
+```
+
+```json
+{
+  "version": "31.4.0",
+  "uptimeSeconds": 3600,
+  "ready": true,
+  "gitEngine": "subprocess",
+  "trackDeps": false,
+  "cache": {"directory": "/var/cache/bazel-diff", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB"},
+  "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
+}
+```
+
 Notes and current limitations:
+
+* Distance metrics (`/impacted_targets_with_distances`) require the dependency-edge graph, which is
+  only tracked when the server is started with `--trackDeps`. Tracking deps grows each cached hash
+  entry, so it is opt-in. The flag is folded into the cache key, so enabling or disabling it never
+  reuses a previously cached entry of the other kind. This mirrors the `generate-hashes --depEdgesFile`
+  / `get-impacted-targets --depEdgesFile` flow used by the CLI.
 
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
   so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.
-* Git operations run in-process via JGit by default (no `git` binary required). Pass
-  `--gitEngine=subprocess` to shell out to the `git` binary at `--gitPath` instead -- useful for
-  workspaces that depend on checkout filters or hooks that JGit does not run. Note that JGit only
-  moves the git plumbing in-process; the working tree is still materialized on disk for `bazel query`.
-* Hashes are cached on local disk via `--cacheDir` and survive restarts. The cache layer is
-  pluggable behind a byte-oriented interface so a remote backend (e.g. S3) can be added without
-  touching callers.
+* Git operations (fetch and checkout) shell out to the `git` binary at `--gitPath` (default `git`
+  on the `PATH`), so a `git` binary must be available on the host. The working tree is checked out
+  on disk for `bazel query` to read. Because native git performs every fetch, all clone shapes are
+  supported -- including shallow (`--depth`) and partial (`--filter=blob:none`) clones, whose thin
+  packs are delta-compressed against objects the clone does not have.
+* Hashes are cached on local disk via `--cacheDir` and survive restarts. Left unbounded the cache
+  grows by one entry per distinct commit SHA queried, so a long-running server can bound it with any
+  combination of `--cacheMaxAge` (expire entries not read or written within a window, e.g. `7d`),
+  `--cacheMaxEntries`, and `--cacheMaxSize` (e.g. `10GB`, `500MB`, or a bare byte count). A background
+  sweeper enforces the limits once at startup and then every `--cachePruneInterval` (default `1h`),
+  evicting least-recently-used entries first — a cache hit refreshes an entry's recency, so revisions
+  under active query are not expired out from under live traffic. With no `--cacheMax*` flag set the
+  cache is never pruned (the previous behavior). The cache layer is pluggable behind a byte-oriented
+  interface so a remote backend (e.g. S3) can be added without touching callers; such a backend
+  manages its own retention (e.g. a bucket lifecycle policy), and the in-process `--cacheMax*` flags
+  do not apply to it.
 * Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
   `generate-hashes`, and are folded into the cache key so a server started with different flags never
   serves another configuration's cached hashes.
+* `modifiedFilepaths` (POST only) is scoped per request, not a server flag. A scoped hash of a
+  revision is only comparable to another revision hashed with the *same* set, so cached scoped
+  entries are keyed by `<sha>.<fingerprint>.<digest-of-the-set>` — never mixed with, or served in
+  place of, the full-content `<sha>.<fingerprint>` entry. The trade-off: on the scoped path the
+  shared-base full-hash cache is not reused (each distinct changed-set re-hashes the base), but each
+  such hash is cheaper because it skips reading unchanged files. The extra entries are bounded by the
+  same LRU `--cacheMax*` pruning as everything else.
 * Containerization, multi-instance deployment manifests, and remote cache backends are not yet
   included.
 

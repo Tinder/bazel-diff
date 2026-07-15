@@ -2,6 +2,8 @@ package com.bazel_diff.cli
 
 import assertk.assertThat
 import assertk.assertions.contains
+import assertk.assertions.isEmpty
+import assertk.assertions.isEqualTo
 import assertk.assertions.isFalse
 import assertk.assertions.isTrue
 import org.junit.Assert.assertThrows
@@ -38,5 +40,28 @@ class BazelDiffTest {
     val diff = BazelDiff()
     diff.debug = true
     assertThat(diff.isVerbose()).isTrue()
+  }
+
+  // --alwaysAffectedTags (issue #401) parses into a comma-separated Set on generate-hashes.
+  @Test
+  fun generateHashesParsesAlwaysAffectedTags() {
+    val parseResult =
+        CommandLine(BazelDiff())
+            .parseArgs(
+                "generate-hashes",
+                "-w",
+                "/tmp/ws",
+                "--alwaysAffectedTags=external,no-cache",
+                "/tmp/out.json")
+    val command = parseResult.subcommand().commandSpec().userObject() as GenerateHashesCommand
+    assertThat(command.alwaysAffectedTags).isEqualTo(setOf("external", "no-cache"))
+  }
+
+  @Test
+  fun generateHashesAlwaysAffectedTagsDefaultsToEmpty() {
+    val parseResult =
+        CommandLine(BazelDiff()).parseArgs("generate-hashes", "-w", "/tmp/ws", "/tmp/out.json")
+    val command = parseResult.subcommand().commandSpec().userObject() as GenerateHashesCommand
+    assertThat(command.alwaysAffectedTags).isEmpty()
   }
 }

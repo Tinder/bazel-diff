@@ -17,6 +17,13 @@ import org.koin.core.component.inject
 
 data class TargetDistanceMetrics(val targetDistance: Int, val packageDistance: Int) {}
 
+/** An impacted target paired with its build-graph distance metrics. */
+data class ImpactedTargetWithDistance(
+    val label: String,
+    val targetDistance: Int,
+    val packageDistance: Int
+)
+
 class CalculateImpactedTargetsInteractor : KoinComponent {
   private val gson: Gson by inject()
   private val logger: Logger by inject()
@@ -73,7 +80,7 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       from: Map<String, TargetHash>,
       to: Map<String, TargetHash>
   ): Set<String> {
-    val difference = Maps.difference(to, from)
+    val difference = Maps.difference(hashIdentities(to), hashIdentities(from))
     val onlyInEnd: Set<String> = difference.entriesOnlyOnLeft().keys
     val changed: Set<String> = difference.entriesDiffering().keys
     val impactedTargets =
@@ -83,6 +90,21 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
         }
     return impactedTargets
   }
+
+  /**
+   * Projects each target to its hash identity (`type#hash~directHash`) for impactedness comparison.
+   *
+   * Impactedness is defined purely by a target's hash, so the comparison must not include
+   * [TargetHash.deps]: that field is auxiliary data used only to derive distance metrics. It is
+   * populated on freshly generated hashes (under `--trackDeps`) but is always null on hashes
+   * deserialised from cache/JSON ([TargetHash.fromJson] does not restore it). Diffing the full
+   * [TargetHash] data class -- whose generated `equals` includes `deps` -- would therefore report
+   * every dep-carrying target as changed whenever one side was generated and the other read from
+   * cache. That is precisely a query-service cache hit under `--trackDeps`, which spuriously
+   * inflated the impacted set for the cached `from` revision.
+   */
+  private fun hashIdentities(hashes: Map<String, TargetHash>): Map<String, String> =
+      hashes.mapValues { it.value.hashWithType }
 
   fun executeWithDistances(
       from: Map<String, TargetHash>,
@@ -94,6 +116,33 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       toModuleGraphJson: String? = null,
       excludeExternalTargets: Boolean = false,
   ) {
+    val impactedTargets =
+        computeImpactedTargetsWithDistances(
+            from,
+            to,
+            depEdges,
+            targetTypes,
+            fromModuleGraphJson,
+            toModuleGraphJson,
+            excludeExternalTargets)
+    outputWriter.use { writer -> writer.write(gson.toJson(impactedTargets)) }
+  }
+
+  /**
+   * Computes the impacted targets between [from] and [to] together with their build-graph distance
+   * metrics, filtered by [targetTypes]/[excludeExternalTargets] and ordered the same way the
+   * non-distance path orders its output. Returned in-memory so both the CLI writer path
+   * ([executeWithDistances]) and the query service consume identical data without reparsing JSON.
+   */
+  fun computeImpactedTargetsWithDistances(
+      from: Map<String, TargetHash>,
+      to: Map<String, TargetHash>,
+      depEdges: Map<String, List<String>>,
+      targetTypes: Set<String>?,
+      fromModuleGraphJson: String? = null,
+      toModuleGraphJson: String? = null,
+      excludeExternalTargets: Boolean = false,
+  ): List<ImpactedTargetWithDistance> {
     val typeFilter = TargetTypeFilter(targetTypes, to)
 
     // Quick check: if module graph JSON is identical, skip module change detection entirely
@@ -121,21 +170,12 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
         }
 
     val ordering = impactedTargetOrdering(to, from)
-    impactedTargets
+    return impactedTargets
         .filterKeys { typeFilter.accepts(it) }
         .filterKeys { !excludeExternalTargets || !it.startsWith("//external:") }
         .toSortedMap(ordering)
-        .let { filtered ->
-          outputWriter.use { writer ->
-            writer.write(
-                gson.toJson(
-                    filtered.map {
-                      mapOf(
-                          "label" to it.key,
-                          "targetDistance" to it.value.targetDistance,
-                          "packageDistance" to it.value.packageDistance)
-                    }))
-          }
+        .map {
+          ImpactedTargetWithDistance(it.key, it.value.targetDistance, it.value.packageDistance)
         }
   }
 
@@ -163,7 +203,9 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       to: Map<String, TargetHash>,
       depEdges: Map<String, List<String>>
   ): Map<String, TargetDistanceMetrics> {
-    val difference = Maps.difference(to, from)
+    // Diff by hash identity, not the full TargetHash -- see [hashIdentities]. The keys still index
+    // the original `from`/`to` maps below for the directHash (DIRECT vs INDIRECT) check.
+    val difference = Maps.difference(hashIdentities(to), hashIdentities(from))
 
     val newLabels = difference.entriesOnlyOnLeft().keys
     val existingImpactedLabels = difference.entriesDiffering().keys

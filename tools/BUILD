@@ -54,3 +54,30 @@ py_test(
     python_version = "PY3",
     deps = [":coverage_check_lib"],
 )
+
+# Note: the serve integration harnesses (serve_harness.py, serve_stress.py) are intentionally NOT
+# wrapped in py_binary targets. They shell out to `bazel build //cli:bazel-diff`, which would
+# deadlock on the output-base lock if they were themselves launched via `bazel run` (nested bazel,
+# same output base). Run them directly: `python3 tools/serve_harness.py` /
+# `python3 tools/serve_stress.py` (see their module docstrings). They use only the Python stdlib.
+#
+# A py_test over their *pure* helpers is fine, though -- it imports the module and calls functions
+# that never shell out, so no nested bazel and no deadlock. serve_stress_test.py covers the CLI
+# parsing that the serve-stress-real cron depends on (a flag-shaped --real-clone-args value, which
+# argparse rejects unless folded into the `=` spelling; that broke the cron's first two runs).
+py_library(
+    name = "serve_stress_lib",
+    srcs = [
+        "serve_harness.py",  # imported by serve_stress as `base`
+        "serve_stress.py",
+    ],
+    imports = ["."],
+    visibility = ["//visibility:private"],
+)
+
+py_test(
+    name = "serve_stress_test",
+    srcs = ["serve_stress_test.py"],
+    python_version = "PY3",
+    deps = [":serve_stress_lib"],
+)

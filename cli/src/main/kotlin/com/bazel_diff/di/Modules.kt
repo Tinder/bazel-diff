@@ -35,6 +35,8 @@ fun hasherModule(
     fineGrainedHashExternalRepos: Set<String>,
     fineGrainedHashExternalReposFile: File?,
     excludeExternalTargets: Boolean,
+    excludeTargetsQuery: String? = null,
+    alwaysAffectedTags: Set<String> = emptySet(),
 ): Module = module {
   if (fineGrainedHashExternalReposFile != null && fineGrainedHashExternalRepos.isNotEmpty()) {
     System.err.println(
@@ -79,6 +81,14 @@ fun hasherModule(
   }
   val outputPath = Paths.get(result.output.single())
   val debug = System.getProperty("DEBUG", "false").equals("true")
+
+  // issue #401: when the user opts targets in via --alwaysAffectedTags, mint one per-invocation
+  // random sentinel and hand it to RuleHasher, which mixes it into those targets' hashes so a
+  // base/head diff always marks them impacted. Left empty (and never mixed) when the feature is
+  // unused, so every hash stays byte-for-byte identical to a run without the flag.
+  val alwaysAffectedSeed =
+      if (alwaysAffectedTags.isEmpty()) ByteArray(0)
+      else java.util.UUID.randomUUID().toString().toByteArray()
   single {
     BazelQueryService(
         workingDirectory,
@@ -92,11 +102,22 @@ fun hasherModule(
   single { BazelModService(workingDirectory, bazelPath, startupOptions, debug) }
   single {
     BazelClient(
-        useCquery, cqueryExpression, updatedFineGrainedHashExternalRepos, excludeExternalTargets)
+        useCquery,
+        cqueryExpression,
+        updatedFineGrainedHashExternalRepos,
+        excludeExternalTargets,
+        excludeTargetsQuery)
   }
   single { BuildGraphHasher(get()) }
   single { TargetHasher() }
-  single { RuleHasher(useCquery, trackDeps, updatedFineGrainedHashExternalRepos) }
+  single {
+    RuleHasher(
+        useCquery,
+        trackDeps,
+        updatedFineGrainedHashExternalRepos,
+        alwaysAffectedTags,
+        alwaysAffectedSeed)
+  }
   single<SourceFileHasher> { SourceFileHasherImpl(updatedFineGrainedHashExternalRepos) }
   single { ExternalRepoResolver(workingDirectory, bazelPath, outputPath) }
   single(named("working-directory")) { workingDirectory }

@@ -42,6 +42,50 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
   }
 
   @Test
+  fun computeSimpleImpactedTargetsIgnoresDepsAsymmetry() {
+    // Impactedness is defined by a target's hash, not its `deps` metadata. A query-service cache
+    // hit deserialises the `from` hashes (TargetHash.deps == null, fromJson never restores it),
+    // while a freshly generated `to` under --trackDeps has deps populated. A target whose hash is
+    // unchanged must therefore NOT be reported impacted just because its deps field differs
+    // (null vs a list). Regression test for the --trackDeps query-service over-reporting bug.
+    val from =
+        mapOf(
+            "//:unchanged" to TargetHash("Rule", "h", "h", deps = null),
+            "//:changed" to TargetHash("Rule", "old", "old", deps = null),
+        )
+    val to =
+        mapOf(
+            "//:unchanged" to TargetHash("Rule", "h", "h", deps = listOf("//:dep")),
+            "//:changed" to TargetHash("Rule", "new", "new", deps = listOf("//:dep")),
+        )
+
+    val impacted = CalculateImpactedTargetsInteractor().computeSimpleImpactedTargets(from, to)
+
+    assertThat(impacted).containsExactlyInAnyOrder("//:changed")
+  }
+
+  @Test
+  fun computeAllDistancesIgnoresDepsAsymmetry() {
+    // Same deps-asymmetry guard on the distance path (/impacted_targets_with_distances): an
+    // unchanged target must not surface merely because its deps field differs between a
+    // deserialised `from` and a freshly generated `to`.
+    val from =
+        mapOf(
+            "//:unchanged" to TargetHash("Rule", "h", "h", deps = null),
+            "//:changed" to TargetHash("Rule", "old", "old", deps = null),
+        )
+    val to =
+        mapOf(
+            "//:unchanged" to TargetHash("Rule", "h", "h", deps = listOf("//:changed")),
+            "//:changed" to TargetHash("Rule", "new", "new", deps = emptyList()),
+        )
+
+    val distances = CalculateImpactedTargetsInteractor().computeAllDistances(from, to, emptyMap())
+
+    assertThat(distances.keys).containsExactlyInAnyOrder("//:changed")
+  }
+
+  @Test
   fun testExecuteSortsByKindThenLabel() {
     val startHashes =
         mapOf(
@@ -136,6 +180,47 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
             "//:2" to TargetDistanceMetrics(1, 0),
             "//:3" to TargetDistanceMetrics(2, 0),
         )
+  }
+
+  @Test
+  fun testComputeImpactedTargetsWithDistancesReturnsOrderedList() {
+    val (depEdges, startHashes) = createTargetHashes("//:1 <- //:2 <- //:3")
+    val endHashes = startHashes.toMutableMap()
+    makeDirectlyChanged(endHashes, "//:1")
+    makeIndirectlyChanged(endHashes, "//:2", "//:3")
+
+    val interactor = CalculateImpactedTargetsInteractor()
+    val impacted =
+        interactor.computeImpactedTargetsWithDistances(startHashes, endHashes, depEdges, null)
+
+    assertThat(impacted)
+        .containsExactly(
+            ImpactedTargetWithDistance("//:1", 0, 0),
+            ImpactedTargetWithDistance("//:2", 1, 0),
+            ImpactedTargetWithDistance("//:3", 2, 0),
+        )
+  }
+
+  @Test
+  fun testExecuteWithDistancesWritesSameDataAsCompute() {
+    // The writer path must serialize exactly the structured compute result, so the CLI JSON output
+    // is unchanged by the refactor and matches what the query service returns.
+    val (depEdges, startHashes) = createTargetHashes("//A:1 <- //A:2 <- //B:3")
+    val endHashes = startHashes.toMutableMap()
+    makeDirectlyChanged(endHashes, "//A:1")
+    makeIndirectlyChanged(endHashes, "//A:2", "//B:3")
+
+    val interactor = CalculateImpactedTargetsInteractor()
+    val expected =
+        interactor.computeImpactedTargetsWithDistances(startHashes, endHashes, depEdges, null)
+
+    val writer = StringWriter()
+    interactor.executeWithDistances(startHashes, endHashes, depEdges, writer, null)
+
+    val gson = com.google.gson.Gson()
+    val parsed =
+        gson.fromJson(writer.toString(), Array<ImpactedTargetWithDistance>::class.java).toList()
+    assertThat(parsed).isEqualTo(expected)
   }
 
   @Test

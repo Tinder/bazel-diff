@@ -221,7 +221,9 @@ kt_jvm_test(
 
 kt_jvm_test(
     name = "E2ETest",
-    timeout = "long",
+    # "eternal": the suite runs ~1150s on CI's macos-latest x bazel 8.x cell,
+    # right at the "long" ceiling, so slow-runner jitter was timing it out.
+    timeout = "eternal",
     data = [":workspaces"],
     test_class = "com.bazel_diff.e2e.E2ETest",
     runtime_deps = [":cli-test-lib"],

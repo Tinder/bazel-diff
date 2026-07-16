@@ -18,9 +18,25 @@ class QueryProfilerTest {
             heapMax = { 1 },
             gcStats = { GcStats(0, 0) })
 
+    val generation =
+        HashGenerationBreakdown(
+            checkoutMillis = 20,
+            bazelQueryMillis = 150,
+            sourceHashMillis = 30,
+            targetHashMillis = 25,
+            moduleGraphMillis = 15,
+            cacheWriteMillis = 5,
+            targetCount = 1234)
     profiler.recordResolveRevisions(3)
-    profiler.recordHashRetrieval("from-sha", cacheHit = true, durationMillis = 10)
-    profiler.recordHashRetrieval("to-sha", cacheHit = false, durationMillis = 250)
+    profiler.recordHashRetrieval(
+        HashRetrievalProfile("from-sha", cacheHit = true, durationMillis = 10, cacheReadMillis = 9))
+    profiler.recordHashRetrieval(
+        HashRetrievalProfile(
+            "to-sha",
+            cacheHit = false,
+            durationMillis = 250,
+            lockWaitMillis = 2,
+            generation = generation))
     profiler.recordDiff(7)
     nowNanos = 321_000_000 // 321ms since construction
 
@@ -29,11 +45,28 @@ class QueryProfilerTest {
     assertThat(profile.totalDurationMillis).isEqualTo(321)
     assertThat(profile.resolveRevisionsDurationMillis).isEqualTo(3)
     assertThat(profile.diffDurationMillis).isEqualTo(7)
+    assertThat(profile.diffModuleGraphChanged).isEqualTo(false)
     assertThat(profile.hashRetrievals)
         .isEqualTo(
             listOf(
-                HashRetrievalProfile("from-sha", true, 10),
-                HashRetrievalProfile("to-sha", false, 250)))
+                HashRetrievalProfile("from-sha", true, 10, cacheReadMillis = 9),
+                HashRetrievalProfile(
+                    "to-sha", false, 250, lockWaitMillis = 2, generation = generation)))
+  }
+
+  @Test
+  fun diffModuleGraphChangedLatchesAcrossRecordings() {
+    val profiler =
+        QueryProfiler(
+            nanoClock = { 0 }, heapUsed = { 0 }, heapMax = { 1 }, gcStats = { GcStats(0, 0) })
+
+    profiler.recordDiff(5, moduleGraphChanged = true)
+    // A later recording without the flag must not clear it.
+    profiler.recordDiff(2)
+
+    val profile = profiler.queryProfile()
+    assertThat(profile.diffDurationMillis).isEqualTo(7)
+    assertThat(profile.diffModuleGraphChanged).isEqualTo(true)
   }
 
   @Test

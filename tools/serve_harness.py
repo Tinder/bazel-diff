@@ -498,7 +498,7 @@ def _impacted(s: Serve, frm: str, to: str, target_type: str | None = None, timeo
 
 
 def _impacted_post(s: Serve, frm: str, to: str, modified: list[str] | None = None,
-                   target_type: str | None = None, timeout: float = 300.0):
+                   target_type: str | None = None, profile: bool = False, timeout: float = 300.0):
     """POST /impacted_targets with an optional `modifiedFilepaths` scope (the content-hashing
     optimization). `modified` is a list of workspace-relative paths; None omits it (full hash)."""
     payload: dict = {"from": frm, "to": to}
@@ -506,6 +506,8 @@ def _impacted_post(s: Serve, frm: str, to: str, modified: list[str] | None = Non
         payload["modifiedFilepaths"] = modified
     if target_type:
         payload["targetType"] = target_type.split(",")
+    if profile:
+        payload["profile"] = True
     code, body = http(s.port, "/impacted_targets", method="POST", body=json.dumps(payload), timeout=timeout)
     try:
         data = json.loads(body)
@@ -653,6 +655,15 @@ def _full_extras(rep: Report, case: str, s: Serve, remote: Remote, track_deps: b
                         f"hits={[r.get('cacheHit') for r in retrievals]}",
               fail_detail=f"code={code} body={body[:300]}")
 
+    # A cache hit's cost is the cache read + JSON deserialize, so that -- and only that -- phase
+    # rides on each retrieval; the per-phase generation breakdown is a miss-only field.
+    rep.check(case, "hit retrievals carry cacheReadMillis, no generation breakdown",
+              len(retrievals) == 2
+              and all(r.get("cacheReadMillis", -1) >= 0 for r in retrievals)
+              and not any("generation" in r for r in retrievals),
+              ok_detail=f"reads={[r.get('cacheReadMillis') for r in retrievals]}ms",
+              fail_detail=f"retrievals={retrievals}")
+
     # Without the flag the response shape is unchanged (no profile keys leak in).
     code, body, _ = _impacted(s, sh["C1"], sh["C2"])
     rep.check(case, "no profile keys without profile=true",
@@ -764,12 +775,27 @@ def case_scoped(remote: Remote, clone: Path, root: Path, rep: Report) -> None:
         full = _stable(gdata)
 
         # (1) Scope to the actually-changed file -> identical impacted set as the full hash.
-        pc, pbody, pdata = _impacted_post(s, sh["C1"], sh["C2"], modified=["core.txt"])
+        # profile=true rides along: the scoped cache key is fresh, so both sides are cache misses
+        # and must carry the per-phase generation breakdown.
+        pc, pbody, pdata = _impacted_post(s, sh["C1"], sh["C2"], modified=["core.txt"], profile=True)
         rep.check(case, "scope to changed file == full set",
                   pc == 200 and _stable(pdata) == full == core_edit,
                   ok_detail=str(sorted(_stable(pdata))),
                   fail_detail=f"code={pc} scoped={sorted(_stable(pdata))} "
                               f"full={sorted(full)} body={pbody[:160]}")
+
+        sretr = (pdata or {}).get("profile", {}).get("hashRetrievals", [])
+        gens = [r.get("generation") or {} for r in sretr]
+        rep.check(case, "miss retrievals carry per-phase generation breakdown",
+                  len(sretr) == 2
+                  and not any(r.get("cacheHit") for r in sretr)
+                  and all(g.get("bazelQueryMillis", -1) >= 0 for g in gens)
+                  and all(g.get("checkoutMillis", -1) >= 0 for g in gens)
+                  and all(g.get("cacheWriteMillis", -1) >= 0 for g in gens)
+                  and all(g.get("targetCount", 0) > 0 for g in gens),
+                  ok_detail=f"bazelQuery={[g.get('bazelQueryMillis') for g in gens]}ms "
+                            f"targets={[g.get('targetCount') for g in gens]}",
+                  fail_detail=f"retrievals={sretr}")
 
         # (2) Negative control: omit the changed file. It is content-skipped on both revisions, so
         # the change is invisible and its targets are missed -- proving the scope really gates

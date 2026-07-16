@@ -3,6 +3,7 @@ package com.bazel_diff.server
 import com.bazel_diff.bazel.BazelModService
 import com.bazel_diff.extensions.toHexString
 import com.bazel_diff.hash.BuildGraphHasher
+import com.bazel_diff.hash.HasherPhaseTimings
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.hash.sha256
 import com.bazel_diff.interactor.DeserialiseHashesInteractor
@@ -102,15 +103,34 @@ class HashService(
     return "$base.$digest"
   }
 
+  /**
+   * Outcome of one [retrieve]: the data, whether it was a cache hit, and where the time went --
+   * everything [getHashes] needs to assemble a [HashRetrievalProfile] except the total duration.
+   */
+  private data class Retrieval(
+      val data: HashFileData,
+      val cacheHit: Boolean,
+      val lockWaitMillis: Long? = null,
+      val cacheReadMillis: Long? = null,
+      val generation: HashGenerationBreakdown? = null,
+  )
+
   override fun getHashes(
       sha: String,
       modifiedFilepaths: Set<Path>,
       profiler: QueryProfiler?
   ): HashFileData {
     val startNanos = System.nanoTime()
-    val (data, cacheHit) = retrieve(sha, modifiedFilepaths)
-    profiler?.recordHashRetrieval(sha, cacheHit, (System.nanoTime() - startNanos) / 1_000_000)
-    return data
+    val retrieval = retrieve(sha, modifiedFilepaths)
+    profiler?.recordHashRetrieval(
+        HashRetrievalProfile(
+            sha = sha,
+            cacheHit = retrieval.cacheHit,
+            durationMillis = (System.nanoTime() - startNanos) / 1_000_000,
+            lockWaitMillis = retrieval.lockWaitMillis,
+            cacheReadMillis = retrieval.cacheReadMillis,
+            generation = retrieval.generation))
+    return retrieval.data
   }
 
   /**
@@ -118,12 +138,16 @@ class HashService(
    * waited-behind-another-generation case (the after-lock re-check): this request itself ran no
    * checkout/query, though its duration then includes the lock wait.
    */
-  private fun retrieve(sha: String, modifiedFilepaths: Set<Path>): Pair<HashFileData, Boolean> {
+  private fun retrieve(sha: String, modifiedFilepaths: Set<Path>): Retrieval {
     val key = cacheKey(sha, modifiedFilepaths)
+    val readStartNanos = System.nanoTime()
     storage.get(key)?.let { bytes ->
-      logger.i { "Hash cache hit for $sha" }
-      return deserialiser.executeTargetHashWithMetadataFromString(
-          String(bytes, StandardCharsets.UTF_8)) to true
+      val data =
+          deserialiser.executeTargetHashWithMetadataFromString(
+              String(bytes, StandardCharsets.UTF_8))
+      val readMillis = elapsedMillis(readStartNanos)
+      logger.i { "Hash cache hit for $sha (read+deserialize ${readMillis}ms)" }
+      return Retrieval(data, cacheHit = true, cacheReadMillis = readMillis)
     }
     return generate(sha, modifiedFilepaths, key)
   }
@@ -134,29 +158,74 @@ class HashService(
         block()
       }
 
-  private fun generate(
-      sha: String,
-      modifiedFilepaths: Set<Path>,
-      key: String
-  ): Pair<HashFileData, Boolean> =
-      synchronized(generationLock) {
-        // Re-check under the lock: another thread may have generated this revision while we waited.
-        storage.get(key)?.let {
-          logger.i { "Hash cache hit for $sha (after lock)" }
-          return deserialiser.executeTargetHashWithMetadataFromString(
-              String(it, StandardCharsets.UTF_8)) to true
+  private fun generate(sha: String, modifiedFilepaths: Set<Path>, key: String): Retrieval {
+    val lockStartNanos = System.nanoTime()
+    synchronized(generationLock) {
+      val lockWaitMillis = elapsedMillis(lockStartNanos)
+      // Re-check under the lock: another thread may have generated this revision while we waited.
+      val readStartNanos = System.nanoTime()
+      storage.get(key)?.let {
+        val data =
+            deserialiser.executeTargetHashWithMetadataFromString(String(it, StandardCharsets.UTF_8))
+        val readMillis = elapsedMillis(readStartNanos)
+        logger.i {
+          "Hash cache hit for $sha (after ${lockWaitMillis}ms lock wait, " +
+              "read+deserialize ${readMillis}ms)"
         }
-        logger.i { "Hash cache miss for $sha - generating hashes" }
-        gitClient.checkout(sha)
-        val hashes =
-            buildGraphHasher.hashAllBazelTargetsAndSourcefiles(
-                seedFilepaths, ignoredRuleHashingAttributes, modifiedFilepaths)
-        val moduleGraphJson = runBlocking { bazelModService.getModuleGraphJson() }
-        val depEdges = depEdgesOf(hashes)
-        storage.put(
-            key, serialize(hashes, moduleGraphJson, depEdges).toByteArray(StandardCharsets.UTF_8))
-        HashFileData(hashes, moduleGraphJson, depEdges) to false
+        return Retrieval(
+            data, cacheHit = true, lockWaitMillis = lockWaitMillis, cacheReadMillis = readMillis)
       }
+      logger.i { "Hash cache miss for $sha - generating hashes" }
+
+      val checkoutStartNanos = System.nanoTime()
+      gitClient.checkout(sha)
+      val checkoutMillis = elapsedMillis(checkoutStartNanos)
+
+      val hasherTimings = HasherPhaseTimings()
+      val hashes =
+          buildGraphHasher.hashAllBazelTargetsAndSourcefiles(
+              seedFilepaths, ignoredRuleHashingAttributes, modifiedFilepaths, hasherTimings)
+
+      val moduleGraphStartNanos = System.nanoTime()
+      val moduleGraphJson = runBlocking { bazelModService.getModuleGraphJson() }
+      val moduleGraphMillis = elapsedMillis(moduleGraphStartNanos)
+
+      val writeStartNanos = System.nanoTime()
+      val depEdges = depEdgesOf(hashes)
+      storage.put(
+          key, serialize(hashes, moduleGraphJson, depEdges).toByteArray(StandardCharsets.UTF_8))
+      val cacheWriteMillis = elapsedMillis(writeStartNanos)
+
+      val breakdown =
+          HashGenerationBreakdown(
+              checkoutMillis = checkoutMillis,
+              bazelQueryMillis = hasherTimings.bazelQueryMillis,
+              sourceHashMillis = hasherTimings.sourceHashMillis,
+              targetHashMillis = hasherTimings.targetHashMillis,
+              moduleGraphMillis = moduleGraphMillis,
+              cacheWriteMillis = cacheWriteMillis,
+              targetCount = hashes.size,
+          )
+      // Always logged (not just when the request opted into profile=true) so slow generations are
+      // attributable to a phase straight from the server logs.
+      logger.i {
+        "Hash generation for $sha took ${elapsedMillis(lockStartNanos)}ms: " +
+            "lockWait=${lockWaitMillis}ms checkout=${checkoutMillis}ms " +
+            "bazelQuery=${hasherTimings.bazelQueryMillis}ms " +
+            "sourceHash=${hasherTimings.sourceHashMillis}ms " +
+            "targetHash=${hasherTimings.targetHashMillis}ms " +
+            "moduleGraph=${moduleGraphMillis}ms cacheWrite=${cacheWriteMillis}ms " +
+            "targets=${hashes.size}"
+      }
+      return Retrieval(
+          HashFileData(hashes, moduleGraphJson, depEdges),
+          cacheHit = false,
+          lockWaitMillis = lockWaitMillis,
+          generation = breakdown)
+    }
+  }
+
+  private fun elapsedMillis(startNanos: Long): Long = (System.nanoTime() - startNanos) / 1_000_000
 
   /**
    * The dependency-edge adjacency list (label -> direct dep labels) when [trackDeps] is on, else

@@ -43,11 +43,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      STAGE: ${{ runner.temp }}/alpine-stage
       # Pin the image so a new Alpine release (package renames, JDK default changes) can't
       # silently change what the cron measures; bump deliberately.
       ALPINE_IMAGE: alpine:3.22
     steps:
+      # The runner context is not available in job-level env, so the stage dir (the one
+      # directory shared with the container) is exported here instead.
+      - name: Compute stage dir
+        run: echo "STAGE=$RUNNER_TEMP/alpine-stage" >> "$GITHUB_ENV"
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:

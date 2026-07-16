@@ -10,6 +10,7 @@ name: Serve Stress (Alpine 8 GiB)
 # never produce. Alongside the harness's metrics/summary, the run emits a footprint JSON
 # (cgroup memory.peak against the cap + oom/oom_kill counts) as a 90-day artifact so the
 # low-resource numbers can be trended over time and compared against serve-stress.yml's.
+# Real-repo coverage under the same Alpine/8 GiB path lives in serve-stress-alpine-real.yml.
 #
 # Split design (see tools/serve_stress_alpine.sh for the container side): bazel-diff is BUILT
 # on the glibc host -- building it inside Alpine would need the whole Bazel toolchain working
@@ -34,8 +35,9 @@ on:
         type: string
         default: "2"
   schedule:
-    # Daily at 10:30 UTC, offset from serve-stress (30 6), serve-stress-real (30 8), and
-    # serve-harness (0 */12) so the crons never contend for runners.
+    # Daily at 10:30 UTC, offset from serve-stress (30 6), serve-stress-real (30 8),
+    # serve-stress-alpine-real (30 14), and serve-harness (0 */12) so the crons never contend
+    # for runners.
     - cron: "30 10 * * *"
 
 jobs:

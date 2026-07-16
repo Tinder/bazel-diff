@@ -1,0 +1,110 @@
+name: Serve Stress (Alpine 8 GiB)
+
+# Low-resource-node stress + performance profiling for `bazel-diff serve`: the same hermetic
+# harness as serve-stress.yml (tools/serve_stress.py -- concurrent cold/hot load, error mix,
+# index.lock heal/storm, remote outage, lame-duck), but run inside an x86_64 Alpine (musl)
+# container hard-capped at 8 GiB RAM and a small CPU quota. The goal is to see where serve
+# chokes when memory and cores are scarce -- JVM heap pressure (container-aware default heap is
+# ~2 GiB at this cap), `bazel query` server cost, git checkout latency under CPU starvation,
+# and OOM-kill behavior -- signals the 4-core/16 GiB glibc runners of the other stress crons
+# never produce. Alongside the harness's metrics/summary, the run emits a footprint JSON
+# (cgroup memory.peak against the cap + oom/oom_kill counts) as a 90-day artifact so the
+# low-resource numbers can be trended over time and compared against serve-stress.yml's.
+#
+# Split design (see tools/serve_stress_alpine.sh for the container side): bazel-diff is BUILT
+# on the glibc host -- building it inside Alpine would need the whole Bazel toolchain working
+# under musl, the most fragile possible path -- and only RUN in the container, on Alpine's musl
+# OpenJDK. The one glibc-bound runtime piece is the `bazel` binary serve shells out to for
+# `bazel query`; the container script proves a flavor works (official release under gcompat
+# with the server JVM redirected to the musl JDK, falling back to Alpine's packaged bazel)
+# with a real probe query before committing the 30+ minute harness run to it.
+#
+# Scheduled runs use the full profile; on-demand runs from the Actions tab can select the
+# reduced quick profile and a different CPU quota. Note: scheduled runs execute from the
+# default branch, so this must land on master before the cron fires.
+on:
+  workflow_dispatch:
+    inputs:
+      quick:
+        description: "Run the reduced quick profile"
+        type: boolean
+        default: false
+      cpus:
+        description: "Container CPU quota (low-resource profile)"
+        type: string
+        default: "2"
+  schedule:
+    # Daily at 10:30 UTC, offset from serve-stress (30 6), serve-stress-real (30 8), and
+    # serve-harness (0 */12) so the crons never contend for runners.
+    - cron: "30 10 * * *"
+
+jobs:
+  ServeStressAlpine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      STAGE: ${{ runner.temp }}/alpine-stage
+      # Pin the image so a new Alpine release (package renames, JDK default changes) can't
+      # silently change what the cron measures; bump deliberately.
+      ALPINE_IMAGE: alpine:3.22
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+        id: go
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
+      - uses: actions/checkout@v4
+      - name: Build bazel-diff deploy jar (glibc host)
+        run: ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar
+      - name: Stage container inputs
+        # Everything the container needs goes into one mounted directory: the deploy jar, the
+        # harness sources, .bazelversion (the harness copies it into fabricated workspaces),
+        # and the official bazel binary matching .bazelversion -- downloaded here on the host
+        # so the container needs no network beyond apk. bazel-bin is a symlink into the host's
+        # output base, hence the copy rather than mounting the repo.
+        run: |
+          mkdir -p "$STAGE/tools"
+          cp bazel-bin/cli/bazel-diff_deploy.jar "$STAGE/bazel-diff.jar"
+          cp tools/serve_stress.py tools/serve_harness.py tools/serve_stress_alpine.sh "$STAGE/tools/"
+          cp .bazelversion "$STAGE/"
+          BV=$(cat .bazelversion)
+          curl -fsSL -o "$STAGE/bazel-glibc" \
+            "https://github.com/bazelbuild/bazel/releases/download/${BV}/bazel-${BV}-linux-x86_64"
+          chmod +x "$STAGE/bazel-glibc"
+          ls -l "$STAGE"
+      - name: Run serve stress harness (Alpine x86_64, 8 GiB cap)
+        # --memory-swap == --memory disables swap for the container, so hitting the cap means
+        # real OOM pressure (the signal this pipeline exists for), not silent thrashing.
+        # --init reaps the git-daemon/bazel-server orphans the fault phases leave behind.
+        run: >
+          docker run --rm --init --platform linux/amd64
+          --memory 8g --memory-swap 8g
+          --cpus "${{ inputs.cpus || '2' }}"
+          -e QUICK=${{ inputs.quick && '1' || '' }}
+          -v "$STAGE:/stage"
+          "$ALPINE_IMAGE"
+          /bin/sh /stage/tools/serve_stress_alpine.sh
+      - name: Publish step summary
+        if: always()
+        run: |
+          if [ -f "$STAGE/serve-stress-alpine-summary.md" ]; then
+            cat "$STAGE/serve-stress-alpine-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serve-stress-alpine-8gb-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/alpine-stage/serve-stress-alpine-metrics.json
+            ${{ runner.temp }}/alpine-stage/serve-stress-alpine-summary.md
+            ${{ runner.temp }}/alpine-stage/serve-stress-alpine-footprint.json
+          if-no-files-found: warn
+          retention-days: 90

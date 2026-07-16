@@ -163,9 +163,20 @@ for line in (read("memory.events") or "").splitlines():
     key, _, val = line.partition(" ")
     events[key] = int(val)
 
+def cpu_quota():
+    # docker --cpus is a CFS quota, not an affinity mask, so os.cpu_count() still reports the
+    # host's cores; the real limit is cgroup cpu.max ("<quota> <period>", quota "max" = none).
+    raw = read("cpu.max") or ""
+    quota, _, period = raw.partition(" ")
+    try:
+        return round(int(quota) / int(period), 2)
+    except ValueError:
+        return None
+
 footprint = {
     "bazel_flavor": flavor,
     "harness_exit_code": rc,
+    "cpu_quota": cpu_quota(),
     "cpus_visible": os.cpu_count(),
     "memory_max_bytes": read("memory.max"),
     "memory_peak_bytes": read("memory.peak"),
@@ -185,9 +196,10 @@ section = [
     "",
     "## Container footprint (Alpine x86_64, 8 GiB cap)",
     "",
-    "| bazel flavor | cpus | memory.max | memory.peak | oom | oom_kill |",
+    "| bazel flavor | cpu quota | memory.max | memory.peak | oom | oom_kill |",
     "|---|---|---|---|---|---|",
-    f"| {flavor} | {os.cpu_count()} | {gib(read('memory.max'))} | {gib(read('memory.peak'))}"
+    f"| {flavor} | {cpu_quota() or 'none'} (of {os.cpu_count()})"
+    f" | {gib(read('memory.max'))} | {gib(read('memory.peak'))}"
     f" | {events.get('oom', 0)} | {events.get('oom_kill', 0)} |",
     "",
 ]

@@ -4,6 +4,9 @@ import assertk.assertThat
 import assertk.assertions.containsExactly
 import assertk.assertions.containsExactlyInAnyOrder
 import assertk.assertions.isEqualTo
+import assertk.assertions.isGreaterThan
+import assertk.assertions.isGreaterThanOrEqualTo
+import assertk.assertions.isNull
 import com.bazel_diff.SilentLogger
 import com.bazel_diff.bazel.BazelModService
 import com.bazel_diff.hash.TargetHash
@@ -149,8 +152,15 @@ class ImpactedTargetsServiceTest : KoinTest {
     val workspaceAtCalls = mutableListOf<String>()
     val modifiedFilepathsByRev = mutableMapOf<String, Set<Path>>()
 
-    override fun getHashes(sha: String, modifiedFilepaths: Set<Path>): HashFileData {
+    override fun getHashes(
+        sha: String,
+        modifiedFilepaths: Set<Path>,
+        profiler: QueryProfiler?
+    ): HashFileData {
       modifiedFilepathsByRev[sha] = modifiedFilepaths
+      // Mirror HashService: each retrieval reports itself to the profiler (canned data = a "hit").
+      profiler?.recordHashRetrieval(
+          HashRetrievalProfile(sha, cacheHit = true, durationMillis = 1, cacheReadMillis = 1))
       return byRev[sha] ?: error("no canned hashes for $sha")
     }
 
@@ -321,10 +331,76 @@ class ImpactedTargetsServiceTest : KoinTest {
         FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to), allowWorkspaceAt = true)
     val service = ImpactedTargetsService(IdentityGitClient(), provider, depsTracked = true)
 
-    val result = service.getImpactedTargetsWithDistances("from-sha", "to-sha", null)
+    val result =
+        service.getImpactedTargetsWithDistances(
+            "from-sha", "to-sha", null, profiler = QueryProfiler())
 
     assertThat(result.impactedTargets).containsExactly(ImpactedTargetWithDistance("//:a", 0, 0))
     assertThat(provider.workspaceAtCalls).isEqualTo(listOf("to-sha"))
+    // The live-rdeps diff path is called out in the profile so a slow diff is attributable to it.
+    assertThat(result.profile!!.diffModuleGraphChanged).isEqualTo(true)
+  }
+
+  @Test
+  fun profilerAttachesQueryAndMemoryProfiles() {
+    val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), null)
+    val to = HashFileData(mapOf("//:a" to TargetHash("Rule", "h2", "d2")), null)
+    val service =
+        ImpactedTargetsService(
+            IdentityGitClient(), FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to)))
+
+    val result = service.getImpactedTargets("from-sha", "to-sha", null, profiler = QueryProfiler())
+
+    val profile = result.profile!!
+    // Both sides' hash retrievals were recorded, in order, with their cache-hit flags.
+    assertThat(profile.hashRetrievals.map { it.sha }).isEqualTo(listOf("from-sha", "to-sha"))
+    assertThat(profile.hashRetrievals.map { it.cacheHit }).isEqualTo(listOf(true, true))
+    assertThat(profile.totalDurationMillis).isGreaterThanOrEqualTo(0)
+    assertThat(profile.resolveRevisionsDurationMillis).isGreaterThanOrEqualTo(0)
+    assertThat(profile.diffDurationMillis).isGreaterThanOrEqualTo(0)
+    // Identical (null) module graphs on both sides: the pure hash-diff path ran.
+    assertThat(profile.diffModuleGraphChanged).isEqualTo(false)
+    val memory = result.memoryProfile!!
+    assertThat(memory.heapMaxBytes).isGreaterThan(0)
+    assertThat(memory.heapUsedAfterBytes - memory.heapUsedBeforeBytes)
+        .isEqualTo(memory.heapUsedDeltaBytes)
+  }
+
+  @Test
+  fun noProfilerMeansNoProfileOnTheResult() {
+    val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), null)
+    val to = HashFileData(mapOf("//:a" to TargetHash("Rule", "h2", "d2")), null)
+    val service =
+        ImpactedTargetsService(
+            IdentityGitClient(), FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to)))
+
+    val result = service.getImpactedTargets("from-sha", "to-sha", null)
+
+    assertThat(result.profile).isNull()
+    assertThat(result.memoryProfile).isNull()
+  }
+
+  @Test
+  fun distancesResultCarriesProfilesToo() {
+    val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), null)
+    val to =
+        HashFileData(
+            mapOf("//:a" to TargetHash("Rule", "h2", "d2")),
+            null,
+            depEdges = mapOf("//:a" to emptyList()))
+    val service =
+        ImpactedTargetsService(
+            IdentityGitClient(),
+            FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to)),
+            depsTracked = true)
+
+    val result =
+        service.getImpactedTargetsWithDistances(
+            "from-sha", "to-sha", null, profiler = QueryProfiler())
+
+    assertThat(result.profile!!.hashRetrievals.map { it.sha })
+        .isEqualTo(listOf("from-sha", "to-sha"))
+    assertThat(result.memoryProfile!!.heapMaxBytes).isGreaterThan(0)
   }
 
   @Test

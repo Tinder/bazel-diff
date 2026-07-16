@@ -49,7 +49,8 @@ class BazelClientTest : KoinTest {
 
       whenever(modService.isBzlmodEnabled).thenReturn(true)
       whenever(queryService.canUseBzlmodShowRepo).thenReturn(true)
-      whenever(queryService.query("'//...:all-targets'")).thenReturn(listOf(mainTarget))
+      whenever(queryService.query("'//external:all-targets' + '//...:all-targets'"))
+          .thenReturn(listOf(mainTarget))
       whenever(queryService.queryBzlmodRepos()).thenReturn(listOf(bzlmodTarget))
 
       val client =
@@ -68,6 +69,40 @@ class BazelClientTest : KoinTest {
     }
   }
 
+  /**
+   * Enabling Bzlmod does not retire //external: a workspace can run both, and then //external still
+   * carries the repo-generation target -- the only version-bearing hash -- for every WORKSPACE
+   * repo. Skipping it there hashes those repos to nothing, so a WORKSPACE dependency bump reports
+   * no impacted target at all.
+   */
+  @Test
+  fun queryAllTargets_bzlmodEnabled_hybridWorkspace_includesExternalAndBzlmodRepos() {
+    runBlocking {
+      val mainTarget = mockRuleTarget("//src:lib")
+      val workspaceRepoTarget = mockRuleTarget("//external:guava")
+      val bzlmodTarget = mockRuleTarget("//external:rules_java~")
+
+      whenever(modService.isBzlmodEnabled).thenReturn(true)
+      whenever(queryService.canUseBzlmodShowRepo).thenReturn(true)
+      whenever(queryService.query("'//external:all-targets' + '//...:all-targets'"))
+          .thenReturn(listOf(mainTarget, workspaceRepoTarget))
+      whenever(queryService.queryBzlmodRepos()).thenReturn(listOf(bzlmodTarget))
+
+      val client =
+          BazelClient(
+              useCquery = false,
+              cqueryExpression = null,
+              fineGrainedHashExternalRepos = emptySet(),
+              excludeExternalTargets = false,
+              excludeTargetsQuery = null)
+
+      val targets = client.queryAllTargets()
+
+      assertThat(targets.map { it.name })
+          .containsOnly("//src:lib", "//external:guava", "//external:rules_java~")
+    }
+  }
+
   @Test
   fun queryAllTargets_bzlmodEnabled_oldBazel_skipsBzlmodRepos() {
     runBlocking {
@@ -75,7 +110,8 @@ class BazelClientTest : KoinTest {
 
       whenever(modService.isBzlmodEnabled).thenReturn(true)
       whenever(queryService.canUseBzlmodShowRepo).thenReturn(false)
-      whenever(queryService.query("'//...:all-targets'")).thenReturn(listOf(mainTarget))
+      whenever(queryService.query("'//external:all-targets' + '//...:all-targets'"))
+          .thenReturn(listOf(mainTarget))
 
       val client =
           BazelClient(
@@ -127,6 +163,7 @@ class BazelClientTest : KoinTest {
       whenever(queryService.canUseBzlmodShowRepo).thenReturn(true)
       whenever(queryService.query("deps(//...:all-targets)", useCquery = true))
           .thenReturn(listOf(mainTarget))
+      whenever(queryService.query("'//external:all-targets'")).thenReturn(emptyList())
       whenever(queryService.queryBzlmodRepos()).thenReturn(listOf(bzlmodTarget))
 
       val client =
@@ -153,7 +190,8 @@ class BazelClientTest : KoinTest {
 
       whenever(modService.isBzlmodEnabled).thenReturn(true)
       whenever(queryService.canUseBzlmodShowRepo).thenReturn(true)
-      whenever(queryService.query("'//...:all-targets'")).thenReturn(listOf(mainTarget))
+      whenever(queryService.query("'//external:all-targets' + '//...:all-targets'"))
+          .thenReturn(listOf(mainTarget))
       whenever(queryService.queryBzlmodRepos()).thenReturn(listOf(bzlmodTarget))
 
       val client =
@@ -286,6 +324,7 @@ class BazelClientTest : KoinTest {
       whenever(modService.isBzlmodEnabled).thenReturn(true)
       whenever(queryService.canUseBzlmodShowRepo).thenReturn(false)
       whenever(queryService.query(wrapped, useCquery = true)).thenReturn(listOf(mainTarget))
+      whenever(queryService.query("'//external:all-targets'")).thenReturn(emptyList())
 
       val client =
           BazelClient(

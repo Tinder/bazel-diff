@@ -310,6 +310,12 @@ kt_jvm_test(
     runtime_deps = [":cli-test-lib"],
 )
 
+kt_jvm_test(
+    name = "QueryProfilerTest",
+    test_class = "com.bazel_diff.server.QueryProfilerTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
 kt_jvm_library(
     name = "cli-test-lib",
     testonly = True,

@@ -3,7 +3,11 @@ package com.bazel_diff.server
 import assertk.assertThat
 import assertk.assertions.contains
 import assertk.assertions.containsExactly
+import assertk.assertions.doesNotContain
 import assertk.assertions.isEqualTo
+import assertk.assertions.isGreaterThan
+import assertk.assertions.isGreaterThanOrEqualTo
+import assertk.assertions.isNotNull
 import assertk.assertions.isNull
 import com.bazel_diff.SilentLogger
 import com.bazel_diff.interactor.ImpactedTargetWithDistance
@@ -71,16 +75,20 @@ class BazelDiffServerTest : KoinTest {
       var lastTo: String? = null,
       var lastTargetTypes: Set<String>? = null,
       var lastModifiedFilepaths: Set<Path> = emptySet(),
+      var lastProfiler: QueryProfiler? = null,
   ) : ImpactedTargetsProvider {
     override fun getImpactedTargets(
         fromRev: String,
         toRev: String,
         targetTypes: Set<String>?,
         modifiedFilepaths: Set<Path>,
+        profiler: QueryProfiler?,
     ): ImpactedTargetsResult {
-      record(fromRev, toRev, targetTypes, modifiedFilepaths)
+      record(fromRev, toRev, targetTypes, modifiedFilepaths, profiler)
       error?.let { throw it }
-      return result
+      // Mirror the real service: profiles are attached only when a profiler was supplied.
+      return result.copy(
+          profile = profiler?.queryProfile(), memoryProfile = profiler?.memoryProfile())
     }
 
     override fun getImpactedTargetsWithDistances(
@@ -88,22 +96,26 @@ class BazelDiffServerTest : KoinTest {
         toRev: String,
         targetTypes: Set<String>?,
         modifiedFilepaths: Set<Path>,
+        profiler: QueryProfiler?,
     ): ImpactedTargetsWithDistancesResult {
-      record(fromRev, toRev, targetTypes, modifiedFilepaths)
+      record(fromRev, toRev, targetTypes, modifiedFilepaths, profiler)
       distancesError?.let { throw it }
-      return distancesResult
+      return distancesResult.copy(
+          profile = profiler?.queryProfile(), memoryProfile = profiler?.memoryProfile())
     }
 
     private fun record(
         fromRev: String,
         toRev: String,
         targetTypes: Set<String>?,
-        modifiedFilepaths: Set<Path>
+        modifiedFilepaths: Set<Path>,
+        profiler: QueryProfiler?
     ) {
       lastFrom = fromRev
       lastTo = toRev
       lastTargetTypes = targetTypes
       lastModifiedFilepaths = modifiedFilepaths
+      lastProfiler = profiler
     }
   }
 
@@ -126,15 +138,19 @@ class BazelDiffServerTest : KoinTest {
             fromRev: String,
             toRev: String,
             targetTypes: Set<String>?,
-            modifiedFilepaths: Set<Path>
-        ) = provider.getImpactedTargets(fromRev, toRev, targetTypes, modifiedFilepaths)
+            modifiedFilepaths: Set<Path>,
+            profiler: QueryProfiler?
+        ) = provider.getImpactedTargets(fromRev, toRev, targetTypes, modifiedFilepaths, profiler)
 
         override fun getImpactedTargetsWithDistances(
             fromRev: String,
             toRev: String,
             targetTypes: Set<String>?,
-            modifiedFilepaths: Set<Path>
-        ) = provider.getImpactedTargetsWithDistances(fromRev, toRev, targetTypes, modifiedFilepaths)
+            modifiedFilepaths: Set<Path>,
+            profiler: QueryProfiler?
+        ) =
+            provider.getImpactedTargetsWithDistances(
+                fromRev, toRev, targetTypes, modifiedFilepaths, profiler)
       }
 
   private data class Response(val code: Int, val body: String)
@@ -284,6 +300,78 @@ class BazelDiffServerTest : KoinTest {
   }
 
   @Test
+  fun getWithProfileTrueReturnsProfileAndMemoryProfile() {
+    val fixed = FixedProvider()
+    provider = fixed
+    val response = get("/impacted_targets?from=a&to=b&profile=true")
+
+    assertThat(response.code).isEqualTo(200)
+    val parsed = gson.fromJson(response.body, ImpactedTargetsResult::class.java)
+    assertThat(parsed.impactedTargets).containsExactly("//:a", "//:b")
+    // The provider received a live profiler and the profiles rode back on the response.
+    assertThat(fixed.lastProfiler).isNotNull()
+    assertThat(parsed.profile).isNotNull()
+    assertThat(parsed.memoryProfile).isNotNull()
+    assertThat(parsed.profile!!.totalDurationMillis).isGreaterThanOrEqualTo(0)
+    assertThat(parsed.memoryProfile!!.heapMaxBytes).isGreaterThan(0)
+  }
+
+  @Test
+  fun responseOmitsProfileFieldsWhenNotRequested() {
+    provider = FixedProvider()
+    val response = get("/impacted_targets?from=a&to=b")
+
+    assertThat(response.code).isEqualTo(200)
+    // Gson drops null fields, so the default response shape is unchanged for existing clients.
+    assertThat(response.body).doesNotContain("\"profile\"")
+    assertThat(response.body).doesNotContain("\"memoryProfile\"")
+  }
+
+  @Test
+  fun getWithProfileFalseOmitsProfile() {
+    val fixed = FixedProvider()
+    provider = fixed
+    val response = get("/impacted_targets?from=a&to=b&profile=false")
+
+    assertThat(response.code).isEqualTo(200)
+    assertThat(fixed.lastProfiler).isNull()
+    assertThat(response.body).doesNotContain("\"memoryProfile\"")
+  }
+
+  @Test
+  fun postWithProfileTrueReturnsProfileAndMemoryProfile() {
+    provider = FixedProvider()
+    val response = post("/impacted_targets", """{"from":"a","to":"b","profile":true}""")
+
+    assertThat(response.code).isEqualTo(200)
+    val parsed = gson.fromJson(response.body, ImpactedTargetsResult::class.java)
+    assertThat(parsed.profile).isNotNull()
+    assertThat(parsed.memoryProfile).isNotNull()
+  }
+
+  @Test
+  fun postWithoutProfileFieldOmitsProfile() {
+    val fixed = FixedProvider()
+    provider = fixed
+    val response = post("/impacted_targets", """{"from":"a","to":"b"}""")
+
+    assertThat(response.code).isEqualTo(200)
+    assertThat(fixed.lastProfiler).isNull()
+    assertThat(response.body).doesNotContain("\"memoryProfile\"")
+  }
+
+  @Test
+  fun distancesEndpointSupportsProfileToo() {
+    provider = FixedProvider()
+    val response = get("/impacted_targets_with_distances?from=a&to=b&profile=true")
+
+    assertThat(response.code).isEqualTo(200)
+    val parsed = gson.fromJson(response.body, ImpactedTargetsWithDistancesResult::class.java)
+    assertThat(parsed.profile).isNotNull()
+    assertThat(parsed.memoryProfile).isNotNull()
+  }
+
+  @Test
   fun postReturns503WhenNotReady() {
     ready.set(false)
     assertThat(post("/impacted_targets", """{"from":"a","to":"b"}""").code).isEqualTo(503)
@@ -345,7 +433,8 @@ class BazelDiffServerTest : KoinTest {
               fromRev: String,
               toRev: String,
               targetTypes: Set<String>?,
-              modifiedFilepaths: Set<Path>
+              modifiedFilepaths: Set<Path>,
+              profiler: QueryProfiler?
           ): ImpactedTargetsResult {
             Thread.sleep(10_000)
             return ImpactedTargetsResult(fromRev, toRev, emptyList())
@@ -355,7 +444,8 @@ class BazelDiffServerTest : KoinTest {
               fromRev: String,
               toRev: String,
               targetTypes: Set<String>?,
-              modifiedFilepaths: Set<Path>
+              modifiedFilepaths: Set<Path>,
+              profiler: QueryProfiler?
           ) = throw UnsupportedOperationException()
         }
     val slowServer = BazelDiffServer(0, slowProvider, requestTimeoutSeconds = 1) { true }

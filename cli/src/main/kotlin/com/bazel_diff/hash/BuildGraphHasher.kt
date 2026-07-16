@@ -21,6 +21,17 @@ import kotlinx.coroutines.runBlocking
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
+/**
+ * Mutable per-run phase timings, filled in by [BuildGraphHasher.hashAllBazelTargetsAndSourcefiles]
+ * when the caller passes one. The phases run sequentially, in field order; [targetHashMillis] also
+ * covers deriving the seed and per-package `.bzl` seeds that target hashing consumes.
+ */
+class HasherPhaseTimings {
+  var bazelQueryMillis: Long = 0
+  var sourceHashMillis: Long = 0
+  var targetHashMillis: Long = 0
+}
+
 class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
   private val targetHasher: TargetHasher by inject()
   private val sourceFileHasher: SourceFileHasher by inject()
@@ -30,12 +41,15 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
   fun hashAllBazelTargetsAndSourcefiles(
       seedFilepaths: Set<Path> = emptySet(),
       ignoredAttrs: Set<String> = emptySet(),
-      modifiedFilepaths: Set<Path> = emptySet()
+      modifiedFilepaths: Set<Path> = emptySet(),
+      timings: HasherPhaseTimings? = null
   ): Map<String, TargetHash> {
     val (sourceDigests, allTargets) =
         runBlocking {
+          val queryStartNanos = System.nanoTime()
           val targetsTask = async(Dispatchers.IO) { bazelClient.queryAllTargets() }
           val allTargets = targetsTask.await()
+          timings?.bazelQueryMillis = (System.nanoTime() - queryStartNanos) / 1_000_000
           val sourceTargets =
               allTargets
                   .filter { it is BazelTarget.SourceFile }
@@ -47,25 +61,30 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
                 val sourceFileTargets = hashSourcefiles(sourceTargets, modifiedFilepaths)
                 val sourceHashDuration =
                     Calendar.getInstance().getTimeInMillis() - sourceHashDurationEpoch
+                timings?.sourceHashMillis = sourceHashDuration
                 logger.i { "Source file hashes calculated in $sourceHashDuration" }
                 sourceFileTargets
               }
 
           Pair(sourceDigestsFuture.await(), allTargets)
         }
+    val targetHashStartNanos = System.nanoTime()
     val seedForFilepaths = runBlocking(Dispatchers.IO) { createSeedForFilepaths(seedFilepaths) }
     // Attribute each BUILD file's loaded `.bzl` digests to the package that loads them, so a
     // `.bzl` edit only re-hashes targets in packages that actually `load()` it -- not every
     // target in the workspace (issue #365). A package that loads no tracked `.bzl` gets nothing
     // mixed in, keeping its targets' hashes byte-for-byte stable.
     val packageBzlSeeds = createPackageBzlSeeds(allTargets, modifiedFilepaths)
-    return hashAllTargets(
-        seedForFilepaths,
-        packageBzlSeeds,
-        sourceDigests,
-        allTargets,
-        ignoredAttrs,
-        modifiedFilepaths)
+    val result =
+        hashAllTargets(
+            seedForFilepaths,
+            packageBzlSeeds,
+            sourceDigests,
+            allTargets,
+            ignoredAttrs,
+            modifiedFilepaths)
+    timings?.targetHashMillis = (System.nanoTime() - targetHashStartNanos) / 1_000_000
+    return result
   }
 
   private fun hashSourcefiles(

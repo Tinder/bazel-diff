@@ -39,13 +39,14 @@ class BazelClient(
   suspend fun queryAllTargets(): List<BazelTarget> {
     val queryEpoch = Calendar.getInstance().getTimeInMillis()
 
-    // Skip //external:all-targets when explicitly excluded, when Bzlmod is enabled (//external not
-    // available), or when an earlier query already proved //external is unavailable here (the
-    // Bzlmod probe false-negatived -- see [externalPackageUnavailable]).
+    // Skip //external:all-targets when explicitly excluded, or when an earlier query already proved
+    // //external is unavailable here (see [externalPackageUnavailable]).
+    //
+    // Bzlmod being enabled does not retire //external: a workspace can run both, and //external
+    // still holds the only version-bearing hash for every WORKSPACE repo. Ask for it and let the
+    // ExternalPackageUnavailableException path below drop it when it really is gone.
     val repoTargetsQuery =
-        if (excludeExternalTargets ||
-            bazelModService.isBzlmodEnabled ||
-            externalPackageUnavailable) {
+        if (excludeExternalTargets || externalPackageUnavailable) {
           emptyList()
         } else {
           listOf("//external:all-targets")

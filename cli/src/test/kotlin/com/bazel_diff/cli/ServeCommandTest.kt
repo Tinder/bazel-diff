@@ -80,7 +80,8 @@ class ServeCommandTest : KoinTest {
 
     override fun getHashes(
         sha: String,
-        modifiedFilepaths: Set<java.nio.file.Path>
+        modifiedFilepaths: Set<java.nio.file.Path>,
+        profiler: com.bazel_diff.server.QueryProfiler?
     ): com.bazel_diff.interactor.HashFileData {
       warmed += sha
       if (sha in failFor) throw RuntimeException("boom for $sha")
@@ -95,14 +96,16 @@ class ServeCommandTest : KoinTest {
         fromRev: String,
         toRev: String,
         targetTypes: Set<String>?,
-        modifiedFilepaths: Set<java.nio.file.Path>
+        modifiedFilepaths: Set<java.nio.file.Path>,
+        profiler: com.bazel_diff.server.QueryProfiler?
     ) = com.bazel_diff.server.ImpactedTargetsResult(fromRev, toRev, emptyList())
 
     override fun getImpactedTargetsWithDistances(
         fromRev: String,
         toRev: String,
         targetTypes: Set<String>?,
-        modifiedFilepaths: Set<java.nio.file.Path>
+        modifiedFilepaths: Set<java.nio.file.Path>,
+        profiler: com.bazel_diff.server.QueryProfiler?
     ) = com.bazel_diff.server.ImpactedTargetsWithDistancesResult(fromRev, toRev, emptyList())
   }
 

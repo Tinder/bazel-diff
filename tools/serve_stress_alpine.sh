@@ -1,10 +1,13 @@
 #!/bin/sh
-# Container entry for the serve-stress-alpine cron (.github/workflows/serve-stress-alpine.yml).
+# Container entry for the serve-stress-alpine crons:
+#   .github/workflows/serve-stress-alpine.yml       (hermetic fabricated workspace)
+#   .github/workflows/serve-stress-alpine-real.yml  (real repos via REAL_* env)
 #
-# Runs the hermetic serve stress harness (tools/serve_stress.py) inside an x86_64 Alpine (musl)
-# container hard-capped at 8 GiB / few vCPUs, to surface performance choke points on a
-# low-resource node: JVM startup + heap pressure for serve, `bazel query` server cost, git
-# checkout latency, and OOM behavior that a 4-core/16 GiB glibc runner never shows.
+# Runs tools/serve_stress.py inside an x86_64 Alpine (musl) container hard-capped at 8 GiB /
+# few vCPUs, to surface performance choke points on a low-resource node: JVM startup + heap
+# pressure for serve, `bazel query` server cost, git checkout latency, and OOM behavior that a
+# 4-core/16 GiB glibc runner never shows. Hermetic and real-repo modes share this entry so the
+# musl / cgroup footprint path is identical; only the harness args differ.
 #
 # The host workflow stages everything this script needs into one directory (mounted here,
 # path-independent -- the script locates it from $0):
@@ -28,22 +31,30 @@
 #   2. a musl-native bazel from the Alpine package repos (version may lag; recorded as the
 #      "flavor" in the footprint JSON so runs remain interpretable).
 #
-# Inputs (env): QUICK -- non-empty runs the reduced --quick profile.
-# Outputs (written to <stage>): serve-stress-alpine-metrics.json, serve-stress-alpine-summary.md
-# (harness), plus serve-stress-alpine-footprint.json and a footprint section appended to the
-# summary (cgroup peak memory / OOM-kill counts -- the low-resource signal this pipeline exists
-# to capture). Exit code is the harness's.
+# Inputs (env):
+#   QUICK -- non-empty runs the reduced --quick profile (hermetic only; real-repo ignores it).
+#   REAL_REPO_URL / REAL_FROM / REAL_TO / REAL_CLONE_ARGS -- enable real-repo mode (same flags as
+#     tools/serve_stress.py). REAL_CLONE_ARGS should be a single token like `--depth=50`.
+#   OUT_PREFIX -- basename for metrics/summary/footprint under <stage>
+#     (default: serve-stress-alpine; real cron uses serve-stress-alpine-real-<size>).
+# Outputs (written to <stage>): ${OUT_PREFIX}-metrics.json, ${OUT_PREFIX}-summary.md (harness),
+# plus ${OUT_PREFIX}-footprint.json and a footprint section appended to the summary (cgroup peak
+# memory / OOM-kill counts -- the low-resource signal this pipeline exists to capture). Exit
+# code is the harness's.
 set -eu
 
 STAGE=$(cd "$(dirname "$0")/.." && pwd)
+OUT_PREFIX=${OUT_PREFIX:-serve-stress-alpine}
 echo "== stage: $STAGE"
+echo "== out prefix: $OUT_PREFIX"
 cat /etc/alpine-release
 
 # ------------------------------------------------------------------------------------------
-# Packages: harness deps (python3, git + git daemon), the musl JDK that runs both the serve
-# jar and (redirected) bazel server, and the glibc shim for the official bazel client.
+# Packages: harness deps (python3, git + git daemon), ca-certificates for HTTPS real-repo
+# clones, the musl JDK that runs both the serve jar and (redirected) bazel server, and the
+# glibc shim for the official bazel client.
 # ------------------------------------------------------------------------------------------
-apk add --no-cache python3 git git-daemon openjdk21-jdk gcompat libstdc++ libgcc
+apk add --no-cache python3 git git-daemon ca-certificates openjdk21-jdk gcompat libstdc++ libgcc
 
 JAVA_HOME=/usr/lib/jvm/default-jvm
 if [ ! -x "$JAVA_HOME/bin/java" ]; then
@@ -130,14 +141,45 @@ echo "== bazel flavor: $FLAVOR ($BAZEL)"
 # ------------------------------------------------------------------------------------------
 # Run the harness. set +e so a failing (or OOM-mangled) run still yields the footprint data
 # below -- when memory is the choke point, the failing run is the most interesting one.
+# Real-repo mode is selected by REAL_REPO_URL (same contract as serve-stress-real.yml); the
+# clone happens inside the container so checkout / bazel query cost lands under the 8 GiB cap.
 # ------------------------------------------------------------------------------------------
 set +e
-python3 "$STAGE/tools/serve_stress.py" \
-    --skip-build \
-    --bazel "$BAZEL" \
-    --metrics-out "$STAGE/serve-stress-alpine-metrics.json" \
-    --summary-out "$STAGE/serve-stress-alpine-summary.md" \
-    ${QUICK:+--quick}
+if [ -n "${REAL_REPO_URL:-}" ]; then
+    echo "== real-repo mode: $REAL_REPO_URL (${REAL_FROM:-?}..${REAL_TO:-?})"
+    : "${REAL_FROM:?REAL_FROM required when REAL_REPO_URL is set}"
+    : "${REAL_TO:?REAL_TO required when REAL_REPO_URL is set}"
+    # Keep the `=` spelling for --real-clone-args: its value is itself a flag token
+    # (`--depth=50`), and a space-separated form would be parsed as two options
+    # (see serve-stress-real.yml).
+    if [ -n "${REAL_CLONE_ARGS:-}" ]; then
+        python3 "$STAGE/tools/serve_stress.py" \
+            --skip-build \
+            --bazel "$BAZEL" \
+            --metrics-out "$STAGE/${OUT_PREFIX}-metrics.json" \
+            --summary-out "$STAGE/${OUT_PREFIX}-summary.md" \
+            --real-repo-url "$REAL_REPO_URL" \
+            --real-from "$REAL_FROM" \
+            --real-to "$REAL_TO" \
+            --real-clone-args="${REAL_CLONE_ARGS}"
+    else
+        python3 "$STAGE/tools/serve_stress.py" \
+            --skip-build \
+            --bazel "$BAZEL" \
+            --metrics-out "$STAGE/${OUT_PREFIX}-metrics.json" \
+            --summary-out "$STAGE/${OUT_PREFIX}-summary.md" \
+            --real-repo-url "$REAL_REPO_URL" \
+            --real-from "$REAL_FROM" \
+            --real-to "$REAL_TO"
+    fi
+else
+    python3 "$STAGE/tools/serve_stress.py" \
+        --skip-build \
+        --bazel "$BAZEL" \
+        --metrics-out "$STAGE/${OUT_PREFIX}-metrics.json" \
+        --summary-out "$STAGE/${OUT_PREFIX}-summary.md" \
+        ${QUICK:+--quick}
+fi
 rc=$?
 set -e
 echo "== harness exit code: $rc"
@@ -147,10 +189,10 @@ echo "== harness exit code: $rc"
 # against the 8 GiB cap and the oom/oom_kill counters. memory.peak needs kernel >= 5.19;
 # absent files degrade to null rather than failing the run.
 # ------------------------------------------------------------------------------------------
-python3 - "$STAGE" "$FLAVOR" "$rc" <<'EOF'
+python3 - "$STAGE" "$FLAVOR" "$rc" "$OUT_PREFIX" <<'EOF'
 import json, os, sys
 
-stage, flavor, rc = sys.argv[1], sys.argv[2], int(sys.argv[3])
+stage, flavor, rc, out_prefix = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 
 def read(name):
     try:
@@ -183,7 +225,7 @@ footprint = {
     "memory_current_bytes": read("memory.current"),
     "memory_events": events,
 }
-with open(os.path.join(stage, "serve-stress-alpine-footprint.json"), "w") as f:
+with open(os.path.join(stage, f"{out_prefix}-footprint.json"), "w") as f:
     json.dump(footprint, f, indent=2)
 
 def gib(v):
@@ -205,7 +247,7 @@ section = [
 ]
 # Append so it lands under the harness's summary; if the harness died before writing one,
 # this creates the file so the CI step summary still shows the environment numbers.
-with open(os.path.join(stage, "serve-stress-alpine-summary.md"), "a") as f:
+with open(os.path.join(stage, f"{out_prefix}-summary.md"), "a") as f:
     f.write("\n".join(section))
 print("\n".join(section))
 EOF

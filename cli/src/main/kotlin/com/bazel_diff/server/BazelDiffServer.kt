@@ -223,6 +223,13 @@ class BazelDiffServer(
         } catch (e: GitClientException) {
           logger.e(e) { "git error computing impacted targets" }
           respondJson(exchange, 400, mapOf("error" to "git error: ${e.message}"))
+        } catch (e: InterruptedException) {
+          // The compute was interrupted, not broken: in practice [stop]'s shutdownNow() tearing
+          // down the executor while this request was mid-hash-generation (the JVM shutdown hook
+          // gives in-flight exchanges only a short grace period). Not an application error, so
+          // no stack-trace error log; 503 tells the load balancer to retry on another instance.
+          logger.w { "request interrupted mid-compute (server shutting down), abandoning" }
+          respondJson(exchange, 503, mapOf("error" to "request interrupted (server shutting down)"))
         } catch (e: Exception) {
           logger.e(e) { "error computing impacted targets" }
           respondJson(exchange, 500, mapOf("error" to (e.message ?: e.javaClass.simpleName)))
@@ -239,7 +246,17 @@ class BazelDiffServer(
    */
   private fun <T> computeWithTimeout(compute: () -> T): T {
     if (requestTimeoutSeconds <= 0) return compute()
-    val future = computeExecutor.submit(Callable { compute() })
+    val future =
+        computeExecutor.submit(
+            Callable {
+              // A timed-out request's cancel(true) can leave a stale interrupt flag on this pooled
+              // thread: a task blocked in an uninterruptible wait (e.g. `synchronized` on the hash
+              // generation lock) never observes the interrupt, so the flag survives the task and
+              // would make an unrelated request's first blocking call throw InterruptedException.
+              // Clear it before starting fresh work.
+              Thread.interrupted()
+              compute()
+            })
     try {
       return future.get(requestTimeoutSeconds, TimeUnit.SECONDS)
     } catch (e: TimeoutException) {

@@ -211,6 +211,12 @@ class BazelQueryService(
           } else {
             add("streamed_proto")
           }
+          // Each rule's macro instantiation stack; RuleHasher.ruleBzlSeed uses it to attribute a
+          // loaded `.bzl` to the rules a macro produced, not every target in the package. The
+          // starlark cquery path emits labels only, so it does not apply there.
+          if (!(useCquery && outputCompatibleTargets)) {
+            add("--proto:instantiation_stack")
+          }
           if (!useCquery) {
             add("--order_output=no")
           }

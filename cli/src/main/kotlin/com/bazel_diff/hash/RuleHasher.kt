@@ -6,6 +6,7 @@ import com.bazel_diff.bazel.decodeConfiguredRuleInputLabel
 import com.bazel_diff.log.Logger
 import com.google.common.annotations.VisibleForTesting
 import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentMap
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
@@ -19,6 +20,46 @@ class RuleHasher(
 ) : KoinComponent {
   private val logger: Logger by inject()
   private val sourceFileHasher: SourceFileHasher by inject()
+
+  // main-repo `.bzl` path -> content digest; EMPTY marks a non-main-repo/missing file (skip).
+  private val bzlDigestCache = ConcurrentHashMap<String, ByteArray>()
+  private val EMPTY = ByteArray(0)
+
+  /**
+   * Per-rule `.bzl` seed: digests of the main-repo `.bzl` files in this rule's macro instantiation
+   * stack, so a macro edit re-hashes only the rules that macro produced (issue #365).
+   * `$rule_implementation_hash` (in [BazelRule.digest]) already covers a rule class's own
+   * definition `.bzl`. Returns null only when the rule has no stack (`--proto:instantiation_stack`
+   * off) so the caller falls back to the package seed; a macro-less rule returns a stable constant,
+   * so the caller does NOT fall back.
+   */
+  private fun ruleBzlSeed(rule: BazelRule, modifiedFilepaths: Set<Path>): ByteArray? {
+    val stack = rule.instantiationStack
+    if (stack.isEmpty()) return null
+    val bzlPaths = sortedSetOf<String>()
+    for (frame in stack) {
+      val path = frame.substringBefore(":") // "tools/x.bzl:12:3: macro" -> "tools/x.bzl"
+      if ((path.endsWith(".bzl") || path.endsWith(".scl")) &&
+          !path.startsWith("external/") &&
+          !path.startsWith("@") &&
+          !path.startsWith("../")) {
+        bzlPaths.add(path)
+      }
+    }
+    return sha256 {
+      for (path in bzlPaths) {
+        val digest =
+            bzlDigestCache.computeIfAbsent(path) {
+              sourceFileHasher.softDigest(
+                  BazelSourceFileTarget("//$it", ByteArray(0)), modifiedFilepaths) ?: EMPTY
+            }
+        if (digest.isNotEmpty()) {
+          safePutBytes(path.toByteArray())
+          safePutBytes(digest)
+        }
+      }
+    }
+  }
 
   @VisibleForTesting class CircularDependencyException(message: String) : Exception(message)
 
@@ -67,11 +108,10 @@ class RuleHasher(
         targetSha256(trackDepLabels) {
           putDirectBytes(rule.digest(ignoredAttrs))
           putDirectBytes(seedHash)
-          // Mix in the `.bzl` seed for this rule's own package only. Each rule always looks up
-          // its own package (not the caller's), so this stays consistent under the memoized,
-          // depth-first recursion below and a macro edit re-hashes only the packages that
-          // `load()` it (issue #365).
-          putDirectBytes(packageBzlSeeds[labelToPackage(rule.name)])
+          // Per-rule macro seed (see ruleBzlSeed), else the package-wide fallback. Each rule
+          // resolves its own seed, so this is stable under the memoized recursion below (#365).
+          putDirectBytes(
+              ruleBzlSeed(rule, modifiedFilepaths) ?: packageBzlSeeds[labelToPackage(rule.name)])
           // Mixed into the *direct* digest (not transitively) so the tagged target is classified
           // as DIRECT-impacted for distance metrics; it still bubbles into the overall digest, so
           // any rdeps are conservatively re-hashed too.

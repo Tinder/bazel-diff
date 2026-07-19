@@ -2743,6 +2743,152 @@ class E2ETest {
         .isEqualTo(true)
   }
 
+  // Editing an EXISTING widely-loaded rule `.bzl` must be scoped too, not just newly-added macros
+  // (#365). Fixture `rule_bzl_overtrigger`: `//app` loads `//defs:thing.bzl` for one target
+  // (`//app:t`) alongside unrelated native targets (`:native_gen`, `:fg`, `:data.txt`). Editing
+  // `thing.bzl` must impact `//app:t` (its instantiation-stack seed + `$rule_implementation_hash`)
+  // but MUST NOT impact the native targets that only share its package.
+  @Test
+  fun testEditingRuleBzlDoesNotOverInvalidateSamePackageTargets() {
+    val workspaceA = copyTestWorkspace("rule_bzl_overtrigger")
+    val workspaceB = copyTestWorkspace("rule_bzl_overtrigger")
+
+    // Change thing.bzl's rule impl without changing any emitted attribute of `thing`.
+    val bzlInB = File(workspaceB, "defs/thing.bzl")
+    val original = bzlInB.readText()
+    val mutated =
+        original.replace(
+            "ctx.actions.write(out, \"thing\")", "ctx.actions.write(out, \"thing\")  # edited")
+    assertThat(mutated != original).isEqualTo(true)
+    bzlInB.writeText(mutated)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+
+    // The target that instantiates the rule from thing.bzl must be impacted.
+    assertThat(impacted.any { it.endsWith("//app:t") })
+        .transform("//app:t should be impacted by a thing.bzl edit; got: $impacted") { it }
+        .isEqualTo(true)
+
+    // Unrelated native targets sharing the package must NOT be impacted (the over-invalidation).
+    val overInvalidated =
+        impacted.filter {
+          it.endsWith("//app:native_gen") ||
+              it.endsWith("//app:g.txt") ||
+              it.endsWith("//app:fg") ||
+              it.endsWith("//app:data.txt")
+        }
+    assertThat(overInvalidated.isEmpty())
+        .transform(
+            "Editing thing.bzl must not impact unrelated //app targets; over-invalidated: $overInvalidated") {
+              it
+            }
+        .isEqualTo(true)
+  }
+
+  // Cross-file macro/rule: `//app` loads `//defs:macro.bzl`, which loads `//defs:rule.bzl`, for one
+  // target (`//app:s`). Editing EITHER file must impact `//app:s` -- the macro via its
+  // instantiation-stack seed, the rule via `$rule_implementation_hash` -- so the scoping does not
+  // under-invalidate. `//app:unrelated_gen` (a sibling native target) must stay out.
+  private fun crossFileImpacted(mutate: (File) -> Unit): Set<String> {
+    val workspaceA = copyTestWorkspace("cross_file_macro_rule")
+    val workspaceB = copyTestWorkspace("cross_file_macro_rule")
+    mutate(workspaceB)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impacted = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impacted.absolutePath))
+        .isEqualTo(0)
+    return impacted.readLines().filter { it.isNotBlank() }.toSet()
+  }
+
+  private fun assertCrossFileConsumerScoped(impacted: Set<String>, edited: String) {
+    assertThat(impacted.any { it.endsWith("//app:s") })
+        .transform("//app:s should be impacted by the $edited edit; got: $impacted") { it }
+        .isEqualTo(true)
+    assertThat(impacted.none { it.endsWith("//app:unrelated_gen") || it.endsWith("//app:u.txt") })
+        .transform("$edited edit must not impact //app:unrelated_gen; got: $impacted") { it }
+        .isEqualTo(true)
+  }
+
+  @Test
+  fun testEditingCrossFileMacroImpactsConsumerNotSiblings() {
+    val impacted = crossFileImpacted { ws ->
+      val f = File(ws, "defs/macro.bzl")
+      f.writeText(
+          f.readText()
+              .replace(
+                  "def split(name, **kwargs):",
+                  "def split(name, **kwargs):\n    print(\"split: \" + name)"))
+    }
+    assertCrossFileConsumerScoped(impacted, "defs/macro.bzl")
+  }
+
+  @Test
+  fun testEditingCrossFileRuleImpactsConsumerNotSiblings() {
+    val impacted = crossFileImpacted { ws ->
+      val f = File(ws, "defs/rule.bzl")
+      f.writeText(
+          f.readText()
+              .replace(
+                  "ctx.actions.write(out, \"split\")",
+                  "ctx.actions.write(out, \"split\")  # edited"))
+    }
+    assertCrossFileConsumerScoped(impacted, "defs/rule.bzl")
+  }
+
   /**
    * Reads a `generate-hashes` output file into a flat `target -> hash` map, tolerating both the
    * bzlmod "new format" (`{"hashes": {...}, "metadata": {...}}`) and the legacy flat format

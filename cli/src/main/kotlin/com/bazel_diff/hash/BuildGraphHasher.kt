@@ -70,11 +70,14 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
         }
     val targetHashStartNanos = System.nanoTime()
     val seedForFilepaths = runBlocking(Dispatchers.IO) { createSeedForFilepaths(seedFilepaths) }
-    // Attribute each BUILD file's loaded `.bzl` digests to the package that loads them, so a
-    // `.bzl` edit only re-hashes targets in packages that actually `load()` it -- not every
-    // target in the workspace (issue #365). A package that loads no tracked `.bzl` gets nothing
-    // mixed in, keeping its targets' hashes byte-for-byte stable.
-    val packageBzlSeeds = createPackageBzlSeeds(allTargets, modifiedFilepaths)
+    // With macro instantiation stacks (`--proto:instantiation_stack`), RuleHasher.ruleBzlSeed
+    // attributes each `.bzl` to the rules a macro produced, so the coarse package seed (and its
+    // source-file over-invalidation) is dropped. Fall back to it when stacks are absent (#365).
+    val hasInstantiationStacks =
+        allTargets.any { it is BazelTarget.Rule && it.rule.instantiationStack.isNotEmpty() }
+    val packageBzlSeeds =
+        if (hasInstantiationStacks) emptyMap()
+        else createPackageBzlSeeds(allTargets, modifiedFilepaths)
     val result =
         hashAllTargets(
             seedForFilepaths,

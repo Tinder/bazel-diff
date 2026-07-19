@@ -20,6 +20,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
 import java.nio.file.Path
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.After
 import org.junit.Before
@@ -464,6 +465,126 @@ class BazelDiffServerTest : KoinTest {
       assertThat(body).contains("timed out")
     } finally {
       slowServer.stop()
+    }
+  }
+
+  @Test
+  fun interruptedComputeReturns503NotA500() {
+    // An InterruptedException out of the compute is the server being torn down mid-request
+    // (stop()'s shutdownNow() interrupting the in-flight hash generation), not an application
+    // error: it must map to 503 so the caller retries elsewhere, never the generic 500.
+    provider = FixedProvider(error = InterruptedException("sleep interrupted"))
+    val response = get("/impacted_targets?from=a&to=b")
+    assertThat(response.code).isEqualTo(503)
+    assertThat(response.body).contains("interrupted")
+  }
+
+  @Test
+  fun interruptedComputeOnTimeoutExecutorReturns503NotA500() {
+    // Same as above, but with a request timeout configured the compute runs on the executor and
+    // the InterruptedException arrives wrapped in an ExecutionException; the unwrap in
+    // computeWithTimeout must still land it in the 503 branch (this is the exact path of the
+    // production "[Error] error computing impacted targets" InterruptedException stack).
+    val interruptedProvider =
+        object : ImpactedTargetsProvider {
+          override fun getImpactedTargets(
+              fromRev: String,
+              toRev: String,
+              targetTypes: Set<String>?,
+              modifiedFilepaths: Set<Path>,
+              profiler: QueryProfiler?
+          ): ImpactedTargetsResult = throw InterruptedException("interrupted by shutdownNow")
+
+          override fun getImpactedTargetsWithDistances(
+              fromRev: String,
+              toRev: String,
+              targetTypes: Set<String>?,
+              modifiedFilepaths: Set<Path>,
+              profiler: QueryProfiler?
+          ) = throw UnsupportedOperationException()
+        }
+    val timeoutServer = BazelDiffServer(0, interruptedProvider, requestTimeoutSeconds = 30) { true }
+    timeoutServer.start()
+    try {
+      val conn =
+          URL("http://localhost:${timeoutServer.boundPort()}/impacted_targets?from=a&to=b")
+              .openConnection() as HttpURLConnection
+      val code = conn.responseCode
+      val body =
+          (conn.errorStream ?: conn.inputStream)?.let {
+            BufferedReader(InputStreamReader(it, StandardCharsets.UTF_8)).readText()
+          } ?: ""
+      conn.disconnect()
+      assertThat(code).isEqualTo(503)
+      assertThat(body).contains("interrupted")
+    } finally {
+      timeoutServer.stop()
+    }
+  }
+
+  @Test
+  fun staleInterruptFlagFromTimedOutRequestDoesNotPoisonNextRequest() {
+    // A timed-out request's future.cancel(true) interrupts its pooled compute thread; a task
+    // blocked in an uninterruptible wait (like `synchronized` on the hash generation lock) never
+    // observes that interrupt, so the flag can survive onto the pool thread and would make the
+    // next request's first blocking call throw InterruptedException. computeWithTimeout must
+    // start every task with a cleared interrupt flag.
+    val sawInterruptedFlag = AtomicBoolean(false)
+    val flagCheckingProvider =
+        object : ImpactedTargetsProvider {
+          override fun getImpactedTargets(
+              fromRev: String,
+              toRev: String,
+              targetTypes: Set<String>?,
+              modifiedFilepaths: Set<Path>,
+              profiler: QueryProfiler?
+          ): ImpactedTargetsResult {
+            if (Thread.currentThread().isInterrupted) sawInterruptedFlag.set(true)
+            if (fromRev == "poison") {
+              // Uninterruptible wait past the 1s timeout: swallow the cancel(true) interrupt the
+              // way a `synchronized` block would, then leave the flag set on exit exactly as a
+              // real uninterruptible wait does.
+              val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(1_500)
+              var interrupted = false
+              while (System.nanoTime() < deadline) {
+                try {
+                  Thread.sleep(50)
+                } catch (e: InterruptedException) {
+                  interrupted = true
+                }
+              }
+              if (interrupted) Thread.currentThread().interrupt()
+            }
+            return ImpactedTargetsResult(fromRev, toRev, emptyList())
+          }
+
+          override fun getImpactedTargetsWithDistances(
+              fromRev: String,
+              toRev: String,
+              targetTypes: Set<String>?,
+              modifiedFilepaths: Set<Path>,
+              profiler: QueryProfiler?
+          ) = throw UnsupportedOperationException()
+        }
+    val timeoutServer = BazelDiffServer(0, flagCheckingProvider, requestTimeoutSeconds = 1) { true }
+    timeoutServer.start()
+    try {
+      val conn =
+          URL("http://localhost:${timeoutServer.boundPort()}/impacted_targets?from=poison&to=b")
+              .openConnection() as HttpURLConnection
+      assertThat(conn.responseCode).isEqualTo(504)
+      conn.disconnect()
+      // Give the abandoned poison task time to finish and return its thread to the pool.
+      Thread.sleep(1_000)
+      val conn2 =
+          URL("http://localhost:${timeoutServer.boundPort()}/impacted_targets?from=a&to=b")
+              .openConnection() as HttpURLConnection
+      val code = conn2.responseCode
+      conn2.disconnect()
+      assertThat(code).isEqualTo(200)
+      assertThat(sawInterruptedFlag.get()).isEqualTo(false)
+    } finally {
+      timeoutServer.stop()
     }
   }
 

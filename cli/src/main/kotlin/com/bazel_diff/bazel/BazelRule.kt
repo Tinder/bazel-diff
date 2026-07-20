@@ -90,6 +90,13 @@ class BazelRule(private val rule: Build.Rule) {
   val name: String = rule.name
 
   /**
+   * Macro instantiation frames (`"<path>:<line>:<col>: <fn>"`) naming the BUILD/`.bzl` files that
+   * produced this rule. Empty unless the query ran with `--proto:instantiation_stack`.
+   */
+  val instantiationStack: List<String>
+    get() = rule.instantiationStackList
+
+  /**
    * The values of this rule's `tags` attribute, or an empty set when the attribute is absent. Bazel
    * emits user-declared tags as a `STRING_LIST` attribute named `tags` in the query proto.
    * bazel-diff reads them to honour `--alwaysAffectedTags`: a target carrying one of those tags is

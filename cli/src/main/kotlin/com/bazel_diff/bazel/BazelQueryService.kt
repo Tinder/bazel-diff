@@ -611,10 +611,35 @@ class BazelQueryService(
       Build.Target.Discriminator.RULE -> BazelTarget.Rule(target)
       Build.Target.Discriminator.SOURCE_FILE -> BazelTarget.SourceFile(target)
       Build.Target.Discriminator.GENERATED_FILE -> BazelTarget.GeneratedFile(target)
+      Build.Target.Discriminator.PACKAGE_GROUP -> packageGroupToTarget(target)
       else -> {
         logger.w { "Unsupported target type in the build graph: ${target.type.name}" }
         null
       }
     }
+  }
+
+  /**
+   * Lowers a PACKAGE_GROUP query target into a synthetic RULE target so it flows through the
+   * regular rule-hashing pipeline instead of being dropped (issue #441): the group's `packages`
+   * allow-list becomes a hashed attribute, and its `includes` become rule_inputs so an edit to a
+   * nested package_group propagates to every group that includes it. [RuleHasher] separately
+   * follows rules' `visibility` attributes to these targets, which is what carries a group edit to
+   * the rules the group gates -- and from there, transitively, to their dependents.
+   */
+  private fun packageGroupToTarget(target: Build.Target): BazelTarget.Rule {
+    val packageGroup = target.packageGroup
+    val rule =
+        Build.Rule.newBuilder()
+            .setName(packageGroup.name)
+            .setRuleClass("package_group")
+            .addAttribute(
+                Build.Attribute.newBuilder()
+                    .setName("packages")
+                    .setType(Build.Attribute.Discriminator.STRING_LIST)
+                    .addAllStringListValue(packageGroup.containedPackageList))
+            .addAllRuleInput(packageGroup.includedPackageGroupList)
+    return BazelTarget.Rule(
+        Build.Target.newBuilder().setType(Build.Target.Discriminator.RULE).setRule(rule).build())
   }
 }

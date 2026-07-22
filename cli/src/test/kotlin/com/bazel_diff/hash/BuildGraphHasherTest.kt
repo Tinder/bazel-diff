@@ -1,6 +1,7 @@
 package com.bazel_diff.hash
 
 import assertk.all
+import assertk.assertFailure
 import assertk.assertThat
 import assertk.assertions.*
 import com.bazel_diff.bazel.BazelClient
@@ -292,8 +293,7 @@ class BuildGraphHasherTest : KoinTest {
     defaultTargets.add(rule3)
     defaultTargets.add(rule4)
     whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
-    assertThat { hasher.hashAllBazelTargetsAndSourcefiles() }
-        .isFailure()
+    assertFailure { hasher.hashAllBazelTargetsAndSourcefiles() }
         .all {
           isInstanceOf(RuleHasher.CircularDependencyException::class)
           // they are run in parallel, so we don't know whether rule3 or rule4 will be processed

@@ -1,5 +1,6 @@
 package com.bazel_diff.io
 
+import assertk.assertFailure
 import assertk.assertThat
 import assertk.assertions.*
 import com.bazel_diff.testModule
@@ -22,19 +23,17 @@ internal class ContentHashProviderTest : KoinTest {
 
   @Test
   fun testNonExistingPath() = runBlocking {
-    assertThat { ContentHashProvider(File("/not/exists")) }
-        .isFailure()
+    assertFailure { ContentHashProvider(File("/not/exists")) }
         .hasClass(java.io.FileNotFoundException::class)
   }
 
   @Test
   fun testParseJsonFileWithWrongShape() = runBlocking {
     val file = File("cli/src/test/kotlin/com/bazel_diff/io/fixture/wrong.json")
-    assertThat {
+    assertFailure {
           val a = ContentHashProvider(file)
           println(a.filenameToHash)
         }
-        .isFailure()
         .hasClass(JsonSyntaxException::class)
   }
 

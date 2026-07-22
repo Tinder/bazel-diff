@@ -1,7 +1,7 @@
 package com.bazel_diff.cli
 
 import assertk.assertThat
-import assertk.assertions.containsAll
+import assertk.assertions.containsAtLeast
 import assertk.assertions.isEqualTo
 import java.io.File
 import org.junit.Rule
@@ -79,7 +79,7 @@ class FingerprintGathererTest {
     assertThat(String(inputs.moduleLockContent!!)).isEqualTo("lockbytes")
     assertThat(inputs.flags).isEqualTo(flags)
     // both the root rc and the imported rc are captured
-    assertThat(inputs.bazelrcContents.keys).containsAll(".bazelrc", "ci.bazelrc")
+    assertThat(inputs.bazelrcContents.keys).containsAtLeast(".bazelrc", "ci.bazelrc")
   }
 
   @Test

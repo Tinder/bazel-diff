@@ -93,7 +93,7 @@ def bazel_diff_dependencies(
         http_archive,
         name = "rules_kotlin",
         sha256 = rules_kotlin_sha,
-        url = "https://github.com/bazelbuild/rules_kotlin/releases/download/v{version}/rules_kotlin-v{version}.tar.gz".format(version = rules_kotlin_version),
+        url = "https://github.com/bazel-contrib/rules_kotlin/releases/download/v{version}/rules_kotlin-v{version}.tar.gz".format(version = rules_kotlin_version),
     )
 
     _maybe(

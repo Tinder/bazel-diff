@@ -1459,6 +1459,97 @@ class E2ETest {
     assertThat(impacted.contains("//:scanner")).isEqualTo(false)
   }
 
+  @Test
+  fun testPackageGroupChangeIsNotImpacted_reproducerForIssue441() {
+    // Reproducer for https://github.com/Tinder/bazel-diff/issues/441
+    //
+    // The under-invalidation (false-negative) half of the issue. bazel-diff only
+    // keeps targets whose query `Discriminator` is RULE, SOURCE_FILE, or
+    // GENERATED_FILE; every other type is dropped
+    // (BazelQueryService.toBazelTarget -> logs "Unsupported target type" and
+    // returns null). `PACKAGE_GROUP` is one such dropped type, so a change to a
+    // package_group's `packages` list is never reflected in any hash -- even
+    // though it genuinely alters downstream visibility and can flip a consumer
+    // from building to failing.
+    //
+    // The `package_group_dropped` workspace:
+    //   //lib:consumers -- a package_group (created by a macro in lib/defs.bzl)
+    //                      that gates the visibility of //lib:thing. Its
+    //                      allow-list lives in defs.bzl as `ALLOWED`.
+    //   //lib:thing     -- a genrule declared DIRECTLY (not via the macro), so
+    //                      its per-rule `.bzl` seed never picks up defs.bzl.
+    //   //consumer:use_thing -- depends on //lib:thing.
+    //
+    // Between the two checkouts we edit ONLY lib/defs.bzl, emptying `ALLOWED`.
+    // That revokes //consumer's visibility of //lib:thing: workspace A builds
+    // //consumer:use_thing successfully, workspace B fails visibility analysis
+    // for it. The BUILD files and every native rule are byte-for-byte identical
+    // across the checkouts, so the sole semantic change rides entirely on the
+    // (dropped) PACKAGE_GROUP target.
+    //
+    // Current (buggy) behaviour: bazel-diff reports ZERO impacted targets. When
+    // #441's under-invalidation is fixed (e.g. by supporting PACKAGE_GROUP
+    // targets and their reverse-visibility dependents), the changed package_group
+    // -- and/or //consumer:use_thing -- should start appearing here and this
+    // assertion will flag that the behaviour changed.
+    val workspaceA = copyTestWorkspace("package_group_dropped")
+    val workspaceB = copyTestWorkspace("package_group_dropped")
+
+    // The ONLY change: revoke //consumer's visibility by emptying the macro's
+    // allow-list. Nothing else -- no BUILD file, no rule attribute -- changes.
+    val defsInB = File(workspaceB, "lib/defs.bzl")
+    defsInB.writeText(defsInB.readText().replace("ALLOWED = [\"//consumer\"]", "ALLOWED = []"))
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted =
+        filterBazelDiffInternalTargets(
+            impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
+
+    // The genuinely-affected consumer is NOT reported -- pinning the false
+    // negative. (It flips from building to failing visibility analysis, yet its
+    // hash, and every other rule/source-file hash, is unchanged.)
+    assertThat(impacted.contains("//consumer:use_thing")).isEqualTo(false)
+
+    // Nothing at all is reported: the package_group is dropped, so the change is
+    // completely invisible to bazel-diff. This is exactly the under-invalidation
+    // #441 describes.
+    assertThat(impacted)
+        .transform(
+            "editing a dropped PACKAGE_GROUP's `packages` list should surface an impacted target, but got: $impacted") {
+              it.size
+            }
+        .isEqualTo(0)
+  }
+
   /**
    * Returns the Bazel version triple by running `bazel version`, or null if it cannot be
    * determined.

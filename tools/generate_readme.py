@@ -266,6 +266,21 @@ def read_module_version(workspace_dir: Path) -> str:
     return match.group(1)
 
 
+def sync_build_version(workspace_dir: Path, version: str) -> None:
+    """Keep the license() package_version in the root BUILD file in sync."""
+    build_file = workspace_dir / "BUILD"
+    text = build_file.read_text()
+    new_text, count = re.subn(
+        r'(package_version\s*=\s*")[^"]+(")',
+        rf"\g<1>{version}\g<2>",
+        text,
+    )
+    if count == 0:
+        raise ValueError("Could not find package_version in BUILD")
+    if new_text != text:
+        build_file.write_text(new_text)
+
+
 def main() -> None:
     workspace_dir = Path(os.environ["BUILD_WORKSPACE_DIRECTORY"])
     output_path = workspace_dir / "README.md"
@@ -278,6 +293,7 @@ def main() -> None:
 
     version = read_module_version(workspace_dir)
     template = template.replace("{{BAZEL_DIFF_VERSION}}", version)
+    sync_build_version(workspace_dir, version)
 
     print("Fetching GitHub user data...")
     email_map = fetch_github_email_map(REPO)

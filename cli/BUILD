@@ -30,6 +30,11 @@ kt_jvm_library(
     name = "cli-lib",
     srcs = glob(["src/main/kotlin/**/*.kt"]),
     resources = [":version_file"],
+    # sts is runtime-only: the SDK's DefaultCredentialsProvider loads it reflectively to
+    # assume a pod IAM role via web identity (IRSA) for the serve S3 cache backend.
+    runtime_deps = [
+        "@bazel_diff_maven//:software_amazon_awssdk_sts",
+    ],
     deps = [
         "//proto:analysis_v2_java_proto",
         "//proto:build_java_proto",
@@ -39,6 +44,10 @@ kt_jvm_library(
         "@bazel_diff_maven//:io_insert_koin_koin_core_jvm",
         "@bazel_diff_maven//:org_apache_commons_commons_pool2",
         "@bazel_diff_maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core_jvm",
+        "@bazel_diff_maven//:software_amazon_awssdk_regions",
+        "@bazel_diff_maven//:software_amazon_awssdk_s3",
+        "@bazel_diff_maven//:software_amazon_awssdk_sdk_core",
+        "@bazel_diff_maven//:software_amazon_awssdk_url_connection_client",
     ],
 )
 
@@ -245,6 +254,21 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "S3HashCacheStorageTest",
+    jvm_flags = [
+        "-Dnet.bytebuddy.experimental=true",
+    ],
+    test_class = "com.bazel_diff.server.S3HashCacheStorageTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "TieredHashCacheStorageTest",
+    test_class = "com.bazel_diff.server.TieredHashCacheStorageTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "CachePrunerTest",
     test_class = "com.bazel_diff.server.CachePrunerTest",
     runtime_deps = [":cli-test-lib"],
@@ -304,6 +328,8 @@ kt_jvm_library(
         "@bazel_diff_maven//:io_insert_koin_koin_test_jvm",
         "@bazel_diff_maven//:junit_junit",
         "@bazel_diff_maven//:org_mockito_kotlin_mockito_kotlin",
+        "@bazel_diff_maven//:software_amazon_awssdk_s3",
+        "@bazel_diff_maven//:software_amazon_awssdk_sdk_core",
     ],
 )
 

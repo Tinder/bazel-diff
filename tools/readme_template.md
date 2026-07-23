@@ -206,10 +206,40 @@ curl 'http://localhost:8080/metrics'
   "ready": true,
   "gitEngine": "subprocess",
   "trackDeps": false,
-  "cache": {"directory": "/var/cache/bazel-diff", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB"},
+  "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB"},
   "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
 }
 ```
+
+### Shared S3 cache for multi-instance deployments
+
+A single instance caches hashes on local disk only. When you run several replicas behind a load
+balancer (e.g. a Kubernetes Deployment behind a Service, with the readiness probe on `/health`),
+give them a shared S3 cache tier so a revision is cold-hashed once fleet-wide instead of once per
+pod:
+
+```bash
+bazel-diff serve \
+  --workspacePath /path/to/workspace-clone \
+  --cacheDir /var/cache/bazel-diff \
+  --s3Bucket my-hash-cache-bucket \
+  --s3Prefix bazel-diff/my-repo
+```
+
+With `--s3Bucket` set the cache becomes two-tiered: reads check local disk first and fall back to
+the bucket (backfilling local disk on a hit), and every generated entry is published to both, so
+any replica can serve a revision another replica already hashed. Credentials and region resolve
+through the standard AWS default provider chains (environment variables, profile, IRSA web
+identity on EKS, IMDS), or pin the region with `--s3Region`. `--s3Endpoint` plus
+`--s3ForcePathStyle` point the client at an S3-compatible store (MinIO, LocalStack) for local
+testing.
+
+S3 errors never fail a request: a failed read is treated as a cache miss (the revision is
+regenerated — slower, but correct) and a failed write leaves the entry local-only, so an S3 outage
+degrades throughput rather than availability. Concurrent replicas racing to hash the same
+revision are also harmless — entries are deterministic per key, so last-write-wins over identical
+content. The `--cacheMax*` pruning flags bound the *local* tier only; bound the bucket with an S3
+lifecycle policy instead.
 
 Notes and current limitations:
 
@@ -234,10 +264,8 @@ Notes and current limitations:
   sweeper enforces the limits once at startup and then every `--cachePruneInterval` (default `1h`),
   evicting least-recently-used entries first — a cache hit refreshes an entry's recency, so revisions
   under active query are not expired out from under live traffic. With no `--cacheMax*` flag set the
-  cache is never pruned (the previous behavior). The cache layer is pluggable behind a byte-oriented
-  interface so a remote backend (e.g. S3) can be added without touching callers; such a backend
-  manages its own retention (e.g. a bucket lifecycle policy), and the in-process `--cacheMax*` flags
-  do not apply to it.
+  cache is never pruned (the previous behavior). The `--cacheMax*` flags always bound the local-disk
+  tier only; the shared S3 tier (see above) manages its own retention via a bucket lifecycle policy.
 * Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
   `generate-hashes`, and are folded into the cache key so a server started with different flags never
   serves another configuration's cached hashes.
@@ -248,8 +276,8 @@ Notes and current limitations:
   shared-base full-hash cache is not reused (each distinct changed-set re-hashes the base), but each
   such hash is cheaper because it skips reading unchanged files. The extra entries are bounded by the
   same LRU `--cacheMax*` pruning as everything else.
-* Containerization, multi-instance deployment manifests, and remote cache backends are not yet
-  included.
+* Containerization and multi-instance deployment manifests are not yet included; the shared S3
+  cache tier above is the building block for running replicas behind a load balancer.
 
 <!-- BEGIN_SECTION: cli-help -->
 <!-- END_SECTION: cli-help -->

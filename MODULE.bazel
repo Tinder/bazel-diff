@@ -1,6 +1,6 @@
 module(
     name = "bazel-diff",
-    version = "35.0.0",
+    version = "36.0.0",
     compatibility_level = 0,
 )
 
@@ -58,9 +58,37 @@ maven.install(
         "org.apache.commons:commons-pool2:2.11.1",
         "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.5.2",
         "org.mockito.kotlin:mockito-kotlin:5.4.0",
+        "software.amazon.awssdk:url-connection-client:2.46.7",
     ],
     fail_if_repin_required = True,
     lock_file = "//:maven_install.json",
+)
+
+# AWS SDK for the `serve` S3 hash-cache backend. The Netty/Apache HTTP clients are
+# excluded (the service explicitly uses the lightweight url-connection-client above)
+# to keep the deploy jar lean. `sts` is runtime-only: DefaultCredentialsProvider needs
+# it to assume the pod's IAM role via web identity (IRSA) when running on EKS.
+maven.artifact(
+    name = "bazel_diff_maven",
+    artifact = "s3",
+    exclusions = [
+        "software.amazon.awssdk:netty-nio-client",
+        "software.amazon.awssdk:apache-client",
+        "software.amazon.awssdk:apache5-client",
+    ],
+    group = "software.amazon.awssdk",
+    version = "2.46.7",
+)
+maven.artifact(
+    name = "bazel_diff_maven",
+    artifact = "sts",
+    exclusions = [
+        "software.amazon.awssdk:netty-nio-client",
+        "software.amazon.awssdk:apache-client",
+        "software.amazon.awssdk:apache5-client",
+    ],
+    group = "software.amazon.awssdk",
+    version = "2.46.7",
 )
 use_repo(
     maven,

@@ -55,7 +55,7 @@ class BazelDiffServerTest : KoinTest {
             ready = true,
             gitEngine = "subprocess",
             trackDeps = false,
-            cache = CacheMetrics("/cache", 2, 2048, "2.0 KB"),
+            cache = CacheMetrics("/cache", null, 2, 2048, "2.0 KB"),
             jvm = JvmMetrics(1000, 2000),
         )
   }

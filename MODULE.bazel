@@ -1,6 +1,6 @@
 module(
     name = "bazel-diff",
-    version = "36.0.0",
+    version = "37.0.0",
     compatibility_level = 0,
 )
 
@@ -11,8 +11,8 @@ bazel_dep(name = "aspect_bazel_lib", version = "2.22.5", dev_dependency = True)
 
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "rules_proto", version = "7.1.0")
-bazel_dep(name = "rules_java", version = "9.3.0")
-bazel_dep(name = "rules_kotlin", version = "2.3.0")
+bazel_dep(name = "rules_java", version = "9.7.0")
+bazel_dep(name = "rules_kotlin", version = "2.4.0")
 bazel_dep(name = "rules_jvm_external", version = "6.10")
 
 # Add protobuf and grpc for Bazel 9 compatibility
@@ -48,16 +48,16 @@ maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
 maven.install(
     name = "bazel_diff_maven",
     artifacts = [
-        "com.google.code.gson:gson:2.9.0@jar",
-        "com.google.guava:guava:31.1-jre",
-        "com.willowtreeapps.assertk:assertk-jvm:0.25",
-        "info.picocli:picocli:4.6.3@jar",
-        "io.insert-koin:koin-core-jvm:3.1.6",
-        "io.insert-koin:koin-test-junit4:4.0.0",
+        "com.google.code.gson:gson:2.14.0@jar",
+        "com.google.guava:guava:33.6.0-jre",
+        "com.willowtreeapps.assertk:assertk-jvm:0.28.1",
+        "info.picocli:picocli:4.7.7@jar",
+        "io.insert-koin:koin-core-jvm:4.2.2",
+        "io.insert-koin:koin-test-junit4:4.2.2",
         "junit:junit:4.13.2",
-        "org.apache.commons:commons-pool2:2.11.1",
-        "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.5.2",
-        "org.mockito.kotlin:mockito-kotlin:5.4.0",
+        "org.apache.commons:commons-pool2:2.13.1",
+        "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0",
+        "org.mockito.kotlin:mockito-kotlin:6.3.0",
         "software.amazon.awssdk:url-connection-client:2.46.7",
     ],
     fail_if_repin_required = True,

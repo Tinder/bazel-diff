@@ -1,5 +1,6 @@
 package com.bazel_diff.hash
 
+import assertk.assertFailure
 import assertk.assertThat
 import assertk.assertions.*
 import org.junit.Test
@@ -39,10 +40,10 @@ class TargetHashTest {
   @Test
   fun testInvalidFromJson() {
 
-    assertThat { TargetHash.fromJson("invalid") }.isFailure()
+    assertFailure { TargetHash.fromJson("invalid") }
 
-    assertThat { TargetHash.fromJson("") }.isFailure()
+    assertFailure { TargetHash.fromJson("") }
 
-    assertThat { TargetHash.fromJson("too#many#delimeters#here#") }.isFailure()
+    assertFailure { TargetHash.fromJson("too#many#delimeters#here#") }
   }
 }

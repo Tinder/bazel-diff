@@ -167,6 +167,35 @@ class RuleHasher(
               }
             }
           }
+
+          // `visibility` labels are "nodep" labels: `bazel query` does not list them in
+          // `rule_input`, so a referenced package_group's *contents* would otherwise never reach
+          // this rule's digest -- editing a group's `packages` list can flip a dependent of this
+          // rule from building to failing visibility analysis while every hash stays unchanged
+          // (issue #441). Follow package_group visibility entries as dep edges; the special
+          // `//visibility:*` forms and `__pkg__`/`__subpackages__` package specs carry no target
+          // and are already filtered out by [BazelRule.visibilityPackageGroupLabels]. A label
+          // whose group is outside the queried graph is skipped, matching how it was (silently)
+          // invisible before package_group support.
+          if ("visibility" !in ignoredAttrs) {
+            for (packageGroupLabel in rule.visibilityPackageGroupLabels()) {
+              val packageGroup = allRulesMap[packageGroupLabel] ?: continue
+              if (!packageGroup.isPackageGroup || packageGroup.name == rule.name) continue
+              putDirectBytes(packageGroupLabel.toByteArray())
+              val packageGroupHash =
+                  digest(
+                      packageGroup,
+                      allRulesMap,
+                      ruleHashes,
+                      sourceDigests,
+                      seedHash,
+                      packageBzlSeeds,
+                      depPathClone,
+                      ignoredAttrs,
+                      modifiedFilepaths)
+              putTransitiveBytes(packageGroupLabel, packageGroupHash.overallDigest)
+            }
+          }
         }
 
     return finalHashValue.also { ruleHashes[rule.name] = it }

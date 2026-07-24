@@ -76,6 +76,49 @@ class BazelRuleTest {
     assertThat(BazelRule(rulePb).tags()).isEqualTo(emptySet<String>())
   }
 
+  // Backs package_group support (issue #441): only real package_group labels survive the
+  // filter -- the special `//visibility:*` forms and `__pkg__`/`__subpackages__` package specs
+  // name no target of their own.
+  @Test
+  fun testVisibilityPackageGroupLabelsFiltersSpecialForms() {
+    val rulePb =
+        Rule.newBuilder()
+            .setRuleClass("genrule")
+            .setName("//lib:thing")
+            .addAttribute(
+                Attribute.newBuilder()
+                    .setType(Attribute.Discriminator.STRING_LIST)
+                    .setName("visibility")
+                    .addStringListValue("//visibility:public")
+                    .addStringListValue("//other:__pkg__")
+                    .addStringListValue("//other:__subpackages__")
+                    .addStringListValue("//lib:zgroup")
+                    .addStringListValue("//lib:consumers")
+                    .addStringListValue("//lib:consumers")
+                    .build())
+            .build()
+
+    // Deduped and sorted for a deterministic digest contribution.
+    assertThat(BazelRule(rulePb).visibilityPackageGroupLabels())
+        .isEqualTo(listOf("//lib:consumers", "//lib:zgroup"))
+  }
+
+  @Test
+  fun testVisibilityPackageGroupLabelsEmptyWhenAttributeAbsent() {
+    val rulePb = Rule.newBuilder().setRuleClass("java_library").setName("//pkg:lib").build()
+
+    assertThat(BazelRule(rulePb).visibilityPackageGroupLabels()).isEqualTo(emptyList<String>())
+  }
+
+  @Test
+  fun testIsPackageGroup() {
+    val packageGroupPb = Rule.newBuilder().setRuleClass("package_group").setName("//lib:pg").build()
+    val rulePb = Rule.newBuilder().setRuleClass("java_library").setName("//pkg:lib").build()
+
+    assertThat(BazelRule(packageGroupPb).isPackageGroup).isEqualTo(true)
+    assertThat(BazelRule(rulePb).isPackageGroup).isEqualTo(false)
+  }
+
   // Fix for https://github.com/Tinder/bazel-diff/issues/359
   //
   // Under --useCquery, BazelRule.ruleInputList() now folds each ConfiguredRuleInput's

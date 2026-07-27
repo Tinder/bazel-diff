@@ -1,0 +1,4 @@
+module(
+    name = "serve_bzl_cache",
+    version = "0.0.0",
+)

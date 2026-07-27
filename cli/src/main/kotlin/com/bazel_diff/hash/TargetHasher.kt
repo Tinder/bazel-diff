@@ -18,7 +18,8 @@ class TargetHasher : KoinComponent {
       seedHash: ByteArray?,
       packageBzlSeeds: Map<String, ByteArray>,
       ignoredAttrs: Set<String>,
-      modifiedFilepaths: Set<Path>
+      modifiedFilepaths: Set<Path>,
+      hashInvocationContext: HashInvocationContext
   ): TargetDigest {
     return when (target) {
       is BazelTarget.GeneratedFile -> {
@@ -41,7 +42,8 @@ class TargetHasher : KoinComponent {
                   packageBzlSeeds,
                   depPath = null,
                   ignoredAttrs,
-                  modifiedFilepaths)
+                  modifiedFilepaths,
+                  hashInvocationContext)
         }
 
         // Add the generating rule name as a dep of the generated file.
@@ -58,7 +60,8 @@ class TargetHasher : KoinComponent {
             packageBzlSeeds,
             depPath = null,
             ignoredAttrs,
-            modifiedFilepaths)
+            modifiedFilepaths,
+            hashInvocationContext)
       }
       is BazelTarget.SourceFile -> {
         // Mix in the `.bzl` seed for this source file's own package only, so a macro edit in

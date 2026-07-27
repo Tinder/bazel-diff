@@ -44,6 +44,7 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
       modifiedFilepaths: Set<Path> = emptySet(),
       timings: HasherPhaseTimings? = null
   ): Map<String, TargetHash> {
+    val hashInvocationContext = HashInvocationContext()
     val (sourceDigests, allTargets) =
         runBlocking {
           val queryStartNanos = System.nanoTime()
@@ -85,7 +86,8 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
             sourceDigests,
             allTargets,
             ignoredAttrs,
-            modifiedFilepaths)
+            modifiedFilepaths,
+            hashInvocationContext)
     timings?.targetHashMillis = (System.nanoTime() - targetHashStartNanos) / 1_000_000
     return result
   }
@@ -132,7 +134,8 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
       sourceDigests: ConcurrentMap<String, ByteArray>,
       allTargets: List<BazelTarget>,
       ignoredAttrs: Set<String>,
-      modifiedFilepaths: Set<Path>
+      modifiedFilepaths: Set<Path>,
+      hashInvocationContext: HashInvocationContext
   ): Map<String, TargetHash> {
     val ruleHashes: ConcurrentMap<String, TargetDigest> = ConcurrentHashMap()
     val targetToRule: MutableMap<String, BazelRule> = HashMap()
@@ -150,7 +153,8 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
                   seedHash,
                   packageBzlSeeds,
                   ignoredAttrs,
-                  modifiedFilepaths)
+                  modifiedFilepaths,
+                  hashInvocationContext)
           Pair(
               target.name,
               TargetHash(

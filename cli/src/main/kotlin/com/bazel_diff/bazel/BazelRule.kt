@@ -90,6 +90,37 @@ class BazelRule(private val rule: Build.Rule) {
   val name: String = rule.name
 
   /**
+   * True for `package_group` targets. `bazel query` reports them under their own PACKAGE_GROUP
+   * discriminator; [BazelQueryService] lowers them to synthetic rules with this rule class so they
+   * participate in hashing (issue #441).
+   */
+  val isPackageGroup: Boolean
+    get() = rule.ruleClass == "package_group"
+
+  /**
+   * The package_group labels referenced by this rule's `visibility` attribute. A visibility value
+   * is either a package_group label or one of the special forms -- `//visibility:public`,
+   * `//visibility:private`, or a package spec (`//foo:__pkg__` / `//foo:__subpackages__`) -- which
+   * name no target of their own and are filtered out here.
+   *
+   * Visibility labels are "nodep" labels: `bazel query` never lists them in `rule_input`, so
+   * [ruleInputList] cannot surface them and [com.bazel_diff.hash.RuleHasher] follows them
+   * explicitly instead (issue #441).
+   */
+  fun visibilityPackageGroupLabels(): List<String> =
+      rule.attributeList
+          .firstOrNull { it.name == "visibility" }
+          ?.stringListValueList
+          .orEmpty()
+          .filter {
+            !it.startsWith("//visibility:") &&
+                !it.endsWith(":__pkg__") &&
+                !it.endsWith(":__subpackages__")
+          }
+          .distinct()
+          .sorted()
+
+  /**
    * Macro instantiation frames (`"<path>:<line>:<col>: <fn>"`) naming the BUILD/`.bzl` files that
    * produced this rule. Empty unless the query ran with `--proto:instantiation_stack`.
    */

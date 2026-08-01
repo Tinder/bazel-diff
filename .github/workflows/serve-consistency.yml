@@ -1,0 +1,63 @@
+name: Serve Consistency
+
+# Cross-instance hash-consistency check for the `bazel-diff serve` query service. Runs
+# tools/serve_consistency.py, which starts several real `serve` processes against one mock S3 cache
+# tier and verifies they compute identical hashes for the same commit. A failure means target
+# hashes carry host-specific state, which makes every impacted-target answer the fleet gives
+# suspect. See the harness module docstring for the case matrix.
+#
+# Cron-only for now, matching serve-harness.yml's precedent: several concurrent Bazel servers per
+# run is too heavy to gate every PR on until the harness has a healthy track record.
+# `workflow_dispatch` allows on-demand runs from the Actions tab in the meantime. Note that
+# scheduled + dispatched workflows run from the default branch, so this must land on master before
+# the cron fires.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 3 * * *"
+
+jobs:
+  Consistency:
+    runs-on: ubuntu-latest
+    # Three instances means three independent Bazel output bases and three Bazel servers, so this
+    # is meaningfully slower than the single-instance serve harness.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        bazel: [ '8.x', '9.x' ]
+    steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+        id: go
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
+      - uses: actions/checkout@v4
+      - name: Run consistency harness
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+        # git daemon ships with git (preinstalled on the runner); python3 is preinstalled. The mock
+        # S3 backend is pure stdlib, so no service container is needed.
+        run: |
+          python3 tools/serve_consistency.py \
+            --bazel "$HOME/go/bin/bazelisk" \
+            --instances 3 \
+            --metrics-out "serve-consistency-${{ matrix.bazel }}-metrics.json" \
+            --summary-out "serve-consistency-${{ matrix.bazel }}-summary.md"
+      - name: Publish summary
+        if: always()
+        run: cat "serve-consistency-${{ matrix.bazel }}-summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serve-consistency-metrics-${{ matrix.bazel }}
+          path: serve-consistency-${{ matrix.bazel }}-metrics.json
+          if-no-files-found: ignore

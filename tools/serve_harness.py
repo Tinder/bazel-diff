@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -125,6 +126,27 @@ def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def reserve_ports(n: int) -> list:
+    """Returns [n] distinct free ports, holding every socket open until all are chosen.
+
+    `free_port()` releases its socket before returning, so calling it n times in a loop can hand
+    back the same port twice -- harmless for a single server, a real race for a fleet plus a mock
+    S3 plus a git daemon. Holding the sockets simultaneously makes the numbers distinct; there is
+    still a window between close and bind, but it is no worse than the single-port case.
+    """
+    socks = []
+    try:
+        for _ in range(n):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", 0))
+            socks.append(s)
+        return [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            with contextlib.suppress(Exception):
+                s.close()
 
 
 def wait_port(port: int, timeout: float) -> bool:
@@ -365,6 +387,10 @@ def serve(
     track_deps: bool,
     ready_timeout: float,
     verbose_server: bool = False,
+    extra_args=(),
+    env=None,
+    port: int | None = None,
+    bazel: str | None = None,
 ):
     """Launches serve, waits for a health verdict, yields (Serve, health) then tears down.
 
@@ -373,8 +399,18 @@ def serve(
     [verbose_server] launches the subprocess with `-v` so its StderrLogger emits the `[Info]` /
     `[Warning]` git lines (checkouts, the "cleared stale git index.lock" self-heal) to the captured
     stderr; without it only `[Error]` lines appear. The stress harness asserts on those lines.
+
+    The remaining options exist for the multi-instance consistency harness, which needs to vary
+    things this launcher used to hardcode; all four default to today's behaviour exactly.
+    [extra_args] are appended after the built-in flags (e.g. the `--s3*` remote-cache flags).
+    [env] is merged over `os.environ` for the child (a skewed HOME/TMPDIR/USER, AWS credentials).
+    [port] takes a caller-allocated port: `free_port()` closes its socket before returning, so a
+    fleet allocating N ports in a loop can collide -- the caller can instead hold all N sockets
+    open at once and pass the numbers here. [bazel] overrides the global for a single instance,
+    which is how the Bazel-version-skew case runs two versions side by side.
     """
-    port = free_port()
+    if port is None:
+        port = free_port()
     stderr_path = workspace.parent / f"serve.{workspace.name}.stderr.log"
     args = [
         str(LAUNCHER),
@@ -385,7 +421,7 @@ def serve(
         "-w",
         str(workspace),
         "-b",
-        BAZEL,
+        bazel or BAZEL,
         "--cacheDir",
         str(cache),
         "--port",
@@ -395,12 +431,21 @@ def serve(
         args.append("--no-initial-fetch")
     if track_deps:
         args.append("--trackDeps")
+    args += [str(a) for a in extra_args]
+
+    child_env = None
+    if env is not None:
+        child_env = {**os.environ, **{k: str(v) for k, v in env.items() if v is not None}}
+        for k, v in env.items():
+            if v is None:
+                child_env.pop(k, None)
 
     vlog(f"launch serve on :{port}  ws={workspace.name}  initial_fetch={initial_fetch}")
     with open(stderr_path, "w") as errf:
         proc = subprocess.Popen(
             args,
             cwd=str(workspace),
+            env=child_env,
             stdout=(None if VERBOSE else subprocess.DEVNULL),
             stderr=(errf if not VERBOSE else None),
         )

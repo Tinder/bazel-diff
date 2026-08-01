@@ -1,6 +1,7 @@
 package com.bazel_diff.e2e
 
 import assertk.assertThat
+import assertk.assertions.contains
 import assertk.assertions.isEqualTo
 import com.bazel_diff.cli.BazelDiff
 import com.google.gson.Gson
@@ -166,26 +167,16 @@ class E2ETest {
   @Test
   fun testServeEndToEnd() {
     val workspace = copyTestWorkspace("distance_metrics")
-    fun git(vararg args: String): String {
-      val proc =
-          ProcessBuilder(listOf("git") + args)
-              .directory(workspace)
-              .redirectErrorStream(true)
-              .start()
-      val output = proc.inputStream.readBytes().decodeToString()
-      check(proc.waitFor() == 0) { "git ${args.joinToString(" ")} failed: $output" }
-      return output.trim()
-    }
-    git("init", "-q")
-    git("config", "user.email", "test@example.com")
-    git("config", "user.name", "test")
-    git("add", "-A")
-    git("commit", "-q", "-m", "base")
-    val fromSha = git("rev-parse", "HEAD")
+    git(workspace, "init", "-q")
+    git(workspace, "config", "user.email", "test@example.com")
+    git(workspace, "config", "user.name", "test")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-q", "-m", "base")
+    val fromSha = git(workspace, "rev-parse", "HEAD")
     File(workspace, "lib.sh").writeText("echo changed\n")
-    git("add", "-A")
-    git("commit", "-q", "-m", "change lib.sh")
-    val toSha = git("rev-parse", "HEAD")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-q", "-m", "change lib.sh")
+    val toSha = git(workspace, "rev-parse", "HEAD")
 
     val cacheDir = temp.newFolder()
     val port = java.net.ServerSocket(0).use { it.localPort }
@@ -245,6 +236,66 @@ class E2ETest {
       serveThread.interrupt()
       serveThread.join(10_000)
     }
+  }
+
+  @Test
+  fun testServeDoesNotReuseMacroDigestAcrossRevisions() {
+    val workspace = copyTestWorkspace("serve_bzl_cache")
+    git(workspace, "init", "-q")
+    git(workspace, "config", "user.email", "test@example.com")
+    git(workspace, "config", "user.name", "test")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-q", "-m", "base")
+    val fromSha = git(workspace, "rev-parse", "HEAD")
+
+    File(workspace, "defs.bzl").appendText("\n# second revision\n")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-q", "-m", "change macro source")
+    val toSha = git(workspace, "rev-parse", "HEAD")
+
+    val cacheDir = temp.newFolder()
+    val port = java.net.ServerSocket(0).use { it.localPort }
+    val serveThread =
+        Thread {
+              CommandLine(BazelDiff())
+                  .execute(
+                      "serve",
+                      "-w",
+                      workspace.absolutePath,
+                      "-b",
+                      "bazel",
+                      "--cacheDir",
+                      cacheDir.absolutePath,
+                      "--port",
+                      port.toString(),
+                      "--no-initial-fetch")
+            }
+            .apply {
+              isDaemon = true
+              start()
+            }
+
+    try {
+      awaitServeHealthy(port)
+      val (code, body) =
+          httpGetServe("http://localhost:$port/impacted_targets?from=$fromSha&to=$toSha")
+      assertThat(code).isEqualTo(200)
+      val parsed: Map<String, Any> =
+          Gson().fromJson(body, object : TypeToken<Map<String, Any>>() {}.type)
+      @Suppress("UNCHECKED_CAST") val impacted = parsed["impactedTargets"] as List<String>
+      assertThat(impacted.map { it.removePrefix("@@") }).contains("//:generated")
+    } finally {
+      serveThread.interrupt()
+      serveThread.join(10_000)
+    }
+  }
+
+  private fun git(workspace: File, vararg args: String): String {
+    val proc =
+        ProcessBuilder(listOf("git") + args).directory(workspace).redirectErrorStream(true).start()
+    val output = proc.inputStream.readBytes().decodeToString()
+    check(proc.waitFor() == 0) { "git ${args.joinToString(" ")} failed: $output" }
+    return output.trim()
   }
 
   /** Polls `/health` until it returns 200, up to ~30s, failing the test otherwise. */

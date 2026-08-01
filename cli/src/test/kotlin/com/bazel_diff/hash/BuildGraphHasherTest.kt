@@ -60,6 +60,8 @@ class BuildGraphHasherTest : KoinTest {
           add(createRuleTarget(name = "rule2", inputs = ArrayList(), digest = "rule2Digest"))
         }
     Mockito.reset(bazelClientMock)
+    fakeSourceFileHasher.softDigestValue = "fake-soft-digest".toByteArray()
+    fakeSourceFileHasher.softDigestCalls.set(0)
   }
 
   @Test
@@ -344,16 +346,61 @@ class BuildGraphHasherTest : KoinTest {
             "rule3" to listOf("rule0"), "rule0" to listOf("rule1"), "rule1" to emptyList<String>())
   }
 
+  @Test
+  fun testMacroDigestIsScopedToOneHashInvocation() = runBlocking {
+    val target =
+        createRuleTarget(
+            name = "rule1",
+            inputs = emptyList(),
+            digest = "rule1Digest",
+            instantiationStack = listOf("defs/macro.bzl:1:1: macro"))
+    whenever(bazelClientMock.queryAllTargets()).thenReturn(listOf(target))
+
+    fakeSourceFileHasher.softDigestValue = "v1".toByteArray()
+    val first = hasher.hashAllBazelTargetsAndSourcefiles()
+    fakeSourceFileHasher.softDigestValue = "v2".toByteArray()
+    val second = hasher.hashAllBazelTargetsAndSourcefiles()
+    fakeSourceFileHasher.softDigestValue = "v1".toByteArray()
+    val third = hasher.hashAllBazelTargetsAndSourcefiles()
+
+    assertThat(second["rule1"]).isNotEqualTo(first["rule1"])
+    assertThat(third["rule1"]).isEqualTo(first["rule1"])
+  }
+
+  @Test
+  fun testMacroDigestIsReusedWithinHashInvocation() = runBlocking {
+    val instantiationStack = listOf("defs/macro.bzl:1:1: macro")
+    val first =
+        createRuleTarget(
+            name = "rule1",
+            inputs = emptyList(),
+            digest = "rule1Digest",
+            instantiationStack = instantiationStack)
+    val second =
+        createRuleTarget(
+            name = "rule2",
+            inputs = emptyList(),
+            digest = "rule2Digest",
+            instantiationStack = instantiationStack)
+    whenever(bazelClientMock.queryAllTargets()).thenReturn(listOf(first, second))
+
+    hasher.hashAllBazelTargetsAndSourcefiles()
+
+    assertThat(fakeSourceFileHasher.softDigestCalls.get()).isEqualTo(1)
+  }
+
   private fun createRuleTarget(
       name: String,
       inputs: List<String>,
-      digest: String
+      digest: String,
+      instantiationStack: List<String> = emptyList()
   ): BazelTarget.Rule {
     val target = mock<BazelTarget.Rule>()
     val rule = mock<BazelRule>()
     whenever(rule.name).thenReturn(name)
     whenever(rule.ruleInputList(false, emptySet())).thenReturn(inputs)
     whenever(rule.digest(emptySet())).thenReturn(digest.toByteArray())
+    whenever(rule.instantiationStack).thenReturn(instantiationStack)
     whenever(target.rule).thenReturn(rule)
     whenever(target.name).thenReturn(name)
     return target

@@ -58,7 +58,8 @@ class RuleHasherAlwaysAffectedTagsTest : KoinTest {
         emptyMap(),
         null,
         emptySet(),
-        emptySet())
+        emptySet(),
+        HashInvocationContext())
   }
 
   @Test

@@ -8,11 +8,40 @@ import java.util.Collections
  * served from the per-SHA cache -- including when this request waited behind another request that
  * generated them -- and false when this request ran the checkout + `bazel query` itself, which is
  * why a miss is typically orders of magnitude slower than a hit.
+ *
+ * The optional fields break the duration down so a slow retrieval is attributable to a specific
+ * phase (all are omitted from the JSON when absent):
+ * - [lockWaitMillis]: time blocked behind another request's checkout/query on the workspace lock.
+ *   Present whenever the retrieval had to take the lock -- both misses and waited-behind hits.
+ * - [cacheReadMillis]: hit only -- reading the cached entry and deserialising its JSON, which for a
+ *   large graph is the entire cost of a hit.
+ * - [generation]: miss only -- the per-phase cost of generating the hashes.
  */
 data class HashRetrievalProfile(
     val sha: String,
     val cacheHit: Boolean,
     val durationMillis: Long,
+    val lockWaitMillis: Long? = null,
+    val cacheReadMillis: Long? = null,
+    val generation: HashGenerationBreakdown? = null,
+)
+
+/**
+ * Wall-clock breakdown of one cache-miss hash generation, in pipeline order. [checkoutMillis] is
+ * the `git checkout`; [bazelQueryMillis] the `bazel query` for all targets (including proto
+ * parsing); [sourceHashMillis] content-hashing the source files; [targetHashMillis] seeding and
+ * hashing every target; [moduleGraphMillis] the `bazel mod graph --output=json` call (0 when Bzlmod
+ * is off); [cacheWriteMillis] serialising the result and writing it to the cache. [targetCount]
+ * sizes the graph the above phases operated on.
+ */
+data class HashGenerationBreakdown(
+    val checkoutMillis: Long,
+    val bazelQueryMillis: Long,
+    val sourceHashMillis: Long,
+    val targetHashMillis: Long,
+    val moduleGraphMillis: Long,
+    val cacheWriteMillis: Long,
+    val targetCount: Int,
 )
 
 /**
@@ -24,13 +53,16 @@ data class HashRetrievalProfile(
  * the workspace lock, so it can exceed the sum of the individual phases.
  * [resolveRevisionsDurationMillis] covers git revision resolution including any on-demand fetches.
  * [diffDurationMillis] covers the hash diff itself and, when the module graph changed between the
- * revisions, the live `rdeps` query that path issues.
+ * revisions, the live `rdeps` query that path issues -- [diffModuleGraphChanged] is true exactly
+ * when that happened, so an unexpectedly slow diff between two cache-hit revisions is attributable
+ * to the live query rather than the in-memory diff.
  */
 data class QueryProfile(
     val totalDurationMillis: Long,
     val resolveRevisionsDurationMillis: Long,
     val hashRetrievals: List<HashRetrievalProfile>,
     val diffDurationMillis: Long,
+    val diffModuleGraphChanged: Boolean = false,
 )
 
 /**
@@ -85,18 +117,20 @@ class QueryProfiler(
 
   @Volatile private var resolveRevisionsMillis = 0L
   @Volatile private var diffMillis = 0L
+  @Volatile private var diffModuleGraphChanged = false
   private val hashRetrievals = Collections.synchronizedList(mutableListOf<HashRetrievalProfile>())
 
   fun recordResolveRevisions(durationMillis: Long) {
     resolveRevisionsMillis += durationMillis
   }
 
-  fun recordHashRetrieval(sha: String, cacheHit: Boolean, durationMillis: Long) {
-    hashRetrievals.add(HashRetrievalProfile(sha, cacheHit, durationMillis))
+  fun recordHashRetrieval(retrieval: HashRetrievalProfile) {
+    hashRetrievals.add(retrieval)
   }
 
-  fun recordDiff(durationMillis: Long) {
+  fun recordDiff(durationMillis: Long, moduleGraphChanged: Boolean = false) {
     diffMillis += durationMillis
+    if (moduleGraphChanged) diffModuleGraphChanged = true
   }
 
   /** Snapshot of the recorded phases; total spans construction to this call. */
@@ -106,6 +140,7 @@ class QueryProfiler(
           resolveRevisionsDurationMillis = resolveRevisionsMillis,
           hashRetrievals = synchronized(hashRetrievals) { hashRetrievals.toList() },
           diffDurationMillis = diffMillis,
+          diffModuleGraphChanged = diffModuleGraphChanged,
       )
 
   /** Heap/GC movement between construction and this call. */

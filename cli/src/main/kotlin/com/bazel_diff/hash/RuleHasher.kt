@@ -20,6 +20,46 @@ class RuleHasher(
   private val logger: Logger by inject()
   private val sourceFileHasher: SourceFileHasher by inject()
 
+  /**
+   * Per-rule `.bzl` seed: digests of the main-repo `.bzl` files in this rule's macro instantiation
+   * stack, so a macro edit re-hashes only the rules that macro produced (issue #365).
+   * `$rule_implementation_hash` (in [BazelRule.digest]) already covers a rule class's own
+   * definition `.bzl`. Returns null only when the rule has no stack (`--proto:instantiation_stack`
+   * off) so the caller falls back to the package seed; a macro-less rule returns a stable constant,
+   * so the caller does NOT fall back.
+   */
+  private fun ruleBzlSeed(
+      rule: BazelRule,
+      modifiedFilepaths: Set<Path>,
+      hashInvocationContext: HashInvocationContext
+  ): ByteArray? {
+    val stack = rule.instantiationStack
+    if (stack.isEmpty()) return null
+    val bzlPaths = sortedSetOf<String>()
+    for (frame in stack) {
+      val path = frame.substringBefore(":") // "tools/x.bzl:12:3: macro" -> "tools/x.bzl"
+      if ((path.endsWith(".bzl") || path.endsWith(".scl")) &&
+          !path.startsWith("external/") &&
+          !path.startsWith("@") &&
+          !path.startsWith("../")) {
+        bzlPaths.add(path)
+      }
+    }
+    return sha256 {
+      for (path in bzlPaths) {
+        val digest =
+            hashInvocationContext.bzlDigest(path) {
+              sourceFileHasher.softDigest(
+                  BazelSourceFileTarget("//$path", ByteArray(0)), modifiedFilepaths)
+            }
+        if (digest != null) {
+          safePutBytes(path.toByteArray())
+          safePutBytes(digest)
+        }
+      }
+    }
+  }
+
   @VisibleForTesting class CircularDependencyException(message: String) : Exception(message)
 
   private fun raiseCircularDependency(
@@ -43,7 +83,8 @@ class RuleHasher(
       packageBzlSeeds: Map<String, ByteArray>,
       depPath: LinkedHashSet<String>?,
       ignoredAttrs: Set<String>,
-      modifiedFilepaths: Set<Path>
+      modifiedFilepaths: Set<Path>,
+      hashInvocationContext: HashInvocationContext
   ): TargetDigest {
     val depPathClone = if (depPath != null) LinkedHashSet(depPath) else LinkedHashSet()
     if (depPathClone.contains(rule.name)) {
@@ -67,11 +108,11 @@ class RuleHasher(
         targetSha256(trackDepLabels) {
           putDirectBytes(rule.digest(ignoredAttrs))
           putDirectBytes(seedHash)
-          // Mix in the `.bzl` seed for this rule's own package only. Each rule always looks up
-          // its own package (not the caller's), so this stays consistent under the memoized,
-          // depth-first recursion below and a macro edit re-hashes only the packages that
-          // `load()` it (issue #365).
-          putDirectBytes(packageBzlSeeds[labelToPackage(rule.name)])
+          // Per-rule macro seed (see ruleBzlSeed), else the package-wide fallback. Each rule
+          // resolves its own seed, so this is stable under the memoized recursion below (#365).
+          putDirectBytes(
+              ruleBzlSeed(rule, modifiedFilepaths, hashInvocationContext)
+                  ?: packageBzlSeeds[labelToPackage(rule.name)])
           // Mixed into the *direct* digest (not transitively) so the tagged target is classified
           // as DIRECT-impacted for distance metrics; it still bubbles into the overall digest, so
           // any rdeps are conservatively re-hashed too.
@@ -104,7 +145,8 @@ class RuleHasher(
                         packageBzlSeeds,
                         depPathClone,
                         ignoredAttrs,
-                        modifiedFilepaths)
+                        modifiedFilepaths,
+                        hashInvocationContext)
                 putTransitiveBytes(inputLabel, ruleInputHash.overallDigest)
               }
               else -> {
@@ -125,6 +167,36 @@ class RuleHasher(
                       }
                 }
               }
+            }
+          }
+
+          // `visibility` labels are "nodep" labels: `bazel query` does not list them in
+          // `rule_input`, so a referenced package_group's *contents* would otherwise never reach
+          // this rule's digest -- editing a group's `packages` list can flip a dependent of this
+          // rule from building to failing visibility analysis while every hash stays unchanged
+          // (issue #441). Follow package_group visibility entries as dep edges; the special
+          // `//visibility:*` forms and `__pkg__`/`__subpackages__` package specs carry no target
+          // and are already filtered out by [BazelRule.visibilityPackageGroupLabels]. A label
+          // whose group is outside the queried graph is skipped, matching how it was (silently)
+          // invisible before package_group support.
+          if ("visibility" !in ignoredAttrs) {
+            for (packageGroupLabel in rule.visibilityPackageGroupLabels()) {
+              val packageGroup = allRulesMap[packageGroupLabel] ?: continue
+              if (!packageGroup.isPackageGroup || packageGroup.name == rule.name) continue
+              putDirectBytes(packageGroupLabel.toByteArray())
+              val packageGroupHash =
+                  digest(
+                      packageGroup,
+                      allRulesMap,
+                      ruleHashes,
+                      sourceDigests,
+                      seedHash,
+                      packageBzlSeeds,
+                      depPathClone,
+                      ignoredAttrs,
+                      modifiedFilepaths,
+                      hashInvocationContext)
+              putTransitiveBytes(packageGroupLabel, packageGroupHash.overallDigest)
             }
           }
         }

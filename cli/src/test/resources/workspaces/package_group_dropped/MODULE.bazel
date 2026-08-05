@@ -1,0 +1,4 @@
+module(
+    name = "package_group_dropped",
+    version = "0.0.0",
+)

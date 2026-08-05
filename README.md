@@ -206,10 +206,40 @@ curl 'http://localhost:8080/metrics'
   "ready": true,
   "gitEngine": "subprocess",
   "trackDeps": false,
-  "cache": {"directory": "/var/cache/bazel-diff", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB"},
+  "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB"},
   "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
 }
 ```
+
+### Shared S3 cache for multi-instance deployments
+
+A single instance caches hashes on local disk only. When you run several replicas behind a load
+balancer (e.g. a Kubernetes Deployment behind a Service, with the readiness probe on `/health`),
+give them a shared S3 cache tier so a revision is cold-hashed once fleet-wide instead of once per
+pod:
+
+```bash
+bazel-diff serve \
+  --workspacePath /path/to/workspace-clone \
+  --cacheDir /var/cache/bazel-diff \
+  --s3Bucket my-hash-cache-bucket \
+  --s3Prefix bazel-diff/my-repo
+```
+
+With `--s3Bucket` set the cache becomes two-tiered: reads check local disk first and fall back to
+the bucket (backfilling local disk on a hit), and every generated entry is published to both, so
+any replica can serve a revision another replica already hashed. Credentials and region resolve
+through the standard AWS default provider chains (environment variables, profile, IRSA web
+identity on EKS, IMDS), or pin the region with `--s3Region`. `--s3Endpoint` plus
+`--s3ForcePathStyle` point the client at an S3-compatible store (MinIO, LocalStack) for local
+testing.
+
+S3 errors never fail a request: a failed read is treated as a cache miss (the revision is
+regenerated — slower, but correct) and a failed write leaves the entry local-only, so an S3 outage
+degrades throughput rather than availability. Concurrent replicas racing to hash the same
+revision are also harmless — entries are deterministic per key, so last-write-wins over identical
+content. The `--cacheMax*` pruning flags bound the *local* tier only; bound the bucket with an S3
+lifecycle policy instead.
 
 Notes and current limitations:
 
@@ -234,10 +264,8 @@ Notes and current limitations:
   sweeper enforces the limits once at startup and then every `--cachePruneInterval` (default `1h`),
   evicting least-recently-used entries first — a cache hit refreshes an entry's recency, so revisions
   under active query are not expired out from under live traffic. With no `--cacheMax*` flag set the
-  cache is never pruned (the previous behavior). The cache layer is pluggable behind a byte-oriented
-  interface so a remote backend (e.g. S3) can be added without touching callers; such a backend
-  manages its own retention (e.g. a bucket lifecycle policy), and the in-process `--cacheMax*` flags
-  do not apply to it.
+  cache is never pruned (the previous behavior). The `--cacheMax*` flags always bound the local-disk
+  tier only; the shared S3 tier (see above) manages its own retention via a bucket lifecycle policy.
 * Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
   `generate-hashes`, and are folded into the cache key so a server started with different flags never
   serves another configuration's cached hashes.
@@ -248,8 +276,8 @@ Notes and current limitations:
   shared-base full-hash cache is not reused (each distinct changed-set re-hashes the base), but each
   such hash is cheaper because it skips reading unchanged files. The extra entries are bounded by the
   same LRU `--cacheMax*` pruning as everything else.
-* Containerization, multi-instance deployment manifests, and remote cache backends are not yet
-  included.
+* Containerization and multi-instance deployment manifests are not yet included; the shared S3
+  cache tier above is the building block for running replicas behind a load balancer.
 
 <!-- BEGIN_SECTION: cli-help -->
 ## CLI Interface
@@ -508,9 +536,9 @@ Command-line utility to analyze the state of the bazel build graph
 
 ```terminal
 Usage: bazel-diff serve [-hkvV] [--[no-]excludeExternalTargets]
-                        [--no-initial-fetch] [--[no-]trackDeps] [--[no-]
-                        useCquery] [-b=<bazelPath>] --cacheDir=<cacheDir>
-                        [--cacheMaxAge=<cacheMaxAge>]
+                        [--no-initial-fetch] [--[no-]s3ForcePathStyle] [--[no-]
+                        trackDeps] [--[no-]useCquery] [-b=<bazelPath>]
+                        --cacheDir=<cacheDir> [--cacheMaxAge=<cacheMaxAge>]
                         [--cacheMaxEntries=<cacheMaxEntries>]
                         [--cacheMaxSize=<cacheMaxSize>]
                         [--cachePruneInterval=<cachePruneInterval>]
@@ -519,7 +547,9 @@ Usage: bazel-diff serve [-hkvV] [--[no-]excludeExternalTargets]
                         [--fineGrainedHashExternalReposFile=<fineGrainedHashExte
                         rnalReposFile>] [--gitPath=<gitPath>] [--port=<port>]
                         [--requestTimeout=<requestTimeoutSeconds>]
-                        [-s=<seedFilepaths>] -w=<workspacePath>
+                        [-s=<seedFilepaths>] [--s3Bucket=<s3Bucket>]
+                        [--s3Endpoint=<s3Endpoint>] [--s3Prefix=<s3Prefix>]
+                        [--s3Region=<s3Region>] -w=<workspacePath>
                         [-co=<bazelCommandOptions>]...
                         [--cqueryCommandOptions=<cqueryCommandOptions>]...
                         [--fineGrainedHashExternalRepos=<fineGrainedHashExternal
@@ -602,6 +632,27 @@ targets between two git revisions, caching generated hashes per commit SHA.
   -s, --seed-filepaths=<seedFilepaths>
                             A text file with a newline separated list of
                               filepaths used as a SHA256 seed for all targets.
+      --s3Bucket=<s3Bucket> S3 bucket used as a shared hash cache behind the
+                              local --cacheDir tier. Generated hashes are
+                              published to the bucket and local cache misses
+                              fall back to it, so replicas behind a load
+                              balancer share one cache. Credentials and region
+                              come from the AWS default provider chains (env
+                              vars, profile, IRSA, IMDS). Unset (the default)
+                              means local-disk caching only.
+      --s3Endpoint=<s3Endpoint>
+                            Custom S3 endpoint URL for S3-compatible stores
+                              (MinIO, LocalStack). Usually combined with
+                              --s3ForcePathStyle.
+      --[no-]s3ForcePathStyle
+                            Use path-style S3 addressing (bucket in the URL
+                              path, not the hostname), required by most
+                              S3-compatible stores. Defaults to false.
+      --s3Prefix=<s3Prefix> Key prefix for cache objects in --s3Bucket, e.g.
+                              'bazel-diff/my-repo'. Defaults to no prefix
+                              (objects at the bucket root).
+      --s3Region=<s3Region> AWS region of --s3Bucket. Defaults to the SDK's
+                              default region chain (env vars, profile, IMDS).
       -so, --bazelStartupOptions=<bazelStartupOptions>
                             Additional space separated Bazel client startup
                               options used when invoking Bazel
@@ -646,7 +697,7 @@ First, add the following snippet to your project:
 #### Bzlmod snippet
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "34.0.0")
+bazel_dep(name = "bazel-diff", version = "39.0.0")
 ```
 
 You can now run the tool with:
@@ -766,17 +817,17 @@ bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
   <tr>
     <td align="center"><a href="https://github.com/tinder-maxwellelliott"><img src="https://avatars.githubusercontent.com/u/56700854?s=64" width="64" alt="Maxwell Elliott"/><br/><sub><b>Maxwell Elliott</b></sub></a></td>
     <td align="center"><a href="https://github.com/honnix"><img src="https://avatars.githubusercontent.com/u/158892?s=64" width="64" alt="Honnix"/><br/><sub><b>Honnix</b></sub></a></td>
-    <td align="center"><a href="https://github.com/github-actions[bot]"><img src="https://avatars.githubusercontent.com/in/15368?s=64" width="64" alt="github-actions[bot]"/><br/><sub><b>github-actions[bot]</b></sub></a></td>
     <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="eric wang"/><br/><sub><b>eric wang</b></sub></a></td>
     <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="Eric Wang"/><br/><sub><b>Eric Wang</b></sub></a></td>
     <td align="center"><a href="https://github.com/tgeng"><img src="https://avatars.githubusercontent.com/u/29584386?s=64" width="64" alt="Tianyu Geng"/><br/><sub><b>Tianyu Geng</b></sub></a></td>
+    <td align="center"><a href="https://github.com/BalestraPatrick"><img src="https://avatars.githubusercontent.com/u/3658887?s=64" width="64" alt="Patrick Balestra"/><br/><sub><b>Patrick Balestra</b></sub></a></td>
   </tr>
   <tr>
-    <td align="center"><a href="https://github.com/BalestraPatrick"><img src="https://avatars.githubusercontent.com/u/3658887?s=64" width="64" alt="Patrick Balestra"/><br/><sub><b>Patrick Balestra</b></sub></a></td>
     <td align="center"><a href="https://github.com/purkhusid"><img src="https://avatars.githubusercontent.com/u/5622403?s=64" width="64" alt="Daniel P. Purkhus"/><br/><sub><b>Daniel P. Purkhus</b></sub></a></td>
     <td align="center"><a href="https://github.com/alexeagle"><img src="https://avatars.githubusercontent.com/u/47395?s=64" width="64" alt="Alex Eagle"/><br/><sub><b>Alex Eagle</b></sub></a></td>
     <td align="center"><a href="https://github.com/Malinskiy"><img src="https://avatars.githubusercontent.com/u/2089114?s=64" width="64" alt="Anton Malinskiy"/><br/><sub><b>Anton Malinskiy</b></sub></a></td>
     <td align="center"><a href="https://github.com/rdark"><img src="https://avatars.githubusercontent.com/u/260691?s=64" width="64" alt="rdark"/><br/><sub><b>rdark</b></sub></a></td>
+    <td align="center"><a href="https://github.com/corypaik"><img src="https://avatars.githubusercontent.com/u/36490981?s=64" width="64" alt="Cory Paik"/><br/><sub><b>Cory Paik</b></sub></a></td>
     <td align="center"><a href="https://github.com/thirtyseven"><img src="https://avatars.githubusercontent.com/u/123678?s=64" width="64" alt="Ted Kaplan"/><br/><sub><b>Ted Kaplan</b></sub></a></td>
   </tr>
   <tr>
@@ -789,29 +840,30 @@ bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
   </tr>
   <tr>
     <td align="center"><a href="https://github.com/JaimeLennox"><img src="https://avatars.githubusercontent.com/u/1424638?s=64" width="64" alt="Jaime Lennox"/><br/><sub><b>Jaime Lennox</b></sub></a></td>
+    <td align="center"><a href="https://github.com/dgollahon-plaid"><img src="https://avatars.githubusercontent.com/u/179647366?s=64" width="64" alt="dgollahon-plaid"/><br/><sub><b>dgollahon-plaid</b></sub></a></td>
     <td align="center"><a href="https://github.com/jmwachtel"><img src="https://avatars.githubusercontent.com/u/1046228?s=64" width="64" alt="jmwachtel"/><br/><sub><b>jmwachtel</b></sub></a></td>
     <td align="center"><a href="https://github.com/Ahajha"><img src="https://avatars.githubusercontent.com/u/44127594?s=64" width="64" alt="Alex Trotta"/><br/><sub><b>Alex Trotta</b></sub></a></td>
     <td align="center"><a href="https://github.com/nollbit"><img src="https://avatars.githubusercontent.com/u/99957?s=64" width="64" alt="Johan Mjönes"/><br/><sub><b>Johan Mjönes</b></sub></a></td>
     <td align="center"><a href="https://github.com/lucasteixeira-cb"><img src="https://avatars.githubusercontent.com/u/116316841?s=64" width="64" alt="Lucas Teixeira"/><br/><sub><b>Lucas Teixeira</b></sub></a></td>
-    <td align="center"><a href="https://github.com/GuillaumeVW"><img src="https://avatars.githubusercontent.com/u/53425033?s=64" width="64" alt="Guillaume Van Wassenhove"/><br/><sub><b>Guillaume Van Wassenhove</b></sub></a></td>
   </tr>
   <tr>
+    <td align="center"><a href="https://github.com/GuillaumeVW"><img src="https://avatars.githubusercontent.com/u/53425033?s=64" width="64" alt="Guillaume Van Wassenhove"/><br/><sub><b>Guillaume Van Wassenhove</b></sub></a></td>
     <td align="center"><a href="https://github.com/fmeum"><img src="https://avatars.githubusercontent.com/u/4312191?s=64" width="64" alt="Fabian Meumertzheim"/><br/><sub><b>Fabian Meumertzheim</b></sub></a></td>
     <td align="center"><a href="https://github.com/blockjon-dd"><img src="https://avatars.githubusercontent.com/u/117850895?s=64" width="64" alt="Jonathan Block"/><br/><sub><b>Jonathan Block</b></sub></a></td>
     <td align="center"><a href="https://github.com/alex-torok"><img src="https://avatars.githubusercontent.com/u/8749956?s=64" width="64" alt="Alex Torok"/><br/><sub><b>Alex Torok</b></sub></a></td>
     <td align="center"><a href="https://github.com/naveenOnarayanan"><img src="https://avatars.githubusercontent.com/u/3528131?s=64" width="64" alt="Naveen Narayanan"/><br/><sub><b>Naveen Narayanan</b></sub></a></td>
     <td align="center"><a href="https://github.com/OniOni"><img src="https://avatars.githubusercontent.com/u/385657?s=64" width="64" alt="Mathieu Sabourin"/><br/><sub><b>Mathieu Sabourin</b></sub></a></td>
-    <td align="center"><a href="https://github.com/andre-alves"><img src="https://avatars.githubusercontent.com/u/7773955?s=64" width="64" alt="André"/><br/><sub><b>André</b></sub></a></td>
   </tr>
   <tr>
+    <td align="center"><a href="https://github.com/andre-alves"><img src="https://avatars.githubusercontent.com/u/7773955?s=64" width="64" alt="André"/><br/><sub><b>André</b></sub></a></td>
     <td align="center"><a href="https://github.com/bz-canva"><img src="https://avatars.githubusercontent.com/u/125319243?s=64" width="64" alt="Boris"/><br/><sub><b>Boris</b></sub></a></td>
     <td align="center"><a href="https://github.com/chenrui333"><img src="https://avatars.githubusercontent.com/u/1580956?s=64" width="64" alt="Rui Chen"/><br/><sub><b>Rui Chen</b></sub></a></td>
     <td align="center"><a href="https://github.com/sanju-naik"><img src="https://avatars.githubusercontent.com/u/66404008?s=64" width="64" alt="Sanju Naik"/><br/><sub><b>Sanju Naik</b></sub></a></td>
     <td align="center"><a href="https://github.com/lalten"><img src="https://avatars.githubusercontent.com/u/11611719?s=64" width="64" alt="Laurenz"/><br/><sub><b>Laurenz</b></sub></a></td>
     <td align="center"><a href="https://github.com/molar"><img src="https://avatars.githubusercontent.com/u/1433210?s=64" width="64" alt="mla"/><br/><sub><b>mla</b></sub></a></td>
-    <td align="center"><a href="https://github.com/tinder-yukisawa"><img src="https://avatars.githubusercontent.com/u/54122444?s=64" width="64" alt="tinder-yukisawa"/><br/><sub><b>tinder-yukisawa</b></sub></a></td>
   </tr>
   <tr>
+    <td align="center"><a href="https://github.com/tinder-yukisawa"><img src="https://avatars.githubusercontent.com/u/54122444?s=64" width="64" alt="tinder-yukisawa"/><br/><sub><b>tinder-yukisawa</b></sub></a></td>
     <td align="center"><a href="https://github.com/KevinJiao"><img src="https://avatars.githubusercontent.com/u/9851473?s=64" width="64" alt="Kevin Jiao"/><br/><sub><b>Kevin Jiao</b></sub></a></td>
     <td align="center"><a href="https://github.com/vcase"><img src="https://avatars.githubusercontent.com/u/10698795?s=64" width="64" alt="Vincent Case"/><br/><sub><b>Vincent Case</b></sub></a></td>
     <td align="center"><a href="https://github.com/fh-wpanfil"><img src="https://avatars.githubusercontent.com/u/262680997?s=64" width="64" alt="Walt Panfil"/><br/><sub><b>Walt Panfil</b></sub></a></td>

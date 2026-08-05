@@ -159,7 +159,8 @@ class ImpactedTargetsServiceTest : KoinTest {
     ): HashFileData {
       modifiedFilepathsByRev[sha] = modifiedFilepaths
       // Mirror HashService: each retrieval reports itself to the profiler (canned data = a "hit").
-      profiler?.recordHashRetrieval(sha, cacheHit = true, durationMillis = 1)
+      profiler?.recordHashRetrieval(
+          HashRetrievalProfile(sha, cacheHit = true, durationMillis = 1, cacheReadMillis = 1))
       return byRev[sha] ?: error("no canned hashes for $sha")
     }
 
@@ -330,10 +331,14 @@ class ImpactedTargetsServiceTest : KoinTest {
         FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to), allowWorkspaceAt = true)
     val service = ImpactedTargetsService(IdentityGitClient(), provider, depsTracked = true)
 
-    val result = service.getImpactedTargetsWithDistances("from-sha", "to-sha", null)
+    val result =
+        service.getImpactedTargetsWithDistances(
+            "from-sha", "to-sha", null, profiler = QueryProfiler())
 
     assertThat(result.impactedTargets).containsExactly(ImpactedTargetWithDistance("//:a", 0, 0))
     assertThat(provider.workspaceAtCalls).isEqualTo(listOf("to-sha"))
+    // The live-rdeps diff path is called out in the profile so a slow diff is attributable to it.
+    assertThat(result.profile!!.diffModuleGraphChanged).isEqualTo(true)
   }
 
   @Test
@@ -353,6 +358,8 @@ class ImpactedTargetsServiceTest : KoinTest {
     assertThat(profile.totalDurationMillis).isGreaterThanOrEqualTo(0)
     assertThat(profile.resolveRevisionsDurationMillis).isGreaterThanOrEqualTo(0)
     assertThat(profile.diffDurationMillis).isGreaterThanOrEqualTo(0)
+    // Identical (null) module graphs on both sides: the pure hash-diff path ran.
+    assertThat(profile.diffModuleGraphChanged).isEqualTo(false)
     val memory = result.memoryProfile!!
     assertThat(memory.heapMaxBytes).isGreaterThan(0)
     assertThat(memory.heapUsedAfterBytes - memory.heapUsedBeforeBytes)

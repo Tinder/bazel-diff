@@ -1,6 +1,7 @@
 package com.bazel_diff.e2e
 
 import assertk.assertThat
+import assertk.assertions.contains
 import assertk.assertions.isEqualTo
 import com.bazel_diff.cli.BazelDiff
 import com.google.gson.Gson
@@ -166,26 +167,16 @@ class E2ETest {
   @Test
   fun testServeEndToEnd() {
     val workspace = copyTestWorkspace("distance_metrics")
-    fun git(vararg args: String): String {
-      val proc =
-          ProcessBuilder(listOf("git") + args)
-              .directory(workspace)
-              .redirectErrorStream(true)
-              .start()
-      val output = proc.inputStream.readBytes().decodeToString()
-      check(proc.waitFor() == 0) { "git ${args.joinToString(" ")} failed: $output" }
-      return output.trim()
-    }
-    git("init", "-q")
-    git("config", "user.email", "test@example.com")
-    git("config", "user.name", "test")
-    git("add", "-A")
-    git("commit", "-q", "-m", "base")
-    val fromSha = git("rev-parse", "HEAD")
+    git(workspace, "init", "-q")
+    git(workspace, "config", "user.email", "test@example.com")
+    git(workspace, "config", "user.name", "test")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-q", "-m", "base")
+    val fromSha = git(workspace, "rev-parse", "HEAD")
     File(workspace, "lib.sh").writeText("echo changed\n")
-    git("add", "-A")
-    git("commit", "-q", "-m", "change lib.sh")
-    val toSha = git("rev-parse", "HEAD")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-q", "-m", "change lib.sh")
+    val toSha = git(workspace, "rev-parse", "HEAD")
 
     val cacheDir = temp.newFolder()
     val port = java.net.ServerSocket(0).use { it.localPort }
@@ -245,6 +236,66 @@ class E2ETest {
       serveThread.interrupt()
       serveThread.join(10_000)
     }
+  }
+
+  @Test
+  fun testServeDoesNotReuseMacroDigestAcrossRevisions() {
+    val workspace = copyTestWorkspace("serve_bzl_cache")
+    git(workspace, "init", "-q")
+    git(workspace, "config", "user.email", "test@example.com")
+    git(workspace, "config", "user.name", "test")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-q", "-m", "base")
+    val fromSha = git(workspace, "rev-parse", "HEAD")
+
+    File(workspace, "defs.bzl").appendText("\n# second revision\n")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-q", "-m", "change macro source")
+    val toSha = git(workspace, "rev-parse", "HEAD")
+
+    val cacheDir = temp.newFolder()
+    val port = java.net.ServerSocket(0).use { it.localPort }
+    val serveThread =
+        Thread {
+              CommandLine(BazelDiff())
+                  .execute(
+                      "serve",
+                      "-w",
+                      workspace.absolutePath,
+                      "-b",
+                      "bazel",
+                      "--cacheDir",
+                      cacheDir.absolutePath,
+                      "--port",
+                      port.toString(),
+                      "--no-initial-fetch")
+            }
+            .apply {
+              isDaemon = true
+              start()
+            }
+
+    try {
+      awaitServeHealthy(port)
+      val (code, body) =
+          httpGetServe("http://localhost:$port/impacted_targets?from=$fromSha&to=$toSha")
+      assertThat(code).isEqualTo(200)
+      val parsed: Map<String, Any> =
+          Gson().fromJson(body, object : TypeToken<Map<String, Any>>() {}.type)
+      @Suppress("UNCHECKED_CAST") val impacted = parsed["impactedTargets"] as List<String>
+      assertThat(impacted.map { it.removePrefix("@@") }).contains("//:generated")
+    } finally {
+      serveThread.interrupt()
+      serveThread.join(10_000)
+    }
+  }
+
+  private fun git(workspace: File, vararg args: String): String {
+    val proc =
+        ProcessBuilder(listOf("git") + args).directory(workspace).redirectErrorStream(true).start()
+    val output = proc.inputStream.readBytes().decodeToString()
+    check(proc.waitFor() == 0) { "git ${args.joinToString(" ")} failed: $output" }
+    return output.trim()
   }
 
   /** Polls `/health` until it returns 200, up to ~30s, failing the test otherwise. */
@@ -1457,6 +1508,93 @@ class E2ETest {
     // The `external`-tagged scanner read a file it never declared. Its hash is unchanged,
     // so bazel-diff does NOT report it -- this is exactly the gap #401 asks to close.
     assertThat(impacted.contains("//:scanner")).isEqualTo(false)
+  }
+
+  @Test
+  fun testPackageGroupChangeImpactsConsumers_regressionForIssue441() {
+    // Regression test for the under-invalidation (false-negative) half of
+    // https://github.com/Tinder/bazel-diff/issues/441.
+    //
+    // bazel-diff used to keep only targets whose query `Discriminator` is RULE,
+    // SOURCE_FILE, or GENERATED_FILE; `PACKAGE_GROUP` was dropped
+    // (BazelQueryService.toBazelTarget logged "Unsupported target type" and
+    // returned null), so a change to a package_group's `packages` list was never
+    // reflected in any hash -- even though it genuinely alters downstream
+    // visibility and can flip a consumer from building to failing.
+    //
+    // The `package_group_dropped` workspace:
+    //   //lib:consumers -- a package_group (created by a macro in lib/defs.bzl)
+    //                      that gates the visibility of //lib:thing. Its
+    //                      allow-list lives in defs.bzl as `ALLOWED`.
+    //   //lib:thing     -- a genrule declared DIRECTLY (not via the macro), so
+    //                      its per-rule `.bzl` seed never picks up defs.bzl.
+    //   //consumer:use_thing -- depends on //lib:thing.
+    //
+    // Between the two checkouts we edit ONLY lib/defs.bzl, emptying `ALLOWED`.
+    // That revokes //consumer's visibility of //lib:thing: workspace A builds
+    // //consumer:use_thing successfully, workspace B fails visibility analysis
+    // for it. The BUILD files and every native rule are byte-for-byte identical
+    // across the checkouts, so the sole semantic change rides entirely on the
+    // PACKAGE_GROUP target.
+    //
+    // Fixed behaviour: the package_group is lowered to a synthetic rule and
+    // hashed, and RuleHasher follows the (nodep) `visibility` edge from
+    // //lib:thing to it -- so the group, the rule it gates, and that rule's
+    // transitive dependents are all reported.
+    val workspaceA = copyTestWorkspace("package_group_dropped")
+    val workspaceB = copyTestWorkspace("package_group_dropped")
+
+    // The ONLY change: revoke //consumer's visibility by emptying the macro's
+    // allow-list. Nothing else -- no BUILD file, no rule attribute -- changes.
+    val defsInB = File(workspaceB, "lib/defs.bzl")
+    defsInB.writeText(defsInB.readText().replace("ALLOWED = [\"//consumer\"]", "ALLOWED = []"))
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted =
+        filterBazelDiffInternalTargets(
+            impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
+
+    // The changed package_group itself, the rule it gates (via the visibility
+    // edge), and that rule's transitive dependents -- including generated files
+    // -- are all reported. In particular //consumer:use_thing, which really does
+    // flip from building to failing visibility analysis, is now surfaced.
+    assertThat(impacted)
+        .isEqualTo(
+            setOf(
+                "//lib:consumers",
+                "//lib:thing",
+                "//lib:thing.txt",
+                "//consumer:use_thing",
+                "//consumer:use_thing.txt"))
   }
 
   /**
@@ -2741,6 +2879,152 @@ class E2ETest {
               it
             }
         .isEqualTo(true)
+  }
+
+  // Editing an EXISTING widely-loaded rule `.bzl` must be scoped too, not just newly-added macros
+  // (#365). Fixture `rule_bzl_overtrigger`: `//app` loads `//defs:thing.bzl` for one target
+  // (`//app:t`) alongside unrelated native targets (`:native_gen`, `:fg`, `:data.txt`). Editing
+  // `thing.bzl` must impact `//app:t` (its instantiation-stack seed + `$rule_implementation_hash`)
+  // but MUST NOT impact the native targets that only share its package.
+  @Test
+  fun testEditingRuleBzlDoesNotOverInvalidateSamePackageTargets() {
+    val workspaceA = copyTestWorkspace("rule_bzl_overtrigger")
+    val workspaceB = copyTestWorkspace("rule_bzl_overtrigger")
+
+    // Change thing.bzl's rule impl without changing any emitted attribute of `thing`.
+    val bzlInB = File(workspaceB, "defs/thing.bzl")
+    val original = bzlInB.readText()
+    val mutated =
+        original.replace(
+            "ctx.actions.write(out, \"thing\")", "ctx.actions.write(out, \"thing\")  # edited")
+    assertThat(mutated != original).isEqualTo(true)
+    bzlInB.writeText(mutated)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+
+    // The target that instantiates the rule from thing.bzl must be impacted.
+    assertThat(impacted.any { it.endsWith("//app:t") })
+        .transform("//app:t should be impacted by a thing.bzl edit; got: $impacted") { it }
+        .isEqualTo(true)
+
+    // Unrelated native targets sharing the package must NOT be impacted (the over-invalidation).
+    val overInvalidated =
+        impacted.filter {
+          it.endsWith("//app:native_gen") ||
+              it.endsWith("//app:g.txt") ||
+              it.endsWith("//app:fg") ||
+              it.endsWith("//app:data.txt")
+        }
+    assertThat(overInvalidated.isEmpty())
+        .transform(
+            "Editing thing.bzl must not impact unrelated //app targets; over-invalidated: $overInvalidated") {
+              it
+            }
+        .isEqualTo(true)
+  }
+
+  // Cross-file macro/rule: `//app` loads `//defs:macro.bzl`, which loads `//defs:rule.bzl`, for one
+  // target (`//app:s`). Editing EITHER file must impact `//app:s` -- the macro via its
+  // instantiation-stack seed, the rule via `$rule_implementation_hash` -- so the scoping does not
+  // under-invalidate. `//app:unrelated_gen` (a sibling native target) must stay out.
+  private fun crossFileImpacted(mutate: (File) -> Unit): Set<String> {
+    val workspaceA = copyTestWorkspace("cross_file_macro_rule")
+    val workspaceB = copyTestWorkspace("cross_file_macro_rule")
+    mutate(workspaceB)
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impacted = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceA.absolutePath, "-b", "bazel", from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes", "-w", workspaceB.absolutePath, "-b", "bazel", to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impacted.absolutePath))
+        .isEqualTo(0)
+    return impacted.readLines().filter { it.isNotBlank() }.toSet()
+  }
+
+  private fun assertCrossFileConsumerScoped(impacted: Set<String>, edited: String) {
+    assertThat(impacted.any { it.endsWith("//app:s") })
+        .transform("//app:s should be impacted by the $edited edit; got: $impacted") { it }
+        .isEqualTo(true)
+    assertThat(impacted.none { it.endsWith("//app:unrelated_gen") || it.endsWith("//app:u.txt") })
+        .transform("$edited edit must not impact //app:unrelated_gen; got: $impacted") { it }
+        .isEqualTo(true)
+  }
+
+  @Test
+  fun testEditingCrossFileMacroImpactsConsumerNotSiblings() {
+    val impacted = crossFileImpacted { ws ->
+      val f = File(ws, "defs/macro.bzl")
+      f.writeText(
+          f.readText()
+              .replace(
+                  "def split(name, **kwargs):",
+                  "def split(name, **kwargs):\n    print(\"split: \" + name)"))
+    }
+    assertCrossFileConsumerScoped(impacted, "defs/macro.bzl")
+  }
+
+  @Test
+  fun testEditingCrossFileRuleImpactsConsumerNotSiblings() {
+    val impacted = crossFileImpacted { ws ->
+      val f = File(ws, "defs/rule.bzl")
+      f.writeText(
+          f.readText()
+              .replace(
+                  "ctx.actions.write(out, \"split\")",
+                  "ctx.actions.write(out, \"split\")  # edited"))
+    }
+    assertCrossFileConsumerScoped(impacted, "defs/rule.bzl")
   }
 
   /**

@@ -27,6 +27,7 @@ class MetricsServiceTest {
       ready: Boolean = true,
       nowMillis: Long = 10_000,
       startedAtMillis: Long = 4_000,
+      remoteCache: String? = null,
   ) =
       MetricsService(
           version = "1.2.3",
@@ -35,6 +36,7 @@ class MetricsServiceTest {
           trackDeps = true,
           cacheDir = "/var/cache/bazel-diff",
           storage = storage,
+          remoteCache = remoteCache,
           readiness = { ready },
           clock = { nowMillis },
       )
@@ -66,6 +68,13 @@ class MetricsServiceTest {
     assertThat(snap.cache.entries).isNull()
     assertThat(snap.cache.sizeBytes).isNull()
     assertThat(snap.cache.sizeHuman).isNull()
+  }
+
+  @Test
+  fun remoteCacheLocationIsReportedWhenConfigured() {
+    assertThat(service(FakePlain()).snapshot().cache.remote).isNull()
+    assertThat(service(FakePlain(), remoteCache = "s3://bucket/prefix/").snapshot().cache.remote)
+        .isEqualTo("s3://bucket/prefix/")
   }
 
   @Test

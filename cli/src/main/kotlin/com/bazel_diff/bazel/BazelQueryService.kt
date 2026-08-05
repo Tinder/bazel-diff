@@ -211,6 +211,12 @@ class BazelQueryService(
           } else {
             add("streamed_proto")
           }
+          // Each rule's macro instantiation stack; RuleHasher.ruleBzlSeed uses it to attribute a
+          // loaded `.bzl` to the rules a macro produced, not every target in the package. The
+          // starlark cquery path emits labels only, so it does not apply there.
+          if (!(useCquery && outputCompatibleTargets)) {
+            add("--proto:instantiation_stack")
+          }
           if (!useCquery) {
             add("--order_output=no")
           }
@@ -310,7 +316,17 @@ class BazelQueryService(
     }
 
     // Step 2: Fetch repo definitions via `mod show_repo @@<canonical>... --output=streamed_proto`.
-    val canonicalNames = canonicalToApparent.keys.map { "@@$it" }
+    //
+    // Ask only for repos `bazel mod` can resolve. A workspace running Bzlmod alongside WORKSPACE
+    // maps its WORKSPACE repos into the root repo mapping too, and show_repo fails the whole batch
+    // on the first one it does not know -- leaving every Bzlmod repo unhashed. A Bzlmod canonical
+    // name carries the module separator ('+', or '~' before Bazel 7.1); //external covers the rest.
+    val canonicalNames =
+        canonicalToApparent.keys.filter { it.contains('+') || it.contains('~') }.map { "@@$it" }
+    if (canonicalNames.isEmpty()) {
+      logger.w { "No bzlmod-canonical repos in the repo mapping, skipping mod show_repo" }
+      return emptyList()
+    }
     val outputFile = Files.createTempFile(null, ".bin").toFile()
     outputFile.deleteOnExit()
 
@@ -595,10 +611,35 @@ class BazelQueryService(
       Build.Target.Discriminator.RULE -> BazelTarget.Rule(target)
       Build.Target.Discriminator.SOURCE_FILE -> BazelTarget.SourceFile(target)
       Build.Target.Discriminator.GENERATED_FILE -> BazelTarget.GeneratedFile(target)
+      Build.Target.Discriminator.PACKAGE_GROUP -> packageGroupToTarget(target)
       else -> {
         logger.w { "Unsupported target type in the build graph: ${target.type.name}" }
         null
       }
     }
+  }
+
+  /**
+   * Lowers a PACKAGE_GROUP query target into a synthetic RULE target so it flows through the
+   * regular rule-hashing pipeline instead of being dropped (issue #441): the group's `packages`
+   * allow-list becomes a hashed attribute, and its `includes` become rule_inputs so an edit to a
+   * nested package_group propagates to every group that includes it. [RuleHasher] separately
+   * follows rules' `visibility` attributes to these targets, which is what carries a group edit to
+   * the rules the group gates -- and from there, transitively, to their dependents.
+   */
+  private fun packageGroupToTarget(target: Build.Target): BazelTarget.Rule {
+    val packageGroup = target.packageGroup
+    val rule =
+        Build.Rule.newBuilder()
+            .setName(packageGroup.name)
+            .setRuleClass("package_group")
+            .addAttribute(
+                Build.Attribute.newBuilder()
+                    .setName("packages")
+                    .setType(Build.Attribute.Discriminator.STRING_LIST)
+                    .addAllStringListValue(packageGroup.containedPackageList))
+            .addAllRuleInput(packageGroup.includedPackageGroupList)
+    return BazelTarget.Rule(
+        Build.Target.newBuilder().setType(Build.Target.Discriminator.RULE).setRule(rule).build())
   }
 }

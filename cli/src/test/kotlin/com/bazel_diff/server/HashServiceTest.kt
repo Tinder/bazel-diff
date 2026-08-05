@@ -25,6 +25,8 @@ import org.mockito.Mockito.times
 import org.mockito.Mockito.verify
 import org.mockito.junit.MockitoJUnit
 import org.mockito.kotlin.any
+import org.mockito.kotlin.anyOrNull
+import org.mockito.kotlin.eq
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
 
@@ -81,7 +83,7 @@ class HashServiceTest : KoinTest {
 
   @Test
   fun cacheMissGeneratesAndStores() {
-    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any()))
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
         .thenReturn(sampleHashes)
     runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
     val git = RecordingGitClient()
@@ -99,7 +101,7 @@ class HashServiceTest : KoinTest {
 
   @Test
   fun scopedRequestUsesADistinctCacheKeyAndPassesTheSetToTheHasher() {
-    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any()))
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
         .thenReturn(sampleHashes)
     runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
     val storage = InMemoryStorage()
@@ -113,7 +115,9 @@ class HashServiceTest : KoinTest {
     assertThat(key).startsWith("sha1.fp.")
     assertThat(key).isNotEqualTo("sha1.fp")
     // The scope reaches the hasher (3rd arg) so unchanged files skip content reads.
-    verify(buildGraphHasher).hashAllBazelTargetsAndSourcefiles(emptySet(), emptySet(), modified)
+    verify(buildGraphHasher)
+        .hashAllBazelTargetsAndSourcefiles(
+            eq(emptySet()), eq(emptySet()), eq(modified), anyOrNull())
   }
 
   @Test
@@ -131,7 +135,7 @@ class HashServiceTest : KoinTest {
 
   @Test
   fun secondCallIsServedFromCacheWithoutRegenerating() {
-    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any()))
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
         .thenReturn(sampleHashes)
     runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
     val git = RecordingGitClient()
@@ -144,12 +148,13 @@ class HashServiceTest : KoinTest {
     assertThat(second.hashes).isEqualTo(sampleHashes)
     // Only the first call touches the workspace / runs the hasher.
     assertThat(git.checkouts).isEqualTo(listOf("sha1"))
-    verify(buildGraphHasher, times(1)).hashAllBazelTargetsAndSourcefiles(any(), any(), any())
+    verify(buildGraphHasher, times(1))
+        .hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull())
   }
 
   @Test
   fun profilerRecordsCacheMissThenHit() {
-    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any()))
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
         .thenReturn(sampleHashes)
     runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
     val service = newService(RecordingGitClient(), InMemoryStorage())
@@ -163,9 +168,18 @@ class HashServiceTest : KoinTest {
     assertThat(miss.sha).isEqualTo("sha1")
     assertThat(miss.cacheHit).isEqualTo(false)
     assertThat(miss.durationMillis >= 0).isEqualTo(true)
+    // A miss carries the per-phase generation breakdown (and no cache-read time).
+    assertThat(miss.cacheReadMillis).isNull()
+    val generation = miss.generation!!
+    assertThat(generation.targetCount).isEqualTo(sampleHashes.size)
+    assertThat(generation.checkoutMillis >= 0).isEqualTo(true)
+    assertThat(miss.lockWaitMillis!! >= 0).isEqualTo(true)
     val hit = hitProfiler.queryProfile().hashRetrievals.single()
     assertThat(hit.sha).isEqualTo("sha1")
     assertThat(hit.cacheHit).isEqualTo(true)
+    // A hit carries the read+deserialize time and no generation breakdown.
+    assertThat(hit.cacheReadMillis!! >= 0).isEqualTo(true)
+    assertThat(hit.generation).isNull()
   }
 
   @Test
@@ -181,7 +195,7 @@ class HashServiceTest : KoinTest {
 
   @Test
   fun cachePreservesModuleGraphJson() {
-    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any()))
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
         .thenReturn(sampleHashes)
     runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn("""{"graph":1}""") }
     val storage = InMemoryStorage()
@@ -196,7 +210,7 @@ class HashServiceTest : KoinTest {
 
   @Test
   fun trackDepsPersistsAndRoundTripsDepEdges() {
-    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any()))
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
         .thenReturn(sampleHashesWithDeps)
     runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
     val storage = InMemoryStorage()
@@ -214,7 +228,7 @@ class HashServiceTest : KoinTest {
 
   @Test
   fun withoutTrackDepsCacheHasNoDepEdges() {
-    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any()))
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
         .thenReturn(sampleHashesWithDeps)
     runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
     val storage = InMemoryStorage()

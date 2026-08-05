@@ -18,10 +18,13 @@ data class ServerMetrics(
 
 /**
  * Footprint of the hash cache. [entries]/[sizeBytes]/[sizeHuman] are null when the backend does not
- * cheaply report its size (e.g. a remote store) -- see [MeasurableHashCacheStorage].
+ * cheaply report its size (e.g. a remote store) -- see [MeasurableHashCacheStorage]. [remote] is
+ * the shared remote tier's location (e.g. `s3://bucket/prefix/`) when one is configured, null for a
+ * local-only cache; the size fields always describe the local tier only.
  */
 data class CacheMetrics(
     val directory: String?,
+    val remote: String?,
     val entries: Long?,
     val sizeBytes: Long?,
     val sizeHuman: String?,
@@ -57,6 +60,7 @@ class MetricsService(
     private val trackDeps: Boolean,
     private val cacheDir: String,
     private val storage: HashCacheStorage,
+    private val remoteCache: String? = null,
     private val readiness: () -> Boolean,
     private val clock: () -> Long = System::currentTimeMillis,
 ) : MetricsProvider {
@@ -72,6 +76,7 @@ class MetricsService(
         cache =
             CacheMetrics(
                 directory = cacheDir,
+                remote = remoteCache,
                 entries = cacheStats?.entryCount,
                 sizeBytes = cacheStats?.totalBytes,
                 sizeHuman = cacheStats?.totalBytes?.let(::humanReadableBytes),

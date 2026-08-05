@@ -1,0 +1,111 @@
+name: Serve Stress (Alpine 8 GiB, real repos)
+
+# Low-resource-node stress + performance profiling for `bazel-diff serve` against REAL repos,
+# complementing the hermetic serve-stress-alpine.yml. Same Alpine (musl) / 8 GiB / small CPU
+# container path as the hermetic alpine cron, but each matrix leg runs tools/serve_stress.py in
+# --real-repo-url mode (via tools/serve_stress_alpine.sh + REAL_* env) so checkout and `bazel
+# query` cost land under the memory/CPU cap -- signals the glibc serve-stress-real.yml runners
+# never produce on large trees.
+#
+# Matrix / targets match serve-stress-real.yml (small / medium / bazel). fail-fast:false so a
+# slow or OOM'd leg still yields comparison data from the others. Each leg gets a 150-min
+# timeout (longer than the glibc real cron: cold query + 2-CPU starvation). If daily runner
+# cost outweighs the trend data, dial the cron below back to weekly (e.g. "30 14 * * 1").
+#
+# Note: scheduled runs execute from the default branch, so this must land on master before the
+# cron fires.
+on:
+  workflow_dispatch:
+    inputs:
+      cpus:
+        description: "Container CPU quota (low-resource profile)"
+        type: string
+        default: "2"
+  schedule:
+    # Daily at 14:30 UTC, offset from serve-stress (30 6), serve-stress-real (30 8),
+    # serve-stress-alpine (30 10), and the format/buildifier crons (0/30 12) so the jobs never
+    # contend for runners. Change to "30 14 * * 1" for a weekly cadence on the heavy legs.
+    - cron: "30 14 * * *"
+
+jobs:
+  ServeStressAlpineReal:
+    strategy:
+      fail-fast: false  # a slow/OOM'd leg must not cancel the others' comparison data
+      matrix:
+        include:
+          - size: small
+            repo: "https://github.com/bazelbuild/bazel-skylib.git"
+            clone_args: "--depth=50"
+          - size: medium
+            repo: "https://github.com/abseil/abseil-cpp.git"
+            clone_args: "--depth=50"
+          - size: bazel
+            repo: "https://github.com/bazelbuild/bazel.git"
+            clone_args: "--depth=50"
+    name: ServeStressAlpineReal (${{ matrix.size }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      # Pin the image so a new Alpine release can't silently change what the cron measures.
+      ALPINE_IMAGE: alpine:3.22
+    steps:
+      - name: Compute stage dir
+        run: echo "STAGE=$RUNNER_TEMP/alpine-stage-${{ matrix.size }}" >> "$GITHUB_ENV"
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+        id: go
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
+      - uses: actions/checkout@v4
+      - name: Build bazel-diff deploy jar (glibc host)
+        run: ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar
+      - name: Stage container inputs
+        run: |
+          mkdir -p "$STAGE/tools"
+          cp bazel-bin/cli/bazel-diff_deploy.jar "$STAGE/bazel-diff.jar"
+          cp tools/serve_stress.py tools/serve_harness.py tools/serve_stress_alpine.sh "$STAGE/tools/"
+          cp .bazelversion "$STAGE/"
+          BV=$(cat .bazelversion)
+          curl -fsSL -o "$STAGE/bazel-glibc" \
+            "https://github.com/bazelbuild/bazel/releases/download/${BV}/bazel-${BV}-linux-x86_64"
+          chmod +x "$STAGE/bazel-glibc"
+          ls -l "$STAGE"
+      - name: Run serve stress harness (Alpine x86_64, 8 GiB, ${{ matrix.size }})
+        # --memory-swap == --memory disables swap so hitting the cap means real OOM pressure.
+        # Network is left at docker default so the container can clone REAL_REPO_URL.
+        run: >
+          docker run --rm --init --platform linux/amd64
+          --memory 8g --memory-swap 8g
+          --cpus "${{ inputs.cpus || '2' }}"
+          -e OUT_PREFIX=serve-stress-alpine-real-${{ matrix.size }}
+          -e REAL_REPO_URL="${{ matrix.repo }}"
+          -e REAL_FROM=HEAD~1
+          -e REAL_TO=HEAD
+          -e REAL_CLONE_ARGS="${{ matrix.clone_args }}"
+          -v "$STAGE:/stage"
+          "$ALPINE_IMAGE"
+          /bin/sh /stage/tools/serve_stress_alpine.sh
+      - name: Publish step summary
+        if: always()
+        run: |
+          if [ -f "$STAGE/serve-stress-alpine-real-${{ matrix.size }}-summary.md" ]; then
+            cat "$STAGE/serve-stress-alpine-real-${{ matrix.size }}-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serve-stress-alpine-real-${{ matrix.size }}-8gb-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/alpine-stage-${{ matrix.size }}/serve-stress-alpine-real-${{ matrix.size }}-metrics.json
+            ${{ runner.temp }}/alpine-stage-${{ matrix.size }}/serve-stress-alpine-real-${{ matrix.size }}-summary.md
+            ${{ runner.temp }}/alpine-stage-${{ matrix.size }}/serve-stress-alpine-real-${{ matrix.size }}-footprint.json
+          if-no-files-found: warn
+          retention-days: 90

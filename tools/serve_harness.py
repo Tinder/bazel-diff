@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -125,6 +126,27 @@ def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def reserve_ports(n: int) -> list:
+    """Returns [n] distinct free ports, holding every socket open until all are chosen.
+
+    `free_port()` releases its socket before returning, so calling it n times in a loop can hand
+    back the same port twice -- harmless for a single server, a real race for a fleet plus a mock
+    S3 plus a git daemon. Holding the sockets simultaneously makes the numbers distinct; there is
+    still a window between close and bind, but it is no worse than the single-port case.
+    """
+    socks = []
+    try:
+        for _ in range(n):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", 0))
+            socks.append(s)
+        return [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            with contextlib.suppress(Exception):
+                s.close()
 
 
 def wait_port(port: int, timeout: float) -> bool:
@@ -365,6 +387,10 @@ def serve(
     track_deps: bool,
     ready_timeout: float,
     verbose_server: bool = False,
+    extra_args=(),
+    env=None,
+    port: int | None = None,
+    bazel: str | None = None,
 ):
     """Launches serve, waits for a health verdict, yields (Serve, health) then tears down.
 
@@ -373,8 +399,18 @@ def serve(
     [verbose_server] launches the subprocess with `-v` so its StderrLogger emits the `[Info]` /
     `[Warning]` git lines (checkouts, the "cleared stale git index.lock" self-heal) to the captured
     stderr; without it only `[Error]` lines appear. The stress harness asserts on those lines.
+
+    The remaining options exist for the multi-instance consistency harness, which needs to vary
+    things this launcher used to hardcode; all four default to today's behaviour exactly.
+    [extra_args] are appended after the built-in flags (e.g. the `--s3*` remote-cache flags).
+    [env] is merged over `os.environ` for the child (a skewed HOME/TMPDIR/USER, AWS credentials).
+    [port] takes a caller-allocated port: `free_port()` closes its socket before returning, so a
+    fleet allocating N ports in a loop can collide -- the caller can instead hold all N sockets
+    open at once and pass the numbers here. [bazel] overrides the global for a single instance,
+    which is how the Bazel-version-skew case runs two versions side by side.
     """
-    port = free_port()
+    if port is None:
+        port = free_port()
     stderr_path = workspace.parent / f"serve.{workspace.name}.stderr.log"
     args = [
         str(LAUNCHER),
@@ -385,7 +421,7 @@ def serve(
         "-w",
         str(workspace),
         "-b",
-        BAZEL,
+        bazel or BAZEL,
         "--cacheDir",
         str(cache),
         "--port",
@@ -395,12 +431,21 @@ def serve(
         args.append("--no-initial-fetch")
     if track_deps:
         args.append("--trackDeps")
+    args += [str(a) for a in extra_args]
+
+    child_env = None
+    if env is not None:
+        child_env = {**os.environ, **{k: str(v) for k, v in env.items() if v is not None}}
+        for k, v in env.items():
+            if v is None:
+                child_env.pop(k, None)
 
     vlog(f"launch serve on :{port}  ws={workspace.name}  initial_fetch={initial_fetch}")
     with open(stderr_path, "w") as errf:
         proc = subprocess.Popen(
             args,
             cwd=str(workspace),
+            env=child_env,
             stdout=(None if VERBOSE else subprocess.DEVNULL),
             stderr=(errf if not VERBOSE else None),
         )
@@ -498,7 +543,7 @@ def _impacted(s: Serve, frm: str, to: str, target_type: str | None = None, timeo
 
 
 def _impacted_post(s: Serve, frm: str, to: str, modified: list[str] | None = None,
-                   target_type: str | None = None, timeout: float = 300.0):
+                   target_type: str | None = None, profile: bool = False, timeout: float = 300.0):
     """POST /impacted_targets with an optional `modifiedFilepaths` scope (the content-hashing
     optimization). `modified` is a list of workspace-relative paths; None omits it (full hash)."""
     payload: dict = {"from": frm, "to": to}
@@ -506,6 +551,8 @@ def _impacted_post(s: Serve, frm: str, to: str, modified: list[str] | None = Non
         payload["modifiedFilepaths"] = modified
     if target_type:
         payload["targetType"] = target_type.split(",")
+    if profile:
+        payload["profile"] = True
     code, body = http(s.port, "/impacted_targets", method="POST", body=json.dumps(payload), timeout=timeout)
     try:
         data = json.loads(body)
@@ -653,6 +700,15 @@ def _full_extras(rep: Report, case: str, s: Serve, remote: Remote, track_deps: b
                         f"hits={[r.get('cacheHit') for r in retrievals]}",
               fail_detail=f"code={code} body={body[:300]}")
 
+    # A cache hit's cost is the cache read + JSON deserialize, so that -- and only that -- phase
+    # rides on each retrieval; the per-phase generation breakdown is a miss-only field.
+    rep.check(case, "hit retrievals carry cacheReadMillis, no generation breakdown",
+              len(retrievals) == 2
+              and all(r.get("cacheReadMillis", -1) >= 0 for r in retrievals)
+              and not any("generation" in r for r in retrievals),
+              ok_detail=f"reads={[r.get('cacheReadMillis') for r in retrievals]}ms",
+              fail_detail=f"retrievals={retrievals}")
+
     # Without the flag the response shape is unchanged (no profile keys leak in).
     code, body, _ = _impacted(s, sh["C1"], sh["C2"])
     rep.check(case, "no profile keys without profile=true",
@@ -764,12 +820,27 @@ def case_scoped(remote: Remote, clone: Path, root: Path, rep: Report) -> None:
         full = _stable(gdata)
 
         # (1) Scope to the actually-changed file -> identical impacted set as the full hash.
-        pc, pbody, pdata = _impacted_post(s, sh["C1"], sh["C2"], modified=["core.txt"])
+        # profile=true rides along: the scoped cache key is fresh, so both sides are cache misses
+        # and must carry the per-phase generation breakdown.
+        pc, pbody, pdata = _impacted_post(s, sh["C1"], sh["C2"], modified=["core.txt"], profile=True)
         rep.check(case, "scope to changed file == full set",
                   pc == 200 and _stable(pdata) == full == core_edit,
                   ok_detail=str(sorted(_stable(pdata))),
                   fail_detail=f"code={pc} scoped={sorted(_stable(pdata))} "
                               f"full={sorted(full)} body={pbody[:160]}")
+
+        sretr = (pdata or {}).get("profile", {}).get("hashRetrievals", [])
+        gens = [r.get("generation") or {} for r in sretr]
+        rep.check(case, "miss retrievals carry per-phase generation breakdown",
+                  len(sretr) == 2
+                  and not any(r.get("cacheHit") for r in sretr)
+                  and all(g.get("bazelQueryMillis", -1) >= 0 for g in gens)
+                  and all(g.get("checkoutMillis", -1) >= 0 for g in gens)
+                  and all(g.get("cacheWriteMillis", -1) >= 0 for g in gens)
+                  and all(g.get("targetCount", 0) > 0 for g in gens),
+                  ok_detail=f"bazelQuery={[g.get('bazelQueryMillis') for g in gens]}ms "
+                            f"targets={[g.get('targetCount') for g in gens]}",
+                  fail_detail=f"retrievals={sretr}")
 
         # (2) Negative control: omit the changed file. It is content-skipped on both revisions, so
         # the change is invisible and its targets are missed -- proving the scope really gates

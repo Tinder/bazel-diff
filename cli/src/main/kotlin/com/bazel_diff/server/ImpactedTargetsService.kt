@@ -116,7 +116,8 @@ class ImpactedTargetsService(
     val writer = StringWriter()
     val interactor = CalculateImpactedTargetsInteractor()
     val diffStartNanos = System.nanoTime()
-    runOnGraph(fromData.moduleGraphJson, toData.moduleGraphJson, toSha) {
+    val moduleGraphChanged = fromData.moduleGraphJson != toData.moduleGraphJson
+    runOnGraph(moduleGraphChanged, toSha) {
       interactor.execute(
           fromData.hashes,
           toData.hashes,
@@ -126,7 +127,7 @@ class ImpactedTargetsService(
           toData.moduleGraphJson,
           excludeExternalTargets())
     }
-    profiler?.recordDiff(elapsedMillis(diffStartNanos))
+    profiler?.recordDiff(elapsedMillis(diffStartNanos), moduleGraphChanged)
 
     val impacted = writer.toString().split("\n").filter { it.isNotBlank() }
     return ImpactedTargetsResult(
@@ -152,8 +153,9 @@ class ImpactedTargetsService(
 
     val interactor = CalculateImpactedTargetsInteractor()
     val diffStartNanos = System.nanoTime()
+    val moduleGraphChanged = fromData.moduleGraphJson != toData.moduleGraphJson
     val impacted =
-        runOnGraph(fromData.moduleGraphJson, toData.moduleGraphJson, toSha) {
+        runOnGraph(moduleGraphChanged, toSha) {
           // Use the `to` revision's dependency edges: distances are measured by traversing the
           // impacted labels through the final build graph (matches the CLI's depEdgesFile usage).
           interactor.computeImpactedTargetsWithDistances(
@@ -165,7 +167,7 @@ class ImpactedTargetsService(
               toData.moduleGraphJson,
               excludeExternalTargets())
         }
-    profiler?.recordDiff(elapsedMillis(diffStartNanos))
+    profiler?.recordDiff(elapsedMillis(diffStartNanos), moduleGraphChanged)
     return ImpactedTargetsWithDistancesResult(
         fromSha, toSha, impacted, profiler?.queryProfile(), profiler?.memoryProfile())
   }
@@ -255,18 +257,16 @@ class ImpactedTargetsService(
   private fun excludeExternalTargets(): Boolean = bazelModService.isBzlmodEnabled
 
   /**
-   * Runs [block], holding the workspace at [toSha] only when the module graph changed. In that case
-   * the interactor issues a live `rdeps` query against the working tree, so it must be checked out
-   * at `to` and held there while the query runs. The common (pure hash-diff) path touches no
-   * workspace state, so it runs without the lock.
+   * Runs [block], holding the workspace at [toSha] only when [moduleGraphChanged]. In that case the
+   * interactor issues a live `rdeps` query against the working tree, so it must be checked out at
+   * `to` and held there while the query runs. The common (pure hash-diff) path touches no workspace
+   * state, so it runs without the lock.
    */
-  private fun <T> runOnGraph(
-      fromModuleGraphJson: String?,
-      toModuleGraphJson: String?,
-      toSha: String,
-      block: () -> T
-  ): T =
-      if (fromModuleGraphJson != toModuleGraphJson) {
+  private fun <T> runOnGraph(moduleGraphChanged: Boolean, toSha: String, block: () -> T): T =
+      if (moduleGraphChanged) {
+        logger.i {
+          "Module graph changed between revisions; diff includes a live rdeps query at $toSha"
+        }
         hashProvider.withWorkspaceAt(toSha) { block() }
       } else {
         block()

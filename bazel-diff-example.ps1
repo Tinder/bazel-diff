@@ -66,6 +66,11 @@ function Run-BazelDiff {
     param(
         [string[]]$Arguments
     )
+    # Shut down the Bazel server first so its persistent workers exit. On Windows a
+    # live Kotlin worker keeps rules_kotlin's build.exe/compiler.jar locked, and the
+    # external repo refetch fails with "Permission denied" whenever the two revisions
+    # being diffed pin different rules_kotlin versions.
+    & $BazelPath shutdown
     & $BazelPath run @BazelExtraOptions //:bazel-diff -- @Arguments
     return $LASTEXITCODE
 }

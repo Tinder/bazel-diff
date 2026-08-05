@@ -130,8 +130,11 @@ def fetch_github_email_map(repo: str) -> dict[str, dict]:
             gh_author = commit.get("author")
             email = (commit.get("commit") or {}).get("author", {}).get("email", "")
             if gh_author and email and email not in email_map:
+                login = gh_author["login"]
+                if is_bot_account(login=login, account_type=gh_author.get("type", "")):
+                    continue
                 email_map[email] = {
-                    "login": gh_author["login"],
+                    "login": login,
                     "avatar_url": gh_author["avatar_url"],
                 }
 
@@ -150,6 +153,17 @@ def resolve_noreply_username(email: str) -> str | None:
     local = email.split("@")[0]
     # Strip leading numeric id: "12345+username" -> "username"
     return local.split("+")[-1]
+
+
+def is_bot_account(name: str = "", login: str = "", account_type: str = "") -> bool:
+    """Return True for GitHub Apps / Actions bots that should not appear as contributors."""
+    if account_type == "Bot":
+        return True
+    # GitHub bot logins and commit author names conventionally end with "[bot]".
+    for value in (name, login):
+        if value.lower().endswith("[bot]"):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +187,7 @@ def build_contributors_section(workspace_dir: Path, email_map: dict[str, dict]) 
             continue
         name, email = line.split("\t", 1)
         name, email = name.strip(), email.strip()
-        if name:
+        if name and not is_bot_account(name=name):
             pair_counts[(name, email)] += 1
 
     # Roll up by name: sum counts, pick the email with the highest count.
@@ -200,7 +214,7 @@ def build_contributors_section(workspace_dir: Path, email_map: dict[str, dict]) 
         # Fallback: try to extract username from noreply address.
         if not user:
             login = resolve_noreply_username(email)
-            if login:
+            if login and not is_bot_account(login=login):
                 user = {
                     "login": login,
                     "avatar_url": f"https://avatars.githubusercontent.com/{login}",
@@ -208,6 +222,8 @@ def build_contributors_section(workspace_dir: Path, email_map: dict[str, dict]) 
 
         if user:
             login = user["login"]
+            if is_bot_account(name=name, login=login):
+                continue
             base_avatar = user["avatar_url"].split("?")[0]
             avatar = base_avatar + "?s=64"
             profile = f"https://github.com/{login}"

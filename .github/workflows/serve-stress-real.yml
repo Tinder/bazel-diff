@@ -13,7 +13,8 @@ name: Serve Stress (real repos)
 # runs over time*. Runs daily alongside the other serve crons; each leg gets a 90-min timeout and
 # fail-fast:false because the `bazel` leg's full `bazel query` on bazelbuild/bazel is minutes-scale
 # and network-heavy. If a daily run of the large leg is more runner cost than the trend data is
-# worth, dial the cron below back to weekly (e.g. "30 8 * * 1").
+# worth, dial the cron below back to weekly (e.g. "30 8 * * 1"). The Alpine/8 GiB counterpart
+# (same matrix, musl + memory cap) is serve-stress-alpine-real.yml.
 #
 # The targets are wired here, not in code (the harness is preset-free). Swap a repo by editing its
 # matrix row; from/to default to HEAD~1..HEAD so every run tests each repo's latest commit.

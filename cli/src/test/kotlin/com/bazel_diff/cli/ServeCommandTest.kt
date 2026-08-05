@@ -16,6 +16,7 @@ import com.bazel_diff.server.HashCacheStorage
 import com.bazel_diff.server.LocalDiskHashCacheStorage
 import com.bazel_diff.server.ProcessGitClient
 import com.bazel_diff.server.ServerMetrics
+import com.bazel_diff.server.TieredHashCacheStorage
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import java.net.HttpURLConnection
@@ -301,6 +302,113 @@ class ServeCommandTest : KoinTest {
     val cmd = command().apply { cacheMaxEntries = 10 }
     val storage = LocalDiskHashCacheStorage(temp.newFolder().toPath())
     assertThat(cmd.buildCachePruner(storage)).isNotNull()
+  }
+
+  @Test
+  fun parsesS3Flags() {
+    val cmd = ServeCommand()
+    picocli
+        .CommandLine(cmd)
+        .parseArgs(
+            "--workspacePath",
+            "/tmp/ws",
+            "--cacheDir",
+            "/tmp/cache",
+            "--s3Bucket",
+            "my-bucket",
+            "--s3Prefix",
+            "bazel-diff/repo",
+            "--s3Region",
+            "us-east-1",
+            "--s3Endpoint",
+            "http://localhost:9000",
+            "--s3ForcePathStyle")
+
+    assertThat(cmd.s3Bucket).isEqualTo("my-bucket")
+    assertThat(cmd.s3Prefix).isEqualTo("bazel-diff/repo")
+    assertThat(cmd.s3Region).isEqualTo("us-east-1")
+    assertThat(cmd.s3Endpoint).isEqualTo(java.net.URI("http://localhost:9000"))
+    assertThat(cmd.s3ForcePathStyle).isEqualTo(true)
+  }
+
+  @Test
+  fun createStorageIsLocalOnlyWithoutABucket() {
+    val cmd = command()
+    // --s3Bucket unset: no remote tier is built and the stack stays a bare local-disk cache.
+    assertThat(cmd.createS3Storage()).isNull()
+    assertThat(cmd.createStorage()).isInstanceOf(LocalDiskHashCacheStorage::class)
+  }
+
+  @Test
+  fun createStorageIsTieredWhenARemoteIsConfigured() {
+    val cmd = command()
+    val remote = InMemoryStorage()
+
+    val storage = cmd.createStorage(remote = remote)
+
+    assertThat(storage).isInstanceOf(TieredHashCacheStorage::class)
+    // A write must land in the shared tier (that is what publishes hashes to the fleet), and a
+    // local miss must fall back to it.
+    storage.put("k", byteArrayOf(1))
+    assertThat(remote.get("k")).isNotNull()
+    remote.put("only-remote", byteArrayOf(2))
+    assertThat(storage.get("only-remote")).isNotNull()
+  }
+
+  @Test
+  fun createS3StorageBuildsTheTierFromFlags() {
+    // Building the client is offline (no credential/network resolution), so the full flag-driven
+    // construction path -- including the S3-compatible-store shape -- is exercised directly.
+    val cmd =
+        command().apply {
+          s3Bucket = "my-bucket"
+          s3Prefix = "/bazel-diff/repo/"
+          s3Region = "us-east-1"
+          s3Endpoint = java.net.URI("http://localhost:9000")
+          s3ForcePathStyle = true
+        }
+
+    val s3 = cmd.createS3Storage()
+
+    assertThat(s3).isNotNull()
+    assertThat(s3!!.location).isEqualTo("s3://my-bucket/bazel-diff/repo/")
+  }
+
+  @Test
+  fun remoteCacheLocationReflectsFlags() {
+    assertThat(command().remoteCacheLocation()).isNull()
+    val cmd = command().apply { s3Bucket = "b" }
+    assertThat(cmd.remoteCacheLocation()).isEqualTo("s3://b/")
+    cmd.s3Prefix = "team/repo"
+    assertThat(cmd.remoteCacheLocation()).isEqualTo("s3://b/team/repo/")
+  }
+
+  @Test
+  fun buildCachePrunerPrunesTheLocalTierOfATieredStorage() {
+    // --cacheMax* limits must keep working when the S3 tier is enabled: they bound the local disk
+    // tier, while the remote's retention is the bucket lifecycle policy's job.
+    val cmd = command().apply { cacheMaxEntries = 10 }
+    val tiered =
+        TieredHashCacheStorage(
+            LocalDiskHashCacheStorage(temp.newFolder().toPath()), InMemoryStorage())
+    assertThat(cmd.buildCachePruner(tiered)).isNotNull()
+  }
+
+  @Test
+  fun metricsReportTheRemoteCacheLocationWhenConfigured() {
+    val cmd = command().apply { s3Bucket = "shared-bucket" }
+    val server =
+        cmd.buildAndStartServer(FakeGitClient(), InMemoryStorage()).also { startedServers += it }
+
+    val conn =
+        URL("http://localhost:${server.boundPort()}/metrics").openConnection() as HttpURLConnection
+    try {
+      val parsed =
+          Gson().fromJson(conn.inputStream.bufferedReader().readText(), ServerMetrics::class.java)
+      assertThat(parsed.cache.remote).isEqualTo("s3://shared-bucket/")
+    } finally {
+      conn.disconnect()
+    }
   }
 
   @Test

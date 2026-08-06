@@ -4,7 +4,6 @@ module(
     compatibility_level = 0,
 )
 
-bazel_dep(name = "rules_license", version = "1.0.0", dev_dependency = True)
 bazel_dep(name = "aspect_rules_lint", version = "2.1.0", dev_dependency = True)
 bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.2", dev_dependency = True)
 bazel_dep(name = "aspect_bazel_lib", version = "2.22.5", dev_dependency = True)

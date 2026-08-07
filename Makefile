@@ -3,6 +3,7 @@ release_source_archive:
 	mkdir -p archives
 	tar --exclude-vcs \
 		--exclude=bazel-* \
+		--exclude=target \
 		--exclude=.github \
 		--exclude=archives \
 		-zcf "archives/release.tar.gz" .
@@ -14,9 +15,14 @@ release_deploy_jar:
 		//cli:bazel-diff_deploy.jar \
 		-c opt
 
+.PHONY: build_rust
+build_rust:
+	bazel build //:bazel-diff-rust -c opt
+
 .PHONY: format
 format:
 	bazel run //cli/format
+	cargo fmt --all
 
 .PHONY: generate-readme
 generate-readme:
@@ -42,3 +48,21 @@ coverage-html:
 	bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/go/...
 	bazel run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat --html coverage-html
 	@echo "Open coverage-html/index.html in a browser to inspect."
+
+.PHONY: coverage_rust
+coverage_rust:
+	cargo llvm-cov --all-targets --lcov --output-path lcov-rust.info
+
+.PHONY: benchmark
+benchmark:
+	@test -n "$(WORKSPACE)" || (echo "usage: make benchmark WORKSPACE=/path/to/bazel [BAZEL=/path/to/bazelisk] [HYPERFINE=/path/to/hyperfine] [STREAMED_PROTO=/path/to/targets.pb] [INCLUDE_BAZEL=1] [ITERATIONS=10] [WARMUP=3] [RSS_RUNS=5] [JSON=benchmark.json]" >&2; exit 2)
+	python3 tools/benchmark.py \
+		--workspace "$(WORKSPACE)" \
+		--bazel "$(or $(BAZEL),bazel)" \
+		--hyperfine "$(or $(HYPERFINE),hyperfine)" \
+		--iterations "$(or $(ITERATIONS),10)" \
+		--warmup "$(or $(WARMUP),3)" \
+		--rss-runs "$(or $(RSS_RUNS),5)" \
+		$(if $(STREAMED_PROTO),--streamed-proto "$(STREAMED_PROTO)",) \
+		$(if $(INCLUDE_BAZEL),--include-bazel,) \
+		$(if $(JSON),--json "$(JSON)",)

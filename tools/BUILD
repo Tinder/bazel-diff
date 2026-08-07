@@ -55,6 +55,22 @@ py_test(
     deps = [":coverage_check_lib"],
 )
 
+# The benchmark shells out to Bazel, so only its pure parsing/statistics helpers run under
+# `bazel test`. Invoke the real benchmark directly to avoid nesting Bazel under Bazel.
+py_library(
+    name = "benchmark_lib",
+    srcs = ["benchmark.py"],
+    imports = ["."],
+    visibility = ["//visibility:private"],
+)
+
+py_test(
+    name = "benchmark_test",
+    srcs = ["benchmark_test.py"],
+    python_version = "PY3",
+    deps = [":benchmark_lib"],
+)
+
 # Note: the serve integration harnesses (serve_harness.py, serve_stress.py, serve_consistency.py)
 # are intentionally NOT wrapped in py_binary targets. They shell out to
 # `bazel build //cli:bazel-diff`, which would deadlock on the output-base lock if they were

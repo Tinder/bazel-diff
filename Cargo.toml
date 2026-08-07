@@ -1,0 +1,40 @@
+[package]
+name = "bazel-diff"
+version = "39.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Determine impacted Bazel targets between two revisions"
+repository = "https://github.com/Tinder/bazel-diff"
+build = "build.rs"
+publish = false
+
+[[bin]]
+name = "bazel-diff"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+buffa = "0.9.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+hex = "0.4"
+rayon = "1.10"
+rust-s3 = { version = "=0.36.0", default-features = false, features = ["sync-rustls-tls", "fail-on-err"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.20"
+tiny_http = "0.12"
+url = "2.5"
+walkdir = "2.5"
+
+[build-dependencies]
+buffa-build = "0.9.1"
+protoc-bin-vendored = "3.2"
+
+[dev-dependencies]
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = "thin"
+strip = true

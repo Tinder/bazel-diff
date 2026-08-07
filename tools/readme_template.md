@@ -444,6 +444,15 @@ To run the tests simply run
 bazel test //...
 ```
 
+## Experimental Rust candidate
+
+This branch includes a proposed Rust implementation at `//:bazel-diff-rust`. The existing Kotlin
+implementation remains the default `//:bazel-diff` target and the released JAR.
+
+```terminal
+bazel run //:bazel-diff-rust -- --help
+```
+
 ## Code coverage
 
 CI enforces a minimum **90% line coverage** on production sources. Kotlin

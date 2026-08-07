@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package analysis;
+
+import "build.proto";
+
+message Configuration {
+  uint32 id = 1;
+  string mnemonic = 2;
+  string platform_name = 3;
+  string checksum = 4;
+  bool is_tool = 5;
+}
+
+message ConfiguredTarget {
+  blaze_query.Target target = 1;
+  Configuration configuration = 2;
+  uint32 configuration_id = 3;
+}
+
+message CqueryResult {
+  repeated ConfiguredTarget results = 1;
+  repeated Configuration configurations = 2;
+}

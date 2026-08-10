@@ -456,7 +456,7 @@ make coverage
 ```
 
 This invokes
-`bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/go/...`
+`bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/coverage/... //tools/go/...`
 and then runs `//tools:coverage-check` twice against the resulting LCOV report — once for
 the Kotlin main sources and once scoped to `tools/go/` (`--include tools/go/`). The check is
 a Python `py_binary` ([`tools/coverage_check.py`](tools/coverage_check.py)) that prints a
@@ -468,6 +468,34 @@ If you've already produced a coverage report and just want to re-check the thres
 
 The enforcement logic itself is tested under `//tools:coverage_check_test` — run it
 directly with `make coverage-test` (or `bazel test //tools:coverage_check_test`).
+
+### Per-target coverage minimums
+
+In addition to the repo-wide gate above, individual test targets declare their own
+line-coverage minimums, enforced *during* the coverage run itself by a Rust LCOV
+merger ([`tools/coverage/`](tools/coverage/)) that replaces Bazel's built-in one
+(`coverage --coverage_output_generator=//tools/coverage:lcov_merger` in `.bazelrc`).
+Bazel only invokes the merger for `bazel coverage`, so plain `bazel test` runs are
+unaffected. A target opts in through its `env` attribute via
+`//tools/coverage:defs.bzl`:
+
+```starlark
+load("//tools/coverage:defs.bzl", "coverage_enforced_test")
+
+coverage_enforced_test(
+    rule = go_test,          # any test rule with the standard `env` attribute
+    name = "sample_test",
+    min_line_coverage = 90,
+    coverage_include = ["tools/go/"],
+    ...
+)
+```
+
+Go (`//tools/go/sample:sample_test`), Rust (`//tools/coverage:lcov_merger_test`)
+and the Kotlin/JVM tests under `//cli` all carry such minimums. When a target's
+merged report falls below its minimum, the coverage run fails that target and the
+test log contains a per-file breakdown. See
+[`tools/coverage/README.md`](tools/coverage/README.md) for details.
 
 For an interactive HTML report (annotated source with covered/uncovered lines
 highlighted), use `make coverage-html`. This requires the `lcov` package

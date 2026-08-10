@@ -44,6 +44,24 @@ bazel_dep(name = "gazelle", version = "0.45.0", dev_dependency = True)
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk", dev_dependency = True)
 go_sdk.download(version = "1.23.1")
 
+# Rust support is internal to building/testing bazel-diff: it builds the LCOV
+# merger (//tools/coverage) that `bazel coverage` runs use to merge per-test
+# tracefiles and enforce per-target coverage minimums. Marked dev_dependency
+# so consumers of bazel-diff as a module don't inherit rules_rust via MVS.
+bazel_dep(name = "rules_rust", version = "0.73.0", dev_dependency = True)
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust", dev_dependency = True)
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.90.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains(
+    "@rust_toolchains//:all",
+    dev_dependency = True,
+)
+
 maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
 maven.install(
     name = "bazel_diff_maven",

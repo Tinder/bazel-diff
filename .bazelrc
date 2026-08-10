@@ -22,3 +22,11 @@ build:windows --host_cxxopt=/std:c++17
 # Avoid cache thrashing, but allow integration tests to find "bazel" on the PATH.
 common --incompatible_strict_action_env
 common --test_env=PATH
+
+# Coverage runs use the Rust LCOV merger from //tools/coverage instead of
+# Bazel's built-in one. Besides merging each test's raw tracefiles into its
+# coverage.dat, it enforces the per-target line-coverage minimums declared
+# via //tools/coverage:defs.bzl (targets opt in through their `env` attr).
+# Scoped to the `coverage` command, and Bazel only invokes an LCOV merger in
+# coverage mode anyway, so plain `bazel test` runs are never affected.
+coverage --coverage_output_generator=//tools/coverage:lcov_merger

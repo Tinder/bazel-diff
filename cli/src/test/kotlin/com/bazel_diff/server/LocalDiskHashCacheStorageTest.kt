@@ -242,44 +242,36 @@ class LocalDiskHashCacheStorageTest {
 
   @Test
   fun pruneContinuesWhenAnEntryCannotBeDeleted() {
-    // Best-effort prune: an undeletable entry (uchg on macOS / immutable) must not abort the pass.
-    val storage = storage()
-    storage.put("locked", bytes("x"))
-    storage.put("free", bytes("y"))
-    setAgeMinutes("locked", 120)
-    setAgeMinutes("free", 120)
-    val locked = temp.root.toPath().resolve("locked.json")
-    val chflags = ProcessBuilder("chflags", "uchg", locked.toString()).start().waitFor()
-    if (chflags != 0) {
-      // Environments without chflags: still exercise maxBytes=0 eviction of deletable entries.
-      storage.prune(CachePruneLimits(maxEntries = 0))
-      return
-    }
+    // Best-effort prune: an undeletable entry must not abort the pass. Make the cache directory
+    // non-writable so Deletes fail with AccessDeniedException (works on Linux and macOS; unlike
+    // macOS-only `chflags uchg`, which is missing on Ubuntu CI).
+    val dir = temp.newFolder("prune-locked").toPath()
+    val storage = LocalDiskHashCacheStorage(dir)
+    storage.put("a", bytes("a"))
+    storage.put("b", bytes("b"))
+    val originalPerms = Files.getPosixFilePermissions(dir)
+    Files.setPosixFilePermissions(
+        dir, java.nio.file.attribute.PosixFilePermissions.fromString("r-xr-xr-x"))
     try {
-      val result = storage.prune(CachePruneLimits(maxAge = Duration.ofHours(1)))
-      // "free" deleted; "locked" may remain if delete threw (caught) or failed.
+      val result = storage.prune(CachePruneLimits(maxEntries = 0))
       assertThat(result.scanned).isEqualTo(2)
-      assertThat(storage.contains("free")).isFalse()
+      // Neither entry could be removed; prune still returns without throwing.
+      assertThat(result.evicted).isEqualTo(0)
+      assertThat(Files.isRegularFile(dir.resolve("a.json"))).isTrue()
+      assertThat(Files.isRegularFile(dir.resolve("b.json"))).isTrue()
     } finally {
-      ProcessBuilder("chflags", "nouchg", locked.toString()).start().waitFor()
-      Files.deleteIfExists(locked)
+      Files.setPosixFilePermissions(dir, originalPerms)
     }
   }
 
   @Test
   fun getStillReturnsDataWhenTouchFails() {
+    // touchQuietly must swallow IOException so a failed mtime bump never fails the read. Call it
+    // directly with a missing path (setLastModifiedTime throws) — same catch as an immutable file.
     val storage = storage()
-    storage.put("locked", bytes("payload"))
-    val path = temp.root.toPath().resolve("locked.json")
-    val chflags = ProcessBuilder("chflags", "uchg", path.toString()).start().waitFor()
-    if (chflags != 0) return
-    try {
-      // setLastModifiedTime fails on uchg; touchQuietly must swallow it so the read still succeeds.
-      assertThat(String(storage.get("locked")!!, StandardCharsets.UTF_8)).isEqualTo("payload")
-    } finally {
-      ProcessBuilder("chflags", "nouchg", path.toString()).start().waitFor()
-      Files.deleteIfExists(path)
-    }
+    storage.put("ok", bytes("payload"))
+    storage.touchQuietlyForTest(temp.root.toPath().resolve("does-not-exist.json"))
+    assertThat(String(storage.get("ok")!!, StandardCharsets.UTF_8)).isEqualTo("payload")
   }
 
   @Test

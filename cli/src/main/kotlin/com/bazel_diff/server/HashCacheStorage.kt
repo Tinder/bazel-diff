@@ -216,4 +216,11 @@ class LocalDiskHashCacheStorage(private val directory: Path) :
       // The mtime bump is only LRU bookkeeping; failing it must never fail the read.
     }
   }
+
+  /**
+   * Test-only: exercise [touchQuietly]'s IOException swallow without OS-specific immutable flags
+   * (e.g. macOS `chflags uchg`, which is unavailable on Linux CI).
+   */
+  @com.google.common.annotations.VisibleForTesting
+  fun touchQuietlyForTest(path: Path) = touchQuietly(path)
 }

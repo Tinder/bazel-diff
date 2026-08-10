@@ -13,6 +13,19 @@ bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "rules_java", version = "9.7.0")
 bazel_dep(name = "rules_kotlin", version = "2.4.0")
 bazel_dep(name = "rules_license", version = "1.0.0")
+
+# kt_jvm_test hardcodes its _lcov_merger to Bazel's built-in merger instead of
+# reading the coverage fragment's output_generator configuration field, so it
+# ignores --coverage_output_generator (see tools/coverage/README.md — that flag
+# is how per-target coverage minimums are enforced). Patch it to use the
+# configuration field, like rules_go/rules_rust/rules_java do. Root-module-only:
+# overrides are ignored when bazel-diff is consumed as a dependency.
+single_version_override(
+    module_name = "rules_kotlin",
+    patch_strip = 1,
+    patches = ["//tools/coverage:rules_kotlin_lcov_merger.patch"],
+)
+
 bazel_dep(name = "rules_jvm_external", version = "6.10")
 
 # Add protobuf and grpc for Bazel 9 compatibility
@@ -39,10 +52,28 @@ bazel_dep(name = "rules_python", version = "1.8.4", dev_dependency = True)
 # whose line coverage is gated at >=90% in CI). Marked dev_dependency so consumers
 # of bazel-diff as a module don't inherit rules_go/gazelle via MVS.
 bazel_dep(name = "rules_go", version = "0.60.0", dev_dependency = True)
-bazel_dep(name = "gazelle", version = "0.45.0", dev_dependency = True)
+bazel_dep(name = "gazelle", version = "0.47.0", dev_dependency = True)
 
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk", dev_dependency = True)
 go_sdk.download(version = "1.23.1")
+
+# Rust support is internal to building/testing bazel-diff: it builds the LCOV
+# merger (//tools/coverage) that `bazel coverage` runs use to merge per-test
+# tracefiles and enforce per-target coverage minimums. Marked dev_dependency
+# so consumers of bazel-diff as a module don't inherit rules_rust via MVS.
+bazel_dep(name = "rules_rust", version = "0.73.0", dev_dependency = True)
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust", dev_dependency = True)
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.90.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains(
+    "@rust_toolchains//:all",
+    dev_dependency = True,
+)
 
 maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
 maven.install(

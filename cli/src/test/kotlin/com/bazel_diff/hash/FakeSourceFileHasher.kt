@@ -22,6 +22,11 @@ class FakeSourceFileHasher : SourceFileHasher {
       modifiedFilepaths: Set<Path>
   ): ByteArray? {
     softDigestCalls.incrementAndGet()
+    // Mirror SourceFileHasherImpl: external-repo labels never contribute a soft digest.
+    if (sourceFileTarget.name.startsWith("@") && !sourceFileTarget.name.startsWith("@//") &&
+        !sourceFileTarget.name.startsWith("@@//")) {
+      return null
+    }
     return softDigestValue
   }
 

@@ -183,4 +183,61 @@ class GitClientTest : KoinTest {
     // No remotes to ask -> nothing to fetch from -> false, and no throw.
     assertThat(ProcessGitClient(temp.root.toPath()).fetchRevision("HEAD")).isFalse()
   }
+
+  @Test
+  fun fetchRevisionTriesSubsequentRemotesAfterFirstFails() {
+    // Two remotes: the first cannot supply the object, the second can. fetchRevision must walk
+    // remotes and return true once any remote succeeds.
+    val goodOrigin = File(temp.root, "good-origin").apply { mkdirs() }
+    runGit(goodOrigin, "init", "-q")
+    runGit(goodOrigin, "config", "user.email", "test@example.com")
+    runGit(goodOrigin, "config", "user.name", "test")
+    runGit(goodOrigin, "config", "uploadpack.allowReachableSHA1InWant", "true")
+    File(goodOrigin, "file.txt").writeText("one")
+    runGit(goodOrigin, "add", ".")
+    runGit(goodOrigin, "commit", "-q", "-m", "first")
+    val sha = runGit(goodOrigin, "rev-parse", "HEAD")
+
+    val emptyOrigin = File(temp.root, "empty-origin").apply { mkdirs() }
+    runGit(emptyOrigin, "init", "-q")
+    runGit(emptyOrigin, "config", "user.email", "test@example.com")
+    runGit(emptyOrigin, "config", "user.name", "test")
+    // A distinct empty commit so fetch by SHA from this remote fails.
+    File(emptyOrigin, "other.txt").writeText("other")
+    runGit(emptyOrigin, "add", ".")
+    runGit(emptyOrigin, "commit", "-q", "-m", "unrelated")
+
+    val workspace = File(temp.root, "multi-remote-ws")
+    runGit(temp.root, "clone", "-q", "file://${emptyOrigin.absolutePath}", workspace.absolutePath)
+    // Rename the clone's origin and add the good remote second so the first fetch attempt fails.
+    runGit(workspace, "remote", "rename", "origin", "bad")
+    runGit(workspace, "remote", "add", "good", "file://${goodOrigin.absolutePath}")
+
+    val client = ProcessGitClient(workspace.toPath())
+    assertThrows(MissingRevisionException::class.java) { client.resolveSha(sha) }
+    assertThat(client.fetchRevision(sha)).isTrue()
+    assertThat(client.resolveSha(sha)).isEqualTo(sha)
+  }
+
+  @Test
+  fun fetchRevisionReturnsFalseWhenListingRemotesFails() {
+    initRepoWithTwoCommits()
+    // A git wrapper that fails `git remote` exercises remoteNames()' empty-on-failure path.
+    val wrapper =
+        File(temp.root, "git-fail-remote").apply {
+          writeText(
+              """
+              #!/bin/sh
+              if [ "${'$'}1" = "remote" ]; then
+                echo "remote listing disabled" >&2
+                exit 1
+              fi
+              exec git "${'$'}@"
+              """
+                  .trimIndent())
+          setExecutable(true)
+        }
+    assertThat(ProcessGitClient(temp.root.toPath(), wrapper.absolutePath).fetchRevision("HEAD"))
+        .isFalse()
+  }
 }

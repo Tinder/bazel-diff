@@ -341,4 +341,104 @@ internal class SourceFileHasherTest : KoinTest {
         Files.deleteIfExists(testDir.resolve("path"))
         Files.deleteIfExists(testDir)
       }
+
+  @Test
+  fun testHashAtSlashMainRepoLabel() = runBlocking {
+    val hasher = SourceFileHasherImpl(repoAbsolutePath, null, externalRepoResolver)
+    val target = "@//cli/src/test/kotlin/com/bazel_diff/hash/fixture:foo.ts"
+    val bazelSourceFileTarget = BazelSourceFileTarget(target, seed)
+    val actual = hasher.digest(bazelSourceFileTarget).toHexString()
+    val expected =
+        sha256 {
+              safePutBytes(fixtureFileContent)
+              putBytes(byteArrayOf(0x01))
+              putBytes(byteArrayOf(0x00))
+              safePutBytes(seed)
+              safePutBytes(target.toByteArray())
+            }
+            .toHexString()
+    assertThat(actual).isEqualTo(expected)
+  }
+
+  @Test
+  fun testHashDoubleAtSlashMainRepoLabel() = runBlocking {
+    val hasher = SourceFileHasherImpl(repoAbsolutePath, null, externalRepoResolver)
+    val target = "@@//cli/src/test/kotlin/com/bazel_diff/hash/fixture:foo.ts"
+    val bazelSourceFileTarget = BazelSourceFileTarget(target, seed)
+    val actual = hasher.digest(bazelSourceFileTarget).toHexString()
+    val expected =
+        sha256 {
+              safePutBytes(fixtureFileContent)
+              putBytes(byteArrayOf(0x01))
+              putBytes(byteArrayOf(0x00))
+              safePutBytes(seed)
+              safePutBytes(target.toByteArray())
+            }
+            .toHexString()
+    assertThat(actual).isEqualTo(expected)
+  }
+
+  @Test
+  fun testHashInvalidExternalLabelReturnsEmptyDigest() = runBlocking {
+    val hasher = SourceFileHasherImpl(repoAbsolutePath, null, externalRepoResolver)
+    val target = "@not_a_valid_label"
+    val actual = hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
+    assertThat(actual).isEqualTo(sha256 {}.toHexString())
+  }
+
+  @Test
+  fun testHashNonFineGrainedExternalRepoIsSkipped() = runBlocking {
+    // Repo exists on disk but is not in fineGrainedHashExternalRepos — digest must stay empty
+    // (seed/name are never mixed in after the early return).
+    val externalRepoFilePath = outputBasePath.resolve("external/other_repo/path/to/file.txt")
+    Files.createDirectories(externalRepoFilePath.parent)
+    externalRepoFilePath.toFile().writeText("ignored")
+    val hasher = SourceFileHasherImpl(repoAbsolutePath, null, externalRepoResolver, emptySet())
+    val target = "@other_repo//path/to:file.txt"
+    val actual = hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
+    assertThat(actual).isEqualTo(sha256 {}.toHexString())
+  }
+
+  @Test
+  fun testSoftDigestNullForNonMainRepoLabel() = runBlocking {
+    val hasher = SourceFileHasherImpl(repoAbsolutePath, null, externalRepoResolver, setOf("ext"))
+    assertThat(hasher.softDigest(BazelSourceFileTarget("@ext//:file.txt", seed))).isNull()
+    assertThat(hasher.softDigest(BazelSourceFileTarget("not-a-label", seed))).isNull()
+  }
+
+  @Test
+  fun testSoftDigestNullForDirectory() = runBlocking {
+    val testDir = Files.createTempDirectory("soft_digest_dir")
+    val dirPath = testDir.resolve("path/to/dir")
+    Files.createDirectories(dirPath)
+    val hasher = SourceFileHasherImpl(testDir, null, externalRepoResolver)
+    assertThat(hasher.softDigest(BazelSourceFileTarget("//path/to:dir", seed))).isNull()
+  }
+
+  @Test
+  fun testKoinInjectedConstructor() = runBlocking {
+    // Covers the secondary constructor that resolves workingDirectory / ContentHashProvider /
+    // ExternalRepoResolver from Koin (lines unused by the explicit-arg constructor tests).
+    val hasher = SourceFileHasherImpl(setOf("external_repo"))
+    val target = "//cli/src/test/kotlin/com/bazel_diff/hash/fixture:foo.ts"
+    // working-directory from testModule is "working-directory", so the fixture is missing —
+    // still exercises the inject path and produces a stable missing-file digest.
+    val actual = hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
+    val expected =
+        sha256 {
+              putBytes(byteArrayOf(0x00))
+              safePutBytes(seed)
+              safePutBytes(target.toByteArray())
+            }
+            .toHexString()
+    assertThat(actual).isEqualTo(expected)
+  }
+
+  @Test
+  fun testHashUnrecognizedLabelFormReturnsEmptyDigest() = runBlocking {
+    val hasher = SourceFileHasherImpl(repoAbsolutePath, null, externalRepoResolver)
+    val target = "not-a-bazel-label"
+    val actual = hasher.digest(BazelSourceFileTarget(target, seed)).toHexString()
+    assertThat(actual).isEqualTo(sha256 {}.toHexString())
+  }
 }

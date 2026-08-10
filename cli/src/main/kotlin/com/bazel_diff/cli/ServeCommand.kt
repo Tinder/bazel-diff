@@ -55,7 +55,7 @@ import picocli.CommandLine
             "Runs bazel-diff as a long-running HTTP query service that returns the impacted targets " +
                 "between two git revisions, caching generated hashes per commit SHA."],
     versionProvider = VersionProvider::class)
-class ServeCommand : Callable<Int> {
+open class ServeCommand : Callable<Int> {
   @CommandLine.ParentCommand private lateinit var parent: BazelDiff
 
   @CommandLine.Option(
@@ -365,9 +365,10 @@ class ServeCommand : Callable<Int> {
 
   /**
    * Builds the [GitClient]. Git fetch/checkout operations shell out to the `git` binary at
-   * [gitPath], so a `git` binary must be available on the host.
+   * [gitPath], so a `git` binary must be available on the host. Overridable in tests so [call] can
+   * avoid shelling out during the initial-fetch handshake.
    */
-  fun createGitClient(): GitClient = ProcessGitClient(workspacePath, gitPath)
+  open fun createGitClient(): GitClient = ProcessGitClient(workspacePath, gitPath)
 
   /**
    * Wires the services, starts the HTTP server, and performs the initial git fetch + readiness
@@ -493,18 +494,27 @@ class ServeCommand : Callable<Int> {
       seedFilepaths?.readLines()?.filter { it.isNotBlank() }?.map { File(it).toPath() }?.toSet()
           ?: emptySet()
 
-  /** Blocks until a JVM shutdown signal (or thread interrupt), stopping the server cleanly. */
-  private fun awaitShutdown(server: BazelDiffServer) {
+  /**
+   * Blocks until a JVM shutdown signal (or thread interrupt), stopping the server cleanly.
+   *
+   * [registerShutdownHook] and [await] default to the real JVM shutdown-hook + latch wait. Tests
+   * override this method (see [call]) or pass hooks so both the hook path and the interrupt path
+   * can be covered without hanging on a long-lived server.
+   */
+  open fun awaitShutdown(
+      server: BazelDiffServer,
+      registerShutdownHook: (Thread) -> Unit = Runtime.getRuntime()::addShutdownHook,
+      await: (CountDownLatch) -> Unit = { it.await() },
+  ) {
     val latch = CountDownLatch(1)
-    Runtime.getRuntime()
-        .addShutdownHook(
-            Thread {
-              cachePruner?.stop()
-              server.stop(1)
-              latch.countDown()
-            })
+    registerShutdownHook(
+        Thread {
+          cachePruner?.stop()
+          server.stop(1)
+          latch.countDown()
+        })
     try {
-      latch.await()
+      await(latch)
     } catch (e: InterruptedException) {
       // Treated as a shutdown signal: stop serving and restore the interrupt flag.
       cachePruner?.stop()

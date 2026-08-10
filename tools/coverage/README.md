@@ -26,6 +26,14 @@ fall out of that placement:
    so it sees the target's `env` attribute — that is how a target declares
    its minimum, without any global configuration or custom test rules.
 
+One caveat: rules_kotlin hardcodes `kt_jvm_test`'s `_lcov_merger` attribute
+to Bazel's built-in merger instead of reading the configuration field that
+`--coverage_output_generator` sets, which would silently bypass enforcement
+for Kotlin targets. `MODULE.bazel` carries a `single_version_override` patch
+([`rules_kotlin_lcov_merger.patch`](rules_kotlin_lcov_merger.patch)) that
+makes it use the configuration field, like rules_go/rules_rust/rules_java
+already do.
+
 ## Declaring a minimum
 
 Wrap any test rule that has the standard `env` attribute (`go_test`,

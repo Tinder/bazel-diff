@@ -12,10 +12,10 @@ go_library(
 # below 90% — the same floor the repo-wide CI gate applies to Go — enforced
 # per-target by //tools/coverage:lcov_merger.
 coverage_enforced_test(
+    name = "sample_test",
+    srcs = ["sample_test.go"],
     coverage_include = ["tools/go/"],
     embed = [":sample"],
     min_line_coverage = 90,
-    name = "sample_test",
     rule = go_test,
-    srcs = ["sample_test.go"],
 )

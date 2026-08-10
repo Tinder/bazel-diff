@@ -50,6 +50,10 @@ jobs:
             echo "BAZEL_OUTPUT_USER_ROOT=/mnt/bazel-output" >> "$GITHUB_ENV"
           fi
           df -h / /mnt 2>/dev/null || df -h /
+      - name: Build license target
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+        run: ~/go/bin/bazelisk build //:license --enable_bzlmod=true --enable_workspace=false
       - name: Run bazel-diff tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}

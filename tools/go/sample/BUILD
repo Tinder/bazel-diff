@@ -9,13 +9,12 @@ go_library(
 )
 
 # `bazel coverage` fails this target if line coverage of tools/go/ drops
-# below 90% — the same floor the repo-wide CI gate applies to Go — enforced
-# per-target by //tools/coverage:lcov_merger.
+# below the default 90% floor — the same floor the repo-wide CI gate
+# applies to Go — enforced per-target by //tools/coverage:lcov_merger.
 coverage_enforced_test(
     name = "sample_test",
     srcs = ["sample_test.go"],
     coverage_include = ["tools/go/"],
     embed = [":sample"],
-    min_line_coverage = 90,
     rule = go_test,
 )

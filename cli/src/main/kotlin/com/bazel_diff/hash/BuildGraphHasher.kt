@@ -275,7 +275,7 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
  * `//pkg:a` -> `//pkg`, `//:logo` -> `//`, `@@repo//pkg:a` -> `@@repo//pkg`. Labels without a `:`
  * (not expected from `bazel query` output) are returned unchanged.
  */
-internal fun labelToPackage(label: String): String {
+fun labelToPackage(label: String): String {
   val colon = label.lastIndexOf(':')
   return if (colon >= 0) label.substring(0, colon) else label
 }

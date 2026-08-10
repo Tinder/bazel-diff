@@ -485,16 +485,16 @@ load("//tools/coverage:defs.bzl", "coverage_enforced_test")
 coverage_enforced_test(
     rule = go_test,          # any test rule with the standard `env` attribute
     name = "sample_test",
-    min_line_coverage = 90,
     coverage_include = ["tools/go/"],
     ...
 )
 ```
 
-Go (`//tools/go/sample:sample_test`), Rust (`//tools/coverage:lcov_merger_test`)
-and the Kotlin/JVM tests under `//cli` all carry such minimums. When a target's
-merged report falls below its minimum, the coverage run fails that target and the
-test log contains a per-file breakdown. See
+The default minimum is 90%. Go (`//tools/go/sample:sample_test`), Rust
+(`//tools/coverage:lcov_merger_test`) and the primary-owner Kotlin/JVM tests
+under `//cli` all carry such minimums. When a target's merged report falls
+below its minimum, the coverage run fails that target and the test log
+contains a per-file breakdown. See
 [`tools/coverage/README.md`](tools/coverage/README.md) for details.
 
 For an interactive HTML report (annotated source with covered/uncovered lines

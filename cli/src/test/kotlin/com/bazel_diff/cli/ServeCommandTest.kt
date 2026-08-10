@@ -2,12 +2,14 @@ package com.bazel_diff.cli
 
 import assertk.assertThat
 import assertk.assertions.hasLength
+import assertk.assertions.hasSize
 import assertk.assertions.isEqualTo
 import assertk.assertions.isFalse
 import assertk.assertions.isInstanceOf
 import assertk.assertions.isNotEqualTo
 import assertk.assertions.isNotNull
 import assertk.assertions.isNull
+import assertk.assertions.isTrue
 import com.bazel_diff.SilentLogger
 import com.bazel_diff.log.Logger
 import com.bazel_diff.server.GitClient
@@ -19,9 +21,14 @@ import com.bazel_diff.server.ServerMetrics
 import com.bazel_diff.server.TieredHashCacheStorage
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.time.Duration
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.After
 import org.junit.Rule
 import org.junit.Test
@@ -29,6 +36,7 @@ import org.junit.rules.TemporaryFolder
 import org.koin.dsl.module
 import org.koin.test.KoinTest
 import org.koin.test.KoinTestRule
+import picocli.CommandLine
 
 class ServeCommandTest : KoinTest {
   @get:Rule
@@ -443,5 +451,182 @@ class ServeCommandTest : KoinTest {
     } finally {
       conn.disconnect()
     }
+  }
+
+  @Test
+  fun configFingerprintChangesWithExternalReposFile() {
+    val base = ServeCommand().computeConfigFingerprint()
+    val reposFile = temp.newFile().apply { writeText("@maven\n") }
+    val withFile =
+        ServeCommand()
+            .apply { fineGrainedHashExternalReposFile = reposFile }
+            .computeConfigFingerprint()
+    assertThat(withFile).isNotEqualTo(base)
+  }
+
+  @Test
+  fun buildAndStartServerStartsCachePrunerWhenLimitsConfigured() {
+    // Exercises the cachePruner = buildCachePruner(...)?.also { it.start() } path with a real
+    // prunable backend so awaitShutdown can later stop a non-null pruner.
+    val cmd = command(noFetch = true).apply { cacheMaxEntries = 10 }
+    val server =
+        cmd
+            .buildAndStartServer(FakeGitClient(), LocalDiskHashCacheStorage(cmd.cacheDir))
+            .also { startedServers += it }
+    assertThat(healthCode(server)).isEqualTo(200)
+  }
+
+  @Test
+  fun warmUpCacheRunsBeforeReadinessIsFlipped() {
+    // ready must stay false for the whole warmUpCache call so a load balancer cannot route to an
+    // instance mid-warmup.
+    val sawReadyDuringWarmup = AtomicBoolean(true)
+    val ready = AtomicBoolean(false)
+    val provider =
+        object : com.bazel_diff.server.HashProvider {
+          override fun getHashes(
+              sha: String,
+              modifiedFilepaths: Set<java.nio.file.Path>,
+              profiler: com.bazel_diff.server.QueryProfiler?
+          ): com.bazel_diff.interactor.HashFileData {
+            sawReadyDuringWarmup.set(ready.get())
+            return com.bazel_diff.interactor.HashFileData(emptyMap(), null)
+          }
+
+          override fun <T> withWorkspaceAt(sha: String, block: () -> T): T = block()
+        }
+    val cmd = command().apply { warmupRevisions = linkedSetOf("main") }
+    val server =
+        com.bazel_diff.server
+            .BazelDiffServer(0, NoopImpactedTargets) { ready.get() }
+            .also { startedServers += it }
+    server.start()
+
+    cmd.performInitialFetch(FakeGitClient(), provider, ready, server)
+
+    assertThat(sawReadyDuringWarmup.get()).isFalse()
+    assertThat(ready.get()).isTrue()
+  }
+
+  @Test
+  fun awaitShutdownHookStopsServerAndPruner() {
+    val cmd = command(noFetch = true).apply { cacheMaxEntries = 5 }
+    val server =
+        cmd
+            .buildAndStartServer(FakeGitClient(), LocalDiskHashCacheStorage(cmd.cacheDir))
+            .also { startedServers += it }
+
+    val hooks = mutableListOf<Thread>()
+    cmd.awaitShutdown(
+        server,
+        registerShutdownHook = { hooks.add(it) },
+        await = { latch ->
+          assertThat(hooks).hasSize(1)
+          hooks[0].run()
+          assertThat(latch.await(5, TimeUnit.SECONDS)).isTrue()
+        })
+  }
+
+  @Test
+  fun awaitShutdownStopsServerOnInterrupt() {
+    val cmd = command(noFetch = true).apply { cacheMaxEntries = 5 }
+    val server =
+        cmd
+            .buildAndStartServer(FakeGitClient(), LocalDiskHashCacheStorage(cmd.cacheDir))
+            .also { startedServers += it }
+
+    cmd.awaitShutdown(
+        server,
+        registerShutdownHook = {},
+        await = { throw InterruptedException("test shutdown") })
+
+    assertThat(Thread.interrupted()).isTrue() // clears the flag restored by awaitShutdown
+  }
+
+  /**
+   * Stub bazel binary for [ServeCommand.call]: [hasherModule] eagerly runs `bazel info
+   * output_base`, so a real binary is not required as long as this script prints a path.
+   */
+  private fun fakeBazelBinary(): File =
+      File(temp.root, "fake-bazel").apply {
+        writeText("#!/bin/sh\necho '${temp.root.absolutePath}/fake-output-base'\n")
+        setExecutable(true)
+      }
+
+  /**
+   * Overrides [ServeCommand.awaitShutdown] so [ServeCommand.call] can be exercised end-to-end
+   * without blocking the test on a JVM shutdown signal.
+   */
+  private inner class ServeCommandUnderTest : ServeCommand() {
+    val startedServer = AtomicReference<com.bazel_diff.server.BazelDiffServer?>(null)
+    val fakeGit = FakeGitClient()
+
+    override fun createGitClient(): GitClient = fakeGit
+
+    override fun awaitShutdown(
+        server: com.bazel_diff.server.BazelDiffServer,
+        registerShutdownHook: (Thread) -> Unit,
+        await: (CountDownLatch) -> Unit,
+    ) {
+      startedServer.set(server)
+      startedServers += server
+      // Mirror production cleanup without hanging: stop the pruner via the real hook body, then
+      // return so call() can unwind stopKoin().
+      cachePrunerStopViaHook(server)
+    }
+
+    private fun cachePrunerStopViaHook(server: com.bazel_diff.server.BazelDiffServer) {
+      // Invoke the production awaitShutdown hook path with an immediate await so call()'s
+      // surrounding try/finally is what we are really covering here; the dedicated awaitShutdown*
+      // tests cover both branches in isolation.
+      super.awaitShutdown(
+          server,
+          registerShutdownHook = { hook -> hook.run() },
+          await = { latch -> latch.await(5, TimeUnit.SECONDS) },
+      )
+    }
+  }
+
+  @Test
+  fun callStartsServerAndReturnsOkWithoutHanging() {
+    val ws = temp.newFolder("ws-call")
+    val cache = temp.newFolder("cache-call")
+    val bazel = fakeBazelBinary()
+    val underTest = ServeCommandUnderTest()
+
+    val exit =
+        CommandLine(
+                BazelDiff(),
+                object : CommandLine.IFactory {
+                  override fun <K : Any?> create(cls: Class<K>): K {
+                    @Suppress("UNCHECKED_CAST")
+                    if (ServeCommand::class.java.isAssignableFrom(cls)) return underTest as K
+                    return CommandLine.defaultFactory().create(cls)
+                  }
+                })
+            .execute(
+                "serve",
+                "--workspacePath",
+                ws.absolutePath,
+                "--cacheDir",
+                cache.absolutePath,
+                "--bazelPath",
+                bazel.absolutePath,
+                "--port",
+                "0",
+                "--no-initial-fetch",
+                "--cacheMaxEntries",
+                "3",
+                "--requestTimeout",
+                "30",
+                "--keep_going",
+                "--cqueryExpression",
+                "deps(//...)",
+                "--excludeExternalTargets",
+            )
+
+    assertThat(exit).isEqualTo(CommandLine.ExitCode.OK)
+    assertThat(underTest.fakeGit.fetched).isFalse()
+    assertThat(underTest.startedServer.get()).isNotNull()
   }
 }

@@ -48,7 +48,6 @@ coverage_enforced_test(
     name = "sample_test",
     srcs = ["sample_test.go"],
     embed = [":sample"],
-    min_line_coverage = 90,
     coverage_include = ["tools/go/"],
 )
 ```
@@ -62,15 +61,15 @@ kt_jvm_test(
     name = "DurationConverterTest",
     ...
     env = coverage_minimum_env(
-        85,
         coverage_include = ["cli/src/main/kotlin/com/bazel_diff/cli/converter/"],
     ),
 )
 ```
 
 - `min_line_coverage` — minimum overall line coverage (percent, 0–100) of
-  the target's merged report. `bazel coverage` fails the target below it,
-  with a per-file breakdown in the test log; `bazel test` is unaffected.
+  the target's merged report. Defaults to **90**. `bazel coverage` fails
+  the target below it, with a per-file breakdown in the test log;
+  `bazel test` is unaffected.
 - `coverage_include` — optional path prefixes scoping which source files
   count. Essential for JVM targets: Jacoco instruments the whole library
   on the test's classpath, so an unscoped percentage would dilute a focused

@@ -188,4 +188,105 @@ class LocalDiskHashCacheStorageTest {
     assertThat(result.evicted).isEqualTo(1)
     assertThat(Files.exists(sibling)).isTrue()
   }
+
+  @Test
+  fun defaultContainsDelegatesToGet() {
+    // LocalDiskHashCacheStorage overrides contains; exercise the interface default on a bare impl.
+    val backing = mutableMapOf<String, ByteArray>()
+    val storage =
+        object : HashCacheStorage {
+          override fun get(key: String): ByteArray? = backing[key]
+          override fun put(key: String, data: ByteArray) {
+            backing[key] = data
+          }
+        }
+    assertThat(storage.contains("k")).isFalse()
+    storage.put("k", bytes("v"))
+    assertThat(storage.contains("k")).isTrue()
+  }
+
+  @Test
+  fun getReturnsNullAfterEntryFileDeleted() {
+    val storage = storage()
+    storage.put("gone", bytes("x"))
+    Files.delete(temp.root.toPath().resolve("gone.json"))
+    assertThat(storage.get("gone")).isNull()
+    assertThat(storage.contains("gone")).isFalse()
+  }
+
+  @Test
+  fun statsAndPruneAreEmptyWhenDirectoryRemoved() {
+    val dir = temp.newFolder("cache-dir").toPath()
+    val storage = LocalDiskHashCacheStorage(dir)
+    storage.put("k", bytes("v"))
+    // Wipe the directory after construction: stats/prune must degrade gracefully.
+    dir.toFile().deleteRecursively()
+
+    assertThat(storage.stats()).isEqualTo(CacheStorageStats(0, 0))
+    val result = storage.prune(CachePruneLimits(maxEntries = 1))
+    assertThat(result).isEqualTo(CachePruneResult(0, 0, 0))
+  }
+
+  @Test
+  fun pruneWithMaxEntriesZeroEvictsEverything() {
+    val storage = storage()
+    storage.put("a", bytes("a"))
+    storage.put("b", bytes("b"))
+
+    val result = storage.prune(CachePruneLimits(maxEntries = 0))
+
+    assertThat(result.evicted).isEqualTo(2)
+    assertThat(storage.contains("a")).isFalse()
+    assertThat(storage.contains("b")).isFalse()
+  }
+
+  @Test
+  fun pruneContinuesWhenAnEntryCannotBeDeleted() {
+    // Best-effort prune: an undeletable entry (uchg on macOS / immutable) must not abort the pass.
+    val storage = storage()
+    storage.put("locked", bytes("x"))
+    storage.put("free", bytes("y"))
+    setAgeMinutes("locked", 120)
+    setAgeMinutes("free", 120)
+    val locked = temp.root.toPath().resolve("locked.json")
+    val chflags = ProcessBuilder("chflags", "uchg", locked.toString()).start().waitFor()
+    if (chflags != 0) {
+      // Environments without chflags: still exercise maxBytes=0 eviction of deletable entries.
+      storage.prune(CachePruneLimits(maxEntries = 0))
+      return
+    }
+    try {
+      val result = storage.prune(CachePruneLimits(maxAge = Duration.ofHours(1)))
+      // "free" deleted; "locked" may remain if delete threw (caught) or failed.
+      assertThat(result.scanned).isEqualTo(2)
+      assertThat(storage.contains("free")).isFalse()
+    } finally {
+      ProcessBuilder("chflags", "nouchg", locked.toString()).start().waitFor()
+      Files.deleteIfExists(locked)
+    }
+  }
+
+  @Test
+  fun getStillReturnsDataWhenTouchFails() {
+    val storage = storage()
+    storage.put("locked", bytes("payload"))
+    val path = temp.root.toPath().resolve("locked.json")
+    val chflags = ProcessBuilder("chflags", "uchg", path.toString()).start().waitFor()
+    if (chflags != 0) return
+    try {
+      // setLastModifiedTime fails on uchg; touchQuietly must swallow it so the read still succeeds.
+      assertThat(String(storage.get("locked")!!, StandardCharsets.UTF_8)).isEqualTo("payload")
+    } finally {
+      ProcessBuilder("chflags", "nouchg", path.toString()).start().waitFor()
+      Files.deleteIfExists(path)
+    }
+  }
+
+  @Test
+  fun interfaceTypedCallsReachStatsAndPrune() {
+    val measurable: MeasurableHashCacheStorage = storage()
+    assertThat(measurable.stats()).isEqualTo(CacheStorageStats(0, 0))
+    val prunable: PrunableHashCacheStorage = storage()
+    assertThat(prunable.prune(CachePruneLimits(maxBytes = 0))).isEqualTo(CachePruneResult(0, 0, 0))
+  }
 }

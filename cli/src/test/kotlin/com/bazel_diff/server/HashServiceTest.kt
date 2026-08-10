@@ -6,6 +6,7 @@ import assertk.assertions.doesNotContain
 import assertk.assertions.hasSize
 import assertk.assertions.isEqualTo
 import assertk.assertions.isNotEqualTo
+import assertk.assertions.isNotNull
 import assertk.assertions.isNull
 import assertk.assertions.startsWith
 import com.bazel_diff.SilentLogger
@@ -14,7 +15,11 @@ import com.bazel_diff.hash.BuildGraphHasher
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.log.Logger
 import com.google.gson.GsonBuilder
+import java.nio.charset.StandardCharsets
 import java.nio.file.Path
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.runBlocking
 import org.junit.Rule
 import org.junit.Test
@@ -29,6 +34,7 @@ import org.mockito.kotlin.anyOrNull
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
+import kotlin.concurrent.thread
 
 class HashServiceTest : KoinTest {
   @get:Rule val mockitoRule = MockitoJUnit.rule()
@@ -237,5 +243,100 @@ class HashServiceTest : KoinTest {
 
     assertThat(generated.depEdges).isEqualTo(emptyMap())
     assertThat(String(storage.entries.values.single())).doesNotContain("depEdges")
+  }
+
+  @Test
+  fun serializeLegacyFlatFormatWhenNoMetadata() {
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
+        .thenReturn(sampleHashes)
+    runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
+    val storage = InMemoryStorage()
+
+    newService(RecordingGitClient(), storage).getHashes("sha1")
+
+    val json = String(storage.entries.values.single(), StandardCharsets.UTF_8)
+    // Flat shape: label -> hash string, no wrapping "hashes"/"metadata" object.
+    assertThat(json).doesNotContain("\"hashes\"")
+    assertThat(json).doesNotContain("\"metadata\"")
+    assertThat(json).contains("\"//:a\"")
+    assertThat(json).contains("Rule#h~d")
+  }
+
+  @Test
+  fun serializeWithMetadataFields() {
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
+        .thenReturn(sampleHashesWithDeps)
+    runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn("""{"graph":1}""") }
+    val storage = InMemoryStorage()
+
+    newService(RecordingGitClient(), storage, trackDeps = true).getHashes("sha1")
+
+    val json = String(storage.entries.values.single(), StandardCharsets.UTF_8)
+    assertThat(json).contains("\"hashes\"")
+    assertThat(json).contains("\"metadata\"")
+    assertThat(json).contains("\"moduleGraphJson\"")
+    assertThat(json).contains("\"depEdges\"")
+    assertThat(json).contains("graph")
+  }
+
+  @Test
+  fun deserializeLegacyFlatCacheEntry() {
+    val storage = InMemoryStorage()
+    storage.entries["sha1.fp"] =
+        """{"//:a":"Rule#h~d"}""".toByteArray(StandardCharsets.UTF_8)
+
+    val data = newService(RecordingGitClient(), storage).getHashes("sha1")
+
+    assertThat(data.hashes).isEqualTo(sampleHashes)
+    assertThat(data.moduleGraphJson).isNull()
+    assertThat(data.depEdges).isEqualTo(emptyMap())
+    // No generation on a pure cache hit.
+    verify(buildGraphHasher, times(0))
+        .hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull())
+  }
+
+  @Test
+  fun lockWaitCacheHitAfterConcurrentGeneration() {
+    val hasherStarted = CountDownLatch(1)
+    val allowFinish = CountDownLatch(1)
+    val hasherCalls = AtomicInteger(0)
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
+        .thenAnswer {
+          hasherCalls.incrementAndGet()
+          hasherStarted.countDown()
+          allowFinish.await(5, TimeUnit.SECONDS)
+          sampleHashes
+        }
+    runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
+
+    val service = newService(RecordingGitClient(), InMemoryStorage())
+    val missDone = CountDownLatch(1)
+    val hitProfiler = QueryProfiler()
+
+    val generator =
+        thread {
+          service.getHashes("sha1")
+          missDone.countDown()
+        }
+    assertThat(hasherStarted.await(5, TimeUnit.SECONDS)).isEqualTo(true)
+
+    val waiter =
+        thread {
+          service.getHashes("sha1", profiler = hitProfiler)
+        }
+    // Give the waiter time to miss the initial cache check and block on generationLock.
+    Thread.sleep(100)
+    allowFinish.countDown()
+    generator.join(5_000)
+    waiter.join(5_000)
+    assertThat(missDone.await(1, TimeUnit.SECONDS)).isEqualTo(true)
+
+    assertThat(hasherCalls.get()).isEqualTo(1)
+    val hit = hitProfiler.queryProfile().hashRetrievals.single()
+    assertThat(hit.cacheHit).isEqualTo(true)
+    assertThat(hit.lockWaitMillis).isNotNull()
+    assertThat(hit.lockWaitMillis!! >= 0).isEqualTo(true)
+    assertThat(hit.cacheReadMillis).isNotNull()
+    assertThat(hit.generation).isNull()
   }
 }

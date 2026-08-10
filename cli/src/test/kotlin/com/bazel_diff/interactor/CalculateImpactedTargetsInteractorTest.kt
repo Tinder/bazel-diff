@@ -1,5 +1,7 @@
 package com.bazel_diff.interactor
 
+import assertk.all
+import assertk.assertFailure
 import assertk.assertThat
 import assertk.assertions.*
 import com.bazel_diff.bazel.BazelQueryService
@@ -7,6 +9,7 @@ import com.bazel_diff.bazel.BazelTarget
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.testModule
 import java.io.StringWriter
+import java.util.concurrent.ConcurrentHashMap
 import org.junit.Rule
 import org.junit.Test
 import org.koin.core.context.loadKoinModules
@@ -1000,5 +1003,351 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
     assertThat(output).contains("//:changed")
     assertThat(output).doesNotContain("//:unchanged_a")
     assertThat(output).doesNotContain("//:unchanged_b")
+  }
+
+  @Test
+  fun calculateDistanceThrowsForUnimpactedLabel() {
+    val interactor = CalculateImpactedTargetsInteractor()
+    val impactedTargets = ConcurrentHashMap<String, TargetDistanceMetrics>()
+    val impactedLabels =
+        mapOf("//:impacted" to CalculateImpactedTargetsInteractor.ImpactType.DIRECT)
+
+    assertFailure {
+          interactor.calculateDistance(
+              "//:not-impacted", emptyMap(), impactedTargets, impactedLabels)
+        }
+        .all {
+          isInstanceOf(IllegalArgumentException::class)
+          message().matchesPredicate {
+            it != null && it.contains("//:not-impacted was not impacted")
+          }
+        }
+  }
+
+  @Test
+  fun calculateDistanceReturnsCachedMetricsWithoutRecalculating() {
+    val interactor = CalculateImpactedTargetsInteractor()
+    val cached = TargetDistanceMetrics(7, 3)
+    val impactedTargets = ConcurrentHashMap(mapOf("//:cached" to cached))
+    val impactedLabels =
+        mapOf("//:cached" to CalculateImpactedTargetsInteractor.ImpactType.INDIRECT)
+
+    val result =
+        interactor.calculateDistance("//:cached", emptyMap(), impactedTargets, impactedLabels)
+
+    assertThat(result).isEqualTo(cached)
+  }
+
+  @Test
+  fun testExecuteSortsUnknownTypesAfterKnownKinds() {
+    // kindRank: SourceFile=0, GeneratedFile=1, Rule=2, unknown non-empty=3, null/empty=4
+    val startHashes =
+        mapOf(
+            "//pkg:zzz_unknown" to TargetHash("Aspect", "u", "u"),
+            "//pkg:aaa_empty" to TargetHash("", "e", "e"),
+            "//pkg:rule" to TargetHash("Rule", "r", "r"),
+            "//pkg:src" to TargetHash("SourceFile", "s", "s"),
+        )
+    val endHashes = startHashes.mapValues { (_, v) -> v.copy(hash = v.hash + "-changed") }
+
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = startHashes,
+            to = endHashes,
+            outputWriter = outputWriter,
+            targetTypes = null,
+        )
+
+    val lines = outputWriter.toString().trimEnd('\n').split("\n")
+    assertThat(lines)
+        .containsExactly(
+            "//pkg:src",
+            "//pkg:rule",
+            "//pkg:zzz_unknown",
+            "//pkg:aaa_empty",
+        )
+  }
+
+  @Test
+  fun testOneSidedModuleGraphFallsBackToHashDiff() {
+    // detectChangedModules returns empty when either side is null, even if the other is present.
+    val startHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1", "hash1"),
+            "//:target2" to TargetHash("", "hash2", "hash2"))
+    val endHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1-changed", "hash1-changed"),
+            "//:target2" to TargetHash("", "hash2", "hash2"))
+    val moduleGraph =
+        """
+      {
+        "key": "root",
+        "name": "root",
+        "version": "",
+        "apparentName": "root",
+        "dependencies": [
+          {"key": "abseil-cpp@20240116.2", "name": "abseil-cpp", "version": "20240116.2", "apparentName": "abseil-cpp"}
+        ]
+      }
+    """
+            .trimIndent()
+
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = startHashes,
+            to = endHashes,
+            outputWriter = outputWriter,
+            targetTypes = null,
+            fromModuleGraphJson = null,
+            toModuleGraphJson = moduleGraph)
+
+    assertThat(outputWriter.toString().trim().split("\n")).containsExactly("//:target1")
+  }
+
+  @Test
+  fun testRemovedModuleResolvesFromFromGraph() {
+    // A module present only in the from-graph (removed) still resolves via fromGraph fallback.
+    val startHashes =
+        mapOf(
+            "//:target1" to TargetHash("", "hash1", "hash1"),
+            "@@gone~1.0//:lib" to TargetHash("", "ext", "ext"))
+    val endHashes =
+        mapOf("//:target1" to TargetHash("", "hash1", "hash1"))
+
+    val fromModuleGraph =
+        """
+      {
+        "key": "root", "name": "root", "version": "", "apparentName": "root",
+        "dependencies": [
+          {"key": "gone@1.0", "name": "gone", "version": "1.0", "apparentName": "gone"}
+        ]
+      }
+    """
+            .trimIndent()
+    val toModuleGraph =
+        """
+      {
+        "key": "root", "name": "root", "version": "", "apparentName": "root",
+        "dependencies": []
+      }
+    """
+            .trimIndent()
+
+    val outputWriter = StringWriter()
+    // No query service — falls back to allTargets.keys when modules change.
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = startHashes,
+            to = endHashes,
+            outputWriter = outputWriter,
+            targetTypes = null,
+            fromModuleGraphJson = fromModuleGraph,
+            toModuleGraphJson = toModuleGraph)
+
+    val output = outputWriter.toString().trim().split("\n").filter { it.isNotEmpty() }.toSet()
+    assertThat(output).contains("//:target1")
+  }
+
+  @Test
+  fun testPackageDistanceWithCachedIndirectPredecessor() {
+    // Exercise the cache hit path inside calculateDistance while computing package distance
+    // across a diamond where two paths share an intermediate node.
+    val (depEdges, startHashes) =
+        createTargetHashes(
+            "//A:1 <- //A:2 <- //B:4",
+            "//A:1 <- //B:3 <- //B:4",
+        )
+    val endHashes = startHashes.toMutableMap()
+    makeDirectlyChanged(endHashes, "//A:1")
+    makeIndirectlyChanged(endHashes, "//A:2", "//B:3", "//B:4")
+
+    val impacted =
+        CalculateImpactedTargetsInteractor().computeAllDistances(startHashes, endHashes, depEdges)
+
+    assertThat(impacted["//B:4"]).isEqualTo(TargetDistanceMetrics(2, 1))
+  }
+
+  @Test
+  fun changedModuleWithNoMatchingReposFallsBackToHashDiff() {
+    // Query service is bound, but the changed module name matches no @@ canonical repo in
+    // allTargets — hits skippedNoMatch / empty moduleRepos and falls back to hash-diff.
+    val fakeQueryService: BazelQueryService = mock {
+      onBlocking { query(any(), any()) } doAnswer { emptyList<BazelTarget>() }
+    }
+    loadKoinModules(module { single { fakeQueryService } })
+
+    val from =
+        mapOf(
+            "//:unchanged" to TargetHash("Rule", "h", "h"),
+            "//:changed" to TargetHash("Rule", "old", "old"),
+            "@@other_mod~1.0//:lib" to TargetHash("Rule", "e", "e"),
+        )
+    val to =
+        mapOf(
+            "//:unchanged" to TargetHash("Rule", "h", "h"),
+            "//:changed" to TargetHash("Rule", "new", "new"),
+            "@@other_mod~1.0//:lib" to TargetHash("Rule", "e", "e"),
+        )
+    val fromGraph =
+        """
+      {
+        "key": "root", "name": "root", "version": "", "apparentName": "root",
+        "dependencies": [
+          {"key": "unmaterialised@1.0", "name": "unmaterialised", "version": "1.0", "apparentName": "unmaterialised"}
+        ]
+      }
+    """
+            .trimIndent()
+    val toGraph =
+        """
+      {
+        "key": "root", "name": "root", "version": "", "apparentName": "root",
+        "dependencies": [
+          {"key": "unmaterialised@2.0", "name": "unmaterialised", "version": "2.0", "apparentName": "unmaterialised"}
+        ]
+      }
+    """
+            .trimIndent()
+
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = from,
+            to = to,
+            outputWriter = outputWriter,
+            targetTypes = null,
+            fromModuleGraphJson = fromGraph,
+            toModuleGraphJson = toGraph,
+        )
+
+    assertThat(outputWriter.toString().trim().split("\n")).containsExactly("//:changed")
+  }
+
+  @Test
+  fun moduleQueryFailureFallsBackToBuildableWorkspaceTargets() {
+    val fakeQueryService: BazelQueryService = mock {
+      onBlocking { query(any(), any()) } doAnswer
+          {
+            throw RuntimeException("simulated query failure")
+          }
+    }
+    loadKoinModules(module { single { fakeQueryService } })
+
+    val hashes =
+        mapOf(
+            "//app:app" to TargetHash("Rule", "a", "a"),
+            "//lib:util" to TargetHash("Rule", "b", "b"),
+            "@@abseil-cpp~20240116.2//:strings" to TargetHash("Rule", "c", "c"),
+            "//external:abseil-cpp" to TargetHash("Rule", "e", "e"),
+        )
+    val fromGraph =
+        """
+      {
+        "key": "root", "name": "root", "version": "", "apparentName": "root",
+        "dependencies": [
+          {"key": "abseil-cpp@20240116.2", "name": "abseil-cpp", "version": "20240116.2", "apparentName": "abseil-cpp"}
+        ]
+      }
+    """
+            .trimIndent()
+    val toGraph =
+        """
+      {
+        "key": "root", "name": "root", "version": "", "apparentName": "root",
+        "dependencies": [
+          {"key": "abseil-cpp@20240722.0", "name": "abseil-cpp", "version": "20240722.0", "apparentName": "abseil-cpp"}
+        ]
+      }
+    """
+            .trimIndent()
+
+    // Use the newer version in `to` so the canonical repo filter can still match the
+    // @@abseil-cpp~... label shape via the '+'/'~' base-repo predicate on the from side's
+    // materialised repo name prefix "abseil-cpp".
+    val toHashes =
+        mapOf(
+            "//app:app" to TargetHash("Rule", "a", "a"),
+            "//lib:util" to TargetHash("Rule", "b", "b"),
+            "@@abseil-cpp~20240722.0//:strings" to TargetHash("Rule", "c2", "c2"),
+            "//external:abseil-cpp" to TargetHash("Rule", "e", "e"),
+        )
+
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = hashes,
+            to = toHashes,
+            outputWriter = outputWriter,
+            targetTypes = null,
+            fromModuleGraphJson = fromGraph,
+            toModuleGraphJson = toGraph,
+        )
+
+    val impacted = outputWriter.toString().trim().split("\n").filter { it.isNotEmpty() }.toSet()
+    // Catch fallback keeps buildable workspace targets; hash-diff also adds the version-bumped
+    // external label.
+    assertThat(impacted).contains("//app:app")
+    assertThat(impacted).contains("//lib:util")
+  }
+
+  @Test
+  fun moduleQueryFailureOnBzlmodOnlyFallsBackToAllTargets() {
+    val fakeQueryService: BazelQueryService = mock {
+      onBlocking { query(any(), any()) } doAnswer
+          {
+            throw RuntimeException("simulated query failure")
+          }
+    }
+    loadKoinModules(module { single { fakeQueryService } })
+
+    val hashes =
+        mapOf(
+            "@@abseil-cpp~20240116.2//:strings" to TargetHash("Rule", "a", "a"),
+            "@@abseil-cpp~20240116.2//:base" to TargetHash("Rule", "b", "b"),
+        )
+    val toHashes =
+        mapOf(
+            "@@abseil-cpp~20240722.0//:strings" to TargetHash("Rule", "a2", "a2"),
+            "@@abseil-cpp~20240722.0//:base" to TargetHash("Rule", "b2", "b2"),
+        )
+    val fromGraph =
+        """
+      {
+        "key": "root", "name": "root", "version": "", "apparentName": "root",
+        "dependencies": [
+          {"key": "abseil-cpp@20240116.2", "name": "abseil-cpp", "version": "20240116.2", "apparentName": "abseil-cpp"}
+        ]
+      }
+    """
+            .trimIndent()
+    val toGraph =
+        """
+      {
+        "key": "root", "name": "root", "version": "", "apparentName": "root",
+        "dependencies": [
+          {"key": "abseil-cpp@20240722.0", "name": "abseil-cpp", "version": "20240722.0", "apparentName": "abseil-cpp"}
+        ]
+      }
+    """
+            .trimIndent()
+
+    val outputWriter = StringWriter()
+    CalculateImpactedTargetsInteractor()
+        .execute(
+            from = hashes,
+            to = toHashes,
+            outputWriter = outputWriter,
+            targetTypes = null,
+            fromModuleGraphJson = fromGraph,
+            toModuleGraphJson = toGraph,
+        )
+
+    val impacted = outputWriter.toString().trim().split("\n").filter { it.isNotEmpty() }.toSet()
+    assertThat(impacted)
+        .containsExactlyInAnyOrder(
+            "@@abseil-cpp~20240722.0//:strings", "@@abseil-cpp~20240722.0//:base")
   }
 }

@@ -33,6 +33,5 @@ coverage_enforced_test(
     name = "lcov_merger_test",
     coverage_include = ["tools/coverage/src/"],
     crate = ":lcov_merger_lib",
-    min_line_coverage = 90,
     rule = rust_test,
 )

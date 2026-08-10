@@ -16,21 +16,23 @@ which is the channel these helpers use to declare a minimum:
         name = "sample_test",
         srcs = ["sample_test.go"],
         embed = [":sample"],
-        min_line_coverage = 90,
         coverage_include = ["tools/go/"],
     )
 
-Any rule with the standard `env` attribute works (`go_test`, `rust_test`,
-`kt_jvm_test`, `java_test`, `py_test`, ...). A target whose merged report
-falls below its minimum fails the coverage run with the merger's per-file
-breakdown in the test log; plain `bazel test` runs are untouched.
+The default minimum is 90%. Any rule with the standard `env` attribute
+works (`go_test`, `rust_test`, `kt_jvm_test`, `java_test`, `py_test`,
+...). A target whose merged report falls below its minimum fails the
+coverage run with the merger's per-file breakdown in the test log; plain
+`bazel test` runs are untouched.
 """
 
 MIN_LINE_COVERAGE_ENV = "LCOV_MERGER_MIN_LINE_COVERAGE"
 COVERAGE_INCLUDE_ENV = "LCOV_MERGER_COVERAGE_INCLUDE"
 COVERAGE_EXCLUDE_ENV = "LCOV_MERGER_COVERAGE_EXCLUDE"
 
-def coverage_minimum_env(min_line_coverage, coverage_include = [], coverage_exclude = []):
+DEFAULT_MIN_LINE_COVERAGE = 90
+
+def coverage_minimum_env(min_line_coverage = DEFAULT_MIN_LINE_COVERAGE, coverage_include = [], coverage_exclude = []):
     """Returns the `env` entries declaring a line-coverage minimum.
 
     Use this directly when you cannot (or prefer not to) route a target
@@ -40,12 +42,15 @@ def coverage_minimum_env(min_line_coverage, coverage_include = [], coverage_excl
         kt_jvm_test(
             name = "FooTest",
             ...
-            env = coverage_minimum_env(85, ["cli/src/main/kotlin/foo/"]),
+            env = coverage_minimum_env(
+                coverage_include = ["cli/src/main/kotlin/foo/"],
+            ),
         )
 
     Args:
       min_line_coverage: minimum overall line-coverage percentage (0-100)
         for the target's merged LCOV report during `bazel coverage`.
+        Defaults to 90.
       coverage_include: optional path prefixes; when non-empty, only source
         files starting with one of them count toward the minimum. Use this
         to scope the check to the code the target is responsible for.
@@ -67,7 +72,7 @@ def coverage_minimum_env(min_line_coverage, coverage_include = [], coverage_excl
 def coverage_enforced_test(
         rule,
         name,
-        min_line_coverage,
+        min_line_coverage = DEFAULT_MIN_LINE_COVERAGE,
         coverage_include = [],
         coverage_exclude = [],
         **kwargs):
@@ -77,7 +82,7 @@ def coverage_enforced_test(
       rule: any test rule with the standard `env` attribute
         (`go_test`, `rust_test`, `kt_jvm_test`, `py_test`, ...).
       name: forwarded to the rule.
-      min_line_coverage: see `coverage_minimum_env`.
+      min_line_coverage: see `coverage_minimum_env` (defaults to 90).
       coverage_include: see `coverage_minimum_env`.
       coverage_exclude: see `coverage_minimum_env`.
       **kwargs: every other attribute, forwarded untouched (an existing

@@ -2,6 +2,7 @@ package com.bazel_diff.interactor
 
 import assertk.assertThat
 import assertk.assertions.isEqualTo
+import assertk.assertions.isNull
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.testModule
 import org.junit.Rule
@@ -73,6 +74,61 @@ class DeserialiseHashesInteractorTest : KoinTest {
 
     val data = interactor.executeTargetHashWithMetadataFromString(json)
 
+    assertThat(data.depEdges).isEqualTo(emptyMap())
+  }
+
+  @Test
+  fun executeSimpleDeserialisesFlatStringMap() {
+    val file = temp.newFile().apply { writeText("""{"a/path":"abc","b/path":"def"}""") }
+
+    assertThat(interactor.executeSimple(file)).isEqualTo(mapOf("a/path" to "abc", "b/path" to "def"))
+  }
+
+  @Test
+  fun deserializeDepsReadsAdjacencyList() {
+    val file =
+        temp.newFile().apply {
+          writeText("""{"//a:lib":["//b:lib"], "//b:lib":[]}""")
+        }
+
+    assertThat(interactor.deserializeDeps(file))
+        .isEqualTo(mapOf("//a:lib" to listOf("//b:lib"), "//b:lib" to emptyList()))
+  }
+
+  @Test
+  fun executeTargetHashWithMetadataReadsFileWithMetadata() {
+    val file =
+        temp.newFile().apply {
+          writeText(
+              """{
+                |  "hashes": {"//a:lib":"Rule#h1~d1"},
+                |  "metadata": {
+                |    "moduleGraphJson": "{\"nodes\":[]}",
+                |    "depEdges": {"//a:lib":[]}
+                |  }
+                |}"""
+                  .trimMargin())
+        }
+
+    val data = interactor.executeTargetHashWithMetadata(file)
+
+    assertThat(data.hashes).isEqualTo(mapOf("//a:lib" to TargetHash("Rule", "h1", "d1")))
+    assertThat(data.moduleGraphJson).isEqualTo("""{"nodes":[]}""")
+    assertThat(data.depEdges).isEqualTo(mapOf("//a:lib" to emptyList()))
+  }
+
+  @Test
+  fun executeTargetHashWithMetadataFromStringLegacyFlatFormat() {
+    val json = """{"//a:lib":"Rule#h1~d1", "//b:lib":"SourceFile#h2~d2"}"""
+
+    val data = interactor.executeTargetHashWithMetadataFromString(json)
+
+    assertThat(data.hashes)
+        .isEqualTo(
+            mapOf(
+                "//a:lib" to TargetHash("Rule", "h1", "d1"),
+                "//b:lib" to TargetHash("SourceFile", "h2", "d2")))
+    assertThat(data.moduleGraphJson).isNull()
     assertThat(data.depEdges).isEqualTo(emptyMap())
   }
 }

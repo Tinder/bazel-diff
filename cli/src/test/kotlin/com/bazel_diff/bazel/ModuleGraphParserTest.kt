@@ -366,11 +366,234 @@ class ModuleGraphParserTest {
   }
 
   // ---------------------------------------------------------------------------------------
+  // parseModuleGraphDepEdges
+  // ---------------------------------------------------------------------------------------
+
+  @Test
+  fun parseModuleGraphDepEdges_happyPath_mapsModuleNamesToDeps() {
+    val json =
+        """
+      {
+        "key": "<root>",
+        "name": "my-project",
+        "version": "1.0.0",
+        "apparentName": "my-project",
+        "dependencies": [
+          {
+            "key": "abseil-cpp@20240116.2",
+            "name": "abseil-cpp",
+            "version": "20240116.2",
+            "apparentName": "com_google_absl",
+            "dependencies": [
+              {
+                "key": "googletest@1.14.0",
+                "name": "googletest",
+                "version": "1.14.0",
+                "apparentName": "com_google_googletest",
+                "dependencies": []
+              }
+            ]
+          },
+          {
+            "key": "protobuf@21.7",
+            "name": "protobuf",
+            "version": "21.7",
+            "apparentName": "com_google_protobuf",
+            "dependencies": []
+          }
+        ]
+      }
+    """
+            .trimIndent()
+
+    val edges = parser.parseModuleGraphDepEdges(json)
+
+    assertThat(edges["my-project"]!!).containsExactlyInAnyOrder("abseil-cpp", "protobuf")
+    assertThat(edges["abseil-cpp"]!!).containsExactlyInAnyOrder("googletest")
+    // Leaf modules with empty dependencies still appear with an empty list.
+    assertThat(edges["googletest"]!!).isEmpty()
+    assertThat(edges["protobuf"]!!).isEmpty()
+  }
+
+  @Test
+  fun parseModuleGraphDepEdges_unexpandedStubs_stillContributeEdges() {
+    // Same issue #197 shape: middle_repo's dependency on inner_repo is an unexpanded stub.
+    // parseModuleGraphDepEdges still records the edge and recurses (unlike walkEdges).
+    val json =
+        """
+      {
+        "key": "<root>",
+        "name": "wrapped_external_repo_test",
+        "version": "0.0.0",
+        "apparentName": "wrapped_external_repo_test",
+        "dependencies": [
+          {
+            "key": "inner_repo@_",
+            "name": "inner_repo",
+            "version": "0.0.0",
+            "apparentName": "inner_repo",
+            "dependencies": []
+          },
+          {
+            "key": "middle_repo@_",
+            "name": "middle_repo",
+            "version": "0.0.0",
+            "apparentName": "middle_repo",
+            "dependencies": [
+              {
+                "key": "inner_repo@_",
+                "name": "inner_repo",
+                "version": "0.0.0",
+                "apparentName": "inner_repo",
+                "unexpanded": true
+              }
+            ]
+          }
+        ]
+      }
+    """
+            .trimIndent()
+
+    val edges = parser.parseModuleGraphDepEdges(json)
+
+    assertThat(edges["wrapped_external_repo_test"]!!)
+        .containsExactlyInAnyOrder("inner_repo", "middle_repo")
+    assertThat(edges["middle_repo"]!!).containsExactlyInAnyOrder("inner_repo")
+  }
+
+  @Test
+  fun parseModuleGraphDepEdges_withStderrPrefix_extractsEdges() {
+    val cleanJson =
+        """
+      {
+        "key": "<root>",
+        "name": "ws",
+        "version": "",
+        "apparentName": "ws",
+        "dependencies": [
+          {"key": "a@1", "name": "a", "version": "1", "apparentName": "a", "dependencies": []}
+        ]
+      }
+    """
+            .trimIndent()
+    val polluted = "INFO: Invocation ID: abc\nLoading: 0 packages loaded\n$cleanJson"
+
+    assertThat(parser.parseModuleGraphDepEdges(polluted)).isEqualTo(parser.parseModuleGraphDepEdges(cleanJson))
+    assertThat(parser.parseModuleGraphDepEdges(polluted)["ws"]!!).containsExactlyInAnyOrder("a")
+  }
+
+  @Test
+  fun parseModuleGraphDepEdges_withInvalidJson_returnsEmptyMap() {
+    assertThat(parser.parseModuleGraphDepEdges("{ invalid json")).isEmpty()
+  }
+
+  @Test
+  fun parseModuleGraphDepEdges_withMissingBrace_returnsEmptyMap() {
+    assertThat(parser.parseModuleGraphDepEdges("not json at all")).isEmpty()
+  }
+
+  @Test
+  fun parseModuleGraphDepEdges_skipsNonObjectDepsAndMissingNames() {
+    val json =
+        """
+      {
+        "key": "<root>",
+        "name": "root",
+        "version": "1",
+        "apparentName": "root",
+        "dependencies": [
+          "string-dep",
+          {"key": "no-name@1", "version": "1", "apparentName": "x"},
+          {"key": "ok@1", "name": "ok", "version": "1", "apparentName": "ok", "dependencies": []}
+        ]
+      }
+    """
+            .trimIndent()
+
+    val edges = parser.parseModuleGraphDepEdges(json)
+
+    assertThat(edges["root"]!!).containsExactlyInAnyOrder("ok")
+  }
+
+  @Test
+  fun parseModuleGraphDepEdges_moduleWithoutNameOrDeps_returnsEmpty() {
+    // Missing `name` short-circuits extractDepEdges; no edges recorded.
+    assertThat(parser.parseModuleGraphDepEdges("""{"key":"<root>","dependencies":[]}""")).isEmpty()
+    // Present name but missing dependencies array also short-circuits.
+    assertThat(parser.parseModuleGraphDepEdges("""{"key":"<root>","name":"root"}""")).isEmpty()
+  }
+
+  // ---------------------------------------------------------------------------------------
   // parseModuleGraphEdges / findTransitiveDependents (issue #197 expansion)
   // ---------------------------------------------------------------------------------------
   // Edge / transitive-dependents tests are regression coverage for issue #197: when
   // `@inner_repo` is the user-listed fine-grained repo and `@middle_repo` wraps it, the
   // expansion has to follow `bazel mod graph` backwards to add `@middle_repo` automatically.
+
+  @Test
+  fun parseModuleGraphEdges_withInvalidJson_returnsEmpty() {
+    val graph = parser.parseModuleGraphEdges("{ invalid json")
+    assertThat(graph.edges).isEmpty()
+    assertThat(graph.rootApparentNames).isEmpty()
+  }
+
+  @Test
+  fun parseModuleGraphEdges_withMissingBrace_returnsEmpty() {
+    val graph = parser.parseModuleGraphEdges("stderr only, no json object")
+    assertThat(graph.edges).isEmpty()
+    assertThat(graph.rootApparentNames).isEmpty()
+  }
+
+  @Test
+  fun parseModuleGraphEdges_withStderrPrefix_extractsEdges() {
+    val cleanJson =
+        """
+      {
+        "key": "<root>",
+        "name": "ws",
+        "version": "",
+        "apparentName": "ws",
+        "dependencies": [
+          {"key": "a@1", "name": "a", "version": "1", "apparentName": "a", "dependencies": []}
+        ]
+      }
+    """
+            .trimIndent()
+    val polluted = "WARNING: something\n$cleanJson"
+
+    val graph = parser.parseModuleGraphEdges(polluted)
+    assertThat(graph.rootApparentNames).containsExactlyInAnyOrder("ws")
+    assertThat(graph.edges["ws"]!!).containsExactlyInAnyOrder("a")
+  }
+
+  @Test
+  fun parseModuleGraphEdges_skipsNonObjectDepsAndMissingApparentNames() {
+    val json =
+        """
+      {
+        "key": "<root>",
+        "name": "root",
+        "version": "1",
+        "apparentName": "root",
+        "dependencies": [
+          42,
+          {"key": "no-app@1", "name": "no-app", "version": "1"},
+          {"key": "ok@1", "name": "ok", "version": "1", "apparentName": "ok", "dependencies": []}
+        ]
+      }
+    """
+            .trimIndent()
+
+    val graph = parser.parseModuleGraphEdges(json)
+    assertThat(graph.edges["root"]!!).containsExactlyInAnyOrder("ok")
+  }
+
+  @Test
+  fun parseModuleGraphEdges_missingApparentName_returnsEmpty() {
+    val graph = parser.parseModuleGraphEdges("""{"key":"<root>","name":"root","dependencies":[]}""")
+    assertThat(graph.edges).isEmpty()
+    assertThat(graph.rootApparentNames).isEmpty()
+  }
 
   @Test
   fun parseModuleGraphEdges_realIssue197Shape_extractsEdgesAndRoot() {

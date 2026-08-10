@@ -324,6 +324,169 @@ class BazelRuleTest {
     assertThat(forward).isEqualTo(reversed)
   }
 
+  // External @repo//... inputs that are not in fineGrainedHashExternalRepos collapse to a
+  // synthetic //external:<repo> label so dependents pick up WORKSPACE/bzlmod repo hash changes.
+  @Test
+  fun testExternalRepoInputCollapsesToSyntheticExternalTarget() {
+    val rule =
+        Rule.newBuilder()
+            .setRuleClass("java_library")
+            .setName("//pkg:lib")
+            .addRuleInput("@com_google_guava//guava:guava")
+            .addRuleInput("//pkg:local")
+            .build()
+
+    val inputs =
+        BazelRule(rule).ruleInputList(useCquery = false, fineGrainedHashExternalRepos = emptySet())
+
+    assertThat(inputs)
+        .isEqualTo(
+            listOf("//external:com_google_guava", "//pkg:local", "@com_google_guava//guava:guava"))
+  }
+
+  // Canonical @@repo labels strip all leading @ chars when collapsing.
+  @Test
+  fun testCanonicalExternalRepoInputCollapsesWithoutAtSigns() {
+    val rule =
+        Rule.newBuilder()
+            .setRuleClass("java_library")
+            .setName("//pkg:lib")
+            .addRuleInput("@@rules_jvm_external//:defs")
+            .build()
+
+    val inputs =
+        BazelRule(rule).ruleInputList(useCquery = false, fineGrainedHashExternalRepos = emptySet())
+
+    assertThat(inputs)
+        .isEqualTo(listOf("//external:rules_jvm_external", "@@rules_jvm_external//:defs"))
+  }
+
+  // Repos listed in fineGrainedHashExternalRepos keep their real labels; no //external:* synthetic.
+  @Test
+  fun testFineGrainedHashExternalReposPreservesExternalLabel() {
+    val rule =
+        Rule.newBuilder()
+            .setRuleClass("java_library")
+            .setName("//pkg:lib")
+            .addRuleInput("@inner_repo//:lib")
+            .addRuleInput("@other_repo//:lib")
+            .build()
+
+    val inputs =
+        BazelRule(rule)
+            .ruleInputList(
+                useCquery = false, fineGrainedHashExternalRepos = setOf("@inner_repo"))
+
+    assertThat(inputs)
+        .isEqualTo(
+            listOf("//external:other_repo", "@inner_repo//:lib", "@other_repo//:lib"))
+  }
+
+  // Main-repo spellings must never be collapsed to //external:*.
+  @Test
+  fun testMainRepoInputsAreNotCollapsed() {
+    val rule =
+        Rule.newBuilder()
+            .setRuleClass("java_library")
+            .setName("//pkg:lib")
+            .addRuleInput("//pkg:dep")
+            .addRuleInput("@//pkg:at_main")
+            .addRuleInput("@@//pkg:canonical_main")
+            .build()
+
+    val inputs =
+        BazelRule(rule).ruleInputList(useCquery = false, fineGrainedHashExternalRepos = emptySet())
+
+    assertThat(inputs)
+        .isEqualTo(listOf("//pkg:dep", "@//pkg:at_main", "@@//pkg:canonical_main"))
+  }
+
+  // Under cquery, synthetic //external:* inputs still come from rule_input (not configured_rule_input).
+  @Test
+  fun testCqueryRuleInputListIncludesExternalSyntheticFromRuleInputs() {
+    val rule =
+        Rule.newBuilder()
+            .setRuleClass("genrule")
+            .setName("//:gen")
+            .addRuleInput("@ext//:lib")
+            .addConfiguredRuleInput(
+                Build.ConfiguredRuleInput.newBuilder()
+                    .setLabel("//:dep")
+                    .setConfigurationChecksum("cfg-A")
+                    .build())
+            .build()
+
+    val inputs =
+        BazelRule(rule).ruleInputList(useCquery = true, fineGrainedHashExternalRepos = emptySet())
+
+    assertThat(inputs).isEqualTo(listOf("//:dep|cfg-A", "//external:ext"))
+  }
+
+  // Labels that start with @ but lack a // package separator are left unchanged.
+  @Test
+  fun testExternalInputWithoutPackageSeparatorIsUnchanged() {
+    val rule =
+        Rule.newBuilder()
+            .setRuleClass("java_library")
+            .setName("//pkg:lib")
+            .addRuleInput("@nopackage")
+            .build()
+
+    val inputs =
+        BazelRule(rule).ruleInputList(useCquery = false, fineGrainedHashExternalRepos = emptySet())
+
+    assertThat(inputs).isEqualTo(listOf("@nopackage"))
+  }
+
+  @Test
+  fun testInstantiationStackReturnsProtoFrames() {
+    val rule =
+        Rule.newBuilder()
+            .setRuleClass("java_library")
+            .setName("//pkg:lib")
+            .addInstantiationStack("macros.bzl:10:2: my_macro")
+            .addInstantiationStack("BUILD:5:1: <toplevel>")
+            .build()
+
+    assertThat(BazelRule(rule).instantiationStack)
+        .isEqualTo(listOf("macros.bzl:10:2: my_macro", "BUILD:5:1: <toplevel>"))
+  }
+
+  @Test
+  fun testInstantiationStackEmptyByDefault() {
+    val rule = Rule.newBuilder().setRuleClass("java_library").setName("//pkg:lib").build()
+
+    assertThat(BazelRule(rule).instantiationStack).isEqualTo(emptyList<String>())
+  }
+
+  // Custom ignoredAttrs are layered on top of DEFAULT_IGNORED_ATTRS (generator_location).
+  @Test
+  fun testDigestIgnoresCustomIgnoredAttrs() {
+    fun ruleWith(tags: String) =
+        Rule.newBuilder()
+            .setRuleClass("java_library")
+            .setName("lib")
+            .addAttribute(
+                Attribute.newBuilder()
+                    .setType(Attribute.Discriminator.STRING)
+                    .setName("tags")
+                    .setStringValue(tags)
+                    .build())
+            .addAttribute(
+                Attribute.newBuilder()
+                    .setType(Attribute.Discriminator.STRING)
+                    .setName("generator_location")
+                    .setStringValue("BUILD:1:1")
+                    .build())
+            .build()
+
+    val a = BazelRule(ruleWith("keep"))
+    val b = BazelRule(ruleWith("drop"))
+
+    assertThat(a.digest(setOf("tags"))).isEqualTo(b.digest(setOf("tags")))
+    assertThat(a.digest(emptySet())).isNotEqualTo(b.digest(emptySet()))
+  }
+
   private fun configuredGenrule(depLabel: String, configurationChecksum: String): Rule {
     return Rule.newBuilder()
         .setRuleClass("genrule")

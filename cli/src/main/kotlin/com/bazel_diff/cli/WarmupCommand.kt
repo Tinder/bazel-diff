@@ -28,7 +28,7 @@ import picocli.CommandLine
                 "revision, writes base hashes + fingerprint to known paths, and exits 0 only once " +
                 "the Bazel server is warm (the host's 'safe to snapshot' signal)."],
     versionProvider = VersionProvider::class)
-class WarmupCommand : GenerateHashesCommand() {
+open class WarmupCommand : GenerateHashesCommand() {
 
   @CommandLine.Option(
       names = ["--base-hashes"],
@@ -47,7 +47,7 @@ class WarmupCommand : GenerateHashesCommand() {
     outputPath = baseHashesPath
     baseHashesPath.parentFile?.mkdirs()
 
-    val genResult = super.call()
+    val genResult = runGenerateHashes()
     if (genResult != CommandLine.ExitCode.OK) {
       // Do not write the fingerprint or signal "safe to snapshot" on a failed warmup.
       return genResult
@@ -56,6 +56,12 @@ class WarmupCommand : GenerateHashesCommand() {
     writeFingerprint()
     return CommandLine.ExitCode.OK
   }
+
+  /**
+   * Invokes [GenerateHashesCommand.call]. Overridable in tests so [call] can be exercised without a
+   * real `bazel query`.
+   */
+  open fun runGenerateHashes(): Int = super.call()
 
   /**
    * Computes the fingerprint over the current flag set + workspace and writes it to

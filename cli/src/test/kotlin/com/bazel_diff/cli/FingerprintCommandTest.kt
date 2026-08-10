@@ -3,7 +3,9 @@ package com.bazel_diff.cli
 import assertk.assertThat
 import assertk.assertions.contains
 import assertk.assertions.isEqualTo
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.PrintStream
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -62,5 +64,47 @@ class FingerprintCommandTest {
     val cmd = command(ws).apply { outputPath = File("-") }
     assertThat(cmd.call()).isEqualTo(CommandLine.ExitCode.OK)
     assertThat(File("-").exists()).isEqualTo(false)
+  }
+
+  @Test
+  fun nullOutputPathWritesFingerprintJsonToStdout() {
+    val ws = temp.newFolder("ws4")
+    val cmd = command(ws).apply { outputPath = null }
+    val captured = ByteArrayOutputStream()
+    val previous = System.out
+    System.setOut(PrintStream(captured))
+    try {
+      assertThat(cmd.call()).isEqualTo(CommandLine.ExitCode.OK)
+    } finally {
+      System.setOut(previous)
+    }
+    val json = captured.toString()
+    assertThat(json).contains("\"fingerprint\"")
+    assertThat(json).contains("\"flags\"")
+  }
+
+  @Test
+  fun flagsInOutputAreSortedByKey() {
+    val ws = temp.newFolder("ws5")
+    val out = File(temp.root, "sorted.json")
+    command(ws)
+        .apply {
+          outputPath = out
+          keepGoing = true
+          useCquery = true
+          includeTargetType = true
+          excludeExternalTargets = true
+          bazelCommandOptions = listOf("--foo")
+          bazelStartupOptions = listOf("--bar")
+        }
+        .call()
+    val json = out.readText()
+    // canonicalizeFlags + toSortedMap should emit keys in lexicographic order
+    val flagsIdx = json.indexOf("\"flags\"")
+    val keepGoingIdx = json.indexOf("\"keepGoing\"", flagsIdx)
+    val useCqueryIdx = json.indexOf("\"useCquery\"", flagsIdx)
+    assert(keepGoingIdx in 1 until useCqueryIdx) {
+      "expected keepGoing before useCquery in sorted flags block"
+    }
   }
 }

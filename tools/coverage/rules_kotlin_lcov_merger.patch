@@ -1,0 +1,19 @@
+Make kt_jvm_test respect --coverage_output_generator.
+
+rules_kotlin hardcodes the test rule's _lcov_merger attribute to Bazel's
+built-in CoverageOutputGenerator instead of reading the coverage fragment's
+output_generator configuration field (the mechanism every other major rule
+set uses, and what the --coverage_output_generator flag sets). That pins
+kt_jvm_test coverage post-processing to the default merger and silently
+ignores the custom LCOV merger this repository configures in .bazelrc, which
+is what enforces per-target coverage minimums (//tools/coverage).
+
+--- a/kotlin/internal/jvm/jvm.bzl
++++ b/kotlin/internal/jvm/jvm.bzl
+@@ -430,5 +430,5 @@
+         "_lcov_merger": attr.label(
+-            default = Label("@bazel_tools//tools/test/CoverageOutputGenerator/java/com/google/devtools/coverageoutputgenerator:Main"),
++            default = configuration_field(fragment = "coverage", name = "output_generator"),
+         ),
+     }),
+     executable = True,

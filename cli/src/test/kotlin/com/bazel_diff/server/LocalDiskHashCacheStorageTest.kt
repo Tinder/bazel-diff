@@ -188,4 +188,97 @@ class LocalDiskHashCacheStorageTest {
     assertThat(result.evicted).isEqualTo(1)
     assertThat(Files.exists(sibling)).isTrue()
   }
+
+  @Test
+  fun defaultContainsDelegatesToGet() {
+    // LocalDiskHashCacheStorage overrides contains; exercise the interface default on a bare impl.
+    val backing = mutableMapOf<String, ByteArray>()
+    val storage =
+        object : HashCacheStorage {
+          override fun get(key: String): ByteArray? = backing[key]
+          override fun put(key: String, data: ByteArray) {
+            backing[key] = data
+          }
+        }
+    assertThat(storage.contains("k")).isFalse()
+    storage.put("k", bytes("v"))
+    assertThat(storage.contains("k")).isTrue()
+  }
+
+  @Test
+  fun getReturnsNullAfterEntryFileDeleted() {
+    val storage = storage()
+    storage.put("gone", bytes("x"))
+    Files.delete(temp.root.toPath().resolve("gone.json"))
+    assertThat(storage.get("gone")).isNull()
+    assertThat(storage.contains("gone")).isFalse()
+  }
+
+  @Test
+  fun statsAndPruneAreEmptyWhenDirectoryRemoved() {
+    val dir = temp.newFolder("cache-dir").toPath()
+    val storage = LocalDiskHashCacheStorage(dir)
+    storage.put("k", bytes("v"))
+    // Wipe the directory after construction: stats/prune must degrade gracefully.
+    dir.toFile().deleteRecursively()
+
+    assertThat(storage.stats()).isEqualTo(CacheStorageStats(0, 0))
+    val result = storage.prune(CachePruneLimits(maxEntries = 1))
+    assertThat(result).isEqualTo(CachePruneResult(0, 0, 0))
+  }
+
+  @Test
+  fun pruneWithMaxEntriesZeroEvictsEverything() {
+    val storage = storage()
+    storage.put("a", bytes("a"))
+    storage.put("b", bytes("b"))
+
+    val result = storage.prune(CachePruneLimits(maxEntries = 0))
+
+    assertThat(result.evicted).isEqualTo(2)
+    assertThat(storage.contains("a")).isFalse()
+    assertThat(storage.contains("b")).isFalse()
+  }
+
+  @Test
+  fun pruneContinuesWhenAnEntryCannotBeDeleted() {
+    // Best-effort prune: an undeletable entry must not abort the pass. Make the cache directory
+    // non-writable so Deletes fail with AccessDeniedException (works on Linux and macOS; unlike
+    // macOS-only `chflags uchg`, which is missing on Ubuntu CI).
+    val dir = temp.newFolder("prune-locked").toPath()
+    val storage = LocalDiskHashCacheStorage(dir)
+    storage.put("a", bytes("a"))
+    storage.put("b", bytes("b"))
+    val originalPerms = Files.getPosixFilePermissions(dir)
+    Files.setPosixFilePermissions(
+        dir, java.nio.file.attribute.PosixFilePermissions.fromString("r-xr-xr-x"))
+    try {
+      val result = storage.prune(CachePruneLimits(maxEntries = 0))
+      assertThat(result.scanned).isEqualTo(2)
+      // Neither entry could be removed; prune still returns without throwing.
+      assertThat(result.evicted).isEqualTo(0)
+      assertThat(Files.isRegularFile(dir.resolve("a.json"))).isTrue()
+      assertThat(Files.isRegularFile(dir.resolve("b.json"))).isTrue()
+    } finally {
+      Files.setPosixFilePermissions(dir, originalPerms)
+    }
+  }
+
+  @Test
+  fun getStillReturnsDataWhenTouchFails() {
+    // touchQuietly must swallow IOException so a failed mtime bump never fails the read. Call it
+    // directly with a missing path (setLastModifiedTime throws) — same catch as an immutable file.
+    val storage = storage()
+    storage.put("ok", bytes("payload"))
+    storage.touchQuietlyForTest(temp.root.toPath().resolve("does-not-exist.json"))
+    assertThat(String(storage.get("ok")!!, StandardCharsets.UTF_8)).isEqualTo("payload")
+  }
+
+  @Test
+  fun interfaceTypedCallsReachStatsAndPrune() {
+    val measurable: MeasurableHashCacheStorage = storage()
+    assertThat(measurable.stats()).isEqualTo(CacheStorageStats(0, 0))
+    val prunable: PrunableHashCacheStorage = storage()
+    assertThat(prunable.prune(CachePruneLimits(maxBytes = 0))).isEqualTo(CachePruneResult(0, 0, 0))
+  }
 }

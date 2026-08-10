@@ -389,6 +389,93 @@ class BuildGraphHasherTest : KoinTest {
     assertThat(fakeSourceFileHasher.softDigestCalls.get()).isEqualTo(1)
   }
 
+  @Test
+  fun labelToPackageExtractsPackagePortion() {
+    assertThat(labelToPackage("//pkg:a")).isEqualTo("//pkg")
+    assertThat(labelToPackage("//:logo")).isEqualTo("//")
+    assertThat(labelToPackage("@@repo//pkg:a")).isEqualTo("@@repo//pkg")
+    assertThat(labelToPackage("//pkg")).isEqualTo("//pkg")
+  }
+
+  @Test
+  fun generatedFileWithoutGeneratorThrows() = runBlocking {
+    declareMock<Logger>()
+    val orphan = createGeneratedTarget("gen0", "missing_generator")
+    whenever(bazelClientMock.queryAllTargets()).thenReturn(listOf(orphan))
+
+    assertFailure { hasher.hashAllBazelTargetsAndSourcefiles() }
+        .all {
+          isInstanceOf(RuntimeException::class)
+          message().matchesPredicate {
+            it != null && it.contains("Not possible to traverse the build graph")
+          }
+        }
+  }
+
+  @Test
+  fun hasherPhaseTimingsArePopulated() = runBlocking {
+    declareMock<Logger>()
+    whenever(bazelClientMock.queryAllTargets()).thenReturn(defaultTargets)
+
+    val timings = HasherPhaseTimings()
+    hasher.hashAllBazelTargetsAndSourcefiles(timings = timings)
+
+    assertThat(timings.bazelQueryMillis).isGreaterThanOrEqualTo(0)
+    assertThat(timings.sourceHashMillis).isGreaterThanOrEqualTo(0)
+    assertThat(timings.targetHashMillis).isGreaterThanOrEqualTo(0)
+  }
+
+  @Test
+  fun instantiationStacksDisablePackageBzlSeeds() = runBlocking {
+    declareMock<Logger>()
+    val buildSrc =
+        createSrcTarget(
+            name = "//pkg:BUILD.bazel",
+            digest = "build",
+            subincludes = listOf("//pkg:macro.bzl"))
+    val ruleWithoutStack =
+        createRuleTarget(name = "//pkg:lib", inputs = emptyList(), digest = "digest")
+    whenever(bazelClientMock.queryAllTargets()).thenReturn(listOf(buildSrc, ruleWithoutStack))
+
+    fakeSourceFileHasher.softDigestCalls.set(0)
+    hasher.hashAllBazelTargetsAndSourcefiles()
+    val callsWithoutStacks = fakeSourceFileHasher.softDigestCalls.get()
+    assertThat(callsWithoutStacks).isGreaterThan(0)
+
+    val ruleWithStack =
+        createRuleTarget(
+            name = "//pkg:lib",
+            inputs = emptyList(),
+            digest = "digest",
+            instantiationStack = listOf("pkg/macro.bzl:1:1: macro"))
+    whenever(bazelClientMock.queryAllTargets()).thenReturn(listOf(buildSrc, ruleWithStack))
+
+    fakeSourceFileHasher.softDigestCalls.set(0)
+    hasher.hashAllBazelTargetsAndSourcefiles()
+    // Package seeds are skipped; only RuleHasher's per-macro softDigest runs (once).
+    assertThat(fakeSourceFileHasher.softDigestCalls.get()).isEqualTo(1)
+  }
+
+  @Test
+  fun externalSubincludesAreSkippedInPackageBzlSeeds() = runBlocking {
+    declareMock<Logger>()
+    val buildSrc =
+        createSrcTarget(
+            name = "//pkg:BUILD.bazel",
+            digest = "build",
+            subincludes = listOf("@external_repo//:defs.bzl", "//pkg:local.bzl"))
+    val rule = createRuleTarget(name = "//pkg:lib", inputs = emptyList(), digest = "digest")
+    whenever(bazelClientMock.queryAllTargets()).thenReturn(listOf(buildSrc, rule))
+
+    fakeSourceFileHasher.softDigestCalls.set(0)
+    val hash = hasher.hashAllBazelTargetsAndSourcefiles()
+
+    // softDigest is still invoked for both labels, but the external one returns null and is
+    // dropped from the seed — hashing still succeeds and produces a stable package entry.
+    assertThat(fakeSourceFileHasher.softDigestCalls.get()).isEqualTo(2)
+    assertThat(hash.containsKey("//pkg:lib")).isEqualTo(true)
+  }
+
   private fun createRuleTarget(
       name: String,
       inputs: List<String>,
@@ -414,13 +501,17 @@ class BuildGraphHasherTest : KoinTest {
     return target
   }
 
-  private fun createSrcTarget(name: String, digest: String): BazelTarget {
+  private fun createSrcTarget(
+      name: String,
+      digest: String,
+      subincludes: List<String> = emptyList()
+  ): BazelTarget {
     fakeSourceFileHasher.add(name, digest.toByteArray())
 
     val target = mock<BazelTarget.SourceFile>()
     whenever(target.name).thenReturn(name)
     whenever(target.sourceFileName).thenReturn(name)
-    whenever(target.subincludeList).thenReturn(listOf())
+    whenever(target.subincludeList).thenReturn(subincludes)
     return target
   }
 }

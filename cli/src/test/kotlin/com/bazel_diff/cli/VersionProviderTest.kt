@@ -2,7 +2,11 @@ package com.bazel_diff.cli
 
 import assertk.assertThat
 import assertk.assertions.hasSize
+import assertk.assertions.isEqualTo
 import assertk.assertions.isNotEmpty
+import java.io.ByteArrayInputStream
+import java.io.InputStream
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class VersionProviderTest {
@@ -15,5 +19,30 @@ class VersionProviderTest {
     val versions = VersionProvider().getVersion()
     assertThat(versions).hasSize(1)
     assertThat(versions[0]).isNotEmpty()
+  }
+
+  @Test
+  fun missingResourceThrows() {
+    val emptyLoader =
+        object : ClassLoader() {
+          override fun getResourceAsStream(name: String): InputStream? = null
+        }
+    assertThrows(IllegalArgumentException::class.java) {
+      VersionProvider(emptyLoader).getVersion()
+    }
+  }
+
+  @Test
+  fun fallsBackToVersionResourceWhenCliVersionAbsent() {
+    val loader =
+        object : ClassLoader() {
+          override fun getResourceAsStream(name: String): InputStream? =
+              when (name) {
+                "cli/version" -> null
+                "version" -> ByteArrayInputStream("1.2.3-fallback\n".toByteArray())
+                else -> null
+              }
+        }
+    assertThat(VersionProvider(loader).getVersion().toList()).isEqualTo(listOf("1.2.3-fallback"))
   }
 }

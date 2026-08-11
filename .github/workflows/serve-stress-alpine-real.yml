@@ -7,6 +7,12 @@ name: Serve Stress (Alpine 8 GiB, real repos)
 # query` cost land under the memory/CPU cap -- signals the glibc serve-stress-real.yml runners
 # never produce on large trees.
 #
+# Bazel binary staging: peek the matrix repo's .bazelversion on the host. A concrete X.Y.Z pin
+# (e.g. bazelbuild/bazel.git -> 9.2.0) is downloaded as bazel-glibc so `bazel query` can parse
+# that tree's BUILD files -- matching serve-stress-real.yml's bazelisk-honors-clone-.bazelversion
+# intent. Floating pins (skylib's "8.x") or a missing file fall back to bazel-diff's
+# .bazelversion so those legs keep today's known-good binary without needing bazelisk under musl.
+#
 # Matrix / targets match serve-stress-real.yml (small / medium / bazel). fail-fast:false so a
 # slow or OOM'd leg still yields comparison data from the others. Each leg gets a 150-min
 # timeout (longer than the glibc real cron: cold query + 2-CPU starvation). If daily runner
@@ -72,7 +78,31 @@ jobs:
           cp bazel-bin/cli/bazel-diff_deploy.jar "$STAGE/bazel-diff.jar"
           cp tools/serve_stress.py tools/serve_harness.py tools/serve_stress_alpine.sh "$STAGE/tools/"
           cp .bazelversion "$STAGE/"
-          BV=$(cat .bazelversion)
+          FALLBACK_BV=$(tr -d '[:space:]' < .bazelversion)
+
+          # Sparse-peek the target repo's .bazelversion so we can stage a Bazel that can parse
+          # its BUILD files (bazel.git HEAD needs 9.x). Download stays on the glibc host so the
+          # 8 GiB Alpine cgroup does not pay for the release fetch.
+          PEEK=$(mktemp -d)
+          TARGET_BV=""
+          if git clone --depth=1 --filter=blob:none --sparse "${{ matrix.repo }}" "$PEEK"; then
+            git -C "$PEEK" sparse-checkout set .bazelversion || true
+            if [ -f "$PEEK/.bazelversion" ]; then
+              TARGET_BV=$(tr -d '[:space:]' < "$PEEK/.bazelversion")
+            fi
+          else
+            echo "WARN: could not peek ${{ matrix.repo }}; using fallback Bazel $FALLBACK_BV"
+          fi
+          rm -rf "$PEEK"
+
+          # Concrete X.Y.Z only — floating pins (e.g. skylib's "8.x") keep the fallback.
+          if echo "$TARGET_BV" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            BV="$TARGET_BV"
+            echo "Staging target-repo Bazel $BV (from ${{ matrix.repo }} .bazelversion)"
+          else
+            BV="$FALLBACK_BV"
+            echo "Staging fallback Bazel $BV (target .bazelversion=${TARGET_BV:-missing})"
+          fi
           curl -fsSL -o "$STAGE/bazel-glibc" \
             "https://github.com/bazelbuild/bazel/releases/download/${BV}/bazel-${BV}-linux-x86_64"
           chmod +x "$STAGE/bazel-glibc"

@@ -30,7 +30,7 @@ generate-readme:
 
 .PHONY: coverage
 coverage:
-	bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/coverage/... //tools/go/...
+	bazel coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...
 	bazel run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat
 	bazel run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
 
@@ -45,18 +45,18 @@ coverage-test:
 
 .PHONY: coverage-html
 coverage-html:
-	bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/coverage/... //tools/go/...
+	bazel coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...
 	bazel run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat --html coverage-html
 	@echo "Open coverage-html/index.html in a browser to inspect."
 
 .PHONY: coverage_rust
 coverage_rust:
-	cargo llvm-cov --all-targets --lcov --output-path lcov-rust.info
+	bazel coverage //src:cli_tests //src:rust_tests
 
 .PHONY: benchmark
 benchmark:
 	@test -n "$(WORKSPACE)" || (echo "usage: make benchmark WORKSPACE=/path/to/bazel [BAZEL=/path/to/bazelisk] [HYPERFINE=/path/to/hyperfine] [STREAMED_PROTO=/path/to/targets.pb] [INCLUDE_BAZEL=1] [ITERATIONS=10] [WARMUP=3] [RSS_RUNS=5] [JSON=benchmark.json]" >&2; exit 2)
-	python3 tools/benchmark.py \
+	$(or $(BAZEL),bazel) run -c opt //tools:benchmark -- \
 		--workspace "$(WORKSPACE)" \
 		--bazel "$(or $(BAZEL),bazel)" \
 		--hyperfine "$(or $(HYPERFINE),hyperfine)" \

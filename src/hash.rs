@@ -134,9 +134,26 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
 fn hash_targets_with_digests(
     options: &HashOptions,
     targets: Vec<Target>,
-    mut definition_digests: HashMap<String, DigestBytes>,
+    definition_digests: HashMap<String, DigestBytes>,
 ) -> Result<HashFileData> {
     let external_resolver = ExternalRepoResolver::new(&options.bazel)?;
+    let module_graph_json = options.bazel.module_graph_json();
+    hash_targets_with_environment(
+        options,
+        targets,
+        definition_digests,
+        external_resolver,
+        module_graph_json,
+    )
+}
+
+fn hash_targets_with_environment(
+    options: &HashOptions,
+    targets: Vec<Target>,
+    mut definition_digests: HashMap<String, DigestBytes>,
+    external_resolver: ExternalRepoResolver,
+    module_graph_json: Option<String>,
+) -> Result<HashFileData> {
     let source_hasher = SourceHasher {
         workspace: &options.bazel.workspace,
         content_hashes: options.content_hashes.as_ref(),
@@ -318,7 +335,7 @@ fn hash_targets_with_digests(
     };
     Ok(HashFileData {
         hashes,
-        module_graph_json: options.bazel.module_graph_json(),
+        module_graph_json,
         dep_edges,
     })
 }
@@ -906,7 +923,100 @@ impl HashingCommand for BazelOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::blaze_query::{attribute, Attribute, ConfiguredRuleInput};
+    use crate::proto::blaze_query::{
+        attribute, Attribute, ConfiguredRuleInput, GeneratedFile, SourceFile,
+    };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn bazel_options(workspace: &Path) -> BazelOptions {
+        BazelOptions {
+            workspace: workspace.to_path_buf(),
+            bazel: PathBuf::from("bazel"),
+            startup_options: Vec::new(),
+            command_options: Vec::new(),
+            cquery_options: Vec::new(),
+            use_cquery: false,
+            cquery_expression: None,
+            keep_going: false,
+            fine_grained_external_repos: BTreeSet::new(),
+            exclude_external_targets: false,
+            exclude_targets_query: None,
+            no_bazelrc: true,
+            verbose: false,
+        }
+    }
+
+    fn hash_options(workspace: &Path) -> HashOptions {
+        HashOptions {
+            bazel: bazel_options(workspace),
+            content_hashes: None,
+            ignored_attributes: HashSet::new(),
+            seed_filepaths: BTreeSet::new(),
+            modified_filepaths: BTreeSet::new(),
+            track_deps: true,
+            always_affected_tags: HashSet::new(),
+        }
+    }
+
+    fn hash_targets_for_test(
+        options: &HashOptions,
+        targets: Vec<Target>,
+        output_base: &Path,
+    ) -> Result<HashFileData> {
+        hash_targets_with_environment(
+            options,
+            targets,
+            HashMap::new(),
+            ExternalRepoResolver {
+                workspace: options.bazel.workspace.clone(),
+                bazel: options.bazel.bazel.clone(),
+                output_base: output_base.to_path_buf(),
+            },
+            Some(r#"{"name":"root"}"#.to_owned()),
+        )
+    }
+
+    fn source_target(name: &str, subincludes: &[&str]) -> Target {
+        let mut target = Target::default();
+        target.r#type = target::Discriminator::SourceFile;
+        target.source_file = buffa::MessageField::some(SourceFile {
+            name: name.to_owned(),
+            subinclude: subincludes
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            ..Default::default()
+        });
+        target
+    }
+
+    fn rule_target(rule: Rule) -> Target {
+        let mut target = Target::default();
+        target.r#type = target::Discriminator::Rule;
+        target.rule = buffa::MessageField::some(rule);
+        target
+    }
+
+    fn generated_target(name: &str, generating_rule: &str) -> Target {
+        let mut target = Target::default();
+        target.r#type = target::Discriminator::GeneratedFile;
+        target.generated_file = buffa::MessageField::some(GeneratedFile {
+            name: name.to_owned(),
+            generating_rule: generating_rule.to_owned(),
+            ..Default::default()
+        });
+        target
+    }
+
+    fn string_list_attribute(name: &str, values: &[&str]) -> Attribute {
+        Attribute {
+            name: name.to_owned(),
+            r#type: attribute::Discriminator::StringList,
+            string_list_value: values.iter().map(|value| (*value).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn canonical_rule_inputs_are_sorted_and_configuration_sensitive() {
@@ -1047,5 +1157,526 @@ mod tests {
 
         let expected: DigestBytes = Sha256::digest(b"seed contents").into();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn digest_builder_tracks_direct_transitive_and_dependencies() {
+        let mut tracked = TargetDigestBuilder::new(true);
+        tracked.direct(b"direct");
+        tracked.transitive("//dep:a", b"dependency");
+        let tracked = tracked.finish();
+        assert_eq!(tracked.deps, ["//dep:a"]);
+        assert_ne!(tracked.direct, tracked.overall);
+
+        let mut untracked = TargetDigestBuilder::new(false);
+        untracked.direct(b"direct");
+        untracked.transitive("//dep:a", b"dependency");
+        assert!(untracked.finish().deps.is_empty());
+        assert_eq!(digest_hex([0; 32]).len(), 64);
+    }
+
+    #[test]
+    fn source_helpers_cover_labels_permissions_and_missing_files() {
+        assert!(is_main_repo("//pkg:file"));
+        assert!(is_main_repo("@//pkg:file"));
+        assert!(is_main_repo("@@//pkg:file"));
+        assert!(!is_main_repo("@repo//pkg:file"));
+        assert_eq!(
+            main_repo_path("//pkg:file").unwrap(),
+            PathBuf::from("pkg/file")
+        );
+        assert_eq!(main_repo_path("//:root").unwrap(), PathBuf::from("root"));
+        assert!(main_repo_path("not-a-label").is_none());
+        assert_eq!(label_package("//pkg:file"), "//pkg");
+        assert_eq!(label_package("//pkg"), "//pkg");
+        assert!(!owner_executable(Path::new("/definitely/missing/file")));
+    }
+
+    #[test]
+    fn tags_visibility_and_external_inputs_are_normalized() {
+        let rule = Rule {
+            attribute: vec![
+                string_list_attribute("tags", &["manual", "always"]),
+                string_list_attribute(
+                    "visibility",
+                    &[
+                        "//visibility:public",
+                        "//pkg:friends",
+                        "//pkg:friends",
+                        "//pkg:__pkg__",
+                        "//other:clients",
+                    ],
+                ),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(rule_tags(&rule), HashSet::from(["manual", "always"]));
+        assert_eq!(
+            visibility_package_groups(&rule),
+            ["//other:clients", "//pkg:friends"]
+        );
+        assert!(rule_tags(&Rule::default()).is_empty());
+        assert!(visibility_package_groups(&Rule::default()).is_empty());
+
+        let fine_grained = BTreeSet::from(["@repo".to_owned()]);
+        assert_eq!(
+            transform_external_input("@repo//pkg:file", &fine_grained),
+            "@repo//pkg:file"
+        );
+        assert_eq!(
+            transform_external_input("@other//pkg:file", &fine_grained),
+            "//external:other"
+        );
+        assert_eq!(
+            transform_external_input("@@other+1.0//pkg:file", &fine_grained),
+            "//external:other+1.0"
+        );
+        assert_eq!(
+            transform_external_input("@//pkg:file", &fine_grained),
+            "@//pkg:file"
+        );
+    }
+
+    #[test]
+    fn source_seed_and_attribute_hashing_are_sensitive_to_inputs() {
+        let first = SourceTarget {
+            name: "//pkg:a".into(),
+            subincludes: vec!["//tools:a.bzl".into()],
+        };
+        let second = SourceTarget {
+            name: "//pkg:b".into(),
+            subincludes: vec!["//tools:a.bzl".into()],
+        };
+        assert_ne!(source_seed(&first), source_seed(&second));
+
+        let attribute = Attribute {
+            name: "cmd".into(),
+            r#type: attribute::Discriminator::String,
+            string_value: Some("echo hi".into()),
+            ..Default::default()
+        };
+        let mut included = Sha256::new();
+        hash_attribute(
+            &attribute,
+            &HashSet::new(),
+            &mut SizeCache::new(),
+            &mut included,
+        );
+        let mut ignored = Sha256::new();
+        hash_attribute(
+            &attribute,
+            &HashSet::from(["cmd".to_owned()]),
+            &mut SizeCache::new(),
+            &mut ignored,
+        );
+        assert_ne!(included.finalize().to_vec(), ignored.finalize().to_vec());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hashes_rules_sources_generated_files_and_visibility_groups() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        fs::create_dir_all(workspace.path().join("pkg")).unwrap();
+        fs::create_dir_all(workspace.path().join("tools")).unwrap();
+        fs::write(workspace.path().join("pkg/data.txt"), "data").unwrap();
+        fs::write(workspace.path().join("tools/defs.bzl"), "def macro(): pass").unwrap();
+        fs::write(workspace.path().join("seed.txt"), "seed").unwrap();
+        let mut options = hash_options(workspace.path());
+        options.seed_filepaths.insert(PathBuf::from("seed.txt"));
+
+        let group = Rule {
+            name: "//pkg:friends".into(),
+            rule_class: "package_group".into(),
+            attribute: vec![string_list_attribute("packages", &["//client/..."])],
+            ..Default::default()
+        };
+        let dependency = Rule {
+            name: "//pkg:dep".into(),
+            rule_class: "sh_library".into(),
+            rule_input: vec!["//pkg:data.txt".into()],
+            ..Default::default()
+        };
+        let top = Rule {
+            name: "//pkg:top".into(),
+            rule_class: "genrule".into(),
+            attribute: vec![
+                string_list_attribute("tags", &["manual"]),
+                string_list_attribute("visibility", &["//pkg:friends"]),
+            ],
+            rule_input: vec![
+                "//pkg:dep".into(),
+                "//pkg:data.txt".into(),
+                "@opaque//lib:file".into(),
+            ],
+            instantiation_stack: vec!["tools/defs.bzl:1:1: macro".into()],
+            ..Default::default()
+        };
+        let data = hash_targets_for_test(
+            &options,
+            vec![
+                source_target("//pkg:data.txt", &["//tools:defs.bzl"]),
+                rule_target(group),
+                rule_target(dependency),
+                rule_target(top),
+                generated_target("//pkg:out.txt", "//pkg:top"),
+            ],
+            &output_base,
+        )
+        .unwrap();
+
+        assert_eq!(data.hashes.len(), 5);
+        assert_eq!(data.hashes["//pkg:data.txt"].kind, "SourceFile");
+        assert_eq!(data.hashes["//pkg:top"].kind, "Rule");
+        assert_eq!(data.hashes["//pkg:out.txt"].kind, "GeneratedFile");
+        assert!(data.dep_edges["//pkg:top"].contains(&"//pkg:dep".to_owned()));
+        assert_eq!(data.dep_edges["//pkg:out.txt"], ["//pkg:top"]);
+        assert_eq!(
+            data.module_graph_json.as_deref(),
+            Some(r#"{"name":"root"}"#)
+        );
+
+        fs::write(workspace.path().join("pkg/data.txt"), "changed").unwrap();
+        let changed = hash_targets_for_test(
+            &options,
+            vec![
+                source_target("//pkg:data.txt", &["//tools:defs.bzl"]),
+                rule_target(Rule {
+                    name: "//pkg:dep".into(),
+                    rule_class: "sh_library".into(),
+                    rule_input: vec!["//pkg:data.txt".into()],
+                    ..Default::default()
+                }),
+            ],
+            &output_base,
+        )
+        .unwrap();
+        assert_ne!(
+            data.hashes["//pkg:data.txt"].hash,
+            changed.hashes["//pkg:data.txt"].hash
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_bzl_seed_content_hashes_and_modified_filter_affect_sources() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        fs::create_dir_all(workspace.path().join("pkg")).unwrap();
+        fs::create_dir_all(workspace.path().join("tools")).unwrap();
+        fs::write(workspace.path().join("pkg/data.txt"), "actual").unwrap();
+        fs::write(workspace.path().join("tools/defs.bzl"), "v1").unwrap();
+        let mut options = hash_options(workspace.path());
+        options.content_hashes = Some(BTreeMap::from([(
+            "pkg/data.txt".into(),
+            "precomputed".into(),
+        )]));
+        options.modified_filepaths = BTreeSet::from([PathBuf::from("other.txt")]);
+        let targets = vec![
+            source_target("//pkg:data.txt", &["//tools:defs.bzl"]),
+            source_target("//tools:defs.bzl", &[]),
+            rule_target(Rule {
+                name: "//pkg:rule".into(),
+                rule_class: "sh_library".into(),
+                rule_input: vec!["//pkg:data.txt".into()],
+                ..Default::default()
+            }),
+        ];
+        let first = hash_targets_for_test(&options, targets, &output_base).unwrap();
+
+        fs::write(workspace.path().join("tools/defs.bzl"), "v2").unwrap();
+        let second = hash_targets_for_test(
+            &options,
+            vec![
+                source_target("//pkg:data.txt", &["//tools:defs.bzl"]),
+                source_target("//tools:defs.bzl", &[]),
+                rule_target(Rule {
+                    name: "//pkg:rule".into(),
+                    rule_class: "sh_library".into(),
+                    rule_input: vec!["//pkg:data.txt".into()],
+                    ..Default::default()
+                }),
+            ],
+            &output_base,
+        )
+        .unwrap();
+        assert_eq!(
+            first.hashes["//pkg:rule"].hash,
+            second.hashes["//pkg:rule"].hash
+        );
+
+        options.modified_filepaths = BTreeSet::from([PathBuf::from("tools/defs.bzl")]);
+        let tracked = hash_targets_for_test(
+            &options,
+            vec![
+                source_target("//pkg:data.txt", &["//tools:defs.bzl"]),
+                source_target("//tools:defs.bzl", &[]),
+                rule_target(Rule {
+                    name: "//pkg:rule".into(),
+                    rule_class: "sh_library".into(),
+                    rule_input: vec!["//pkg:data.txt".into()],
+                    ..Default::default()
+                }),
+            ],
+            &output_base,
+        )
+        .unwrap();
+        assert_ne!(
+            first.hashes["//pkg:rule"].hash,
+            tracked.hashes["//pkg:rule"].hash
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hashing_reports_cycles_and_missing_generators() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        let options = hash_options(workspace.path());
+        let cycle = hash_targets_for_test(
+            &options,
+            vec![
+                rule_target(Rule {
+                    name: "//:a".into(),
+                    rule_class: "alias".into(),
+                    rule_input: vec!["//:b".into()],
+                    ..Default::default()
+                }),
+                rule_target(Rule {
+                    name: "//:b".into(),
+                    rule_class: "alias".into(),
+                    rule_input: vec!["//:a".into()],
+                    ..Default::default()
+                }),
+            ],
+            &output_base,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(cycle.contains("Circular dependency detected"));
+
+        let missing = hash_targets_for_test(
+            &options,
+            vec![generated_target("//:out", "//:missing")],
+            &output_base,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("Unexpected generating rule"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn always_affected_tags_change_each_invocation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        let mut options = hash_options(workspace.path());
+        options
+            .always_affected_tags
+            .insert("non-hermetic".to_owned());
+        let target = || {
+            rule_target(Rule {
+                name: "//:volatile".into(),
+                rule_class: "genrule".into(),
+                attribute: vec![string_list_attribute("tags", &["non-hermetic"])],
+                ..Default::default()
+            })
+        };
+        let first = hash_targets_for_test(&options, vec![target()], &output_base).unwrap();
+        let second = hash_targets_for_test(&options, vec![target()], &output_base).unwrap();
+        assert_ne!(
+            first.hashes["//:volatile"].direct_hash,
+            second.hashes["//:volatile"].direct_hash
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_repo_resolver_handles_existing_repository_directories() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        let external = output_base.join("external");
+        fs::create_dir_all(external.join("existing+")).unwrap();
+        let resolver = ExternalRepoResolver {
+            workspace: workspace.path().to_path_buf(),
+            bazel: PathBuf::from("bazel"),
+            output_base,
+        };
+        assert_eq!(
+            resolver.resolve("existing").unwrap(),
+            external.join("existing+")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_hash_tracks_owner_executable_but_ignores_group_and_other_bits() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("path/to/script.sh");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "#!/bin/sh\necho hi\n").unwrap();
+        let resolver = ExternalRepoResolver {
+            workspace: workspace.path().to_path_buf(),
+            bazel: PathBuf::from("bazel"),
+            output_base: workspace.path().join("output"),
+        };
+        let modified = BTreeSet::new();
+        let hasher = SourceHasher {
+            workspace: workspace.path(),
+            content_hashes: None,
+            modified_filepaths: &modified,
+            fine_grained_external_repos: BTreeSet::new(),
+            external_resolver: resolver,
+        };
+        let mut permissions = fs::metadata(&file).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&file, permissions.clone()).unwrap();
+        let baseline = hasher.digest("//path/to:script.sh", b"seed").unwrap();
+
+        permissions.set_mode(0o655);
+        fs::set_permissions(&file, permissions.clone()).unwrap();
+        assert_eq!(
+            hasher.digest("//path/to:script.sh", b"seed").unwrap(),
+            baseline
+        );
+
+        permissions.set_mode(0o744);
+        fs::set_permissions(&file, permissions).unwrap();
+        assert_ne!(
+            hasher.digest("//path/to:script.sh", b"seed").unwrap(),
+            baseline
+        );
+    }
+
+    #[test]
+    fn source_hash_distinguishes_empty_missing_and_unrecognized_labels() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("path/to/empty.txt");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "").unwrap();
+        let resolver = ExternalRepoResolver {
+            workspace: workspace.path().to_path_buf(),
+            bazel: PathBuf::from("bazel"),
+            output_base: workspace.path().join("output"),
+        };
+        let modified = BTreeSet::new();
+        let hasher = SourceHasher {
+            workspace: workspace.path(),
+            content_hashes: None,
+            modified_filepaths: &modified,
+            fine_grained_external_repos: BTreeSet::new(),
+            external_resolver: resolver,
+        };
+        let existing = hasher.digest("//path/to:empty.txt", b"seed").unwrap();
+        fs::remove_file(&file).unwrap();
+        let missing = hasher.digest("//path/to:empty.txt", b"seed").unwrap();
+        assert_ne!(existing, missing);
+        assert_eq!(
+            hasher.digest("@not_a_valid_label", b"seed").unwrap(),
+            <DigestBytes>::from(Sha256::digest([]))
+        );
+        assert_eq!(
+            hasher.digest("not-a-bazel-label", b"seed").unwrap(),
+            <DigestBytes>::from(Sha256::digest([]))
+        );
+        assert!(hasher
+            .soft_digest("//path/to:empty.txt", b"seed")
+            .unwrap()
+            .is_none());
+        assert!(hasher
+            .soft_digest("@repo//:file", b"seed")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn source_hash_accepts_main_repo_label_forms_and_content_hash_keys() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("path/to/file.txt");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "on disk").unwrap();
+        let content_hashes = BTreeMap::from([
+            ("path/to/file.txt".to_owned(), "provided".to_owned()),
+            (
+                "external/ext/path/to/file.txt".to_owned(),
+                "external-provided".to_owned(),
+            ),
+        ]);
+        let external_file = workspace
+            .path()
+            .join("output/external/ext/path/to/file.txt");
+        fs::create_dir_all(external_file.parent().unwrap()).unwrap();
+        fs::write(&external_file, "external disk").unwrap();
+        let resolver = ExternalRepoResolver {
+            workspace: workspace.path().to_path_buf(),
+            bazel: PathBuf::from("bazel"),
+            output_base: workspace.path().join("output"),
+        };
+        let modified = BTreeSet::new();
+        let hasher = SourceHasher {
+            workspace: workspace.path(),
+            content_hashes: Some(&content_hashes),
+            modified_filepaths: &modified,
+            fine_grained_external_repos: BTreeSet::from(["ext".to_owned()]),
+            external_resolver: resolver,
+        };
+        let plain = hasher.digest("//path/to:file.txt", b"seed").unwrap();
+        assert_ne!(
+            hasher.digest("@//path/to:file.txt", b"seed").unwrap(),
+            plain
+        );
+        assert_ne!(
+            hasher.digest("@@//path/to:file.txt", b"seed").unwrap(),
+            plain
+        );
+        assert_ne!(
+            hasher.digest("//:path/to/file.txt", b"seed").unwrap(),
+            <DigestBytes>::from(Sha256::digest([]))
+        );
+        assert_ne!(
+            hasher.digest("@ext//path/to:file.txt", b"seed").unwrap(),
+            <DigestBytes>::from(Sha256::digest([]))
+        );
+
+        let not_fine_grained = SourceHasher {
+            workspace: workspace.path(),
+            content_hashes: Some(&content_hashes),
+            modified_filepaths: &modified,
+            fine_grained_external_repos: BTreeSet::new(),
+            external_resolver: hasher.external_resolver.clone(),
+        };
+        assert_eq!(
+            not_fine_grained
+                .digest("@ext//path/to:file.txt", b"seed")
+                .unwrap(),
+            <DigestBytes>::from(Sha256::digest([]))
+        );
+    }
+
+    #[test]
+    fn soft_digest_rejects_directories() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("path/to/dir")).unwrap();
+        let resolver = ExternalRepoResolver {
+            workspace: workspace.path().to_path_buf(),
+            bazel: PathBuf::from("bazel"),
+            output_base: workspace.path().join("output"),
+        };
+        let modified = BTreeSet::new();
+        let hasher = SourceHasher {
+            workspace: workspace.path(),
+            content_hashes: None,
+            modified_filepaths: &modified,
+            fine_grained_external_repos: BTreeSet::new(),
+            external_resolver: resolver,
+        };
+        assert!(hasher
+            .soft_digest("//path/to:dir", b"seed")
+            .unwrap()
+            .is_none());
     }
 }

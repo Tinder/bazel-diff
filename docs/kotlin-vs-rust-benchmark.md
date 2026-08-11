@@ -99,8 +99,10 @@ make benchmark \
   JSON=/tmp/bazel-diff-benchmark.json
 ```
 
-The runner builds both optimized artifacts, records the Hyperfine version and raw wall-time samples
-plus separate process-tree RSS samples and environment metadata in JSON, and exits non-zero if any
-normalized hash maps differ.
+The outer `bazel run -c opt` builds both implementations once and injects the Kotlin launcher and
+Rust binary through runfiles. The benchmark executes those runfiles directly; it does not run a
+nested Bazel build. It records the Hyperfine version and raw wall-time samples plus separate
+process-tree RSS samples and environment metadata in JSON, and exits non-zero if any normalized hash
+maps differ.
 
 To reproduce the secondary Bazel-inclusive table instead, add `INCLUDE_BAZEL=1`.

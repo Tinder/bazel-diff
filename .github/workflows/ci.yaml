@@ -127,7 +127,7 @@ jobs:
           if [ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]; then
             BAZEL_STARTUP=(--output_user_root="${BAZEL_OUTPUT_USER_ROOT}")
           fi
-          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false
+          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         if: always()

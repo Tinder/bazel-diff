@@ -80,6 +80,17 @@ fn bzlmod_transitive_deps_cquery() {
     );
 }
 
+#[test]
+#[ignore = "fixture pins Bazel 7 layout that is incompatible with Bazel 8+ tools/windows packaging"]
+fn bzlmod_cc_transitive_deps_query() {
+    zipped_golden_case(
+        "bzlmod-cc-transitive-test-1.zip",
+        "bzlmod-cc-transitive-test-2.zip",
+        &[],
+        "bzlmod-cc-transitive-test-impacted-targets.txt",
+    );
+}
+
 fn cquery_platform_case(second_zip: &str, platform: &str, golden: &str) {
     let first = extract_fixture("cquery-test-base.zip");
     let second = extract_fixture(second_zip);

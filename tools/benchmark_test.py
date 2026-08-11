@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 
 import json
-import subprocess
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from benchmark import (
     HyperfineResult,
     compare_hashes,
+    _injected_binaries,
+    _resolve_binaries,
     load_hashes,
     load_hyperfine_results,
     speedup,
     summarize,
     wall_time_comparison,
-    _write_replay_bazel,
 )
 
 
@@ -174,36 +177,53 @@ class HyperfineResultTest(unittest.TestCase):
                 load_hyperfine_results(path)
 
 
-class ReplayBazelTest(unittest.TestCase):
-    def test_replays_version_info_and_query_output(self):
+class BinaryResolutionTest(unittest.TestCase):
+    def test_bazel_target_injects_real_binaries(self):
+        if "TEST_SRCDIR" not in os.environ:
+            self.skipTest("requires Bazel runfiles")
+        kotlin, rust = _injected_binaries()
+        self.assertTrue(kotlin.is_file())
+        self.assertTrue(rust.is_file())
+
+    def test_resolves_injected_binaries_from_runfiles(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fixture = root / "targets.pb"
-            fixture.write_bytes(b"protobuf")
-            replay = root / "bazel-replay"
-            output_base = root / "output-base"
-            _write_replay_bazel(replay, fixture, output_base)
+            kotlin = root / "kotlin"
+            rust = root / "rust"
+            kotlin.write_text("kotlin")
+            rust.write_text("rust")
+            resolver = mock.Mock()
+            resolver.Rlocation.side_effect = [str(kotlin), str(rust)]
 
-            version = subprocess.run(
-                [str(replay), "version"],
-                capture_output=True,
-                text=True,
-                check=True,
+            runfiles_module = mock.Mock()
+            runfiles_module.Create.return_value = resolver
+            with mock.patch("benchmark._runfiles", runfiles_module):
+                self.assertEqual(_injected_binaries(), (kotlin, rust))
+
+            resolver.Rlocation.assert_has_calls(
+                [
+                    mock.call("_main/cli/bazel-diff", source_repo=""),
+                    mock.call("_main/src/bazel-diff", source_repo=""),
+                ]
             )
-            self.assertIn("Build label: 9.2.0", version.stdout)
-            info = subprocess.run(
-                [str(replay), "info", "output_base"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            self.assertEqual(info.stdout.strip(), str(output_base))
-            output = root / "output.pb"
-            subprocess.run(
-                [str(replay), "query", "--output_file", str(output)],
-                check=True,
-            )
-            self.assertEqual(output.read_bytes(), b"protobuf")
+
+    def test_explicit_binary_overrides_still_require_a_pair(self):
+        args = SimpleNamespace(
+            kotlin_binary=Path("kotlin"),
+            rust_binary=Path("rust"),
+        )
+        self.assertEqual(
+            _resolve_binaries(args),
+            (Path("kotlin").resolve(), Path("rust").resolve()),
+        )
+        args.rust_binary = None
+        with self.assertRaises(ValueError):
+            _resolve_binaries(args)
+
+    def test_missing_runfiles_reports_actionable_error(self):
+        with mock.patch("benchmark._runfiles", None):
+            with self.assertRaisesRegex(ValueError, "provide both"):
+                _injected_binaries()
 
 
 if __name__ == "__main__":

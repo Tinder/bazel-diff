@@ -23,7 +23,10 @@ alias(
 
 test_suite(
     name = "rust_tests",
-    tests = ["//src:rust_tests"],
+    tests = [
+        "//src:cli_tests",
+        "//src:rust_tests",
+    ],
 )
 
 alias(

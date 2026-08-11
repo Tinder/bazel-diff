@@ -55,18 +55,34 @@ py_test(
     deps = [":coverage_check_lib"],
 )
 
-# The benchmark shells out to Bazel, so only its pure parsing/statistics helpers run under
-# `bazel test`. Invoke the real benchmark directly to avoid nesting Bazel under Bazel.
 py_library(
     name = "benchmark_lib",
     srcs = ["benchmark.py"],
     imports = ["."],
     visibility = ["//visibility:private"],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+py_binary(
+    name = "benchmark",
+    srcs = ["benchmark.py"],
+    data = [
+        "//cli:bazel-diff",
+        "//src:bazel-diff",
+    ],
+    main = "benchmark.py",
+    python_version = "PY3",
+    visibility = ["//visibility:public"],
+    deps = ["@rules_python//python/runfiles"],
 )
 
 py_test(
     name = "benchmark_test",
     srcs = ["benchmark_test.py"],
+    data = [
+        "//cli:bazel-diff",
+        "//src:bazel-diff",
+    ],
     python_version = "PY3",
     deps = [":benchmark_lib"],
 )

@@ -1,5 +1,6 @@
 use crate::bazel::{target_name, BazelOptions};
 use crate::model::{impacted_targets, HashFileData};
+use crate::proto::blaze_query::Target;
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -85,6 +86,17 @@ pub fn impacted_with_module_changes(
     to: &HashFileData,
     bazel: Option<&BazelOptions>,
 ) -> Result<BTreeSet<String>> {
+    impacted_with_module_query(from, to, bazel.is_some(), |expression| {
+        bazel.unwrap().query(expression, false)
+    })
+}
+
+fn impacted_with_module_query(
+    from: &HashFileData,
+    to: &HashFileData,
+    can_query: bool,
+    mut query: impl FnMut(&str) -> Result<Vec<Target>>,
+) -> Result<BTreeSet<String>> {
     let mut impacted = impacted_targets(&from.hashes, &to.hashes, None, false)?
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -101,12 +113,13 @@ pub fn impacted_with_module_changes(
     if changed.is_empty() {
         return Ok(impacted);
     }
-    let Some(bazel) = bazel else {
+    if !can_query {
         return Ok(to.hashes.keys().cloned().collect());
-    };
-    let canonical_repos = to
+    }
+    let canonical_repos = from
         .hashes
         .keys()
+        .chain(to.hashes.keys())
         .filter_map(|label| {
             label
                 .strip_prefix("@@")
@@ -133,7 +146,7 @@ pub fn impacted_with_module_changes(
             .collect::<Vec<_>>()
             .join(" + ")
     );
-    match bazel.query(&expression, false) {
+    match query(&expression) {
         Ok(targets) => {
             impacted.extend(
                 targets
@@ -147,12 +160,17 @@ pub fn impacted_with_module_changes(
             eprintln!(
                 "[Warn] Unioned rdeps query failed ({error}); conservatively including workspace targets"
             );
-            impacted.extend(
-                to.hashes
-                    .keys()
-                    .filter(|label| !label.starts_with("@@") && !label.starts_with("//external:"))
-                    .cloned(),
-            );
+            let workspace_targets = to
+                .hashes
+                .keys()
+                .filter(|label| !label.starts_with("@@") && !label.starts_with("//external:"))
+                .cloned()
+                .collect::<Vec<_>>();
+            if workspace_targets.is_empty() {
+                impacted.extend(to.hashes.keys().cloned());
+            } else {
+                impacted.extend(workspace_targets);
+            }
         }
     }
     Ok(impacted)
@@ -161,6 +179,66 @@ pub fn impacted_with_module_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TargetHash;
+    use crate::proto::blaze_query::{target, Rule, Target};
+
+    fn hash(kind: &str, value: &str) -> TargetHash {
+        TargetHash {
+            kind: kind.to_owned(),
+            hash: value.to_owned(),
+            direct_hash: value.to_owned(),
+            deps: Vec::new(),
+        }
+    }
+
+    fn graph(version: &str) -> String {
+        format!(
+            r#"noise before JSON
+            {{
+              "key": "<root>",
+              "name": "root",
+              "version": "",
+              "apparentName": "root",
+              "dependencies": [
+                {{
+                  "key": "rules_go@{version}",
+                  "name": "rules_go",
+                  "version": "{version}",
+                  "apparentName": "rules_go",
+                  "dependencies": [
+                    {{
+                      "key": "gazelle@0.40.0",
+                      "name": "gazelle",
+                      "version": "0.40.0",
+                      "apparentName": "gazelle"
+                    }}
+                  ]
+                }}
+              ]
+            }}"#
+        )
+    }
+
+    fn root_only_graph() -> &'static str {
+        r#"{
+          "key": "<root>",
+          "name": "root",
+          "version": "",
+          "apparentName": "root",
+          "dependencies": []
+        }"#
+    }
+
+    fn rule_target(name: &str) -> Target {
+        let mut target = Target::default();
+        target.r#type = target::Discriminator::Rule;
+        target.rule = buffa::MessageField::some(Rule {
+            name: name.to_owned(),
+            rule_class: "sh_library".to_owned(),
+            ..Default::default()
+        });
+        target
+    }
 
     #[test]
     fn canonical_base_excludes_extension_repos() {
@@ -170,5 +248,260 @@ mod tests {
             "rules_go++extensions+toolchains",
             "rules_go"
         ));
+        assert!(!canonical_is_base_for_module("rules_go", "rules_go"));
+        assert!(!canonical_is_base_for_module("rules_go_0.50.1", "rules_go"));
+        assert!(!canonical_is_base_for_module("gazelle+0.40.0", "rules_go"));
+    }
+
+    #[test]
+    fn parses_nested_modules_and_ignores_invalid_nodes() {
+        let modules = parse_modules(&graph("0.50.1"));
+        assert_eq!(modules["rules_go@0.50.1"].name, "rules_go");
+        assert_eq!(modules["rules_go@0.50.1"].version, "0.50.1");
+        assert_eq!(modules["gazelle@0.40.0"].name, "gazelle");
+        assert_eq!(modules["<root>"].name, "root");
+        assert!(parse_modules("not json").is_empty());
+        assert!(parse_modules(r#"{"dependencies":[1, null, []]}"#).is_empty());
+    }
+
+    #[test]
+    fn detects_added_removed_and_upgraded_modules() {
+        assert_eq!(
+            changed_modules(&graph("0.49.0"), &graph("0.50.1")),
+            BTreeSet::from(["rules_go".to_owned()])
+        );
+        assert_eq!(
+            changed_modules(root_only_graph(), &graph("0.50.1")),
+            BTreeSet::from(["gazelle".to_owned(), "rules_go".to_owned()])
+        );
+        assert_eq!(
+            changed_modules(&graph("0.50.1"), root_only_graph()),
+            BTreeSet::from(["gazelle".to_owned(), "rules_go".to_owned()])
+        );
+        assert!(changed_modules(&graph("0.50.1"), &graph("0.50.1")).is_empty());
+        assert!(changed_modules("invalid", &graph("0.50.1")).is_empty());
+    }
+
+    #[test]
+    fn module_changes_cover_conservative_and_noop_paths() {
+        let unchanged = BTreeMap::from([("//app:lib".to_owned(), hash("Rule", "same"))]);
+        let changed = BTreeMap::from([
+            ("//app:lib".to_owned(), hash("Rule", "new")),
+            (
+                "@@rules_go+0.50.1//go:def.bzl".to_owned(),
+                hash("SourceFile", "external"),
+            ),
+        ]);
+        let base = HashFileData {
+            hashes: unchanged.clone(),
+            module_graph_json: Some(graph("0.49.0")),
+            ..Default::default()
+        };
+
+        let same_graph = HashFileData {
+            hashes: changed.clone(),
+            module_graph_json: base.module_graph_json.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            impacted_with_module_changes(&base, &same_graph, None).unwrap(),
+            BTreeSet::from([
+                "//app:lib".to_owned(),
+                "@@rules_go+0.50.1//go:def.bzl".to_owned()
+            ])
+        );
+
+        let missing_graph = HashFileData {
+            hashes: changed.clone(),
+            module_graph_json: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            impacted_with_module_changes(&base, &missing_graph, None).unwrap(),
+            BTreeSet::from([
+                "//app:lib".to_owned(),
+                "@@rules_go+0.50.1//go:def.bzl".to_owned()
+            ])
+        );
+
+        let upgraded = HashFileData {
+            hashes: changed.clone(),
+            module_graph_json: Some(graph("0.50.1")),
+            ..Default::default()
+        };
+        assert_eq!(
+            impacted_with_module_changes(&base, &upgraded, None).unwrap(),
+            changed.keys().cloned().collect()
+        );
+
+        let extension_only = HashFileData {
+            hashes: BTreeMap::from([(
+                "@@rules_go++extensions+toolchain//:repo".to_owned(),
+                hash("Rule", "changed"),
+            )]),
+            module_graph_json: Some(graph("0.50.1")),
+            ..Default::default()
+        };
+        assert_eq!(
+            impacted_with_module_changes(&base, &extension_only, None).unwrap(),
+            BTreeSet::from(["@@rules_go++extensions+toolchain//:repo".to_owned()])
+        );
+    }
+
+    #[test]
+    fn module_query_unions_workspace_dependents() {
+        let from = HashFileData {
+            hashes: BTreeMap::from([
+                (
+                    "@@rules_go+0.49.0//go:def.bzl".into(),
+                    hash("SourceFile", "old"),
+                ),
+                ("//app:unchanged".into(), hash("Rule", "same")),
+            ]),
+            module_graph_json: Some(graph("0.49.0")),
+            ..Default::default()
+        };
+        let to = HashFileData {
+            hashes: BTreeMap::from([
+                (
+                    "@@rules_go+0.50.1//go:def.bzl".into(),
+                    hash("SourceFile", "new"),
+                ),
+                ("//app:unchanged".into(), hash("Rule", "same")),
+            ]),
+            module_graph_json: Some(graph("0.50.1")),
+            ..Default::default()
+        };
+        let mut expression = String::new();
+        let impacted = impacted_with_module_query(&from, &to, true, |query| {
+            expression = query.to_owned();
+            Ok(vec![rule_target("//app:one"), rule_target("//app:two")])
+        })
+        .unwrap();
+        assert_eq!(
+            expression,
+            "rdeps(//..., @@rules_go+0.49.0//... + @@rules_go+0.50.1//...)"
+        );
+        assert!(impacted.contains("//app:one"));
+        assert!(impacted.contains("//app:two"));
+        assert!(!impacted.contains("//app:unchanged"));
+    }
+
+    #[test]
+    fn removed_module_resolves_from_starting_hashes() {
+        let from = HashFileData {
+            hashes: BTreeMap::from([(
+                "@@rules_go+0.49.0//go:def.bzl".into(),
+                hash("SourceFile", "old"),
+            )]),
+            module_graph_json: Some(graph("0.49.0")),
+            ..Default::default()
+        };
+        let to = HashFileData {
+            hashes: BTreeMap::from([("//app:consumer".into(), hash("Rule", "same"))]),
+            module_graph_json: Some(root_only_graph().to_owned()),
+            ..Default::default()
+        };
+        assert!(impacted_with_module_query(&from, &to, true, |_| {
+            Ok(vec![rule_target("//app:consumer")])
+        })
+        .unwrap()
+        .contains("//app:consumer"));
+    }
+
+    #[test]
+    fn module_query_failure_uses_workspace_or_all_hashes() {
+        let from = HashFileData {
+            hashes: BTreeMap::from([(
+                "@@rules_go+0.49.0//go:def.bzl".into(),
+                hash("SourceFile", "old"),
+            )]),
+            module_graph_json: Some(graph("0.49.0")),
+            ..Default::default()
+        };
+        let mixed = HashFileData {
+            hashes: BTreeMap::from([
+                ("//app:app".into(), hash("Rule", "same")),
+                (
+                    "@@rules_go+0.50.1//go:def.bzl".into(),
+                    hash("SourceFile", "new"),
+                ),
+                ("//external:rules_go".into(), hash("Rule", "bridge")),
+            ]),
+            module_graph_json: Some(graph("0.50.1")),
+            ..Default::default()
+        };
+        assert_eq!(
+            impacted_with_module_query(&from, &mixed, true, |_| {
+                Err(anyhow::anyhow!("query failed"))
+            })
+            .unwrap(),
+            BTreeSet::from([
+                "//app:app".to_owned(),
+                "@@rules_go+0.50.1//go:def.bzl".to_owned(),
+                "//external:rules_go".to_owned()
+            ])
+        );
+
+        let bzlmod_only = HashFileData {
+            hashes: BTreeMap::from([
+                (
+                    "@@rules_go+0.50.1//go:def.bzl".into(),
+                    hash("SourceFile", "new"),
+                ),
+                (
+                    "@@rules_go+0.50.1//go:toolchain".into(),
+                    hash("Rule", "toolchain"),
+                ),
+                ("//external:rules_go".into(), hash("Rule", "bridge")),
+            ]),
+            module_graph_json: Some(graph("0.50.1")),
+            ..Default::default()
+        };
+        assert_eq!(
+            impacted_with_module_query(&from, &bzlmod_only, true, |_| {
+                Err(anyhow::anyhow!("query failed"))
+            })
+            .unwrap(),
+            bzlmod_only.hashes.keys().cloned().collect()
+        );
+    }
+
+    #[test]
+    fn changed_module_does_not_match_extension_or_substring_repositories() {
+        let from = HashFileData {
+            hashes: BTreeMap::from([(
+                "@@aspect_bazel_lib+1.0.0//:base".into(),
+                hash("Rule", "old"),
+            )]),
+            module_graph_json: Some(
+                graph("1.0.0")
+                    .replace("rules_go", "aspect_bazel_lib")
+                    .replace("gazelle", "unrelated"),
+            ),
+            ..Default::default()
+        };
+        let to = HashFileData {
+            hashes: BTreeMap::from([
+                (
+                    "@@aspect_bazel_lib++toolchains+bats//:repo".into(),
+                    hash("Rule", "same"),
+                ),
+                (
+                    "@@my_aspect_bazel_lib_wrapper+2.0//:repo".into(),
+                    hash("Rule", "same"),
+                ),
+            ]),
+            module_graph_json: Some(
+                graph("2.0.0")
+                    .replace("rules_go", "aspect_bazel_lib")
+                    .replace("gazelle", "unrelated"),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            impacted_with_module_changes(&from, &to, None).unwrap(),
+            to.hashes.keys().cloned().collect()
+        );
     }
 }

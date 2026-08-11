@@ -456,6 +456,7 @@ pub fn impacted_targets_with_distances(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn target(kind: &str, hash: &str, direct: &str) -> TargetHash {
         TargetHash {
@@ -473,6 +474,11 @@ mod tests {
             target("Rule", "a", "b")
         );
         assert_eq!(TargetHash::parse("a~b").unwrap(), target("", "a", "b"));
+        for invalid in ["missing-separator", "a~b~c", "kind#without-tilde"] {
+            assert!(TargetHash::parse(invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(target("Rule", "a", "b").json_value(true), "Rule#a~b");
+        assert_eq!(target("Rule", "a", "b").json_value(false), "a~b");
     }
 
     #[test]
@@ -532,5 +538,137 @@ mod tests {
         data.dep_edges = BTreeMap::from([("//a:a".into(), vec!["//b:b".into()])]);
         let streamed = serde_json::to_value(data.serialized(true, true)).unwrap();
         assert_eq!(streamed, data.to_value(true, true));
+    }
+
+    #[test]
+    fn reads_legacy_and_metadata_hash_files() {
+        let legacy = HashFileData::from_slice(br#"{"//a:a":"Rule#overall~direct"}"#).unwrap();
+        assert_eq!(legacy.hashes["//a:a"], target("Rule", "overall", "direct"));
+        assert!(legacy.module_graph_json.is_none());
+
+        let bytes = br#"{
+          "hashes": {"//a:a": "Rule#overall~direct"},
+          "metadata": {
+            "moduleGraphJson": "{\"root\":true}",
+            "depEdges": {"//a:a": ["//b:b"]}
+          }
+        }"#;
+        let parsed = HashFileData::from_slice(bytes).unwrap();
+        assert_eq!(parsed.module_graph_json.as_deref(), Some("{\"root\":true}"));
+        assert_eq!(parsed.dep_edges["//a:a"], ["//b:b"]);
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(bytes).unwrap();
+        assert_eq!(
+            HashFileData::read(file.path()).unwrap().hashes,
+            parsed.hashes
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_hash_files() {
+        for invalid in [
+            b"not json".as_slice(),
+            b"[]".as_slice(),
+            br#"{"//a:a": 1}"#.as_slice(),
+            br#"{"hashes":[],"metadata":{}}"#.as_slice(),
+            br#"{"hashes":{},"metadata":{"depEdges":[]}}"#.as_slice(),
+        ] {
+            assert!(HashFileData::from_slice(invalid).is_err());
+        }
+        assert!(HashFileData::read(Path::new("/definitely/missing/hash.json")).is_err());
+    }
+
+    #[test]
+    fn type_filters_require_and_apply_type_metadata() {
+        let from = BTreeMap::new();
+        let typed = BTreeMap::from([
+            ("//a:source".into(), target("SourceFile", "a", "a")),
+            ("//b:rule".into(), target("Rule", "b", "b")),
+            ("//external:repo".into(), target("Rule", "c", "c")),
+        ]);
+        let rules = HashSet::from(["Rule".to_owned()]);
+        assert_eq!(
+            impacted_targets(&from, &typed, Some(&rules), true).unwrap(),
+            ["//b:rule"]
+        );
+        assert_eq!(
+            filter_and_sort_labels(
+                vec!["//b:rule".into(), "//b:rule".into(), "//a:source".into()],
+                &from,
+                &typed,
+                Some(&rules),
+                false,
+            )
+            .unwrap(),
+            ["//b:rule"]
+        );
+
+        let untyped = BTreeMap::from([("//a:a".into(), target("", "a", "a"))]);
+        assert!(impacted_targets(&from, &untyped, Some(&rules), false).is_err());
+        assert!(filter_and_sort_labels(
+            vec!["//missing:x".into()],
+            &from,
+            &typed,
+            Some(&rules),
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unchanged_hashes_and_external_filters_are_excluded() {
+        let from = BTreeMap::from([
+            ("//a:a".into(), target("Rule", "same", "same")),
+            ("//external:r".into(), target("Rule", "old", "old")),
+        ]);
+        let to = BTreeMap::from([
+            ("//a:a".into(), target("Rule", "same", "same")),
+            ("//external:r".into(), target("Rule", "new", "new")),
+        ]);
+        assert!(impacted_targets(&from, &to, None, true).unwrap().is_empty());
+        assert_eq!(
+            impacted_targets(&from, &to, None, false).unwrap(),
+            ["//external:r"]
+        );
+    }
+
+    #[test]
+    fn distances_handle_missing_edges_cycles_and_filters() {
+        let from = BTreeMap::from([
+            ("//a:direct".into(), target("Rule", "old", "old")),
+            ("//b:indirect".into(), target("Rule", "old-b", "same-b")),
+            ("//c:cycle".into(), target("Rule", "old-c", "same-c")),
+        ]);
+        let to = BTreeMap::from([
+            ("//a:direct".into(), target("Rule", "new", "new")),
+            ("//b:indirect".into(), target("Rule", "new-b", "same-b")),
+            ("//c:cycle".into(), target("Rule", "new-c", "same-c")),
+            ("//d:added".into(), target("SourceFile", "added", "added")),
+        ]);
+        let edges = BTreeMap::from([
+            ("//b:indirect".into(), vec!["//a:direct".into()]),
+            ("//c:cycle".into(), vec!["//c:cycle".into()]),
+        ]);
+        let source_only = HashSet::from(["SourceFile".to_owned()]);
+        let filtered =
+            impacted_targets_with_distances(&from, &to, &edges, Some(&source_only), false).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].label, "//d:added");
+
+        let all = impacted_targets_with_distances(&from, &to, &edges, None, false).unwrap();
+        let indirect = all
+            .iter()
+            .find(|target| target.label == "//b:indirect")
+            .unwrap();
+        assert_eq!(
+            (indirect.target_distance, indirect.package_distance),
+            (1, 1)
+        );
+        let cycle = all
+            .iter()
+            .find(|target| target.label == "//c:cycle")
+            .unwrap();
+        assert_eq!((cycle.target_distance, cycle.package_distance), (1, 0));
     }
 }

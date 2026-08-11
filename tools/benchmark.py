@@ -17,7 +17,7 @@ releases wrote a flat map while newer releases may wrap it in a ``hashes`` objec
 
 Example:
 
-    python3 tools/benchmark.py \
+    bazel run -c opt //tools:benchmark -- \
       --workspace /tmp/bazel \
       --bazel /path/to/bazelisk \
       --iterations 10 \
@@ -44,8 +44,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+try:
+    from python.runfiles import runfiles as _runfiles
+except ImportError:
+    _runfiles = None
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+
+KOTLIN_RUNFILE = "_main/cli/bazel-diff"
+RUST_RUNFILE = "_main/src/bazel-diff"
 
 
 @dataclass(frozen=True)
@@ -313,23 +319,27 @@ def _shutdown_command(bazel: Path, output_base: Path) -> list[str]:
     return [str(bazel), f"--output_base={output_base}", "shutdown"]
 
 
-def _build_binaries(bazel: Path, env: dict[str, str]) -> tuple[Path, Path]:
-    _run(
-        [
-            str(bazel),
-            "build",
-            "-c",
-            "opt",
-            "//:bazel-diff-rust",
-            "//cli:bazel-diff_deploy.jar",
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-    )
-    return (
-        REPO_ROOT / "bazel-bin/cli/bazel-diff_deploy.jar",
-        REPO_ROOT / "bazel-bin/src/bazel-diff",
-    )
+def _injected_binaries() -> tuple[Path, Path]:
+    resolver = _runfiles.Create() if _runfiles is not None else None
+    if resolver is None:
+        raise ValueError(
+            "Bazel runfiles are unavailable; provide both --kotlin-binary and --rust-binary"
+        )
+    artifacts = []
+    for logical_path in (KOTLIN_RUNFILE, RUST_RUNFILE):
+        resolved = resolver.Rlocation(logical_path, source_repo="")
+        if not resolved or not Path(resolved).is_file():
+            raise ValueError(f"benchmark artifact is missing from runfiles: {logical_path}")
+        artifacts.append(Path(resolved))
+    return artifacts[0], artifacts[1]
+
+
+def _resolve_binaries(args: argparse.Namespace) -> tuple[Path, Path]:
+    if args.kotlin_binary and args.rust_binary:
+        return args.kotlin_binary.resolve(), args.rust_binary.resolve()
+    if args.kotlin_binary or args.rust_binary:
+        raise ValueError("provide both --kotlin-binary and --rust-binary, or neither")
+    return _injected_binaries()
 
 
 def _capture_streamed_proto(
@@ -829,14 +839,7 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
     environment.setdefault("CARGO_BAZEL_ISOLATED", "false")
     environment.setdefault("CARGO_HOME", str(Path.home() / ".cargo"))
 
-    built_binaries = not args.kotlin_binary and not args.rust_binary
-    if args.kotlin_binary and args.rust_binary:
-        kotlin_artifact = args.kotlin_binary.resolve()
-        rust_artifact = args.rust_binary.resolve()
-    elif args.kotlin_binary or args.rust_binary:
-        raise ValueError("provide both --kotlin-binary and --rust-binary, or neither")
-    else:
-        kotlin_artifact, rust_artifact = _build_binaries(bazel, environment)
+    kotlin_artifact, rust_artifact = _resolve_binaries(args)
 
     workspace_commit = _git(workspace, "rev-parse", "HEAD")
     dirty = bool(_git(workspace, "status", "--porcelain"))
@@ -845,24 +848,10 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="bazel-diff-benchmark-") as temp:
         temp_path = Path(temp)
-        staged_rust = temp_path / "bazel-diff-rust"
-        shutil.copy2(rust_artifact, staged_rust)
-        staged_rust.chmod(staged_rust.stat().st_mode | 0o111)
-        if built_binaries:
-            staged_kotlin = temp_path / "bazel-diff-kotlin.jar"
-            shutil.copy2(kotlin_artifact, staged_kotlin)
-            java = shutil.which("java")
-            if not java:
-                raise ValueError("java is required to run the Kotlin deploy JAR")
-            commands = {
-                "kotlin": [java, "-jar", str(staged_kotlin)],
-                "rust": [str(staged_rust)],
-            }
-        else:
-            commands = {
-                "kotlin": [str(kotlin_artifact)],
-                "rust": [str(staged_rust)],
-            }
+        commands = {
+            "kotlin": [str(kotlin_artifact)],
+            "rust": [str(rust_artifact)],
+        }
         if not args.include_bazel:
             summaries, parity, output_summaries, protocol = _benchmark_replay(
                 args=args,

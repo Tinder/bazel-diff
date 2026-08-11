@@ -78,30 +78,8 @@ impl BazelOptions {
             bail!("Bazel version command failed, exit code {}", output.status);
         }
         let text = String::from_utf8_lossy(&output.stdout);
-        let version = text
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("Build label: ")
-                    .or_else(|| line.strip_prefix("bazel "))
-            })
-            .ok_or_else(|| anyhow!("Bazel version command returned unexpected output: {text}"))?;
-        let mut parts = version
-            .split('-')
-            .next()
-            .unwrap_or(version)
-            .split('.')
-            .map(|part| {
-                part.chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect::<String>()
-                    .parse::<u32>()
-                    .unwrap_or(0)
-            });
-        Ok(BazelVersion(
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-        ))
+        parse_bazel_version(&text)
+            .ok_or_else(|| anyhow!("Bazel version command returned unexpected output: {text}"))
     }
 
     fn with_exclude_filter(&self, query: String) -> String {
@@ -133,6 +111,16 @@ impl BazelOptions {
         } else {
             Vec::new()
         };
+        self.collect_all_targets(bzlmod_repos, |expression, use_cquery| {
+            self.query_with(expression, use_cquery, &mut transform)
+        })
+    }
+
+    fn collect_all_targets(
+        &self,
+        bzlmod_repos: Vec<Target>,
+        mut query: impl FnMut(&str, bool) -> Result<Vec<Target>>,
+    ) -> Result<Vec<Target>> {
         let mut queries = Vec::new();
         if !self.exclude_external_targets {
             queries.push("'//external:all-targets'".to_owned());
@@ -142,10 +130,9 @@ impl BazelOptions {
                 .cquery_expression
                 .clone()
                 .unwrap_or_else(|| "deps(//...:all-targets)".to_owned());
-            let mut targets =
-                self.query_with(&self.with_exclude_filter(expression), true, &mut transform)?;
+            let mut targets = query(&self.with_exclude_filter(expression), true)?;
             if !self.exclude_external_targets {
-                match self.query_with("'//external:all-targets'", false, &mut transform) {
+                match query("'//external:all-targets'", false) {
                     Ok(external) => targets.extend(external),
                     Err(error) if is_external_package_error(&error.to_string()) => {
                         eprintln!(
@@ -165,7 +152,7 @@ impl BazelOptions {
                     .map(|repo| format!("'{repo}//...:all-targets'")),
             );
             let full = self.with_exclude_filter(queries.join(" + "));
-            match self.query_with(&full, false, &mut transform) {
+            match query(&full, false) {
                 Ok(mut targets) => {
                     targets.extend(bzlmod_repos.clone());
                     deduplicate_targets(targets)
@@ -184,7 +171,7 @@ impl BazelOptions {
                             .collect::<Vec<_>>()
                             .join(" + "),
                     );
-                    let mut targets = self.query_with(&without_external, false, &mut transform)?;
+                    let mut targets = query(&without_external, false)?;
                     targets.extend(bzlmod_repos);
                     deduplicate_targets(targets)
                 }
@@ -192,40 +179,13 @@ impl BazelOptions {
             }
         }
     }
-
     fn query_bzlmod_repos(&self, transform: &mut impl FnMut(&mut Target)) -> Result<Vec<Target>> {
         let mapping_output = self.run_capture(&["mod", "dump_repo_mapping", ""])?;
         if !mapping_output.status.success() {
             bail!("bazel mod dump_repo_mapping failed");
         }
-        let mut canonical_to_apparent = BTreeMap::<String, Vec<String>>::new();
-        for line in String::from_utf8_lossy(&mapping_output.stdout).lines() {
-            let value: serde_json::Value = match serde_json::from_str(line.trim()) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let Some(mapping) = value.as_object() else {
-                continue;
-            };
-            for (apparent, canonical) in mapping {
-                let Some(canonical) = canonical.as_str() else {
-                    continue;
-                };
-                if apparent.is_empty()
-                    || canonical.is_empty()
-                    || canonical.starts_with("bazel_tools")
-                    || canonical.starts_with("_builtins")
-                    || canonical.starts_with("local_config_")
-                    || canonical.starts_with("rules_java_builtin")
-                {
-                    continue;
-                }
-                canonical_to_apparent
-                    .entry(canonical.to_owned())
-                    .or_default()
-                    .push(apparent.clone());
-            }
-        }
+        let canonical_to_apparent =
+            parse_repo_mapping(&String::from_utf8_lossy(&mapping_output.stdout));
         let canonical_names = canonical_to_apparent
             .keys()
             .filter(|name| name.contains('+') || name.contains('~'))
@@ -255,40 +215,13 @@ impl BazelOptions {
             .as_deref()
             .map(parse_module_dependency_edges)
             .unwrap_or_default();
-        let module_to_canonical = repositories
-            .iter()
-            .filter_map(|repository| {
-                let canonical = repository.canonical_name.as_deref()?;
-                (canonical.matches('+').count() == 1)
-                    .then(|| (canonical.split('+').next().unwrap_or(canonical), canonical))
-            })
-            .map(|(module, canonical)| (module.to_owned(), canonical.to_owned()))
-            .collect::<BTreeMap<_, _>>();
-
-        let mut targets = Vec::new();
-        for repository in repositories {
-            let canonical = repository.canonical_name.as_deref().unwrap_or_default();
-            let module = (canonical.matches('+').count() == 1)
-                .then(|| canonical.split('+').next().unwrap_or(canonical));
-            let dep_apparent = module
-                .into_iter()
-                .flat_map(|module| module_edges.get(module).into_iter().flatten())
-                .filter_map(|dependency| module_to_canonical.get(dependency))
-                .flat_map(|canonical| canonical_to_apparent.get(canonical).into_iter().flatten())
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            let apparent_names = canonical_to_apparent
-                .get(canonical)
-                .cloned()
-                .unwrap_or_else(|| vec![canonical.to_owned()]);
-            for apparent in apparent_names {
-                let mut target =
-                    repository_target(&repository, &apparent, &dep_apparent, &self.workspace);
-                transform(&mut target);
-                targets.push(target);
-            }
-        }
-        Ok(targets)
+        Ok(lower_repositories(
+            repositories,
+            &canonical_to_apparent,
+            &module_edges,
+            &self.workspace,
+            transform,
+        ))
     }
 
     pub fn query(&self, expression: &str, use_cquery: bool) -> Result<Vec<Target>> {
@@ -352,13 +285,13 @@ impl BazelOptions {
             eprintln!("[Info] Command: {command:?}");
         }
         let output = command.output().context("failed to execute Bazel query")?;
-        if !output.stderr.is_empty() {
-            eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        }
         let code = output.status.code().unwrap_or(-1);
         if code != 0 && !(self.keep_going && code == 3) {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("Bazel query failed, exit code {code}: {stderr}");
+        }
+        if !output.stderr.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
         }
 
         let mut targets = if use_cquery {
@@ -417,6 +350,104 @@ impl BazelOptions {
             .map(str::to_owned)
             .collect())
     }
+}
+
+fn parse_repo_mapping(text: &str) -> BTreeMap<String, Vec<String>> {
+    let mut canonical_to_apparent = BTreeMap::<String, Vec<String>>::new();
+    for line in text.lines() {
+        let value: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Some(mapping) = value.as_object() else {
+            continue;
+        };
+        for (apparent, canonical) in mapping {
+            let Some(canonical) = canonical.as_str() else {
+                continue;
+            };
+            if apparent.is_empty()
+                || canonical.is_empty()
+                || canonical.starts_with("bazel_tools")
+                || canonical.starts_with("_builtins")
+                || canonical.starts_with("local_config_")
+                || canonical.starts_with("rules_java_builtin")
+            {
+                continue;
+            }
+            canonical_to_apparent
+                .entry(canonical.to_owned())
+                .or_default()
+                .push(apparent.clone());
+        }
+    }
+    canonical_to_apparent
+}
+
+fn lower_repositories(
+    repositories: Vec<Repository>,
+    canonical_to_apparent: &BTreeMap<String, Vec<String>>,
+    module_edges: &BTreeMap<String, BTreeSet<String>>,
+    workspace: &Path,
+    transform: &mut impl FnMut(&mut Target),
+) -> Vec<Target> {
+    let module_to_canonical = repositories
+        .iter()
+        .filter_map(|repository| {
+            let canonical = repository.canonical_name.as_deref()?;
+            (canonical.matches('+').count() == 1)
+                .then(|| (canonical.split('+').next().unwrap_or(canonical), canonical))
+        })
+        .map(|(module, canonical)| (module.to_owned(), canonical.to_owned()))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut targets = Vec::new();
+    for repository in repositories {
+        let canonical = repository.canonical_name.as_deref().unwrap_or_default();
+        let module = (canonical.matches('+').count() == 1)
+            .then(|| canonical.split('+').next().unwrap_or(canonical));
+        let dep_apparent = module
+            .into_iter()
+            .flat_map(|module| module_edges.get(module).into_iter().flatten())
+            .filter_map(|dependency| module_to_canonical.get(dependency))
+            .flat_map(|canonical| canonical_to_apparent.get(canonical).into_iter().flatten())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let apparent_names = canonical_to_apparent
+            .get(canonical)
+            .cloned()
+            .unwrap_or_else(|| vec![canonical.to_owned()]);
+        for apparent in apparent_names {
+            let mut target = repository_target(&repository, &apparent, &dep_apparent, workspace);
+            transform(&mut target);
+            targets.push(target);
+        }
+    }
+    targets
+}
+
+fn parse_bazel_version(text: &str) -> Option<BazelVersion> {
+    let version = text.lines().find_map(|line| {
+        line.strip_prefix("Build label: ")
+            .or_else(|| line.strip_prefix("bazel "))
+    })?;
+    let mut parts = version
+        .split('-')
+        .next()
+        .unwrap_or(version)
+        .split('.')
+        .map(|part| {
+            part.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u32>()
+                .unwrap_or(0)
+        });
+    Some(BazelVersion(
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    ))
 }
 
 fn is_external_package_error(message: &str) -> bool {
@@ -761,7 +792,27 @@ pub fn encode_configured_input(input: &ConfiguredRuleInput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::blaze_query::{attribute, SourceFile};
+    use crate::proto::analysis::{ConfiguredTarget, CqueryResult};
+    use crate::proto::blaze_query::{attribute, EnvironmentGroup, GeneratedFile, SourceFile};
+
+    fn rule_target(name: &str) -> Target {
+        let mut target = Target::default();
+        target.r#type = target::Discriminator::Rule;
+        target.rule = buffa::MessageField::some(Rule {
+            name: name.to_owned(),
+            rule_class: "sh_library".to_owned(),
+            ..Default::default()
+        });
+        target
+    }
+
+    fn write_delimited(path: &Path, messages: &[impl Message]) {
+        let mut bytes = Vec::new();
+        for message in messages {
+            message.encode_length_delimited(&mut bytes);
+        }
+        fs::write(path, bytes).unwrap();
+    }
 
     #[test]
     fn buffa_decodes_delimited_bazel_target() {
@@ -861,5 +912,359 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(encode_configured_input(&input), "//foo:bar|abc");
+        assert_eq!(
+            encode_configured_input(&ConfiguredRuleInput {
+                label: Some("//foo:bar".into()),
+                ..Default::default()
+            }),
+            "//foo:bar"
+        );
+    }
+
+    #[test]
+    fn target_names_and_lowering_cover_all_target_types() {
+        let source = Target {
+            r#type: target::Discriminator::SourceFile,
+            source_file: buffa::MessageField::some(SourceFile {
+                name: "//pkg:file".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(target_name(&source), Some("//pkg:file"));
+
+        let generated = Target {
+            r#type: target::Discriminator::GeneratedFile,
+            generated_file: buffa::MessageField::some(GeneratedFile {
+                name: "//pkg:generated".into(),
+                generating_rule: "//pkg:rule".into(),
+                location: Some("pkg/BUILD:1:1".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let generated = lower_target(generated).unwrap();
+        assert_eq!(target_name(&generated), Some("//pkg:generated"));
+        assert!(generated
+            .generated_file
+            .as_option()
+            .unwrap()
+            .location
+            .is_none());
+
+        let group = Target {
+            r#type: target::Discriminator::PackageGroup,
+            package_group: buffa::MessageField::some(PackageGroup {
+                name: "//pkg:friends".into(),
+                contained_package: vec!["//client/...".into()],
+                included_package_group: vec!["//pkg:base".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let group = lower_target(group).unwrap();
+        let rule = group.rule.as_option().unwrap();
+        assert_eq!(rule.rule_class, "package_group");
+        assert_eq!(rule.rule_input, ["//pkg:base"]);
+        assert_eq!(rule.attribute[0].string_list_value, ["//client/..."]);
+
+        let environment = Target {
+            r#type: target::Discriminator::EnvironmentGroup,
+            environment_group: buffa::MessageField::some(EnvironmentGroup {
+                name: "//pkg:env".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(target_name(&environment), Some("//pkg:env"));
+        assert!(lower_target(environment).is_none());
+
+        let missing = Target {
+            r#type: target::Discriminator::PackageGroup,
+            ..Default::default()
+        };
+        assert!(lower_target(missing).is_none());
+    }
+
+    #[test]
+    fn deduplicates_named_targets_and_preserves_first() {
+        let targets = vec![
+            rule_target("//a:a"),
+            rule_target("//a:a"),
+            rule_target("//b:b"),
+        ];
+        let targets = deduplicate_targets(targets).unwrap();
+        let names = targets.iter().filter_map(target_name).collect::<Vec<_>>();
+        assert_eq!(names, ["//a:a", "//b:b"]);
+        assert!(is_external_package_error("no such package 'external'"));
+        assert!(is_external_package_error(
+            "//external package is not available"
+        ));
+        assert!(!is_external_package_error("another error"));
+    }
+
+    #[test]
+    fn decodes_query_and_cquery_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let query_path = directory.path().join("query.pb");
+        write_delimited(&query_path, &[rule_target("//a:a"), rule_target("//b:b")]);
+        let mut seen = Vec::new();
+        let targets = decode_target_stream(&query_path, &mut |target| {
+            seen.push(target_name(target).unwrap().to_owned())
+        })
+        .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(seen, ["//a:a", "//b:b"]);
+
+        let result = CqueryResult {
+            results: vec![ConfiguredTarget {
+                target: buffa::MessageField::some(rule_target("//c:c")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let streamed = directory.path().join("cquery-stream.pb");
+        write_delimited(&streamed, std::slice::from_ref(&result));
+        assert_eq!(
+            target_name(&decode_cquery_stream(&streamed, true, &mut |_| {}).unwrap()[0]),
+            Some("//c:c")
+        );
+
+        let non_streamed = directory.path().join("cquery.pb");
+        fs::write(&non_streamed, result.encode_to_vec()).unwrap();
+        assert_eq!(
+            target_name(&decode_cquery_stream(&non_streamed, false, &mut |_| {}).unwrap()[0]),
+            Some("//c:c")
+        );
+    }
+
+    #[test]
+    fn module_edges_are_parsed_and_cycles_broken() {
+        let graph = r#"noise
+        {
+          "name":"root",
+          "dependencies":[
+            {"name":"a","dependencies":[{"name":"b","dependencies":[{"name":"a","dependencies":[]}]}]},
+            {"name":"c","dependencies":[]}
+          ]
+        }"#;
+        let edges = parse_module_dependency_edges(graph);
+        assert_eq!(edges["root"], BTreeSet::from(["a".into(), "c".into()]));
+        assert_eq!(edges["a"], BTreeSet::from(["b".into()]));
+        assert!(edges["b"].is_empty());
+        assert!(edges["c"].is_empty());
+        assert!(parse_module_dependency_edges("not json").is_empty());
+        assert!(parse_module_dependency_edges(r#"{"dependencies":[]}"#).is_empty());
+    }
+
+    #[test]
+    fn local_repository_hash_is_stable_and_ignores_lockfile() {
+        let workspace = tempfile::tempdir().unwrap();
+        let repository_root = workspace.path().join("local");
+        fs::create_dir(&repository_root).unwrap();
+        fs::write(repository_root.join("a.txt"), "a").unwrap();
+        fs::write(repository_root.join("MODULE.bazel.lock"), "one").unwrap();
+        let repository = Repository {
+            repo_rule_name: Some("local_repository".into()),
+            attribute: vec![Attribute {
+                name: "path".into(),
+                r#type: attribute::Discriminator::String,
+                string_value: Some("local".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let first = local_repository_content_hash(&repository, workspace.path()).unwrap();
+        fs::write(repository_root.join("MODULE.bazel.lock"), "two").unwrap();
+        assert_eq!(
+            local_repository_content_hash(&repository, workspace.path()).unwrap(),
+            first
+        );
+        fs::write(repository_root.join("a.txt"), "changed").unwrap();
+        assert_ne!(
+            local_repository_content_hash(&repository, workspace.path()).unwrap(),
+            first
+        );
+
+        let target = repository_target(
+            &repository,
+            "local",
+            &BTreeSet::from(["dep".to_owned(), "local".to_owned()]),
+            workspace.path(),
+        );
+        let rule = target.rule.as_option().unwrap();
+        assert_eq!(rule.name, "//external:local");
+        assert_eq!(rule.rule_class, "local_repository");
+        assert_eq!(rule.rule_input, ["//external:dep"]);
+        assert!(rule
+            .attribute
+            .iter()
+            .any(|attribute| attribute.name == "_bazel_diff_content_hash"));
+
+        assert!(local_repository_content_hash(&Repository::default(), workspace.path()).is_none());
+    }
+
+    #[test]
+    fn parses_versions_and_exclude_filters() {
+        assert_eq!(
+            parse_bazel_version("Build label: 8.6.1-pre.2026\n"),
+            Some(BazelVersion(8, 6, 1))
+        );
+        assert_eq!(
+            parse_bazel_version("bazel 7.0.0\n"),
+            Some(BazelVersion(7, 0, 0))
+        );
+        assert_eq!(parse_bazel_version("unexpected"), None);
+
+        let mut options = BazelOptions {
+            workspace: PathBuf::new(),
+            bazel: PathBuf::new(),
+            startup_options: Vec::new(),
+            command_options: Vec::new(),
+            cquery_options: Vec::new(),
+            use_cquery: false,
+            cquery_expression: None,
+            keep_going: false,
+            fine_grained_external_repos: BTreeSet::new(),
+            exclude_external_targets: false,
+            exclude_targets_query: None,
+            no_bazelrc: false,
+            verbose: false,
+        };
+        options.exclude_targets_query = Some("attr(tags, manual, //...)".into());
+        assert_eq!(
+            options.with_exclude_filter("//...".into()),
+            "(//...) except (attr(tags, manual, //...))"
+        );
+        options.exclude_targets_query = Some(" ".into());
+        assert_eq!(options.with_exclude_filter("//...".into()), "//...");
+    }
+
+    #[test]
+    fn query_collection_retries_without_external_and_deduplicates() {
+        let options = BazelOptions {
+            workspace: PathBuf::new(),
+            bazel: PathBuf::new(),
+            startup_options: Vec::new(),
+            command_options: Vec::new(),
+            cquery_options: Vec::new(),
+            use_cquery: false,
+            cquery_expression: None,
+            keep_going: false,
+            fine_grained_external_repos: BTreeSet::from(["@repo".to_owned()]),
+            exclude_external_targets: false,
+            exclude_targets_query: Some("attr(tags, manual, //...)".into()),
+            no_bazelrc: false,
+            verbose: false,
+        };
+        let mut queries = Vec::new();
+        let targets = options
+            .collect_all_targets(
+                vec![rule_target("//external:bzlmod")],
+                |expression, cquery| {
+                    queries.push((expression.to_owned(), cquery));
+                    if queries.len() == 1 {
+                        Err(anyhow!("no such package 'external'"))
+                    } else {
+                        Ok(vec![rule_target("//app:lib"), rule_target("//app:lib")])
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(queries.len(), 2);
+        assert!(queries[0].0.contains("//external:all-targets"));
+        assert!(!queries[1].0.contains("//external:all-targets"));
+        assert!(queries[1].0.contains("@repo//...:all-targets"));
+        assert!(queries[1].0.contains("except (attr(tags, manual, //...))"));
+        assert_eq!(
+            targets.iter().filter_map(target_name).collect::<Vec<_>>(),
+            ["//app:lib", "//external:bzlmod"]
+        );
+    }
+
+    #[test]
+    fn cquery_collection_drops_missing_external_package() {
+        let options = BazelOptions {
+            workspace: PathBuf::new(),
+            bazel: PathBuf::new(),
+            startup_options: Vec::new(),
+            command_options: Vec::new(),
+            cquery_options: Vec::new(),
+            use_cquery: true,
+            cquery_expression: Some("deps(//app:lib)".into()),
+            keep_going: false,
+            fine_grained_external_repos: BTreeSet::new(),
+            exclude_external_targets: false,
+            exclude_targets_query: None,
+            no_bazelrc: false,
+            verbose: false,
+        };
+        let mut queries = Vec::new();
+        let targets = options
+            .collect_all_targets(Vec::new(), |expression, cquery| {
+                queries.push((expression.to_owned(), cquery));
+                if cquery {
+                    Ok(vec![rule_target("//app:lib")])
+                } else {
+                    Err(anyhow!("//external package is not available"))
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            queries,
+            vec![
+                ("deps(//app:lib)".to_owned(), true),
+                ("'//external:all-targets'".to_owned(), false),
+            ]
+        );
+        assert_eq!(target_name(&targets[0]), Some("//app:lib"));
+    }
+
+    #[test]
+    fn repository_mapping_and_lowering_are_deterministic() {
+        let mapping = parse_repo_mapping(
+            r#"not json
+{"dep":"dep+1.0","alias":"dep+1.0","child":"child+2.0","tools":"bazel_tools","local":"local_config_platform","":""}
+"#,
+        );
+        assert_eq!(mapping["dep+1.0"], ["alias".to_owned(), "dep".to_owned()]);
+        assert_eq!(mapping["child+2.0"], ["child"]);
+        assert!(!mapping.contains_key("bazel_tools"));
+
+        let repositories = vec![
+            Repository {
+                canonical_name: Some("dep+1.0".into()),
+                repo_rule_name: Some("http_archive".into()),
+                ..Default::default()
+            },
+            Repository {
+                canonical_name: Some("child+2.0".into()),
+                repo_rule_name: Some("git_repository".into()),
+                ..Default::default()
+            },
+        ];
+        let edges = BTreeMap::from([("dep".to_owned(), BTreeSet::from(["child".to_owned()]))]);
+        let mut transformed = Vec::new();
+        let targets = lower_repositories(
+            repositories,
+            &mapping,
+            &edges,
+            Path::new("."),
+            &mut |target| transformed.push(target_name(target).unwrap().to_owned()),
+        );
+        assert_eq!(targets.len(), 3);
+        assert_eq!(
+            transformed,
+            ["//external:alias", "//external:dep", "//external:child"]
+        );
+        let dep = targets
+            .iter()
+            .find(|target| target_name(target) == Some("//external:dep"))
+            .unwrap()
+            .rule
+            .as_option()
+            .unwrap();
+        assert_eq!(dep.rule_class, "http_archive");
+        assert_eq!(dep.rule_input, ["//external:child"]);
     }
 }

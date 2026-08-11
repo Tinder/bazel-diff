@@ -162,12 +162,13 @@ struct QueryInputs {
 }
 
 pub fn parse_duration(value: &str) -> Result<Duration> {
-    if value.is_empty() {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
         bail!("invalid duration '{value}'");
     }
     let mut seconds = 0u64;
     let mut digits = String::new();
-    for character in value.chars() {
+    for character in normalized.chars() {
         if character.is_ascii_digit() {
             digits.push(character);
             continue;
@@ -194,7 +195,12 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
 }
 
 pub fn parse_byte_size(value: &str) -> Result<u64> {
-    let normalized = value.trim().to_ascii_lowercase();
+    let normalized = value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
     let digits = normalized
         .chars()
         .take_while(char::is_ascii_digit)
@@ -648,17 +654,34 @@ fn resolve_both(state: &State, from: &str, to: &str) -> Result<(String, String)>
     )?;
     for revision in BTreeSet::from([from, to]) {
         if resolve_sha(state, revision).is_err() {
-            let _ = git(
-                state,
-                &[
-                    String::from("fetch"),
-                    String::from("origin"),
-                    revision.to_owned(),
-                ],
-            );
+            fetch_revision(state, revision);
         }
     }
     Ok((resolve_sha(state, from)?, resolve_sha(state, to)?))
+}
+
+fn fetch_revision(state: &State, revision: &str) -> bool {
+    let Ok(output) = git_output(state, &[String::from("remote")]) else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .any(|remote| {
+            git(
+                state,
+                &[
+                    String::from("fetch"),
+                    remote.to_owned(),
+                    revision.to_owned(),
+                ],
+            )
+            .is_ok()
+        })
 }
 
 fn resolve_sha(state: &State, revision: &str) -> Result<String> {
@@ -681,16 +704,27 @@ fn resolve_sha(state: &State, revision: &str) -> Result<String> {
 }
 
 fn checkout(state: &State, sha: &str) -> Result<()> {
-    git(
-        state,
-        &[
-            String::from("-c"),
-            String::from("advice.detachedHead=false"),
-            String::from("checkout"),
-            String::from("--force"),
-            sha.to_owned(),
-        ],
-    )
+    let args = [
+        String::from("-c"),
+        String::from("advice.detachedHead=false"),
+        String::from("checkout"),
+        String::from("--force"),
+        sha.to_owned(),
+    ];
+    if git(state, &args).is_ok() {
+        return Ok(());
+    }
+    let index_lock = state
+        .config
+        .hash_options
+        .bazel
+        .workspace
+        .join(".git/index.lock");
+    if !index_lock.is_file() {
+        bail!("git checkout failed for revision {sha}");
+    }
+    fs::remove_file(&index_lock).context("failed to remove stale .git/index.lock")?;
+    git(state, &args)
 }
 
 fn git(state: &State, args: &[String]) -> Result<()> {
@@ -853,7 +887,12 @@ fn respond_text(request: Request, status: u16, body: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::bazel::BazelOptions;
+    use crate::model::TargetHash;
     use std::collections::HashSet;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::mpsc as std_mpsc;
+    use std::thread;
 
     fn test_config() -> ServerConfig {
         ServerConfig {
@@ -900,16 +939,158 @@ mod tests {
         }
     }
 
+    fn hash(kind: &str, value: &str, direct: &str) -> TargetHash {
+        TargetHash {
+            kind: kind.to_owned(),
+            hash: value.to_owned(),
+            direct_hash: direct.to_owned(),
+            deps: Vec::new(),
+        }
+    }
+
+    fn write_hashes(path: &Path, data: &HashFileData, include_deps: bool) {
+        fs::write(
+            path,
+            serde_json::to_vec(&data.serialized(true, include_deps)).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn git_command(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn initialize_git_repo() -> (tempfile::TempDir, String, String) {
+        let repo = tempfile::tempdir().unwrap();
+        git_command(repo.path(), &["init", "-q"]);
+        git_command(repo.path(), &["config", "user.email", "test@example.com"]);
+        git_command(repo.path(), &["config", "user.name", "Test"]);
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        git_command(repo.path(), &["add", "file.txt"]);
+        git_command(repo.path(), &["commit", "-q", "-m", "one"]);
+        let first = git_command(repo.path(), &["rev-parse", "HEAD"]);
+        fs::write(repo.path().join("file.txt"), "two").unwrap();
+        git_command(repo.path(), &["commit", "-q", "-am", "two"]);
+        let second = git_command(repo.path(), &["rev-parse", "HEAD"]);
+        (repo, first, second)
+    }
+
+    fn state_for_repo(repo: &Path, cache: &Path, track_deps: bool) -> Arc<State> {
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.to_path_buf();
+        config.hash_options.bazel.bazel = PathBuf::from("/bin/false");
+        config.git_path = PathBuf::from("git");
+        config.cache_dir = cache.to_path_buf();
+        config.track_deps = track_deps;
+        config.hash_options.track_deps = track_deps;
+        let fingerprint = configuration_fingerprint(&config);
+        Arc::new(State {
+            config,
+            ready: AtomicBool::new(true),
+            workspace_lock: Mutex::new(()),
+            started: Instant::now(),
+            fingerprint,
+            remote: None,
+        })
+    }
+
+    fn request(state: &Arc<State>, request: &str) -> String {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let request = request.to_owned();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        });
+        let incoming = server.recv().unwrap();
+        route(incoming, state).unwrap();
+        client.join().unwrap()
+    }
+
+    struct CapturedS3Request {
+        url: String,
+    }
+
+    fn remote_cache_with_responses(
+        prefix: &str,
+        responses: Vec<(u16, Vec<u8>)>,
+    ) -> (
+        RemoteCache,
+        std_mpsc::Receiver<CapturedS3Request>,
+        thread::JoinHandle<()>,
+    ) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let (sender, receiver) = std_mpsc::channel();
+        let handle = thread::spawn(move || {
+            for (status, body) in responses {
+                let request = server.recv().unwrap();
+                sender
+                    .send(CapturedS3Request {
+                        url: request.url().to_owned(),
+                    })
+                    .unwrap();
+                request
+                    .respond(Response::from_data(body).with_status_code(StatusCode(status)))
+                    .unwrap();
+            }
+        });
+        let credentials = Credentials::new(Some("key"), Some("secret"), None, None, None).unwrap();
+        let bucket = Bucket::new(
+            "bucket",
+            Region::Custom {
+                region: "us-east-1".to_owned(),
+                endpoint,
+            },
+            credentials,
+        )
+        .unwrap()
+        .with_path_style();
+        (
+            RemoteCache {
+                bucket,
+                prefix: normalize_s3_prefix(prefix),
+            },
+            receiver,
+            handle,
+        )
+    }
+
     #[test]
     fn parses_compound_duration() {
         assert_eq!(parse_duration("1d12h30m").unwrap().as_secs(), 131_400);
         assert!(parse_duration("1hour").is_err());
+        assert_eq!(parse_duration("0s").unwrap(), Duration::ZERO);
+        for invalid in ["", "10", "s", "1x", "1h30", "18446744073709551615d1d"] {
+            assert!(parse_duration(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
     fn parses_binary_byte_size() {
         assert_eq!(parse_byte_size("10GB").unwrap(), 10 * 1024u64.pow(3));
         assert_eq!(parse_byte_size("42").unwrap(), 42);
+        assert_eq!(parse_byte_size("1kb").unwrap(), 1024);
+        assert_eq!(parse_byte_size("2 MB").unwrap(), 2 * 1024u64.pow(2));
+        assert_eq!(parse_byte_size("3t").unwrap(), 3 * 1024u64.pow(4));
+        for invalid in ["", "kb", "1pb", "18446744073709551615tb"] {
+            assert!(parse_byte_size(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
@@ -933,5 +1114,539 @@ mod tests {
             configuration_fingerprint(&always_affected),
             base_fingerprint
         );
+    }
+
+    #[test]
+    fn normalizes_remote_cache_configuration() {
+        assert_eq!(normalize_s3_prefix(""), "");
+        assert_eq!(normalize_s3_prefix("/"), "");
+        assert_eq!(normalize_s3_prefix("/team/cache/"), "team/cache/");
+        assert!(is_s3_not_found(&S3Error::HttpFailWithBody(
+            404,
+            "missing".into()
+        )));
+        assert!(!is_s3_not_found(&S3Error::HttpFailWithBody(
+            500,
+            "failure".into()
+        )));
+        assert!(RemoteCache::new(&test_config()).unwrap().is_none());
+    }
+
+    #[test]
+    fn remote_cache_operations_use_normalized_key_and_succeed() {
+        let (remote, requests, handle) = remote_cache_with_responses(
+            "/team/repo/",
+            vec![
+                (200, b"hello".to_vec()),
+                (200, Vec::new()),
+                (200, Vec::new()),
+            ],
+        );
+        assert_eq!(remote.object_key("sha.fp"), "team/repo/sha.fp.json");
+        assert_eq!(remote.get("sha.fp"), Some(b"hello".to_vec()));
+        remote.put("sha.fp", b"data");
+        assert!(remote.contains("sha.fp"));
+        let captured = (0..3)
+            .map(|_| requests.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect::<Vec<_>>();
+        handle.join().unwrap();
+        assert!(captured
+            .iter()
+            .all(|request| request.url.contains("/bucket/team/repo/sha.fp.json")));
+    }
+
+    #[test]
+    fn remote_cache_misses_and_errors_degrade_without_failing() {
+        let (remote, requests, handle) = remote_cache_with_responses(
+            "",
+            vec![
+                (404, b"missing".to_vec()),
+                (500, b"failure".to_vec()),
+                (404, Vec::new()),
+                (500, Vec::new()),
+                (500, Vec::new()),
+            ],
+        );
+        assert_eq!(remote.get("missing"), None);
+        assert_eq!(remote.get("failure"), None);
+        assert!(!remote.contains("missing"));
+        assert!(!remote.contains("failure"));
+        remote.put("failure", b"data");
+        for _ in 0..5 {
+            requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn normalizes_target_types() {
+        assert_eq!(
+            normalized_types(Some(vec![
+                " Rule ".into(),
+                "".into(),
+                "SourceFile".into(),
+                "Rule".into(),
+            ])),
+            Some(HashSet::from(["Rule".into(), "SourceFile".into()]))
+        );
+        assert!(normalized_types(None).is_none());
+        assert!(normalized_types(Some(vec![" ".into()])).is_none());
+    }
+
+    #[test]
+    fn cache_keys_are_stable_and_modified_paths_are_ordered() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        let base = cache_key(&state, "abc", &BTreeSet::new());
+        assert_eq!(base, format!("abc.{}", state.fingerprint));
+        let modified = cache_key(
+            &state,
+            "abc",
+            &BTreeSet::from([PathBuf::from("b"), PathBuf::from("a")]),
+        );
+        assert!(modified.starts_with(&format!("{base}.")));
+        assert_ne!(modified, base);
+        assert_eq!(
+            modified,
+            cache_key(
+                &state,
+                "abc",
+                &BTreeSet::from([PathBuf::from("a"), PathBuf::from("b")])
+            )
+        );
+    }
+
+    #[test]
+    fn git_resolution_checkout_and_errors_use_real_repository() {
+        let (repo, first, second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        assert_eq!(resolve_sha(&state, "HEAD").unwrap(), second);
+        assert_eq!(
+            resolve_both(&state, &first, &second).unwrap(),
+            (first.clone(), second.clone())
+        );
+        checkout(&state, &first).unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+            "one"
+        );
+        fs::write(repo.path().join(".git/index.lock"), "").unwrap();
+        checkout(&state, &second).unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+            "two"
+        );
+        assert!(!repo.path().join(".git/index.lock").exists());
+        assert!(resolve_sha(&state, "missing").is_err());
+        assert!(checkout(&state, "missing").is_err());
+        assert!(git(&state, &["not-a-command".into()]).is_err());
+
+        let output = git_output(&state, &["rev-parse".into(), "HEAD".into()]).unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), second);
+
+        let mut bad_config = state.config.clone();
+        bad_config.git_path = PathBuf::from("/definitely/missing/git");
+        let bad = State {
+            config: bad_config,
+            ready: AtomicBool::new(true),
+            workspace_lock: Mutex::new(()),
+            started: Instant::now(),
+            fingerprint: state.fingerprint.clone(),
+            remote: None,
+        };
+        assert!(git_output(&bad, &[]).is_err());
+    }
+
+    #[test]
+    fn targeted_fetch_tries_each_remote_and_handles_missing_remotes() {
+        let root = tempfile::tempdir().unwrap();
+        let good = root.path().join("good");
+        let bad = root.path().join("bad");
+        fs::create_dir(&good).unwrap();
+        fs::create_dir(&bad).unwrap();
+        for repository in [&good, &bad] {
+            git_command(repository, &["init", "-q"]);
+            git_command(repository, &["config", "user.email", "test@example.com"]);
+            git_command(repository, &["config", "user.name", "Test"]);
+        }
+        fs::write(good.join("good.txt"), "good").unwrap();
+        git_command(&good, &["add", "."]);
+        git_command(&good, &["commit", "-q", "-m", "good"]);
+        let wanted = git_command(&good, &["rev-parse", "HEAD"]);
+        fs::write(bad.join("bad.txt"), "bad").unwrap();
+        git_command(&bad, &["add", "."]);
+        git_command(&bad, &["commit", "-q", "-m", "bad"]);
+
+        let workspace = root.path().join("workspace");
+        git_command(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                bad.to_str().unwrap(),
+                workspace.to_str().unwrap(),
+            ],
+        );
+        git_command(&workspace, &["remote", "rename", "origin", "bad"]);
+        git_command(
+            &workspace,
+            &["remote", "add", "good", good.to_str().unwrap()],
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(&workspace, cache.path(), false);
+        assert!(resolve_sha(&state, &wanted).is_err());
+        assert!(fetch_revision(&state, &wanted));
+        assert_eq!(resolve_sha(&state, &wanted).unwrap(), wanted);
+        assert!(!fetch_revision(
+            &state,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        ));
+
+        git_command(&workspace, &["remote", "remove", "bad"]);
+        git_command(&workspace, &["remote", "remove", "good"]);
+        assert!(!fetch_revision(&state, "HEAD"));
+
+        let mut bad_config = state.config.clone();
+        bad_config.git_path = PathBuf::from("/missing/git");
+        let bad_state = State {
+            config: bad_config,
+            ready: AtomicBool::new(true),
+            workspace_lock: Mutex::new(()),
+            started: Instant::now(),
+            fingerprint: state.fingerprint.clone(),
+            remote: None,
+        };
+        assert!(!fetch_revision(&bad_state, "HEAD"));
+    }
+
+    #[test]
+    fn local_hash_cache_hits_and_touches_entries() {
+        let (repo, _, sha) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), true);
+        let data = HashFileData {
+            hashes: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                hash("Rule", "overall", "direct"),
+            )]),
+            dep_edges: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                vec!["//dep:lib".into()],
+            )]),
+            ..Default::default()
+        };
+        let key = cache_key(&state, &sha, &BTreeSet::new());
+        let path = cache.path().join(format!("{key}.json"));
+        write_hashes(&path, &data, true);
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        let (loaded, hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(hit);
+        assert_eq!(loaded.hashes["//app:lib"].hash, "overall");
+        assert_eq!(loaded.dep_edges["//app:lib"], ["//dep:lib"]);
+        assert!(fs::metadata(path).unwrap().modified().unwrap() >= before);
+    }
+
+    #[test]
+    fn remote_cache_hit_is_backfilled_and_next_read_is_local() {
+        let (repo, _, sha) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let data = HashFileData {
+            hashes: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                hash("Rule", "overall", "direct"),
+            )]),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
+        let (remote, requests, handle) =
+            remote_cache_with_responses("", vec![(200, Vec::new()), (200, bytes)]);
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.path().to_path_buf();
+        config.git_path = PathBuf::from("git");
+        config.cache_dir = cache.path().to_path_buf();
+        let fingerprint = configuration_fingerprint(&config);
+        let state = Arc::new(State {
+            config,
+            ready: AtomicBool::new(true),
+            workspace_lock: Mutex::new(()),
+            started: Instant::now(),
+            fingerprint,
+            remote: Some(remote),
+        });
+
+        let (first, first_hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(first_hit);
+        assert_eq!(first.hashes["//app:lib"].hash, "overall");
+        let key = cache_key(&state, &sha, &BTreeSet::new());
+        assert!(cache.path().join(format!("{key}.json")).is_file());
+        let (second, second_hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(second_hit);
+        assert_eq!(second.hashes["//app:lib"].hash, "overall");
+
+        for _ in 0..2 {
+            requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn compute_query_uses_cached_revisions_and_profiles() {
+        let (repo, first, second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), true);
+        let from = HashFileData {
+            hashes: std::collections::BTreeMap::from([
+                ("//app:source".into(), hash("SourceFile", "old", "old")),
+                ("//app:rule".into(), hash("Rule", "old-rule", "same-direct")),
+            ]),
+            ..Default::default()
+        };
+        let to = HashFileData {
+            hashes: std::collections::BTreeMap::from([
+                ("//app:source".into(), hash("SourceFile", "new", "new")),
+                ("//app:rule".into(), hash("Rule", "new-rule", "same-direct")),
+            ]),
+            dep_edges: std::collections::BTreeMap::from([(
+                "//app:rule".into(),
+                vec!["//app:source".into()],
+            )]),
+            ..Default::default()
+        };
+        for (sha, data) in [(&first, &from), (&second, &to)] {
+            let key = cache_key(&state, sha, &BTreeSet::new());
+            write_hashes(
+                &cache.path().join(format!("{key}.json")),
+                data,
+                state.config.track_deps,
+            );
+        }
+        let inputs = QueryInputs {
+            from: first,
+            to: second.clone(),
+            target_types: None,
+            modified_filepaths: BTreeSet::new(),
+            profile: true,
+        };
+        let result = compute_query(&state, inputs, true).unwrap();
+        assert_eq!(result["to"], second);
+        assert_eq!(result["impactedTargets"].as_array().unwrap().len(), 2);
+        assert_eq!(result["profile"]["hashRetrievals"][0]["cacheHit"], true);
+        assert!(result.get("memoryProfile").is_some());
+        assert_eq!(git_command(repo.path(), &["rev-parse", "HEAD"]), second);
+    }
+
+    #[test]
+    fn cache_pruning_applies_age_count_and_size_limits() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        for (name, size) in [("a.json", 3), ("b.json", 5), ("c.json", 7)] {
+            fs::write(cache.path().join(name), vec![b'x'; size]).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        fs::write(cache.path().join("ignored.tmp"), "keep").unwrap();
+
+        let mut state = state_for_repo(repo.path(), cache.path(), false);
+        Arc::get_mut(&mut state).unwrap().config.cache_max_entries = Some(2);
+        prune_cache(&state).unwrap();
+        assert_eq!(cache_entries(cache.path()).len(), 2);
+
+        Arc::get_mut(&mut state).unwrap().config.cache_max_size = Some(7);
+        prune_cache(&state).unwrap();
+        assert!(
+            cache_entries(cache.path())
+                .iter()
+                .map(|entry| entry.size)
+                .sum::<u64>()
+                <= 7
+        );
+
+        Arc::get_mut(&mut state).unwrap().config.cache_max_age = Some(Duration::ZERO);
+        thread::sleep(Duration::from_millis(2));
+        prune_cache(&state).unwrap();
+        assert!(cache_entries(cache.path()).is_empty());
+        assert!(cache.path().join("ignored.tmp").exists());
+    }
+
+    #[test]
+    fn metrics_and_human_sizes_report_cache_state() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        fs::write(cache.path().join("one.json"), vec![0; 1536]).unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), true);
+        let value = metrics(&state);
+        assert_eq!(value["ready"], true);
+        assert_eq!(value["trackDeps"], true);
+        assert_eq!(value["cache"]["entries"], 1);
+        assert_eq!(value["cache"]["sizeHuman"], "1.5 KB");
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1024u64.pow(2)), "1.0 MB");
+        assert_eq!(human_bytes(1024u64.pow(4)), "1.0 TB");
+        let _ = memory_usage();
+    }
+
+    #[test]
+    fn routing_covers_health_metrics_and_errors() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut state = state_for_repo(repo.path(), cache.path(), false);
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .ready
+            .store(false, Ordering::Release);
+        let response = request(
+            &state,
+            "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 503"));
+        assert!(response.ends_with("NOT_READY\n"));
+
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .ready
+            .store(true, Ordering::Release);
+        let response = request(
+            &state,
+            "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("application/json"));
+        assert!(response.contains("\"gitEngine\":\"subprocess\""));
+
+        let response = request(
+            &state,
+            "POST /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 405"));
+
+        let response = request(
+            &state,
+            "GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 404"));
+
+        let response = request(
+            &state,
+            "GET /impacted_targets HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.contains("missing required query parameters"));
+
+        let response = request(
+            &state,
+            "GET /impacted_targets_with_distances?from=a&to=b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.contains("distances unavailable"));
+    }
+
+    #[test]
+    fn routing_returns_success_profiles_filters_and_distances() {
+        let (repo, first, second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), true);
+        let from = HashFileData {
+            hashes: std::collections::BTreeMap::from([
+                ("//app:source".into(), hash("SourceFile", "old", "old")),
+                ("//app:rule".into(), hash("Rule", "old-rule", "same-direct")),
+            ]),
+            ..Default::default()
+        };
+        let to = HashFileData {
+            hashes: std::collections::BTreeMap::from([
+                ("//app:source".into(), hash("SourceFile", "new", "new")),
+                ("//app:rule".into(), hash("Rule", "new-rule", "same-direct")),
+            ]),
+            dep_edges: std::collections::BTreeMap::from([(
+                "//app:rule".into(),
+                vec!["//app:source".into()],
+            )]),
+            ..Default::default()
+        };
+        for (sha, data) in [(&first, &from), (&second, &to)] {
+            let key = cache_key(&state, sha, &BTreeSet::new());
+            write_hashes(
+                &cache.path().join(format!("{key}.json")),
+                data,
+                state.config.track_deps,
+            );
+        }
+
+        let response = request(
+            &state,
+            &format!(
+                "GET /impacted_targets?from={first}&to={second}&targetType=Rule&profile=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"impactedTargets\":[\"//app:rule\"]"));
+        assert!(response.contains("\"profile\""));
+        assert!(response.contains("\"memoryProfile\""));
+
+        let response = request(
+            &state,
+            &format!(
+                "GET /impacted_targets_with_distances?from={first}&to={second}&targetType=Rule&profile=false HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"targetDistance\":1"));
+        assert!(!response.contains("\"profile\""));
+    }
+
+    #[test]
+    fn slow_request_times_out_with_504() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut state = state_for_repo(repo.path(), cache.path(), false);
+        Arc::get_mut(&mut state).unwrap().config.request_timeout = Duration::from_millis(20);
+        let _guard = state.workspace_lock.lock().unwrap();
+        let response = request(
+            &state,
+            "GET /impacted_targets?from=a&to=b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+        assert!(response.contains("request timed out"));
+    }
+
+    #[test]
+    fn post_query_parsing_covers_json_and_validation() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        let body = r#"{"from":"a","to":"b","targetType":[" Rule ",""],"modifiedFilepaths":[" x ",""],"profile":true}"#;
+        let response = request(
+            &state,
+            &format!(
+                "POST /impacted_targets HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.contains("\"error\":"));
+
+        for body in ["", "not-json", r#"{"from":"","to":"b"}"#] {
+            let response = request(
+                &state,
+                &format!(
+                    "POST /impacted_targets HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                ),
+            );
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        }
+    }
+
+    #[test]
+    fn cache_pruner_is_disabled_without_limits() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        start_cache_pruner(&state).unwrap();
     }
 }

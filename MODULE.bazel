@@ -28,8 +28,6 @@ single_version_override(
 
 bazel_dep(name = "rules_jvm_external", version = "6.10")
 
-bazel_dep(name = "rules_rust", version = "0.67.0", dev_dependency = True)
-
 # Add protobuf and grpc for Bazel 9 compatibility
 bazel_dep(name = "protobuf", version = "33.4")
 bazel_dep(name = "stardoc", version = "0.7.2")
@@ -59,10 +57,10 @@ bazel_dep(name = "gazelle", version = "0.47.0", dev_dependency = True)
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk", dev_dependency = True)
 go_sdk.download(version = "1.23.1")
 
-# Rust support is internal to building/testing bazel-diff: it builds the LCOV
-# merger (//tools/coverage) that `bazel coverage` runs use to merge per-test
-# tracefiles and enforce per-target coverage minimums. Marked dev_dependency
-# so consumers of bazel-diff as a module don't inherit rules_rust via MVS.
+# Rust support is internal to building/testing bazel-diff: it builds the Rust
+# implementation and the LCOV merger (//tools/coverage) that `bazel coverage`
+# uses to enforce per-target coverage minimums. Marked dev_dependency so
+# consumers of bazel-diff as a module don't inherit rules_rust via MVS.
 bazel_dep(name = "rules_rust", version = "0.73.0", dev_dependency = True)
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust", dev_dependency = True)
@@ -132,15 +130,6 @@ non_module_repositories = use_extension("//:extensions.bzl", "non_module_reposit
 use_repo(non_module_repositories, "ktfmt")
 
 register_toolchains("//:kotlin_toolchain")
-
-rust = use_extension("@rules_rust//rust:extensions.bzl", "rust", dev_dependency = True)
-rust.toolchain(edition = "2021")
-use_repo(rust, "rust_toolchains")
-
-register_toolchains(
-    "@rust_toolchains//:all",
-    dev_dependency = True,
-)
 
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate", dev_dependency = True)
 crate.from_cargo(

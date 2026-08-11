@@ -1,6 +1,7 @@
 load("@bazel_diff_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("//tools/coverage:defs.bzl", "coverage_enforced_test")
 
 cargo_build_script(
     name = "build_script",
@@ -53,8 +54,18 @@ rust_binary(
     ) + [":bazel_diff_lib"],
 )
 
-rust_test(
+coverage_enforced_test(
     name = "rust_tests",
+    coverage_include = ["src/"],
     crate = ":bazel_diff_lib",
+    rule = rust_test,
+    visibility = ["//:__pkg__"],
+)
+
+coverage_enforced_test(
+    name = "cli_tests",
+    coverage_include = ["src/main.rs"],
+    crate = ":bazel-diff",
+    rule = rust_test,
     visibility = ["//:__pkg__"],
 )

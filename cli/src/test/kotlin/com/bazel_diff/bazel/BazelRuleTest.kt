@@ -374,12 +374,10 @@ class BazelRuleTest {
 
     val inputs =
         BazelRule(rule)
-            .ruleInputList(
-                useCquery = false, fineGrainedHashExternalRepos = setOf("@inner_repo"))
+            .ruleInputList(useCquery = false, fineGrainedHashExternalRepos = setOf("@inner_repo"))
 
     assertThat(inputs)
-        .isEqualTo(
-            listOf("//external:other_repo", "@inner_repo//:lib", "@other_repo//:lib"))
+        .isEqualTo(listOf("//external:other_repo", "@inner_repo//:lib", "@other_repo//:lib"))
   }
 
   // Main-repo spellings must never be collapsed to //external:*.
@@ -397,11 +395,11 @@ class BazelRuleTest {
     val inputs =
         BazelRule(rule).ruleInputList(useCquery = false, fineGrainedHashExternalRepos = emptySet())
 
-    assertThat(inputs)
-        .isEqualTo(listOf("//pkg:dep", "@//pkg:at_main", "@@//pkg:canonical_main"))
+    assertThat(inputs).isEqualTo(listOf("//pkg:dep", "@//pkg:at_main", "@@//pkg:canonical_main"))
   }
 
-  // Under cquery, synthetic //external:* inputs still come from rule_input (not configured_rule_input).
+  // Under cquery, synthetic //external:* inputs still come from rule_input (not
+  // configured_rule_input).
   @Test
   fun testCqueryRuleInputListIncludesExternalSyntheticFromRuleInputs() {
     val rule =

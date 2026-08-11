@@ -478,7 +478,8 @@ class ModuleGraphParserTest {
             .trimIndent()
     val polluted = "INFO: Invocation ID: abc\nLoading: 0 packages loaded\n$cleanJson"
 
-    assertThat(parser.parseModuleGraphDepEdges(polluted)).isEqualTo(parser.parseModuleGraphDepEdges(cleanJson))
+    assertThat(parser.parseModuleGraphDepEdges(polluted))
+        .isEqualTo(parser.parseModuleGraphDepEdges(cleanJson))
     assertThat(parser.parseModuleGraphDepEdges(polluted)["ws"]!!).containsExactlyInAnyOrder("a")
   }
 

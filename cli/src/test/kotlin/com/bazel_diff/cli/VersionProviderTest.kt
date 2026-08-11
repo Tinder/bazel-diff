@@ -27,9 +27,7 @@ class VersionProviderTest {
         object : ClassLoader() {
           override fun getResourceAsStream(name: String): InputStream? = null
         }
-    assertThrows(IllegalArgumentException::class.java) {
-      VersionProvider(emptyLoader).getVersion()
-    }
+    assertThrows(IllegalArgumentException::class.java) { VersionProvider(emptyLoader).getVersion() }
   }
 
   @Test

@@ -1114,8 +1114,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
         mapOf(
             "//:target1" to TargetHash("", "hash1", "hash1"),
             "@@gone~1.0//:lib" to TargetHash("", "ext", "ext"))
-    val endHashes =
-        mapOf("//:target1" to TargetHash("", "hash1", "hash1"))
+    val endHashes = mapOf("//:target1" to TargetHash("", "hash1", "hash1"))
 
     val fromModuleGraph =
         """

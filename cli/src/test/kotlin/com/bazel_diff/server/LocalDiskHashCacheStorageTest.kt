@@ -196,6 +196,7 @@ class LocalDiskHashCacheStorageTest {
     val storage =
         object : HashCacheStorage {
           override fun get(key: String): ByteArray? = backing[key]
+
           override fun put(key: String, data: ByteArray) {
             backing[key] = data
           }

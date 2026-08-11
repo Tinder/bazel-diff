@@ -72,27 +72,21 @@ class BazelModServiceTest : KoinTest {
     // Fake bazel that would succeed — without MODULE.bazel the production path still runs
     // `bazel mod graph`; use a failing binary so this stays environment-independent.
     val bazel = fakeBazel(body = "exit 1")
-    withService(workspaceDir, bazel) { service ->
-      assertThat(service.isBzlmodEnabled).isFalse()
-    }
+    withService(workspaceDir, bazel) { service -> assertThat(service.isBzlmodEnabled).isFalse() }
   }
 
   @Test
   fun isBzlmodEnabled_returnsTrue_whenModuleBazelPresentAndBazelSucceeds() {
     val workspaceDir = workspaceWithModule()
     val bazel = fakeBazel(body = "echo 'root'\nexit 0")
-    withService(workspaceDir, bazel) { service ->
-      assertThat(service.isBzlmodEnabled).isTrue()
-    }
+    withService(workspaceDir, bazel) { service -> assertThat(service.isBzlmodEnabled).isTrue() }
   }
 
   @Test
   fun isBzlmodEnabled_returnsFalse_whenBazelExitsNonZero_evenWithModuleBazel() {
     val workspaceDir = workspaceWithModule()
     val bazel = fakeBazel(body = "echo 'ERROR: bzlmod disabled' >&2\nexit 2")
-    withService(workspaceDir, bazel) { service ->
-      assertThat(service.isBzlmodEnabled).isFalse()
-    }
+    withService(workspaceDir, bazel) { service -> assertThat(service.isBzlmodEnabled).isFalse() }
   }
 
   @Test
@@ -118,9 +112,7 @@ class BazelModServiceTest : KoinTest {
   fun getModuleGraph_returnsNull_whenBzlmodDisabled() {
     val workspaceDir = workspaceWithModule()
     val bazel = fakeBazel(body = "exit 1")
-    withService(workspaceDir, bazel) { service ->
-      assertThat(service.getModuleGraph()).isNull()
-    }
+    withService(workspaceDir, bazel) { service -> assertThat(service.getModuleGraph()).isNull() }
   }
 
   @Test

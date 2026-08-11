@@ -81,15 +81,13 @@ class DeserialiseHashesInteractorTest : KoinTest {
   fun executeSimpleDeserialisesFlatStringMap() {
     val file = temp.newFile().apply { writeText("""{"a/path":"abc","b/path":"def"}""") }
 
-    assertThat(interactor.executeSimple(file)).isEqualTo(mapOf("a/path" to "abc", "b/path" to "def"))
+    assertThat(interactor.executeSimple(file))
+        .isEqualTo(mapOf("a/path" to "abc", "b/path" to "def"))
   }
 
   @Test
   fun deserializeDepsReadsAdjacencyList() {
-    val file =
-        temp.newFile().apply {
-          writeText("""{"//a:lib":["//b:lib"], "//b:lib":[]}""")
-        }
+    val file = temp.newFile().apply { writeText("""{"//a:lib":["//b:lib"], "//b:lib":[]}""") }
 
     assertThat(interactor.deserializeDeps(file))
         .isEqualTo(mapOf("//a:lib" to listOf("//b:lib"), "//b:lib" to emptyList()))

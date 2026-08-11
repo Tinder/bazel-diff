@@ -430,9 +430,7 @@ class BuildGraphHasherTest : KoinTest {
     declareMock<Logger>()
     val buildSrc =
         createSrcTarget(
-            name = "//pkg:BUILD.bazel",
-            digest = "build",
-            subincludes = listOf("//pkg:macro.bzl"))
+            name = "//pkg:BUILD.bazel", digest = "build", subincludes = listOf("//pkg:macro.bzl"))
     val ruleWithoutStack =
         createRuleTarget(name = "//pkg:lib", inputs = emptyList(), digest = "digest")
     whenever(bazelClientMock.queryAllTargets()).thenReturn(listOf(buildSrc, ruleWithoutStack))

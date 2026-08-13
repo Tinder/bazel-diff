@@ -13,6 +13,7 @@ tasks:
     - '--host_cxxopt=-std=c++17'
     build_targets:
     - '@bazel-diff//:bazel-diff'
+    - '@bazel-diff//:bazel-diff-rust'
   verify_targets_ubuntu2004:
     name: Verify build targets (Ubuntu 20.04)
     platform: ubuntu2004
@@ -22,6 +23,7 @@ tasks:
     - '--host_cxxopt=-std=c++17'
     build_targets:
     - '@bazel-diff//:bazel-diff'
+    - '@bazel-diff//:bazel-diff-rust'
   verify_targets_macos_arm64:
     name: Verify build targets (macOS ARM64)
     platform: macos_arm64
@@ -31,6 +33,7 @@ tasks:
     - '--host_cxxopt=-std=c++17'
     build_targets:
     - '@bazel-diff//:bazel-diff'
+    - '@bazel-diff//:bazel-diff-rust'
   verify_targets_windows_8x:
     name: Verify build targets (Windows, Bazel 8.x)
     platform: windows
@@ -41,6 +44,7 @@ tasks:
     - '--host_cxxopt=-std=c++17'
     build_targets:
     - '@bazel-diff//:bazel-diff'
+    - '@bazel-diff//:bazel-diff-rust'
   verify_targets_windows_9x:
     name: Verify build targets (Windows, Bazel 9.x)
     platform: windows
@@ -51,6 +55,7 @@ tasks:
     - '--host_cxxopt=-std=c++17'
     build_targets:
     - '@bazel-diff//:bazel-diff'
+    - '@bazel-diff//:bazel-diff-rust'
 bcr_test_module:
   module_path: ""
   matrix:
@@ -68,5 +73,8 @@ bcr_test_module:
       build_flags:
       - '--cxxopt=-std=c++17'
       - '--host_cxxopt=-std=c++17'
+      build_targets:
+      - '//:bazel-diff-rust'
       test_targets:
       - '//cli/...'
+      - '//:rust_tests'

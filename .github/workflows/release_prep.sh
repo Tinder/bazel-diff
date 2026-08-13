@@ -18,6 +18,10 @@ make release_deploy_jar &> /dev/null
 
 cp bazel-bin/cli/bazel-diff_deploy.jar archives/bazel-diff_deploy.jar
 
+make release_rust_binary &> /dev/null
+
+cp bazel-bin/src/bazel-diff archives/bazel-diff-rust
+
 SHA=$(shasum -a 256 archives/release.tar.gz | awk '{print $1}')
 
 cat << EOF

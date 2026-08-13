@@ -57,23 +57,20 @@ bazel_dep(name = "gazelle", version = "0.47.0", dev_dependency = True)
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk", dev_dependency = True)
 go_sdk.download(version = "1.23.1")
 
-# Rust support is internal to building/testing bazel-diff: it builds the Rust
-# implementation and the LCOV merger (//tools/coverage) that `bazel coverage`
-# uses to enforce per-target coverage minimums. Marked dev_dependency so
-# consumers of bazel-diff as a module don't inherit rules_rust via MVS.
-bazel_dep(name = "rules_rust", version = "0.73.0", dev_dependency = True)
+# Rust is a first-class published implementation (`//:bazel-diff-rust`) and is
+# also used by the LCOV merger under //tools/coverage. Kept as a non-dev
+# dependency so BCR consumers and top-level verify_targets can build the Rust
+# binary without --ignore_dev_dependency stripping the crate repos/toolchains.
+bazel_dep(name = "rules_rust", version = "0.73.0")
 
-rust = use_extension("@rules_rust//rust:extensions.bzl", "rust", dev_dependency = True)
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2021",
     versions = ["1.90.0"],
 )
 use_repo(rust, "rust_toolchains")
 
-register_toolchains(
-    "@rust_toolchains//:all",
-    dev_dependency = True,
-)
+register_toolchains("@rust_toolchains//:all")
 
 maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
 maven.install(
@@ -131,7 +128,7 @@ use_repo(non_module_repositories, "ktfmt")
 
 register_toolchains("//:kotlin_toolchain")
 
-crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate", dev_dependency = True)
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "bazel_diff_crates",
     cargo_lockfile = "//:Cargo.lock",

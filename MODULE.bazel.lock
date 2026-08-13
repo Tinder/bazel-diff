@@ -507,7 +507,7 @@
     "//:extensions.bzl%non_module_repositories": {
       "general": {
         "bzlTransitiveDigest": "ks6ZQP7BhZgybSu5miBVjOep566JGWK7Lf4pDkWwq4M=",
-        "usagesDigest": "eY6rC8VcsjN2qWlDK73HV9qQ8ZV62/W3wnu43je4N0E=",
+        "usagesDigest": "nIbYb2kOEy/UiP0LzudsoN+laZgnNbB8PD58j/y6n/A=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
@@ -1395,7 +1395,7 @@
     "@@rules_rust+//crate_universe:extensions.bzl%crate": {
       "general": {
         "bzlTransitiveDigest": "1w03uxcBsppz29BtXvvII1OaeTmDlM27XlM9EmLAmPE=",
-        "usagesDigest": "RR0os8iTdVzU15nioXSkPldHOO/oFrG+J6Z7g6hD/og=",
+        "usagesDigest": "GceJk6sDZcu3c88nxNxNhEvodFne1GNMaMpPsALaIAA=",
         "recordedFileInputs": {
           "@@//Cargo.lock": "5dd1bffa8e01c50f5f91eb1f22d643e519a73e2bc2ecd3afe9c7c8d1dbec4ee5",
           "@@//Cargo.toml": "2b637ee57e51fe5d7f26aa4de435b3499bda2417c04d0f8ef640418818b6d9a7"

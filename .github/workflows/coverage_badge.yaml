@@ -32,7 +32,7 @@ jobs:
       - name: Run bazel-diff tests with coverage
         env:
           USE_BAZEL_VERSION: '9.x'
-        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... //tools:coverage_check_test --enable_bzlmod=true --enable_workspace=false
+        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test --enable_bzlmod=true --enable_workspace=false
       - name: Regenerate coverage badge
         env:
           USE_BAZEL_VERSION: '9.x'

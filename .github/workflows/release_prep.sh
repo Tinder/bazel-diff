@@ -9,6 +9,7 @@ TAG=$1
 mkdir -p archives
 tar --exclude-vcs \
   --exclude=bazel-* \
+  --exclude=target \
   --exclude=.github \
   --exclude=archives \
   -zcf "archives/release.tar.gz" .

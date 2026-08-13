@@ -7,6 +7,71 @@ on:
     branches: [ master ]
 
 jobs:
+  rust-candidate:
+    name: Rust candidate (Bazel ${{ matrix.bazel }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bazel: ['8.x', '9.x']
+    steps:
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
+      - uses: actions/checkout@v4
+      - name: Check Cargo build and tests
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --lib --bins --locked
+      - name: Check Bazel build and tests
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+          CARGO_BAZEL_ISOLATED: 'false'
+        run: ~/go/bin/bazelisk test //:rust_tests //tools:benchmark_test --enable_bzlmod=true --enable_workspace=false
+
+  rust-candidate-e2e:
+    name: Rust candidate E2E
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
+      - uses: actions/checkout@v4
+      - name: Run native behavioral suite
+        env:
+          USE_BAZEL_VERSION: '8.x'
+        run: cargo test --locked --test e2e -- --test-threads=1
+
+  rust-candidate-msrv:
+    name: Rust candidate MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Rust 1.85
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.85.0'
+      - uses: actions/checkout@v4
+      - name: Check declared minimum Rust version
+        run: cargo check --locked
+
   test-jre21:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -62,7 +127,7 @@ jobs:
           if [ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]; then
             BAZEL_STARTUP=(--output_user_root="${BAZEL_OUTPUT_USER_ROOT}")
           fi
-          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false
+          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         if: always()

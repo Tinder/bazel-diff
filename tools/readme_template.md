@@ -444,19 +444,29 @@ To run the tests simply run
 bazel test //...
 ```
 
+## Experimental Rust candidate
+
+This branch includes a proposed Rust implementation at `//:bazel-diff-rust`. The existing Kotlin
+implementation remains the default `//:bazel-diff` target and the released JAR.
+
+```terminal
+bazel run //:bazel-diff-rust -- --help
+```
+
 ## Code coverage
 
 CI enforces a minimum **90% line coverage** on production sources. Kotlin
-(`cli/src/main/...`) and Go (`tools/go/...`) are gated **independently** at 90% each, so
-thin coverage in one language can't hide behind well-covered code in the other. To run the
-same checks locally:
+(`cli/src/main/...`), Go (`tools/go/...`), and the experimental Rust
+implementation (`src/...`) are gated **independently** at 90% each, so thin
+coverage in one language can't hide behind well-covered code in another. To
+run the same checks locally:
 
 ```terminal
 make coverage
 ```
 
 This invokes
-`bazel coverage --combined_report=lcov //cli/... //tools:coverage_check_test //tools/coverage/... //tools/go/...`
+`bazel coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...`
 and then runs `//tools:coverage-check` twice against the resulting LCOV report — once for
 the Kotlin main sources and once scoped to `tools/go/` (`--include tools/go/`). The check is
 a Python `py_binary` ([`tools/coverage_check.py`](tools/coverage_check.py)) that prints a
@@ -490,12 +500,15 @@ coverage_enforced_test(
 )
 ```
 
-The default minimum is 90%. Go (`//tools/go/sample:sample_test`), Rust
-(`//tools/coverage:lcov_merger_test`) and the primary-owner Kotlin/JVM tests
-under `//cli` all carry such minimums. When a target's merged report falls
-below its minimum, the coverage run fails that target and the test log
-contains a per-file breakdown. See
+The default minimum is 90%. Go (`//tools/go/sample:sample_test`), the Rust
+LCOV merger (`//tools/coverage:lcov_merger_test`), the experimental Rust
+implementation (`//src:cli_tests` and `//src:rust_tests`), and the
+primary-owner Kotlin/JVM tests under `//cli` all carry minimums. When a
+target's merged report falls below its minimum, the coverage run fails that
+target and the test log contains a per-file breakdown. See
 [`tools/coverage/README.md`](tools/coverage/README.md) for details.
+The Kotlin-to-Rust applicability and parity decisions are tracked in
+[`docs/kotlin-rust-test-parity.md`](docs/kotlin-rust-test-parity.md).
 
 For an interactive HTML report (annotated source with covered/uncovered lines
 highlighted), use `make coverage-html`. This requires the `lcov` package

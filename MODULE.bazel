@@ -57,10 +57,10 @@ bazel_dep(name = "gazelle", version = "0.47.0", dev_dependency = True)
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk", dev_dependency = True)
 go_sdk.download(version = "1.23.1")
 
-# Rust support is internal to building/testing bazel-diff: it builds the LCOV
-# merger (//tools/coverage) that `bazel coverage` runs use to merge per-test
-# tracefiles and enforce per-target coverage minimums. Marked dev_dependency
-# so consumers of bazel-diff as a module don't inherit rules_rust via MVS.
+# Rust support is internal to building/testing bazel-diff: it builds the Rust
+# implementation and the LCOV merger (//tools/coverage) that `bazel coverage`
+# uses to enforce per-target coverage minimums. Marked dev_dependency so
+# consumers of bazel-diff as a module don't inherit rules_rust via MVS.
 bazel_dep(name = "rules_rust", version = "0.73.0", dev_dependency = True)
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust", dev_dependency = True)
@@ -130,3 +130,11 @@ non_module_repositories = use_extension("//:extensions.bzl", "non_module_reposit
 use_repo(non_module_repositories, "ktfmt")
 
 register_toolchains("//:kotlin_toolchain")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate", dev_dependency = True)
+crate.from_cargo(
+    name = "bazel_diff_crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+)
+use_repo(crate, "bazel_diff_crates")

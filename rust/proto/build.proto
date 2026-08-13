@@ -1,0 +1,199 @@
+syntax = "proto2";
+
+package blaze_query;
+
+message StringDictEntry {
+  required string key = 1;
+  required string value = 2;
+}
+
+message LabelDictUnaryEntry {
+  required string key = 1;
+  required string value = 2;
+}
+
+message LabelListDictEntry {
+  required string key = 1;
+  repeated string value = 2;
+}
+
+message LabelKeyedStringDictEntry {
+  required string key = 1;
+  required string value = 2;
+}
+
+message StringListDictEntry {
+  required string key = 1;
+  repeated string value = 2;
+}
+
+message License {
+  repeated string license_type = 1;
+  repeated string exception = 2;
+}
+
+message FilesetEntry {
+  required string source = 1;
+  required string destination_directory = 2;
+  repeated string file = 3;
+  repeated string exclude = 4;
+  optional int32 symlink_behavior = 5;
+  optional string strip_prefix = 6;
+  optional bool files_present = 7;
+}
+
+message Attribute {
+  required string name = 1;
+  required Discriminator type = 2;
+  optional int32 int_value = 3;
+  optional string string_value = 5;
+  repeated string string_list_value = 6;
+  optional License license = 7;
+  repeated StringDictEntry string_dict_value = 8;
+  repeated FilesetEntry fileset_list_value = 9;
+  repeated LabelListDictEntry label_list_dict_value = 10;
+  repeated StringListDictEntry string_list_dict_value = 11;
+  optional bool explicitly_specified = 13;
+  optional bool boolean_value = 14;
+  optional int32 tristate_value = 15;
+  repeated int32 int_list_value = 17;
+  repeated bytes DEPRECATED_string_dict_unary_value = 18;
+  repeated LabelDictUnaryEntry label_dict_unary_value = 19;
+  optional bool nodep = 20;
+  optional SelectorList selector_list = 21;
+  repeated LabelKeyedStringDictEntry label_keyed_string_dict_value = 22;
+  optional string source_aspect_name = 23;
+
+  enum Discriminator {
+    INTEGER = 1;
+    STRING = 2;
+    LABEL = 3;
+    OUTPUT = 4;
+    STRING_LIST = 5;
+    LABEL_LIST = 6;
+    OUTPUT_LIST = 7;
+    DISTRIBUTION_SET = 8;
+    LICENSE = 9;
+    STRING_DICT = 10;
+    FILESET_ENTRY_LIST = 11;
+    LABEL_LIST_DICT = 12;
+    STRING_LIST_DICT = 13;
+    BOOLEAN = 14;
+    TRISTATE = 15;
+    INTEGER_LIST = 16;
+    DEPRECATED_STRING_DICT_UNARY = 17;
+    UNKNOWN = 18;
+    LABEL_DICT_UNARY = 19;
+    SELECTOR_LIST = 20;
+    LABEL_KEYED_STRING_DICT = 21;
+  }
+
+  message SelectorEntry {
+    optional string label = 1;
+    optional int32 int_value = 2;
+    optional string string_value = 3;
+    optional bool boolean_value = 4;
+    optional int32 tristate_value = 5;
+    repeated string string_list_value = 6;
+    optional License license = 7;
+    repeated StringDictEntry string_dict_value = 8;
+    repeated FilesetEntry fileset_list_value = 9;
+    repeated LabelListDictEntry label_list_dict_value = 10;
+    repeated StringListDictEntry string_list_dict_value = 11;
+    repeated int32 int_list_value = 13;
+    repeated bytes DEPRECATED_string_dict_unary_value = 14;
+    repeated LabelDictUnaryEntry label_dict_unary_value = 15;
+    optional bool is_default_value = 16;
+    repeated LabelKeyedStringDictEntry label_keyed_string_dict_value = 17;
+  }
+
+  message Selector {
+    repeated SelectorEntry entries = 1;
+    optional bool has_default_value = 2;
+    optional string no_match_error = 3;
+  }
+
+  message SelectorList {
+    optional Discriminator type = 1;
+    repeated Selector elements = 2;
+  }
+}
+
+message ConfiguredRuleInput {
+  optional string label = 1;
+  optional string configuration_checksum = 2;
+  optional uint32 configuration_id = 3;
+}
+
+message Rule {
+  required string name = 1;
+  required string rule_class = 2;
+  optional string location = 3;
+  repeated Attribute attribute = 4;
+  repeated string rule_input = 5;
+  repeated string rule_output = 6;
+  repeated string default_setting = 7;
+  optional bool DEPRECATED_public_by_default = 9;
+  optional bool DEPRECATED_is_skylark = 10;
+  optional string skylark_environment_hash_code = 12;
+  repeated string instantiation_stack = 13;
+  repeated string definition_stack = 14;
+  repeated ConfiguredRuleInput configured_rule_input = 15;
+  optional string rule_class_key = 16;
+}
+
+message Repository {
+  optional string canonical_name = 1;
+  optional string repo_rule_name = 2;
+  optional string repo_rule_bzl_label = 3;
+  optional string apparent_name = 4;
+  optional string module_key = 5;
+  optional string original_name = 6;
+  repeated Attribute attribute = 7;
+}
+
+message PackageGroup {
+  required string name = 1;
+  repeated string contained_package = 2;
+  repeated string included_package_group = 3;
+}
+
+message EnvironmentGroup {
+  required string name = 1;
+  repeated string environment = 2;
+  repeated string default = 3;
+}
+
+message SourceFile {
+  required string name = 1;
+  optional string location = 2;
+  repeated string subinclude = 3;
+  repeated string package_group = 4;
+  repeated string visibility_label = 5;
+  repeated string feature = 6;
+  optional License license = 8;
+  optional bool package_contains_errors = 9;
+}
+
+message GeneratedFile {
+  required string name = 1;
+  required string generating_rule = 2;
+  optional string location = 3;
+}
+
+message Target {
+  required Discriminator type = 1;
+  optional Rule rule = 2;
+  optional SourceFile source_file = 3;
+  optional GeneratedFile generated_file = 4;
+  optional PackageGroup package_group = 5;
+  optional EnvironmentGroup environment_group = 6;
+
+  enum Discriminator {
+    RULE = 1;
+    SOURCE_FILE = 2;
+    GENERATED_FILE = 3;
+    PACKAGE_GROUP = 4;
+    ENVIRONMENT_GROUP = 5;
+  }
+}

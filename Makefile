@@ -15,6 +15,13 @@ release_deploy_jar:
 		//cli:bazel-diff_deploy.jar \
 		-c opt
 
+.PHONY: release_rust_binary
+release_rust_binary:
+	bazel \
+		build \
+		//:bazel-diff-rust \
+		-c opt
+
 .PHONY: build_rust
 build_rust:
 	bazel build //:bazel-diff-rust -c opt

@@ -13,10 +13,16 @@
 # path-independent -- the script locates it from $0):
 #
 #   <stage>/bazel-diff.jar            the //cli:bazel-diff_deploy.jar built on the glibc host
-#   <stage>/bazel-glibc               the official bazel release binary matching .bazelversion
+#   <stage>/bazel-glibc               the official bazel release binary (see version note below)
 #   <stage>/.bazelversion             copied into fabricated workspaces (harness expects it)
 #   <stage>/tools/serve_stress.py     the harness + its shared plumbing + this script
 #   <stage>/tools/serve_harness.py
+#
+# bazel-glibc version: hermetic serve-stress-alpine.yml stages bazel-diff's .bazelversion so
+# numbers compare cleanly across hermetic pipelines. serve-stress-alpine-real.yml may instead
+# stage the *target repo's* concrete X.Y.Z pin (peeked on the host) when that repo needs a
+# newer Bazel to parse its BUILD files; floating/missing pins still fall back to bazel-diff's
+# pin. Either way this script just probes and runs whatever binary was staged.
 #
 # Building bazel-diff *inside* Alpine would require a full glibc Bazel toolchain to work under
 # musl -- the most fragile possible path -- so the jar is built on the host and only *run* here,
@@ -26,8 +32,9 @@
 # query before the 30+ minute harness commits to it:
 #
 #   1. the official release binary under gcompat (glibc shim), with the server JVM redirected to
-#      the musl OpenJDK via a system bazelrc (`startup --server_javabase=...`) -- this keeps the
-#      bazel *version* identical to the other stress pipelines, so numbers compare cleanly;
+#      the musl OpenJDK via a system bazelrc (`startup --server_javabase=...`) -- hermetic runs
+#      keep this version identical to the other stress pipelines; real-repo runs may use the
+#      target's concrete pin (still under the same gcompat + server_javabase path);
 #   2. a musl-native bazel from the Alpine package repos (version may lag; recorded as the
 #      "flavor" in the footprint JSON so runs remain interpretable).
 #

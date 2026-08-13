@@ -470,9 +470,9 @@ class ServeCommandTest : KoinTest {
     // prunable backend so awaitShutdown can later stop a non-null pruner.
     val cmd = command(noFetch = true).apply { cacheMaxEntries = 10 }
     val server =
-        cmd
-            .buildAndStartServer(FakeGitClient(), LocalDiskHashCacheStorage(cmd.cacheDir))
-            .also { startedServers += it }
+        cmd.buildAndStartServer(FakeGitClient(), LocalDiskHashCacheStorage(cmd.cacheDir)).also {
+          startedServers += it
+        }
     assertThat(healthCode(server)).isEqualTo(200)
   }
 
@@ -512,9 +512,9 @@ class ServeCommandTest : KoinTest {
   fun awaitShutdownHookStopsServerAndPruner() {
     val cmd = command(noFetch = true).apply { cacheMaxEntries = 5 }
     val server =
-        cmd
-            .buildAndStartServer(FakeGitClient(), LocalDiskHashCacheStorage(cmd.cacheDir))
-            .also { startedServers += it }
+        cmd.buildAndStartServer(FakeGitClient(), LocalDiskHashCacheStorage(cmd.cacheDir)).also {
+          startedServers += it
+        }
 
     val hooks = mutableListOf<Thread>()
     cmd.awaitShutdown(
@@ -531,14 +531,12 @@ class ServeCommandTest : KoinTest {
   fun awaitShutdownStopsServerOnInterrupt() {
     val cmd = command(noFetch = true).apply { cacheMaxEntries = 5 }
     val server =
-        cmd
-            .buildAndStartServer(FakeGitClient(), LocalDiskHashCacheStorage(cmd.cacheDir))
-            .also { startedServers += it }
+        cmd.buildAndStartServer(FakeGitClient(), LocalDiskHashCacheStorage(cmd.cacheDir)).also {
+          startedServers += it
+        }
 
     cmd.awaitShutdown(
-        server,
-        registerShutdownHook = {},
-        await = { throw InterruptedException("test shutdown") })
+        server, registerShutdownHook = {}, await = { throw InterruptedException("test shutdown") })
 
     assertThat(Thread.interrupted()).isTrue() // clears the flag restored by awaitShutdown
   }

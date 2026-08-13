@@ -76,15 +76,12 @@ class RuleHasherTest : KoinTest {
     }
     if (visibility.isNotEmpty()) {
       val attr =
-          Attribute.newBuilder()
-              .setName("visibility")
-              .setType(Attribute.Discriminator.STRING_LIST)
+          Attribute.newBuilder().setName("visibility").setType(Attribute.Discriminator.STRING_LIST)
       visibility.forEach { attr.addStringListValue(it) }
       builder.addAttribute(attr.build())
     }
     if (tags.isNotEmpty()) {
-      val attr =
-          Attribute.newBuilder().setName("tags").setType(Attribute.Discriminator.STRING_LIST)
+      val attr = Attribute.newBuilder().setName("tags").setType(Attribute.Discriminator.STRING_LIST)
       tags.forEach { attr.addStringListValue(it) }
       builder.addAttribute(attr.build())
     }
@@ -94,9 +91,7 @@ class RuleHasherTest : KoinTest {
 
   private fun packageGroup(name: String, packages: List<String> = listOf("//...")): BazelRule {
     val attr =
-        Attribute.newBuilder()
-            .setName("packages")
-            .setType(Attribute.Discriminator.STRING_LIST)
+        Attribute.newBuilder().setName("packages").setType(Attribute.Discriminator.STRING_LIST)
     packages.forEach { attr.addStringListValue(it) }
     return BazelRule(
         Build.Rule.newBuilder()
@@ -146,9 +141,7 @@ class RuleHasherTest : KoinTest {
   @Test
   fun circularDependencySelfLoopThrows() {
     val a = rule("//pkg:a")
-    assertFailure {
-          digest(rule = a, depPath = linkedSetOf("//pkg:a"))
-        }
+    assertFailure { digest(rule = a, depPath = linkedSetOf("//pkg:a")) }
         .isInstanceOf(RuleHasher.CircularDependencyException::class)
         .transform { it.message!! }
         .contains("//pkg:a -> //pkg:a")
@@ -181,21 +174,16 @@ class RuleHasherTest : KoinTest {
     val second = digest(rule = leaf, ruleHashes = ruleHashes)
     assertThat(second.overallDigest.toHexString()).isEqualTo(cached.overallDigest.toHexString())
     assertThat(second.directDigest.toHexString()).isEqualTo(cached.directDigest.toHexString())
-    assertThat(second.overallDigest.toHexString())
-        .isNotEqualTo(first.overallDigest.toHexString())
+    assertThat(second.overallDigest.toHexString()).isNotEqualTo(first.overallDigest.toHexString())
   }
 
   @Test
   fun emptyInstantiationStackFallsBackToPackageBzlSeeds() {
     val leaf = rule("//pkg:leaf")
     val withSeed =
-        digest(
-            rule = leaf,
-            packageBzlSeeds = mapOf("//pkg" to "package-seed-v1".toByteArray()))
+        digest(rule = leaf, packageBzlSeeds = mapOf("//pkg" to "package-seed-v1".toByteArray()))
     val withOtherSeed =
-        digest(
-            rule = leaf,
-            packageBzlSeeds = mapOf("//pkg" to "package-seed-v2".toByteArray()))
+        digest(rule = leaf, packageBzlSeeds = mapOf("//pkg" to "package-seed-v2".toByteArray()))
     val withoutSeed = digest(rule = leaf, packageBzlSeeds = emptyMap())
 
     assertThat(withSeed.overallDigest.toHexString())
@@ -287,8 +275,7 @@ class RuleHasherTest : KoinTest {
     val hashV2 =
         digest(rule = consumer, allRulesMap = mapOf(consumer.name to consumer, depV2.name to depV2))
 
-    assertThat(hashV1.overallDigest.toHexString())
-        .isNotEqualTo(hashV2.overallDigest.toHexString())
+    assertThat(hashV1.overallDigest.toHexString()).isNotEqualTo(hashV2.overallDigest.toHexString())
     // Direct digest excludes transitive dep content.
     assertThat(hashV1.directDigest.toHexString()).isEqualTo(hashV2.directDigest.toHexString())
   }
@@ -327,10 +314,8 @@ class RuleHasherTest : KoinTest {
 
   @Test
   fun packageGroupVisibilityEdgesAreFollowed() {
-    val group =
-        packageGroup("//pkg:consumers", packages = listOf("//allowed"))
-    val gated =
-        rule("//pkg:gated", visibility = listOf("//pkg:consumers", "//visibility:public"))
+    val group = packageGroup("//pkg:consumers", packages = listOf("//allowed"))
+    val gated = rule("//pkg:gated", visibility = listOf("//pkg:consumers", "//visibility:public"))
     val rules = mapOf(gated.name to gated, group.name to group)
 
     val hashWithGroup = digest(rule = gated, allRulesMap = rules)
@@ -339,10 +324,11 @@ class RuleHasherTest : KoinTest {
         .isNotEqualTo(hashWithoutGroup.overallDigest.toHexString())
 
     // Changing the package_group attribute changes the gated rule's transitive digest.
-    val groupChanged =
-        packageGroup("//pkg:consumers", packages = listOf("//other"))
+    val groupChanged = packageGroup("//pkg:consumers", packages = listOf("//other"))
     val hashChanged =
-        digest(rule = gated, allRulesMap = mapOf(gated.name to gated, groupChanged.name to groupChanged))
+        digest(
+            rule = gated,
+            allRulesMap = mapOf(gated.name to gated, groupChanged.name to groupChanged))
     assertThat(hashChanged.overallDigest.toHexString())
         .isNotEqualTo(hashWithGroup.overallDigest.toHexString())
   }
@@ -354,8 +340,7 @@ class RuleHasherTest : KoinTest {
     val rules = mapOf(gated.name to gated, group.name to group)
 
     val followed = digest(rule = gated, allRulesMap = rules, ignoredAttrs = emptySet())
-    val ignored =
-        digest(rule = gated, allRulesMap = rules, ignoredAttrs = setOf("visibility"))
+    val ignored = digest(rule = gated, allRulesMap = rules, ignoredAttrs = setOf("visibility"))
     // Ignoring visibility both drops the attribute from rule.digest and skips the edge walk.
     assertThat(followed.overallDigest.toHexString())
         .isNotEqualTo(ignored.overallDigest.toHexString())
@@ -378,23 +363,15 @@ class RuleHasherTest : KoinTest {
             visibility = listOf("//pkg:missing_group", "//pkg:not_a_group", "//pkg:gated"))
     // Self label filtered by name==rule.name; missing continues; non-package_group continues.
     val result =
-        digest(
-            rule = gated,
-            allRulesMap = mapOf(gated.name to gated, notAGroup.name to notAGroup))
+        digest(rule = gated, allRulesMap = mapOf(gated.name to gated, notAGroup.name to notAGroup))
     assertThat(result.deps).isEqualTo(emptyList())
   }
 
   @Test
   fun useCqueryMixesConfiguredRuleInputEncoding() {
     val dep = rule("//pkg:dep")
-    val consumerA =
-        rule(
-            "//pkg:consumer",
-            configuredRuleInputs = listOf("//pkg:dep" to "cfg-A"))
-    val consumerB =
-        rule(
-            "//pkg:consumer",
-            configuredRuleInputs = listOf("//pkg:dep" to "cfg-B"))
+    val consumerA = rule("//pkg:consumer", configuredRuleInputs = listOf("//pkg:dep" to "cfg-A"))
+    val consumerB = rule("//pkg:consumer", configuredRuleInputs = listOf("//pkg:dep" to "cfg-B"))
     val hasher = hasher(useCquery = true)
 
     val hashA =

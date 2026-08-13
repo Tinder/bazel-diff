@@ -20,6 +20,7 @@ import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
 import kotlinx.coroutines.runBlocking
 import org.junit.Rule
 import org.junit.Test
@@ -34,7 +35,6 @@ import org.mockito.kotlin.anyOrNull
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
-import kotlin.concurrent.thread
 
 class HashServiceTest : KoinTest {
   @get:Rule val mockitoRule = MockitoJUnit.rule()
@@ -282,8 +282,7 @@ class HashServiceTest : KoinTest {
   @Test
   fun deserializeLegacyFlatCacheEntry() {
     val storage = InMemoryStorage()
-    storage.entries["sha1.fp"] =
-        """{"//:a":"Rule#h~d"}""".toByteArray(StandardCharsets.UTF_8)
+    storage.entries["sha1.fp"] = """{"//:a":"Rule#h~d"}""".toByteArray(StandardCharsets.UTF_8)
 
     val data = newService(RecordingGitClient(), storage).getHashes("sha1")
 
@@ -313,17 +312,13 @@ class HashServiceTest : KoinTest {
     val missDone = CountDownLatch(1)
     val hitProfiler = QueryProfiler()
 
-    val generator =
-        thread {
-          service.getHashes("sha1")
-          missDone.countDown()
-        }
+    val generator = thread {
+      service.getHashes("sha1")
+      missDone.countDown()
+    }
     assertThat(hasherStarted.await(5, TimeUnit.SECONDS)).isEqualTo(true)
 
-    val waiter =
-        thread {
-          service.getHashes("sha1", profiler = hitProfiler)
-        }
+    val waiter = thread { service.getHashes("sha1", profiler = hitProfiler) }
     // Give the waiter time to miss the initial cache check and block on generationLock.
     Thread.sleep(100)
     allowFinish.countDown()

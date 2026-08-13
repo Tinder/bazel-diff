@@ -428,11 +428,11 @@ Precision CI at Scale: Target-Aware Workflows with Bazel Diff - Maxwell Elliott 
 
 ## Star History
 
-<a href="https://star-history.com/#Tinder/bazel-diff&Date">
+<a href="https://star-history.dera.page/#Tinder/bazel-diff&type=Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Tinder/bazel-diff&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Tinder/bazel-diff&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Tinder/bazel-diff&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=Tinder/bazel-diff&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=Tinder/bazel-diff&type=Date" />
+    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=Tinder/bazel-diff&type=Date" />
   </picture>
 </a>
 

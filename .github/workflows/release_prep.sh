@@ -12,10 +12,6 @@ make release_deploy_jar &> /dev/null
 
 cp bazel-bin/cli/bazel-diff_deploy.jar archives/bazel-diff_deploy.jar
 
-make release_rust_binary &> /dev/null
-
-cp bazel-bin/src/bazel-diff archives/bazel-diff-rust
-
 SHA=$(shasum -a 256 archives/release.tar.gz | awk '{print $1}')
 
 cat << EOF
@@ -38,4 +34,12 @@ http_archive(
   url = "https://github.com/Tinder/bazel-diff/releases/download/${TAG}/release.tar.gz",
 )
 \`\`\`
+
+## Experimental Rust binary
+
+Prebuilt host-native CLIs (attached by the release workflow):
+
+- Linux amd64: https://github.com/Tinder/bazel-diff/releases/download/${TAG}/bazel-diff-rust-linux-amd64
+- macOS arm64: https://github.com/Tinder/bazel-diff/releases/download/${TAG}/bazel-diff-rust-macos-arm64
+- Windows amd64: https://github.com/Tinder/bazel-diff/releases/download/${TAG}/bazel-diff-rust-windows-amd64.exe
 EOF

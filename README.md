@@ -913,6 +913,22 @@ implementation remains the default `//:bazel-diff` target and the released JAR.
 bazel run //:bazel-diff-rust -- --help
 ```
 
+GitHub Releases also ship prebuilt host-native binaries:
+
+```terminal
+# Linux amd64
+curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-amd64
+chmod +x bazel-diff-rust
+
+# macOS arm64
+curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-macos-arm64
+chmod +x bazel-diff-rust
+```
+
+Windows amd64: download
+`bazel-diff-rust-windows-amd64.exe` from the
+[latest release](https://github.com/Tinder/bazel-diff/releases/latest).
+
 ## Code coverage
 
 CI enforces a minimum **90% line coverage** on production sources. Kotlin

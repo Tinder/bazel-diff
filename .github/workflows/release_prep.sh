@@ -12,6 +12,8 @@ tar --exclude-vcs \
   --exclude=target \
   --exclude=.github \
   --exclude=archives \
+  --exclude=__pycache__ \
+  --exclude='*.pyc' \
   -zcf "archives/release.tar.gz" .
 
 make release_deploy_jar &> /dev/null

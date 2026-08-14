@@ -42,3 +42,6 @@ coverage-html/
 
 # Go orchestrator build output (go build . in tools/firecracker)
 /tools/firecracker/firecracker
+
+# Python bytecode cache (running tools/*_test.py directly writes this).
+__pycache__/

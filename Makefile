@@ -73,3 +73,21 @@ benchmark:
 		$(if $(STREAMED_PROTO),--streamed-proto "$(STREAMED_PROTO)",) \
 		$(if $(INCLUDE_BAZEL),--include-bazel,) \
 		$(if $(JSON),--json "$(JSON)",)
+
+# Hermetic Kotlin-vs-Rust performance gate. Unlike `make benchmark` this needs no
+# workspace, no Bazel server and no Hyperfine: it generates its own fixtures and fails
+# (exit 1) if Rust is not faster than Kotlin on every workload. JSON=... must be an
+# absolute path -- `bazel run` executes from the runfiles tree, not the repo root.
+.PHONY: perf-gate
+perf-gate:
+	$(or $(BAZEL),bazel) run -c opt //tools:perf-gate -- \
+		--rounds "$(or $(ROUNDS),5)" \
+		--warmup-rounds "$(or $(WARMUP),1)" \
+		--scale "$(or $(SCALE),1)" \
+		$(if $(WORKLOAD),--workload "$(WORKLOAD)",) \
+		$(if $(RSS_RUNS),--rss-runs "$(RSS_RUNS)",) \
+		$(if $(JSON),--json "$(JSON)",)
+
+.PHONY: perf-gate-test
+perf-gate-test:
+	$(or $(BAZEL),bazel) test //tools:perf_gate_test

@@ -6,13 +6,7 @@ set -o errexit -o nounset -o pipefail
 # https://github.com/bazel-contrib/.github/blob/master/.github/workflows/release_ruleset.yaml
 TAG=$1
 
-mkdir -p archives
-tar --exclude-vcs \
-  --exclude=bazel-* \
-  --exclude=target \
-  --exclude=.github \
-  --exclude=archives \
-  -zcf "archives/release.tar.gz" .
+"$(dirname "$0")/pack_release_archive.sh" archives/release.tar.gz
 
 make release_deploy_jar &> /dev/null
 

@@ -1,0 +1,66 @@
+name: BCR consumer
+
+# The BCR presubmit's verify_targets tasks consume bazel-diff as a
+# *dependency* (non-root module) unpacked from the release source archive.
+# Regular CI only ever builds bazel-diff as the root module, which misses
+# failure modes specific to non-root consumption — e.g. crate_universe
+# refusing a from_cargo call without a shipped cargo-bazel lockfile (the
+# bazel-central-registry#10043 presubmit failure) — as well as files missing
+# from the release archive altogether. This check packs the archive with the
+# same script release_prep.sh uses, then builds the BCR verify_targets from a
+# scratch consumer module that pulls bazel-diff in via archive_override.
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  verify-targets:
+    name: Consume as dependency (Bazel ${{ matrix.bazel }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with the bazel matrix in .bcr/presubmit.yml.
+        bazel: ['7.x', '8.x', '9.x']
+    steps:
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
+      - uses: actions/checkout@v4
+      - name: Pack release archive
+        run: .github/workflows/pack_release_archive.sh "$RUNNER_TEMP/release.tar.gz"
+      - name: Set up consumer module
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          cat > MODULE.bazel <<EOF
+          module(name = "bcr-consumer-check")
+
+          # The version is irrelevant: archive_override bypasses the registry
+          # and takes the module from the packed release archive.
+          bazel_dep(name = "bazel-diff", version = "0.0.0")
+
+          archive_override(
+              module_name = "bazel-diff",
+              urls = ["file://$RUNNER_TEMP/release.tar.gz"],
+          )
+          EOF
+          touch BUILD.bazel
+          # Mirror the build flags the BCR presubmit passes on Linux.
+          cat > .bazelrc <<EOF
+          build --cxxopt=-std=c++17
+          build --host_cxxopt=-std=c++17
+          EOF
+      - name: Build BCR verify_targets as a consumer
+        working-directory: ${{ runner.temp }}/consumer
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+        # Keep in sync with the build_targets in .bcr/presubmit.yml.
+        run: ~/go/bin/bazelisk build @bazel-diff//:bazel-diff @bazel-diff//:bazel-diff-rust

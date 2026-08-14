@@ -1129,7 +1129,10 @@ mod tests {
     #[test]
     fn read_message_length_parses_varints_and_rejects_bad_prefixes() {
         assert_eq!(read_message_length(&mut [].as_slice()).unwrap(), None);
-        assert_eq!(read_message_length(&mut [0x05].as_slice()).unwrap(), Some(5));
+        assert_eq!(
+            read_message_length(&mut [0x05].as_slice()).unwrap(),
+            Some(5)
+        );
         // 300 encodes as two continuation-flagged bytes.
         assert_eq!(
             read_message_length(&mut [0xAC, 0x02].as_slice()).unwrap(),

@@ -4,10 +4,11 @@ use crate::proto::blaze_query::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use buffa::Message;
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
@@ -475,20 +476,107 @@ pub fn decode_delimited<M: Message>(path: &Path) -> Result<Vec<M>> {
     Ok(messages)
 }
 
+/// Upper bounds on one decode batch. Batching keeps peak memory proportional to
+/// the batch rather than to the whole query output, which for a large workspace
+/// is gigabytes.
+const DECODE_BATCH_MESSAGES: usize = 8192;
+const DECODE_BATCH_BYTES: usize = 32 * 1024 * 1024;
+
+/// Raw, still-encoded messages read off the stream, kept in one contiguous
+/// buffer so a batch costs one allocation rather than one per message.
+#[derive(Default)]
+struct RawBatch {
+    buffer: Vec<u8>,
+    bounds: Vec<(usize, usize)>,
+}
+
+impl RawBatch {
+    fn clear(&mut self) {
+        self.buffer.clear();
+        self.bounds.clear();
+    }
+
+    fn slices(&self) -> impl IndexedParallelIterator<Item = &[u8]> {
+        self.bounds
+            .par_iter()
+            .map(|(start, end)| &self.buffer[*start..*end])
+    }
+}
+
+/// Reads a length-delimited varint prefix, returning `None` at end of stream.
+fn read_message_length(reader: &mut impl BufRead) -> Result<Option<usize>> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let available = reader.fill_buf()?;
+        let Some(byte) = available.first().copied() else {
+            if shift == 0 {
+                return Ok(None);
+            }
+            bail!("truncated length prefix in Bazel query output");
+        };
+        reader.consume(1);
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return usize::try_from(value)
+                .map(Some)
+                .map_err(|_| anyhow!("length prefix {value} does not fit in usize"));
+        }
+        shift += 7;
+        if shift >= 64 {
+            bail!("length prefix in Bazel query output overflows a u64");
+        }
+    }
+}
+
+/// Fills `batch` with up to the batch limits worth of encoded messages,
+/// returning false once the stream is exhausted.
+fn read_raw_batch(reader: &mut impl BufRead, batch: &mut RawBatch) -> Result<bool> {
+    batch.clear();
+    while batch.bounds.len() < DECODE_BATCH_MESSAGES && batch.buffer.len() < DECODE_BATCH_BYTES {
+        let Some(length) = read_message_length(reader)? else {
+            break;
+        };
+        let start = batch.buffer.len();
+        batch.buffer.reserve(length);
+        let copied = std::io::copy(
+            &mut reader.take(length as u64),
+            &mut &mut batch.buffer as &mut dyn std::io::Write,
+        )?;
+        if copied != length as u64 {
+            bail!("truncated message in Bazel query output");
+        }
+        batch.bounds.push((start, batch.buffer.len()));
+    }
+    Ok(!batch.bounds.is_empty())
+}
+
 fn decode_target_stream(
     path: &Path,
     transform: &mut impl FnMut(&mut Target),
 ) -> Result<Vec<Target>> {
-    let mut reader = BufReader::new(File::open(path)?);
+    let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
     let mut targets = Vec::new();
-    loop {
-        if reader.fill_buf()?.is_empty() {
-            break;
-        }
-        let target = buffa::DecodeOptions::new().decode_length_delimited_reader(&mut reader)?;
-        if let Some(mut target) = lower_target(target) {
-            transform(&mut target);
-            targets.push(target);
+    let mut batch = RawBatch::default();
+    // Decoding dominates this phase and is independent per message, so each
+    // batch is decoded in parallel. `transform` stays sequential: callers use it
+    // to accumulate into shared state, and it is the cheaper half.
+    let mut decoded = Vec::new();
+    while read_raw_batch(&mut reader, &mut batch)? {
+        batch
+            .slices()
+            .map(|bytes| {
+                <Target as Message>::decode_from_slice(bytes)
+                    .map_err(anyhow::Error::from)
+                    .map(lower_target)
+            })
+            .collect_into_vec(&mut decoded);
+        targets.reserve(decoded.len());
+        for lowered in decoded.drain(..) {
+            if let Some(mut target) = lowered? {
+                transform(&mut target);
+                targets.push(target);
+            }
         }
     }
     Ok(targets)
@@ -1036,6 +1124,59 @@ mod tests {
             target_name(&decode_cquery_stream(&non_streamed, false, &mut |_| {}).unwrap()[0]),
             Some("//c:c")
         );
+    }
+
+    #[test]
+    fn read_message_length_parses_varints_and_rejects_bad_prefixes() {
+        assert_eq!(read_message_length(&mut [].as_slice()).unwrap(), None);
+        assert_eq!(read_message_length(&mut [0x05].as_slice()).unwrap(), Some(5));
+        // 300 encodes as two continuation-flagged bytes.
+        assert_eq!(
+            read_message_length(&mut [0xAC, 0x02].as_slice()).unwrap(),
+            Some(300)
+        );
+        // Continuation bit set with nothing following.
+        assert!(read_message_length(&mut [0x80].as_slice()).is_err());
+        // Never-terminating prefix overflows the shift.
+        assert!(read_message_length(&mut [0x80; 10].as_slice()).is_err());
+    }
+
+    #[test]
+    fn decode_target_stream_preserves_order_across_batches() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("query.pb");
+        let written = (0..DECODE_BATCH_MESSAGES + 5)
+            .map(|index| rule_target(&format!("//pkg:target{index}")))
+            .collect::<Vec<_>>();
+        write_delimited(&path, &written);
+        let mut seen = Vec::new();
+        let decoded = decode_target_stream(&path, &mut |target| {
+            seen.push(target_name(target).unwrap().to_owned())
+        })
+        .unwrap();
+        assert_eq!(decoded.len(), written.len());
+        // Order must survive the batch boundary in both the returned targets and
+        // the sequence `transform` observes.
+        let expected = (0..written.len())
+            .map(|index| format!("//pkg:target{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(seen, expected);
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|target| target_name(target).unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn decode_target_stream_rejects_truncated_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("truncated.pb");
+        // A length prefix of 16 followed by only two bytes of payload.
+        fs::write(&path, [0x10u8, 0x00, 0x00]).unwrap();
+        assert!(decode_target_stream(&path, &mut |_| {}).is_err());
     }
 
     #[test]

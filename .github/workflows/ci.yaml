@@ -339,6 +339,12 @@ jobs:
       # the assertion that Bazel's name still matches matrix.rust_asset.
       - name: Build Rust binary
         shell: bash
+        env:
+          # Windows runs this under Git bash, whose MSYS runtime rewrites any
+          # argument starting with `//package` into a `/package` Windows path --
+          # Bazel then rejects "invalid package name '/release'". (`//:target`
+          # survived only because it has no path-like segment to convert.)
+          MSYS2_ARG_CONV_EXCL: '//'
         run: bazelisk build //release:bazel-diff-rust --config=release ${{ matrix.bazel_extra_flags }}
       - uses: actions/upload-artifact@v4
         with:

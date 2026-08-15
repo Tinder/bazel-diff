@@ -269,6 +269,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # rust_asset is the name //release:bazel-diff-rust gives the binary on
+        # that platform -- it is asserted, not applied (see the upload step).
+        # bazel_extra_flags is Windows-only: --config=release can't carry it,
+        # since .bazelrc expands platform-specific config for the bare `build`
+        # config name only.
         include:
           - os: ubuntu-latest
             java: '11'
@@ -327,21 +332,16 @@ jobs:
           name: release.tar.gz
           path: archives/release.tar.gz
           if-no-files-found: error
+      # //release:bazel-diff-rust names the binary for the platform Bazel built
+      # it for, so this step neither renames nor relocates anything: whatever
+      # lands in bazel-bin/release/ is the published asset. --config=release
+      # carries the flags (see .bazelrc). `if-no-files-found: error` below is
+      # the assertion that Bazel's name still matches matrix.rust_asset.
       - name: Build Rust binary
         shell: bash
-        run: |
-          bazelisk build //:bazel-diff-rust -c opt \
-            --cxxopt=-std=c++17 \
-            --host_cxxopt=-std=c++17 \
-            ${{ matrix.bazel_extra_flags }}
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            src="bazel-bin/src/bazel-diff.exe"
-          else
-            src="bazel-bin/src/bazel-diff"
-          fi
-          cp "$src" "${{ matrix.rust_asset }}"
+        run: bazelisk build //release:bazel-diff-rust --config=release ${{ matrix.bazel_extra_flags }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.rust_asset }}
-          path: ${{ matrix.rust_asset }}
+          path: bazel-bin/release/${{ matrix.rust_asset }}
           if-no-files-found: error

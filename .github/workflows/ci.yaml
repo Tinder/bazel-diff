@@ -271,23 +271,32 @@ jobs:
       matrix:
         # rust_asset is the name //release:bazel-diff-rust gives the binary on
         # that platform -- it is asserted, not applied (see the upload step).
-        # bazel_extra_flags is Windows-only: --config=release can't carry it,
-        # since .bazelrc expands platform-specific config for the bare `build`
-        # config name only.
+        #
+        # The two Windows-only Bazel flags can't move into --config=release:
+        # startup flags can't live in a --config at all, and .bazelrc expands
+        # platform-specific config for the bare `build` config name only.
+        # bazel_startup_flags shortens the output root because MSVC's link.exe
+        # is MAX_PATH-bound (260): under the default root, the Rust stdlib path
+        # ...rust_toolchain\lib\rustlib\x86_64-pc-windows-msvc\lib\
+        # librustc_std_workspace_alloc-<hash>.rlib comes to 263 characters and
+        # the link fails with LNK1181. C:/b buys back 35.
         include:
           - os: ubuntu-latest
             java: '11'
             rust_asset: bazel-diff-rust-linux-amd64
+            bazel_startup_flags: ''
             bazel_extra_flags: ''
             upload_jar_and_archive: true
           - os: macos-latest
             java: '11'
             rust_asset: bazel-diff-rust-macos-arm64
+            bazel_startup_flags: ''
             bazel_extra_flags: ''
             upload_jar_and_archive: false
           - os: windows-latest
             java: '11'
             rust_asset: bazel-diff-rust-windows-amd64.exe
+            bazel_startup_flags: '--output_user_root=C:/b'
             bazel_extra_flags: '--legacy_external_runfiles'
             upload_jar_and_archive: false
     steps:
@@ -345,7 +354,7 @@ jobs:
           # Bazel then rejects "invalid package name '/release'". (`//:target`
           # survived only because it has no path-like segment to convert.)
           MSYS2_ARG_CONV_EXCL: '//'
-        run: bazelisk build //release:bazel-diff-rust --config=release ${{ matrix.bazel_extra_flags }}
+        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=release ${{ matrix.bazel_extra_flags }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.rust_asset }}

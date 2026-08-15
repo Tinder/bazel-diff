@@ -259,13 +259,23 @@ jobs:
           $prevRev = git rev-parse HEAD~1
           $currRev = git rev-parse HEAD
           .\bazel-diff-example.ps1 -WorkspacePath "$env:GITHUB_WORKSPACE" -BazelPath "$env:USERPROFILE\go\bin\bazelisk.exe" -PreviousRevision $prevRev -FinalRevision $currRev
-  deploy:
+  # Verifies per-PR that everything a release ships still builds, on every
+  # platform it ships for. It publishes nothing: release.yaml owns that, via
+  # release_prep.sh (JAR + source archive) and its rust-binaries matrix. This
+  # job predates that flow -- it used to *be* the deploy -- so its uploads are
+  # a build check whose output happens to be downloadable, nothing more.
+  release-artifacts:
+    # Explicit name so the status check is stable. Left implicit, GitHub derives
+    # it from every matrix value -- which is how branch protection ended up
+    # requiring `deploy (11)`, a check that stopped existing the moment this job
+    # grew an os/rust_asset matrix. Adding a matrix key must not rename a check.
+    name: release-artifacts (${{ matrix.os }})
     needs: [test-jre21]
     runs-on: ${{ matrix.os }}
     permissions:
+      # Read-only: nothing here attests or publishes. The id-token/attestations
+      # writes this job used to request were left over from the old deploy.
       contents: read
-      id-token: write
-      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -332,9 +342,13 @@ jobs:
           name: bazel-diff_deploy.jar
           path: bazel-bin/cli/bazel-diff_deploy.jar
           if-no-files-found: error
+      # The same script release_prep.sh packs the shipped archive with, so this
+      # check can't pass on an archive the release would not produce. It used to
+      # call `make release_source_archive`, a second tar recipe that had already
+      # drifted (no __pycache__/*.pyc excludes).
       - name: Build release source archive
         if: matrix.upload_jar_and_archive
-        run: make release_source_archive
+        run: .github/workflows/pack_release_archive.sh archives/release.tar.gz
       - uses: actions/upload-artifact@v4
         if: matrix.upload_jar_and_archive
         with:

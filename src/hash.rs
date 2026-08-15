@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const CONFIGURED_INPUT_SEPARATOR: char = '|';
 type DigestBytes = [u8; 32];
@@ -837,11 +837,20 @@ fn owner_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct ExternalRepoResolver {
     workspace: PathBuf,
     bazel: PathBuf,
     output_base: PathBuf,
+    startup_options: Vec<String>,
+    no_bazelrc: bool,
+    /// Memoizes resolution per apparent repository name. `resolve` is called once
+    /// per external source file and can shell out to Bazel, so without this a
+    /// repository with N source files costs N Bazel invocations, all of which
+    /// serialize on the Bazel server lock.
+    resolved: Arc<Mutex<HashMap<String, PathBuf>>>,
+    /// Lazily populated apparent -> canonical repository name mapping.
+    repo_mapping: Arc<OnceLock<HashMap<String, String>>>,
 }
 
 impl ExternalRepoResolver {
@@ -863,18 +872,63 @@ impl ExternalRepoResolver {
             workspace: options.workspace.clone(),
             bazel: options.bazel.clone(),
             output_base: PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()),
+            startup_options: options.startup_options.clone(),
+            no_bazelrc: options.no_bazelrc,
+            ..Default::default()
         })
     }
 
+    /// Builds a Bazel command carrying the same startup options `new` used, so
+    /// follow-up invocations reach the same server and output base.
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.bazel);
+        command.current_dir(&self.workspace);
+        if self.no_bazelrc {
+            command.arg(if cfg!(windows) {
+                "--bazelrc=NUL"
+            } else {
+                "--bazelrc=/dev/null"
+            });
+        }
+        command.args(&self.startup_options);
+        command
+    }
+
     fn resolve(&self, repo: &str) -> Result<PathBuf> {
+        // The lock is held across resolution so that concurrent hashing threads
+        // missing the same repository do not each shell out to Bazel.
+        let mut resolved = self
+            .resolved
+            .lock()
+            .map_err(|_| anyhow!("external repository cache was poisoned"))?;
+        if let Some(root) = resolved.get(repo) {
+            return Ok(root.clone());
+        }
+        let root = self.resolve_uncached(repo)?;
+        resolved.insert(repo.to_owned(), root.clone());
+        Ok(root)
+    }
+
+    fn resolve_uncached(&self, repo: &str) -> Result<PathBuf> {
         let external = self.output_base.join("external");
         for candidate in [external.join(repo), external.join(format!("{repo}+"))] {
             if candidate.exists() {
                 return Ok(candidate);
             }
         }
-        let output = Command::new(&self.bazel)
-            .current_dir(&self.workspace)
+        // Under Bzlmod the directory is named after the canonical repository name
+        // (`rules_req_compile++requirements+pip_deps`), which neither candidate
+        // above guesses. `bazel mod dump_repo_mapping` reports that name directly
+        // and is one invocation for every repository, so prefer it over the
+        // `bazel query` fallback below.
+        if let Some(canonical) = self.repo_mapping().get(repo) {
+            let candidate = external.join(canonical);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+        let output = self
+            .command()
             .arg("query")
             .arg(format!("@{repo}//..."))
             .arg("--keep_going")
@@ -898,6 +952,50 @@ impl ExternalRepoResolver {
         }
         Ok(external.join(repo))
     }
+
+    /// Returns the main repository's apparent -> canonical repository mapping,
+    /// fetching it at most once. An empty map means the mapping was unavailable
+    /// (for example a WORKSPACE-only build), leaving the `bazel query` fallback.
+    fn repo_mapping(&self) -> &HashMap<String, String> {
+        self.repo_mapping.get_or_init(|| {
+            let output = self
+                .command()
+                .arg("mod")
+                .arg("dump_repo_mapping")
+                .arg("")
+                .stdin(Stdio::null())
+                .output();
+            match output {
+                Ok(output) if output.status.success() => {
+                    parse_apparent_repo_mapping(&String::from_utf8_lossy(&output.stdout))
+                }
+                _ => HashMap::new(),
+            }
+        })
+    }
+}
+
+/// Parses `bazel mod dump_repo_mapping` output, one JSON object of apparent ->
+/// canonical repository names per line, into a flat map.
+fn parse_apparent_repo_mapping(text: &str) -> HashMap<String, String> {
+    let mut mapping = HashMap::new();
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let Some(entries) = value.as_object() else {
+            continue;
+        };
+        for (apparent, canonical) in entries {
+            let Some(canonical) = canonical.as_str() else {
+                continue;
+            };
+            if !apparent.is_empty() && !canonical.is_empty() {
+                mapping.insert(apparent.clone(), canonical.to_owned());
+            }
+        }
+    }
+    mapping
 }
 
 trait HashingCommand {
@@ -972,6 +1070,7 @@ mod tests {
                 workspace: options.bazel.workspace.clone(),
                 bazel: options.bazel.bazel.clone(),
                 output_base: output_base.to_path_buf(),
+                ..Default::default()
             },
             Some(r#"{"name":"root"}"#.to_owned()),
         )
@@ -1505,10 +1604,115 @@ mod tests {
             workspace: workspace.path().to_path_buf(),
             bazel: PathBuf::from("bazel"),
             output_base,
+            ..Default::default()
         };
         assert_eq!(
             resolver.resolve("existing").unwrap(),
             external.join("existing+")
+        );
+    }
+
+    /// A stub `bazel` that appends its argv to `log` and prints `stdout`.
+    #[cfg(unix)]
+    fn stub_bazel(directory: &Path, log: &Path, stdout: &str) -> PathBuf {
+        let script = directory.join("stub-bazel");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {log}\ncat <<'STUB_EOF'\n{stdout}\nSTUB_EOF\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_repo_resolver_uses_repo_mapping_and_resolves_once() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        let external = output_base.join("external");
+        // Only the canonical directory exists, as under Bzlmod.
+        let canonical = external.join("rules_req_compile++requirements+pip_deps");
+        fs::create_dir_all(&canonical).unwrap();
+        let log = workspace.path().join("bazel.log");
+        let bazel = stub_bazel(
+            workspace.path(),
+            &log,
+            r#"{"pip_deps": "rules_req_compile++requirements+pip_deps"}"#,
+        );
+        let resolver = ExternalRepoResolver {
+            workspace: workspace.path().to_path_buf(),
+            bazel,
+            output_base,
+            ..Default::default()
+        };
+
+        for _ in 0..5 {
+            assert_eq!(resolver.resolve("pip_deps").unwrap(), canonical);
+        }
+
+        // One `mod dump_repo_mapping`, and no `query` fallback, for five lookups.
+        let invocations = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            invocations.lines().collect::<Vec<_>>(),
+            ["mod dump_repo_mapping "]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_repo_resolver_falls_back_to_query_and_caches_misses() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        let external = output_base.join("external");
+        fs::create_dir_all(external.join("queried+1.0")).unwrap();
+        let log = workspace.path().join("bazel.log");
+        // The mapping has no entry for `queried`, so resolution falls through to
+        // `bazel query`; the stub answers both with the same location line.
+        let bazel = stub_bazel(
+            workspace.path(),
+            &log,
+            &format!(
+                "{}/queried+1.0/pkg/BUILD:1:1: source file @queried//pkg:BUILD",
+                external.display()
+            ),
+        );
+        let resolver = ExternalRepoResolver {
+            workspace: workspace.path().to_path_buf(),
+            bazel,
+            output_base,
+            startup_options: vec!["--max_idle_secs=17".to_owned()],
+            ..Default::default()
+        };
+
+        for _ in 0..3 {
+            assert_eq!(
+                resolver.resolve("queried").unwrap(),
+                external.join("queried+1.0")
+            );
+        }
+
+        let invocations = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            invocations.lines().collect::<Vec<_>>(),
+            [
+                "--max_idle_secs=17 mod dump_repo_mapping ",
+                "--max_idle_secs=17 query @queried//... --keep_going --output location",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_apparent_repo_mapping_skips_unusable_entries() {
+        let mapping = parse_apparent_repo_mapping(
+            "not json\n{\"apparent\": \"canonical+1.0\", \"\": \"skipped\", \"empty\": \"\", \"wrong_type\": 7}\n[\"not an object\"]\n",
+        );
+        assert_eq!(
+            mapping,
+            HashMap::from([("apparent".to_owned(), "canonical+1.0".to_owned())])
         );
     }
 
@@ -1523,6 +1727,7 @@ mod tests {
             workspace: workspace.path().to_path_buf(),
             bazel: PathBuf::from("bazel"),
             output_base: workspace.path().join("output"),
+            ..Default::default()
         };
         let modified = BTreeSet::new();
         let hasher = SourceHasher {
@@ -1562,6 +1767,7 @@ mod tests {
             workspace: workspace.path().to_path_buf(),
             bazel: PathBuf::from("bazel"),
             output_base: workspace.path().join("output"),
+            ..Default::default()
         };
         let modified = BTreeSet::new();
         let hasher = SourceHasher {
@@ -1615,6 +1821,7 @@ mod tests {
             workspace: workspace.path().to_path_buf(),
             bazel: PathBuf::from("bazel"),
             output_base: workspace.path().join("output"),
+            ..Default::default()
         };
         let modified = BTreeSet::new();
         let hasher = SourceHasher {
@@ -1665,6 +1872,7 @@ mod tests {
             workspace: workspace.path().to_path_buf(),
             bazel: PathBuf::from("bazel"),
             output_base: workspace.path().join("output"),
+            ..Default::default()
         };
         let modified = BTreeSet::new();
         let hasher = SourceHasher {

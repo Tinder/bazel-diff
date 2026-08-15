@@ -35,7 +35,7 @@ jobs:
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           CARGO_BAZEL_ISOLATED: 'false'
-        run: ~/go/bin/bazelisk test //:rust_tests //tools:benchmark_test --enable_bzlmod=true --enable_workspace=false
+        run: ~/go/bin/bazelisk test //:rust_tests //tools:benchmark_test //tools:perf_gate_test --enable_bzlmod=true --enable_workspace=false
 
   rust-candidate-e2e:
     name: Rust candidate E2E

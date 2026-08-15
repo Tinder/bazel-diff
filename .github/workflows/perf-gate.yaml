@@ -1,0 +1,85 @@
+name: Performance Gate
+
+# Fails the build when the Rust implementation is not faster than the Kotlin one.
+#
+# tools/perf_gate.py generates its own workloads (a synthetic `streamed_proto` fixture, the
+# workspace it describes, and hash-file pairs), so this job needs no checkout of another
+# repository, no Bazel server and no Hyperfine -- only the two bazel-diff binaries. Both are
+# built `-c opt`, because comparing a debug build against an optimized one measures the build
+# flags rather than the code.
+#
+# Runs on every pull request: "Rust is faster" is a property of the code, and a regression is
+# cheapest to catch in the change that caused it. The runner is a shared 2-vCPU VM, so the gate
+# pairs its measurements (both binaries every round, alternating which goes first) and takes
+# medians over several rounds rather than trusting a single timing. See
+# docs/kotlin-rust-perf-gate.md for the protocol and for what to do when this job fails.
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  perf-gate:
+    name: Rust vs Kotlin performance gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
+      - uses: actions/checkout@v4
+      - name: Unit-test the gate itself
+        env:
+          USE_BAZEL_VERSION: '8.x'
+          CARGO_BAZEL_ISOLATED: 'false'
+        run: ~/go/bin/bazelisk test //tools:perf_gate_test
+      - name: Build both implementations
+        env:
+          USE_BAZEL_VERSION: '8.x'
+          CARGO_BAZEL_ISOLATED: 'false'
+        run: ~/go/bin/bazelisk build -c opt //cli:bazel-diff //src:bazel-diff
+      - name: Run the performance gate
+        env:
+          USE_BAZEL_VERSION: '8.x'
+          CARGO_BAZEL_ISOLATED: 'false'
+        # Invoked directly rather than through `bazel run` so the JSON report lands in the
+        # workspace instead of the runfiles tree, and so Bazel is not holding the output-base
+        # lock (or competing for cores) while timings are taken.
+        run: |
+          python3 tools/perf_gate.py \
+            --kotlin-binary bazel-bin/cli/bazel-diff \
+            --rust-binary bazel-bin/src/bazel-diff \
+            --rounds 7 \
+            --warmup-rounds 2 \
+            --json perf-gate.json \
+            | tee perf-gate.txt
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo '## Rust vs Kotlin performance gate'
+            echo '```'
+            cat perf-gate.txt || echo 'the gate produced no report'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-gate-report
+          path: |
+            perf-gate.json
+            perf-gate.txt
+          if-no-files-found: ignore

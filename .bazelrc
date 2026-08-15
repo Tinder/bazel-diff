@@ -19,6 +19,26 @@ build:macos --host_cxxopt=-std=c++17
 build:windows --cxxopt=/std:c++17
 build:windows --host_cxxopt=/std:c++17
 
+# Release artifacts: `bazel build //release:bazel-diff-rust --config=release`.
+# CI uses nothing but this config, so the flags a published binary is built with
+# live here rather than in the workflow files. The C++ standard flags come from
+# the platform-specific configs above.
+#
+# rules_rust ignores Cargo profiles, so `-c opt` alone (opt-level=3,
+# debuginfo=0, strip=debuginfo) builds a *weaker* binary than
+# `cargo build --release` does under [profile.release] in Cargo.toml. The two
+# settings below restore the difference; keep them in sync with that profile.
+build:release -c opt
+
+# lto = "thin" in Cargo.toml. Cross-crate inlining/DCE at link time. rules_rust
+# skips it for build scripts and proc-macros, matching Cargo.
+build:release --@rules_rust//rust/settings:lto=thin
+
+# strip = true in Cargo.toml (`-c opt` only strips debuginfo, not the symbol
+# table). Passed as an extra flag because the strip level is otherwise a
+# property of the toolchain, which would change every build, not just releases.
+build:release --@rules_rust//rust/settings:extra_rustc_flags=-Cstrip=symbols
+
 # Avoid cache thrashing, but allow integration tests to find "bazel" on the PATH.
 common --incompatible_strict_action_env
 common --test_env=PATH

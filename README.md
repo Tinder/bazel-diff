@@ -929,6 +929,14 @@ Windows amd64: download
 `bazel-diff-rust-windows-amd64.exe` from the
 [latest release](https://github.com/Tinder/bazel-diff/releases/latest).
 
+Those assets are produced by Bazel alone -- CI runs nothing but the command below and uploads
+whatever lands in `bazel-bin/release/`, so `//release:bazel-diff-rust` names the binary for the
+platform it was built on (`bazel-diff-rust-<os>-<arch>`, plus `.exe` on Windows):
+
+```terminal
+make release_rust_binary   # bazel build //release:bazel-diff-rust --config=release
+```
+
 ### Performance gate
 
 The Rust candidate is expected to be faster than Kotlin, and CI enforces it. `make perf-gate`

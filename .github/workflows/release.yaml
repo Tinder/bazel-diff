@@ -44,15 +44,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # bazel_startup_flags shortens the output root on Windows because MSVC's
+        # link.exe is MAX_PATH-bound (260): under the default root the Rust
+        # stdlib rlib ...\librustc_std_workspace_alloc-<hash>.rlib comes to 263
+        # characters and the link fails with LNK1181. Keep in sync with the
+        # `deploy` job in ci.yaml, which is where this gets exercised per-PR.
         include:
           - os: ubuntu-latest
             asset: bazel-diff-rust-linux-amd64
+            bazel_startup_flags: ""
             bazel_extra_flags: ""
           - os: macos-latest
             asset: bazel-diff-rust-macos-arm64
+            bazel_startup_flags: ""
             bazel_extra_flags: ""
           - os: windows-latest
             asset: bazel-diff-rust-windows-amd64.exe
+            bazel_startup_flags: "--output_user_root=C:/b"
             bazel_extra_flags: "--legacy_external_runfiles"
     steps:
       - name: Checkout
@@ -79,26 +87,26 @@ jobs:
         run: |
           go install github.com/bazelbuild/bazelisk@latest
           echo "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      # //release:bazel-diff-rust names the binary for the platform Bazel built
+      # it for, so nothing here renames or relocates it: bazel-bin/release/ holds
+      # the published asset, and `gh release upload` keeps that file name. The
+      # build flags live in .bazelrc under --config=release.
       - name: Build Rust binary
         shell: bash
-        run: |
-          bazelisk build //:bazel-diff-rust -c opt \
-            --cxxopt=-std=c++17 \
-            --host_cxxopt=-std=c++17 \
-            ${{ matrix.bazel_extra_flags }}
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            src="bazel-bin/src/bazel-diff.exe"
-          else
-            src="bazel-bin/src/bazel-diff"
-          fi
-          cp "$src" "${{ matrix.asset }}"
+        env:
+          # Windows runs this under Git bash, whose MSYS runtime rewrites any
+          # argument starting with `//package` into a `/package` Windows path --
+          # Bazel then rejects "invalid package name '/release'". (`//:target`
+          # survived only because it has no path-like segment to convert.)
+          MSYS2_ARG_CONV_EXCL: '//'
+        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=release ${{ matrix.bazel_extra_flags }}
       - name: Upload release asset
         shell: bash
         env:
           TAG: ${{ inputs.tag_name || github.ref_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "$TAG" "${{ matrix.asset }}" \
+          gh release upload "$TAG" "bazel-bin/release/${{ matrix.asset }}" \
             --clobber \
             --repo "$GITHUB_REPOSITORY"
   finalize:

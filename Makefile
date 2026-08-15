@@ -15,12 +15,14 @@ release_deploy_jar:
 		//cli:bazel-diff_deploy.jar \
 		-c opt
 
+# Builds the same artifact CI publishes, named the same way:
+# bazel-bin/release/bazel-diff-rust-<os>-<arch>[.exe].
 .PHONY: release_rust_binary
 release_rust_binary:
 	bazel \
 		build \
-		//:bazel-diff-rust \
-		-c opt
+		//release:bazel-diff-rust \
+		--config=release
 
 .PHONY: build_rust
 build_rust:

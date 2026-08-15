@@ -87,6 +87,58 @@ py_test(
     deps = [":benchmark_lib"],
 )
 
+# Performance gate: asserts the Rust implementation is faster than the Kotlin one on
+# hermetic, synthetic workloads (no real workspace, no Bazel server, no Hyperfine --
+# see tools/benchmark.py for the real-workspace measurement instead).
+#
+# Deliberately a py_binary and not a test target: `bazel test` runs targets concurrently
+# in a sandbox, and timing two binaries against each other while other actions compete
+# for the same cores measures the scheduler, not the implementations. Run it on its own:
+# `make perf-gate` / `bazel run -c opt //tools:perf-gate`.
+py_library(
+    name = "perf_gate_lib",
+    srcs = [
+        "perf_gate.py",
+        "perf_workload.py",
+    ],
+    imports = ["."],
+    visibility = ["//visibility:private"],
+    deps = [
+        ":benchmark_lib",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_binary(
+    name = "perf-gate",
+    srcs = [
+        "perf_gate.py",
+        "perf_workload.py",
+    ],
+    data = [
+        "//cli:bazel-diff",
+        "//src:bazel-diff",
+    ],
+    main = "perf_gate.py",
+    python_version = "PY3",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":benchmark_lib",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+# The gate's own unit tests are hermetic and fast: they drive the runner with stub
+# binaries whose relative speed the test controls, so they can assert that the gate
+# fails when Rust is not faster -- something a run against the real binaries can never
+# prove.
+py_test(
+    name = "perf_gate_test",
+    srcs = ["perf_gate_test.py"],
+    python_version = "PY3",
+    deps = [":perf_gate_lib"],
+)
+
 # Note: the serve integration harnesses (serve_harness.py, serve_stress.py, serve_consistency.py)
 # are intentionally NOT wrapped in py_binary targets. They shell out to
 # `bazel build //cli:bazel-diff`, which would deadlock on the output-base lock if they were

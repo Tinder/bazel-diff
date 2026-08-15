@@ -913,6 +913,40 @@ implementation remains the default `//:bazel-diff` target and the released JAR.
 bazel run //:bazel-diff-rust -- --help
 ```
 
+GitHub Releases also ship prebuilt host-native binaries:
+
+```terminal
+# Linux amd64
+curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-amd64
+chmod +x bazel-diff-rust
+
+# macOS arm64
+curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-macos-arm64
+chmod +x bazel-diff-rust
+```
+
+Windows amd64: download
+`bazel-diff-rust-windows-amd64.exe` from the
+[latest release](https://github.com/Tinder/bazel-diff/releases/latest).
+
+### Performance gate
+
+The Rust candidate is expected to be faster than Kotlin, and CI enforces it. `make perf-gate`
+runs both binaries over generated workloads -- a synthetic `streamed_proto` graph plus hash-file
+pairs, with no real workspace, Bazel server or Hyperfine involved -- and exits non-zero unless
+Rust wins on median wall time, on start-up-adjusted wall time, and in every paired round.
+
+```terminal
+make perf-gate
+make perf-gate SCALE=4 ROUNDS=9 JSON=/tmp/perf-gate.json
+```
+
+Outputs are compared before timings are reported, so a "speedup" can never come from the two
+implementations doing different work. See
+[`docs/kotlin-rust-perf-gate.md`](docs/kotlin-rust-perf-gate.md) for the protocol, the workload
+list and what to do when the gate fails. For measuring the two implementations against a real
+repository instead, see [`docs/kotlin-vs-rust-benchmark.md`](docs/kotlin-vs-rust-benchmark.md).
+
 ## Code coverage
 
 CI enforces a minimum **90% line coverage** on production sources. Kotlin

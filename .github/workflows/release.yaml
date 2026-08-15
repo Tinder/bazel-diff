@@ -1,5 +1,6 @@
 # Cut a release whenever a new tag is pushed or via workflow_dispatch.
 # Uses bazel-contrib release ruleset: build, attest, and publish to GitHub Releases.
+# A separate matrix job attaches host-native Rust CLI binaries to the draft release.
 name: Release
 on:
   workflow_dispatch:
@@ -35,8 +36,73 @@ jobs:
       tag_name: ${{ inputs.tag_name || github.ref_name }}
     secrets:
       BCR_PUBLISH_TOKEN: ${{ secrets.BCR_PUBLISH_TOKEN }}
+  rust-binaries:
+    needs: release
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: bazel-diff-rust-linux-amd64
+            bazel_extra_flags: ""
+          - os: macos-latest
+            asset: bazel-diff-rust-macos-arm64
+            bazel_extra_flags: ""
+          - os: windows-latest
+            asset: bazel-diff-rust-windows-amd64.exe
+            bazel_extra_flags: "--legacy_external_runfiles"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.ref_name }}
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+      - name: Setup Bazelisk (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          go install github.com/bazelbuild/bazelisk@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Setup Bazelisk (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          go install github.com/bazelbuild/bazelisk@latest
+          echo "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build Rust binary
+        shell: bash
+        run: |
+          bazelisk build //:bazel-diff-rust -c opt \
+            --cxxopt=-std=c++17 \
+            --host_cxxopt=-std=c++17 \
+            ${{ matrix.bazel_extra_flags }}
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            src="bazel-bin/src/bazel-diff.exe"
+          else
+            src="bazel-bin/src/bazel-diff"
+          fi
+          cp "$src" "${{ matrix.asset }}"
+      - name: Upload release asset
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag_name || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG" "${{ matrix.asset }}" \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
   finalize:
-    needs: publish
+    needs: [publish, rust-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: write

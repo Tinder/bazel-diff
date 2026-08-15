@@ -697,7 +697,7 @@ First, add the following snippet to your project:
 #### Bzlmod snippet
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "40.0.0")
+bazel_dep(name = "bazel-diff", version = "40.0.2")
 ```
 
 You can now run the tool with:
@@ -912,6 +912,22 @@ implementation remains the default `//:bazel-diff` target and the released JAR.
 ```terminal
 bazel run //:bazel-diff-rust -- --help
 ```
+
+GitHub Releases also ship prebuilt host-native binaries:
+
+```terminal
+# Linux amd64
+curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-amd64
+chmod +x bazel-diff-rust
+
+# macOS arm64
+curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-macos-arm64
+chmod +x bazel-diff-rust
+```
+
+Windows amd64: download
+`bazel-diff-rust-windows-amd64.exe` from the
+[latest release](https://github.com/Tinder/bazel-diff/releases/latest).
 
 ### Performance gate
 

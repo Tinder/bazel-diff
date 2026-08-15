@@ -23,6 +23,15 @@ build:windows --host_cxxopt=/std:c++17
 common --incompatible_strict_action_env
 common --test_env=PATH
 
+# Lint first-party Rust crates with clippy on every build so issues surface
+# immediately instead of waiting for the `cargo clippy` pass in CI. The aspect
+# only attaches to rules_rust targets (required_providers gates it), skips
+# external crates, and turns warnings into errors by default — matching the
+# `cargo clippy -- -D warnings` gate in ci.yaml. Opt a target out with
+# tags = ["no-clippy"].
+build --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build --output_groups=+clippy_checks
+
 # Coverage runs use the Rust LCOV merger from //tools/coverage instead of
 # Bazel's built-in one. Besides merging each test's raw tracefiles into its
 # coverage.dat, it enforces the per-target line-coverage minimums declared

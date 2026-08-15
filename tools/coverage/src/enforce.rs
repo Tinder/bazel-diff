@@ -103,7 +103,7 @@ pub fn check(report: &Report, config: &Config) -> Outcome {
 
     let mut text = String::new();
     let _ = writeln!(text, "{:>8}  {:>17}  FILE", "COV%", "LINES (hit/total)");
-    rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.3.cmp(&b.3)));
+    rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.3.cmp(b.3)));
     for (pct, hit, found, path) in &rows {
         let _ = writeln!(text, "{pct:>7.2}%  {hit:>7} / {found:<7}  {path}");
     }

@@ -1,12 +1,12 @@
+# Delegates rather than repeating the tar invocation: release_prep.sh (release),
+# bcr_consumer.yaml and ci.yaml all pack through this one script, so the archive
+# you get locally is byte-for-byte the recipe that ships. The inlined copy that
+# used to live here had already drifted from it.
+# Note: the script lives under .github/, which the archive itself excludes, so
+# this target only works in a git checkout -- not inside an extracted release.
 .PHONY: release_source_archive
 release_source_archive:
-	mkdir -p archives
-	tar --exclude-vcs \
-		--exclude=bazel-* \
-		--exclude=target \
-		--exclude=.github \
-		--exclude=archives \
-		-zcf "archives/release.tar.gz" .
+	.github/workflows/pack_release_archive.sh archives/release.tar.gz
 
 .PHONY: release_deploy_jar
 release_deploy_jar:

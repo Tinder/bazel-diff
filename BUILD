@@ -46,7 +46,7 @@ license(
     license_kind = "@rules_license//licenses/spdx:BSD-3-Clause",
     license_text = "LICENSE",
     package_url = "https://github.com/Tinder/bazel-diff",
-    package_version = "40.0.2",
+    package_version = "41.0.0",
 )
 
 define_kt_toolchain(

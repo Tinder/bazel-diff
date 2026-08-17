@@ -48,18 +48,24 @@ jobs:
         # link.exe is MAX_PATH-bound (260): under the default root the Rust
         # stdlib rlib ...\librustc_std_workspace_alloc-<hash>.rlib comes to 263
         # characters and the link fails with LNK1181. Keep in sync with the
-        # `deploy` job in ci.yaml, which is where this gets exercised per-PR.
+        # `release-artifacts` job in ci.yaml, which is where this gets exercised
+        # per-PR -- including release_config, which builds the Linux asset
+        # statically against musl so it runs on any distribution rather than
+        # requiring the runner's glibc or newer.
         include:
           - os: ubuntu-latest
             asset: bazel-diff-rust-linux-amd64
+            release_config: release-musl
             bazel_startup_flags: ""
             bazel_extra_flags: ""
           - os: macos-latest
             asset: bazel-diff-rust-macos-arm64
+            release_config: release
             bazel_startup_flags: ""
             bazel_extra_flags: ""
           - os: windows-latest
             asset: bazel-diff-rust-windows-amd64.exe
+            release_config: release
             bazel_startup_flags: "--output_user_root=C:/b"
             bazel_extra_flags: "--legacy_external_runfiles"
     steps:
@@ -90,7 +96,7 @@ jobs:
       # //release:bazel-diff-rust names the binary for the platform Bazel built
       # it for, so nothing here renames or relocates it: bazel-bin/release/ holds
       # the published asset, and `gh release upload` keeps that file name. The
-      # build flags live in .bazelrc under --config=release.
+      # build flags live in .bazelrc under matrix.release_config.
       - name: Build Rust binary
         shell: bash
         env:
@@ -99,7 +105,12 @@ jobs:
           # Bazel then rejects "invalid package name '/release'". (`//:target`
           # survived only because it has no path-like segment to convert.)
           MSYS2_ARG_CONV_EXCL: '//'
-        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=release ${{ matrix.bazel_extra_flags }}
+        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} ${{ matrix.bazel_extra_flags }}
+      # Last gate before the asset is published: a glibc-linked binary here
+      # would strand every user on an older distribution than the runner.
+      - name: Assert Linux binary is statically linked
+        if: runner.os == 'Linux'
+        run: .github/workflows/assert_static_binary.sh "bazel-bin/release/${{ matrix.asset }}"
       - name: Upload release asset
         shell: bash
         env:

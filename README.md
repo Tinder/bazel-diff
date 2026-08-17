@@ -913,10 +913,11 @@ implementation remains the default `//:bazel-diff` target and the released JAR.
 bazel run //:bazel-diff-rust -- --help
 ```
 
-GitHub Releases also ship prebuilt host-native binaries:
+GitHub Releases also ship prebuilt binaries:
 
 ```terminal
-# Linux amd64
+# Linux amd64 (statically linked against musl -- no glibc requirement, so it
+# runs on any distribution, including Alpine and images older than the runner)
 curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-amd64
 chmod +x bazel-diff-rust
 
@@ -929,13 +930,19 @@ Windows amd64: download
 `bazel-diff-rust-windows-amd64.exe` from the
 [latest release](https://github.com/Tinder/bazel-diff/releases/latest).
 
-Those assets are produced by Bazel alone -- CI runs nothing but the command below and uploads
+Those assets are produced by Bazel alone -- CI runs nothing but the commands below and uploads
 whatever lands in `bazel-bin/release/`, so `//release:bazel-diff-rust` names the binary for the
-platform it was built on (`bazel-diff-rust-<os>-<arch>`, plus `.exe` on Windows):
+platform it was built for (`bazel-diff-rust-<os>-<arch>`, plus `.exe` on Windows):
 
 ```terminal
-make release_rust_binary   # bazel build //release:bazel-diff-rust --config=release
+make release_rust_binary         # bazel build //release:bazel-diff-rust --config=release
+make release_rust_binary_linux   # ... --config=release-musl
 ```
+
+`--config=release-musl` targets `//platforms:linux_x86_64_musl`, which selects a musl Rust std
+and a musl C toolchain, so the Linux asset is statically linked instead of inheriting the build
+runner's glibc as a version floor. It is a cross-compile: the same command produces the same
+`bazel-diff-rust-linux-amd64` on a glibc Linux host and on an Apple Silicon Mac.
 
 ### Performance gate
 

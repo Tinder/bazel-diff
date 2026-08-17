@@ -8,6 +8,7 @@ to assert that the gate *fails* when Rust is not faster.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -15,8 +16,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import perf_gate
 
 from perf_gate import (
     IMPLEMENTATIONS,
@@ -138,6 +142,31 @@ def write_stub(path: Path, *, sleep_seconds: float, output: str = "", log: Path 
     path.write_text("\n".join(lines) + "\n")
     path.chmod(0o755)
     return path
+
+
+@contextlib.contextmanager
+def fixed_timings(**seconds: float):
+    """Run the stubs for real, but report a fixed wall time per binary.
+
+    The gate only passes when the faster implementation wins *every* round, so
+    deciding the winner with a `sleep` in the stub makes the assertion a bet on
+    the scheduler: on a loaded runner -- CI running this alongside the rest of
+    the build -- process start-up noise dwarfs a 0.2s sleep and one round flips,
+    failing the test for reasons that have nothing to do with the gate. These
+    tests are about the gate's decision, not about measurement, so the elapsed
+    time is supplied here and keyed on the binary that ran. The stub still
+    executes, which keeps parity checking, output files and exit codes real, and
+    `TimeCommandTest` still covers the measurement itself.
+    """
+
+    real_time_command = perf_gate.time_command
+
+    def timed(command, **kwargs):
+        real_time_command(command, **kwargs)
+        return seconds[Path(command[0]).name]
+
+    with mock.patch.object(perf_gate, "time_command", timed):
+        yield
 
 
 def stub_workload(name: str = "stub", *, comparison: str = "none") -> PreparedWorkload:
@@ -935,41 +964,41 @@ def _stub_specs() -> list[WorkloadSpec]:
 
 
 class RunGateTest(unittest.TestCase):
-    def _binaries(self, root: Path, *, kotlin_sleep: float, rust_sleep: float):
+    def _binaries(self, root: Path):
         return {
-            "kotlin": write_stub(
-                root / "kotlin", sleep_seconds=kotlin_sleep, output="//:a\n"
-            ),
-            "rust": write_stub(root / "rust", sleep_seconds=rust_sleep, output="//:a\n"),
+            "kotlin": write_stub(root / "kotlin", sleep_seconds=0, output="//:a\n"),
+            "rust": write_stub(root / "rust", sleep_seconds=0, output="//:a\n"),
         }
 
     def test_passes_when_rust_is_consistently_faster(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            binaries = self._binaries(root, kotlin_sleep=0.2, rust_sleep=0.0)
-            reports = run_gate(
-                _stub_specs(),
-                binaries,
-                root / "fixtures",
-                rounds=2,
-                warmup_rounds=0,
-                thresholds=Thresholds(),
-            )
+            binaries = self._binaries(root)
+            with fixed_timings(kotlin=0.25, rust=0.05):
+                reports = run_gate(
+                    _stub_specs(),
+                    binaries,
+                    root / "fixtures",
+                    rounds=2,
+                    warmup_rounds=0,
+                    thresholds=Thresholds(),
+                )
             self.assertTrue(all(report.passed for report in reports))
             self.assertEqual([report.name for report in reports], [STARTUP_WORKLOAD, "stub-work"])
 
     def test_fails_when_rust_is_slower(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            binaries = self._binaries(root, kotlin_sleep=0.0, rust_sleep=0.2)
-            reports = run_gate(
-                _stub_specs(),
-                binaries,
-                root / "fixtures",
-                rounds=2,
-                warmup_rounds=0,
-                thresholds=Thresholds(),
-            )
+            binaries = self._binaries(root)
+            with fixed_timings(kotlin=0.05, rust=0.25):
+                reports = run_gate(
+                    _stub_specs(),
+                    binaries,
+                    root / "fixtures",
+                    rounds=2,
+                    warmup_rounds=0,
+                    thresholds=Thresholds(),
+                )
             self.assertFalse(all(report.passed for report in reports))
 
     def test_stops_on_a_parity_mismatch(self):
@@ -1029,27 +1058,28 @@ class MainTest(unittest.TestCase):
     def test_returns_zero_and_writes_json_when_rust_wins(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            kotlin = write_stub(root / "kotlin", sleep_seconds=0.2)
+            kotlin = write_stub(root / "kotlin", sleep_seconds=0.0)
             rust = write_stub(root / "rust", sleep_seconds=0.0)
             report = root / "report" / "perf.json"
-            exit_code = main(
-                [
-                    "--kotlin-binary",
-                    str(kotlin),
-                    "--rust-binary",
-                    str(rust),
-                    "--workload",
-                    STARTUP_WORKLOAD,
-                    "--rounds",
-                    "2",
-                    "--warmup-rounds",
-                    "0",
-                    "--json",
-                    str(report),
-                    "--fixture-dir",
-                    str(root / "fixtures"),
-                ]
-            )
+            with fixed_timings(kotlin=0.25, rust=0.05):
+                exit_code = main(
+                    [
+                        "--kotlin-binary",
+                        str(kotlin),
+                        "--rust-binary",
+                        str(rust),
+                        "--workload",
+                        STARTUP_WORKLOAD,
+                        "--rounds",
+                        "2",
+                        "--warmup-rounds",
+                        "0",
+                        "--json",
+                        str(report),
+                        "--fixture-dir",
+                        str(root / "fixtures"),
+                    ]
+                )
             self.assertEqual(exit_code, 0)
             document = json.loads(report.read_text())
             self.assertTrue(document["passed"])
@@ -1059,21 +1089,22 @@ class MainTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             kotlin = write_stub(root / "kotlin", sleep_seconds=0.0)
-            rust = write_stub(root / "rust", sleep_seconds=0.2)
-            exit_code = main(
-                [
-                    "--kotlin-binary",
-                    str(kotlin),
-                    "--rust-binary",
-                    str(rust),
-                    "--workload",
-                    STARTUP_WORKLOAD,
-                    "--rounds",
-                    "2",
-                    "--warmup-rounds",
-                    "0",
-                ]
-            )
+            rust = write_stub(root / "rust", sleep_seconds=0.0)
+            with fixed_timings(kotlin=0.05, rust=0.25):
+                exit_code = main(
+                    [
+                        "--kotlin-binary",
+                        str(kotlin),
+                        "--rust-binary",
+                        str(rust),
+                        "--workload",
+                        STARTUP_WORKLOAD,
+                        "--rounds",
+                        "2",
+                        "--warmup-rounds",
+                        "0",
+                    ]
+                )
             self.assertEqual(exit_code, 1)
 
     def test_returns_two_when_a_binary_fails(self):

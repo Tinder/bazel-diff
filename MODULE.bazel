@@ -70,11 +70,84 @@ bazel_dep(name = "rules_rust", version = "0.73.0")
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2021",
+    # Confine the stock toolchains to platforms that use the system libc. They
+    # are only constrained by os and cpu -- rules_rust has no musl constraint --
+    # so on //platforms:linux_x86_64_musl they would match alongside the musl
+    # toolchain below and resolution would silently take whichever of the two
+    # was registered first.
+    target_settings = ["//platforms:is_system_libc"],
     versions = ["1.90.0"],
 )
 use_repo(rust, "rust_toolchains")
 
 register_toolchains("@rust_toolchains//:all")
+
+# Rust std for the statically linked musl release binary, cross-compiled from a
+# glibc Linux host (the release runner) or from an Apple Silicon Mac (so a
+# maintainer can reproduce the published binary locally). rustc itself is the
+# ordinary glibc build: only the target changes, which is what keeps proc-macro
+# and build-script actions -- compiled for the exec platform -- loadable.
+# These toolchains join the same @rust_toolchains hub registered above.
+rust.repository_set(
+    name = "rust_musl_linux_x86_64",
+    edition = "2021",
+    exec_triple = "x86_64-unknown-linux-gnu",
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        "//platforms:musl",
+    ],
+    target_settings = ["//platforms:is_musl"],
+    target_triple = "x86_64-unknown-linux-musl",
+    versions = ["1.90.0"],
+)
+
+# rules_rust also emits a toolchain for a set's own exec triple, so the set
+# above comes with a glibc x86_64 Linux toolchain whether or not it is wanted.
+# Declaring its constraints keeps it from matching musl builds; the set-level
+# //platforms:is_musl gate keeps it out of ordinary builds, where the stock
+# toolchain serves and this one would otherwise be a second, identical
+# candidate whose repository is a redundant ~200MB download.
+rust.repository_set(
+    name = "rust_musl_linux_x86_64",
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        "//platforms:system_libc",
+    ],
+    target_triple = "x86_64-unknown-linux-gnu",
+)
+
+# The macOS-hosted half of the same story. No companion tag is needed here: this
+# set's exec-triple toolchain targets macOS, and a macOS platform can never
+# satisfy the set's //platforms:is_musl gate.
+rust.repository_set(
+    name = "rust_musl_macos_aarch64",
+    edition = "2021",
+    exec_triple = "aarch64-apple-darwin",
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        "//platforms:musl",
+    ],
+    target_settings = ["//platforms:is_musl"],
+    target_triple = "x86_64-unknown-linux-musl",
+    versions = ["1.90.0"],
+)
+
+# C toolchain for the musl target: a gcc cross-compiler bundled with musl libc,
+# used to link the Rust binary and to build the C in `ring` (rustls). Scoped to
+# //platforms:musl so it never displaces the host cc toolchain on ordinary
+# builds. dev_dependency because only bazel-diff's own release build needs it --
+# consumers of the module never resolve it.
+bazel_dep(name = "toolchains_musl", version = "0.1.27.bcr.1", dev_dependency = True)
+
+toolchains_musl = use_extension(
+    "@toolchains_musl//:toolchains_musl.bzl",
+    "toolchains_musl",
+    dev_dependency = True,
+)
+toolchains_musl.config(extra_target_compatible_with = ["//platforms:musl"])
 
 maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
 maven.install(

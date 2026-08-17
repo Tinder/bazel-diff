@@ -290,22 +290,31 @@ jobs:
         # ...rust_toolchain\lib\rustlib\x86_64-pc-windows-msvc\lib\
         # librustc_std_workspace_alloc-<hash>.rlib comes to 263 characters and
         # the link fails with LNK1181. C:/b buys back 35.
+        #
+        # release_config is `release-musl` on Linux: the published Linux binary
+        # is statically linked against musl so it does not inherit the runner's
+        # glibc as a floor on the systems it runs on. It is a cross-compile, not
+        # a different runner, so it stays in this row. macOS and Windows link
+        # their platform's own libc and use the plain `release` config.
         include:
           - os: ubuntu-latest
             java: '11'
             rust_asset: bazel-diff-rust-linux-amd64
+            release_config: release-musl
             bazel_startup_flags: ''
             bazel_extra_flags: ''
             upload_jar_and_archive: true
           - os: macos-latest
             java: '11'
             rust_asset: bazel-diff-rust-macos-arm64
+            release_config: release
             bazel_startup_flags: ''
             bazel_extra_flags: ''
             upload_jar_and_archive: false
           - os: windows-latest
             java: '11'
             rust_asset: bazel-diff-rust-windows-amd64.exe
+            release_config: release
             bazel_startup_flags: '--output_user_root=C:/b'
             bazel_extra_flags: '--legacy_external_runfiles'
             upload_jar_and_archive: false
@@ -357,9 +366,10 @@ jobs:
           if-no-files-found: error
       # //release:bazel-diff-rust names the binary for the platform Bazel built
       # it for, so this step neither renames nor relocates anything: whatever
-      # lands in bazel-bin/release/ is the published asset. --config=release
-      # carries the flags (see .bazelrc). `if-no-files-found: error` below is
-      # the assertion that Bazel's name still matches matrix.rust_asset.
+      # lands in bazel-bin/release/ is the published asset. matrix.release_config
+      # carries the flags (see .bazelrc) -- including, on Linux, the musl target
+      # platform. `if-no-files-found: error` below is the assertion that Bazel's
+      # name still matches matrix.rust_asset.
       - name: Build Rust binary
         shell: bash
         env:
@@ -368,7 +378,10 @@ jobs:
           # Bazel then rejects "invalid package name '/release'". (`//:target`
           # survived only because it has no path-like segment to convert.)
           MSYS2_ARG_CONV_EXCL: '//'
-        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=release ${{ matrix.bazel_extra_flags }}
+        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} ${{ matrix.bazel_extra_flags }}
+      - name: Assert Linux binary is statically linked
+        if: runner.os == 'Linux'
+        run: .github/workflows/assert_static_binary.sh "bazel-bin/release/${{ matrix.rust_asset }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.rust_asset }}

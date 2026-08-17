@@ -14,3 +14,18 @@ format_multirun(
     starlark = "@buildifier_prebuilt//:buildifier",
     visibility = ["//visibility:public"],
 )
+
+# The fixer for the rustfmt gate. //:rust_format_check only reports (it fails
+# the build, it does not rewrite files), so `bazel run //cli/format:rustfmt` is
+# how you satisfy it. Kept separate from `format` for the same reason
+# `buildifier` is: one language per target, so a cron on one never rewrites
+# another's files.
+#
+# `upstream_wrapper:rustfmt` is plain rustfmt from the registered toolchain --
+# not //tools/rustfmt, which is a Bazel-target-driven wrapper that does not take
+# the file list aspect_rules_lint passes it.
+format_multirun(
+    name = "rustfmt",
+    rust = "@rules_rust//tools/upstream_wrapper:rustfmt",
+    visibility = ["//visibility:public"],
+)

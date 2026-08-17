@@ -68,8 +68,15 @@ go_sdk.download(version = "1.23.1")
 bazel_dep(name = "rules_rust", version = "0.73.0")
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+
+# rustfmt_version is pinned to the same release as the toolchain instead of
+# rules_rust's default (a nightly), so the `rustfmt_aspect` gate in .bazelrc
+# checks formatting with the exact rustfmt a contributor gets from `cargo fmt`
+# on a stable toolchain. A nightly rustfmt can change defaults between releases,
+# which would fail CI on code that formats cleanly locally.
 rust.toolchain(
     edition = "2021",
+    rustfmt_version = "1.90.0",
     # Confine the stock toolchains to platforms that use the system libc. They
     # are only constrained by os and cpu -- rules_rust has no musl constraint --
     # so on //platforms:linux_x86_64_musl they would match alongside the musl
@@ -148,6 +155,34 @@ toolchains_musl = use_extension(
     dev_dependency = True,
 )
 toolchains_musl.config(extra_target_compatible_with = ["//platforms:musl"])
+
+# Toolchain pinned to `rust-version` in Cargo.toml, so the MSRV job in ci.yaml
+# can prove the crate still builds on the minimum Rust it advertises. Keep the
+# version in sync with `rust-version` in Cargo.toml.
+#
+# It lands in the same @rust_toolchains hub as everything above, but rules_rust
+# appends `repository_set` toolchains *after* the default ones, so it never wins
+# ordinary toolchain resolution. The MSRV job selects it explicitly with
+# --extra_toolchains, which outranks every registered toolchain. It carries the
+# same system-libc gate as the stock toolchains for the same reason they do: one
+# Rust toolchain should match any given build, never two.
+#
+# Linux/x86_64 only: a `repository_set` tag declares one exec triple, and the
+# MSRV job runs on ubuntu-latest. Building it on another host just falls back to
+# the default toolchain (no MSRV coverage), it does not fail.
+rust.repository_set(
+    name = "rust_msrv",
+    edition = "2021",
+    exec_triple = "x86_64-unknown-linux-gnu",
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        "//platforms:system_libc",
+    ],
+    target_settings = ["//platforms:is_system_libc"],
+    target_triple = "x86_64-unknown-linux-gnu",
+    versions = ["1.85.0"],
+)
 
 maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
 maven.install(

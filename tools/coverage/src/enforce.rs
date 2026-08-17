@@ -40,9 +40,10 @@ pub fn config_from_env(env: &BTreeMap<String, String>) -> Result<Option<Config>,
     let Some(raw) = env.get(MIN_LINE_COVERAGE_ENV) else {
         return Ok(None);
     };
-    let min: f64 = raw.trim().parse().map_err(|_| {
-        format!("{MIN_LINE_COVERAGE_ENV}='{raw}' is not a number (expected 0-100)")
-    })?;
+    let min: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{MIN_LINE_COVERAGE_ENV}='{raw}' is not a number (expected 0-100)"))?;
     if !(0.0..=100.0).contains(&min) {
         return Err(format!(
             "{MIN_LINE_COVERAGE_ENV}={min} is outside the valid range 0-100"

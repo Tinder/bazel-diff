@@ -26,8 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      # No host Rust toolchain: the Rust binary is built by Bazel, which brings
+      # its own rustc pinned in MODULE.bazel.
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:

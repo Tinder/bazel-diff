@@ -34,4 +34,6 @@ coverage_enforced_test(
     coverage_include = ["tools/coverage/src/"],
     crate = ":lcov_merger_lib",
     rule = rust_test,
+    # //:rust_clippy_check and //:rust_format_check name this target directly.
+    visibility = ["//:__pkg__"],
 )

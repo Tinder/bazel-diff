@@ -78,7 +78,10 @@ mod tests {
         assert_eq!(args.coverage_dir.as_deref(), Some("/tmp/cov"));
         assert_eq!(args.output_file.as_deref(), Some("/tmp/out.dat"));
         assert_eq!(args.filter_sources, vec!["/usr/bin/.+", "/usr/lib/.+"]);
-        assert_eq!(args.source_file_manifest.as_deref(), Some("/tmp/manifest.txt"));
+        assert_eq!(
+            args.source_file_manifest.as_deref(),
+            Some("/tmp/manifest.txt")
+        );
         assert!(args.unknown.is_empty());
     }
 

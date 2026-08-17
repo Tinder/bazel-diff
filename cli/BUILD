@@ -462,6 +462,18 @@ filegroup(
     ],
 )
 
+# //tests:e2e_test reads both fixture trees straight off disk (it is not a JVM
+# test, so it cannot pull the zips and goldens off a classpath the way
+# //cli:E2ETest does) and resolves them relative to the runfiles root.
+filegroup(
+    name = "e2e_resources",
+    srcs = [
+        "src/test/resources/fixture",
+        "src/test/resources/workspaces",
+    ],
+    visibility = ["//tests:__pkg__"],
+)
+
 java_binary(
     name = "ktfmt",
     main_class = "com.facebook.ktfmt.cli.Main",

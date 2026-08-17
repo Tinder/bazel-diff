@@ -43,9 +43,7 @@ impl FileCoverage {
     /// Fold `other` into `self`, summing hit counts.
     pub fn merge(&mut self, other: &FileCoverage) {
         for (name, line) in &other.function_lines {
-            self.function_lines
-                .entry(name.clone())
-                .or_insert(*line);
+            self.function_lines.entry(name.clone()).or_insert(*line);
         }
         for (name, hits) in &other.function_hits {
             *self.function_hits.entry(name.clone()).or_insert(0) += hits;
@@ -113,8 +111,9 @@ pub fn parse(text: &str) -> (Report, Vec<String>) {
                     Ok(n) => {
                         cov.function_lines.entry(name.to_string()).or_insert(n);
                     }
-                    Err(_) => warnings
-                        .push(format!("line {}: unparseable FN record '{line}'", idx + 1)),
+                    Err(_) => {
+                        warnings.push(format!("line {}: unparseable FN record '{line}'", idx + 1))
+                    }
                 },
                 None => warnings.push(format!("line {}: unparseable FN record '{line}'", idx + 1)),
             }
@@ -122,12 +121,15 @@ pub fn parse(text: &str) -> (Report, Vec<String>) {
             match rest.split_once(',') {
                 Some((hits, name)) => match hits.parse::<u64>() {
                     Ok(h) => *cov.function_hits.entry(name.to_string()).or_insert(0) += h,
-                    Err(_) => warnings
-                        .push(format!("line {}: unparseable FNDA record '{line}'", idx + 1)),
+                    Err(_) => warnings.push(format!(
+                        "line {}: unparseable FNDA record '{line}'",
+                        idx + 1
+                    )),
                 },
-                None => {
-                    warnings.push(format!("line {}: unparseable FNDA record '{line}'", idx + 1))
-                }
+                None => warnings.push(format!(
+                    "line {}: unparseable FNDA record '{line}'",
+                    idx + 1
+                )),
             }
         } else if let Some(rest) = line.strip_prefix("BRDA:") {
             match parse_brda(rest) {
@@ -138,9 +140,10 @@ pub fn parse(text: &str) -> (Report, Vec<String>) {
                         (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
                     };
                 }
-                None => {
-                    warnings.push(format!("line {}: unparseable BRDA record '{line}'", idx + 1))
-                }
+                None => warnings.push(format!(
+                    "line {}: unparseable BRDA record '{line}'",
+                    idx + 1
+                )),
             }
         }
         // LF/LH/FNF/FNH/BRF/BRH are recomputed on output; TN and anything
@@ -254,8 +257,10 @@ mod tests {
 
     #[test]
     fn merges_hit_counts_across_tracefiles() {
-        let (a, _) = parse("SF:x.rs\nDA:1,1\nDA:2,0\nFNDA:1,f\nFN:1,f\nBRDA:1,0,0,-\nend_of_record\n");
-        let (b, _) = parse("SF:x.rs\nDA:1,3\nDA:5,1\nFNDA:4,f\nFN:1,f\nBRDA:1,0,0,2\nend_of_record\n");
+        let (a, _) =
+            parse("SF:x.rs\nDA:1,1\nDA:2,0\nFNDA:1,f\nFN:1,f\nBRDA:1,0,0,-\nend_of_record\n");
+        let (b, _) =
+            parse("SF:x.rs\nDA:1,3\nDA:5,1\nFNDA:4,f\nFN:1,f\nBRDA:1,0,0,2\nend_of_record\n");
         let mut merged = Report::new();
         merge_reports(&mut merged, a);
         merge_reports(&mut merged, b);
@@ -290,8 +295,9 @@ mod tests {
 
     #[test]
     fn malformed_records_warn_but_do_not_fail() {
-        let (report, warnings) =
-            parse("SF:a.kt\nDA:notanumber,1\nFN:x\nFN:y,f\nFNDA:z,f\nBRDA:1,0\nDA:7,1\nend_of_record\n");
+        let (report, warnings) = parse(
+            "SF:a.kt\nDA:notanumber,1\nFN:x\nFN:y,f\nFNDA:z,f\nBRDA:1,0\nDA:7,1\nend_of_record\n",
+        );
         assert_eq!(report["a.kt"].line_hits, BTreeMap::from([(7, 1)]));
         assert_eq!(warnings.len(), 5);
     }
@@ -319,6 +325,9 @@ mod tests {
     #[test]
     fn emit_skips_function_and_branch_blocks_when_absent() {
         let (report, _) = parse("SF:a.py\nDA:1,0\nend_of_record\n");
-        assert_eq!(emit(&report), "SF:a.py\nDA:1,0\nLH:0\nLF:1\nend_of_record\n");
+        assert_eq!(
+            emit(&report),
+            "SF:a.py\nDA:1,0\nLH:0\nLF:1\nend_of_record\n"
+        );
     }
 }

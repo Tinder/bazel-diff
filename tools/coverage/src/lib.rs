@@ -229,7 +229,10 @@ mod tests {
         if let Some(manifest_content) = manifest {
             let manifest_path = dir.join("manifest.txt");
             fs::write(&manifest_path, manifest_content).unwrap();
-            argv.push(format!("--source_file_manifest={}", manifest_path.display()));
+            argv.push(format!(
+                "--source_file_manifest={}",
+                manifest_path.display()
+            ));
         }
         argv.extend(extra_args.iter().map(|s| s.to_string()));
         let env: BTreeMap<String, String> = env
@@ -331,7 +334,10 @@ mod tests {
     fn enforcement_passes_and_reports_in_the_log() {
         let result = invoke(
             "enforce_pass",
-            &[("a.dat", "SF:pkg/lib.go\nDA:1,1\nDA:2,1\nDA:3,0\nend_of_record\n")],
+            &[(
+                "a.dat",
+                "SF:pkg/lib.go\nDA:1,1\nDA:2,1\nDA:3,0\nend_of_record\n",
+            )],
             None,
             &[(enforce::MIN_LINE_COVERAGE_ENV, "60")],
             &[],
@@ -345,7 +351,10 @@ mod tests {
     fn enforcement_fails_with_distinct_exit_code() {
         let result = invoke(
             "enforce_fail",
-            &[("a.dat", "SF:pkg/lib.go\nDA:1,1\nDA:2,0\nDA:3,0\nend_of_record\n")],
+            &[(
+                "a.dat",
+                "SF:pkg/lib.go\nDA:1,1\nDA:2,0\nDA:3,0\nend_of_record\n",
+            )],
             None,
             &[
                 (enforce::MIN_LINE_COVERAGE_ENV, "90"),

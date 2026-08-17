@@ -7,6 +7,11 @@ on:
     branches: [ master ]
 
 jobs:
+  # Every Rust check here runs through Bazel, with no cargo and no host Rust
+  # toolchain: rules_rust downloads the compiler pinned in MODULE.bazel, so CI
+  # and a local `bazel test` agree on the exact rustc. //:rust_clippy_check and
+  # //:rust_format_check below stand in for `cargo clippy -- -D warnings` and
+  # `cargo fmt --all -- --check`.
   rust-candidate:
     name: Rust candidate (Bazel ${{ matrix.bazel }})
     runs-on: ubuntu-latest
@@ -15,10 +20,6 @@ jobs:
       matrix:
         bazel: ['8.x', '9.x']
     steps:
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
@@ -26,23 +27,16 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest
       - uses: actions/checkout@v4
-      - name: Check Cargo build and tests
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --all-targets --locked -- -D warnings
-          cargo test --lib --bins --locked
       - name: Check Bazel build and tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           CARGO_BAZEL_ISOLATED: 'false'
-        run: ~/go/bin/bazelisk test //:rust_tests //tools:benchmark_test //tools:perf_gate_test --enable_bzlmod=true --enable_workspace=false
+        run: ~/go/bin/bazelisk test //:rust_tests //:rust_clippy_check //:rust_format_check //tools:benchmark_test //tools:perf_gate_test --enable_bzlmod=true --enable_workspace=false
 
   rust-candidate-e2e:
     name: Rust candidate E2E
     runs-on: ubuntu-latest
     steps:
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
@@ -53,24 +47,53 @@ jobs:
         with:
           go-version: ^1.17
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest
+        # $BAZEL is the nested Bazel //tests:e2e_test spawns for each fixture
+        # workspace. Set explicitly because the fallback -- first `bazel` on
+        # PATH -- resolves to the *outer* Bazel's own binary inside a test,
+        # which ignores USE_BAZEL_VERSION. It reaches the test through the
+        # target's env_inherit.
+        run: |
+          go install github.com/bazelbuild/bazelisk@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          echo "BAZEL=$(go env GOPATH)/bin/bazelisk" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - name: Run native behavioral suite
         env:
+          # Read twice: by the outer bazelisk, and by the nested one.
           USE_BAZEL_VERSION: '8.x'
-        run: cargo test --locked --test e2e -- --test-threads=1
+        run: bazelisk test //tests:e2e_test --enable_bzlmod=true --enable_workspace=false
 
   rust-candidate-msrv:
     name: Rust candidate MSRV
     runs-on: ubuntu-latest
     steps:
-      - name: Setup Rust 1.85
-        uses: dtolnay/rust-toolchain@master
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
         with:
-          toolchain: '1.85.0'
+          go-version: ^1.17
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
       - uses: actions/checkout@v4
+      # Builds the crate with the toolchain pinned to `rust-version` in
+      # Cargo.toml instead of the repo default. --extra_toolchains outranks the
+      # registered toolchains, which is what makes the swap take: the MSRV
+      # toolchain is declared in MODULE.bazel but deliberately not preferred.
+      # Bazel has no `cargo check` equivalent, so this is a full build -- which
+      # is strictly stronger, since it links as well as type-checks.
+      #
+      # The lint output groups are dropped because this job asks one question:
+      # does the crate still compile on the oldest Rust it claims to support.
+      # 1.85's clippy has a different lint set than the pinned toolchain's, so
+      # leaving them on would fail this job for warnings that say nothing about
+      # MSRV. //:rust_clippy_check and //:rust_format_check own that gate.
       - name: Check declared minimum Rust version
-        run: cargo check --locked
+        env:
+          USE_BAZEL_VERSION: '8.x'
+        run: |
+          ~/go/bin/bazelisk build //src:bazel-diff \
+            --extra_toolchains=@rust_toolchains//:rust_msrv__x86_64-unknown-linux-gnu__stable \
+            --output_groups=-clippy_checks,-rustfmt_checks \
+            --enable_bzlmod=true --enable_workspace=false
 
   test-jre21:
     runs-on: ${{ matrix.os }}

@@ -34,6 +34,8 @@ rust_library(
     rustc_env = {
         "CARGO_PKG_VERSION": module_version() if module_version() else "unknown",
     },
+    # //:rust_clippy_check and //:rust_format_check name this crate directly.
+    visibility = ["//:__pkg__"],
     deps = all_crate_deps(
         package_name = "",
         normal = True,

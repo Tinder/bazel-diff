@@ -38,10 +38,13 @@ release_rust_binary_linux:
 build_rust:
 	bazel build //:bazel-diff-rust -c opt
 
+# Both go through Bazel so they use the same formatters CI gates on. `cargo fmt
+# --all` is not equivalent: it only sees the root crate, missing tools/coverage,
+# and it uses whatever rustfmt is on PATH rather than the pinned one.
 .PHONY: format
 format:
 	bazel run //cli/format
-	cargo fmt --all
+	bazel run //cli/format:rustfmt
 
 .PHONY: generate-readme
 generate-readme:

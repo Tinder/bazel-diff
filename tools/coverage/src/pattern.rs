@@ -84,7 +84,9 @@ impl Pattern {
                     Elem::Class(negated, ranges)
                 }
                 '*' | '+' | '?' => {
-                    return Err(format!("quantifier '{c}' with nothing to repeat in '{source}'"))
+                    return Err(format!(
+                        "quantifier '{c}' with nothing to repeat in '{source}'"
+                    ))
                 }
                 '(' | ')' | '|' | '{' | '}' | '^' | '$' => {
                     return Err(format!("unsupported regex syntax '{c}' in '{source}'"))
@@ -153,7 +155,11 @@ fn matches_here(terms: &[(Elem, Quant)], input: &[char], pos: usize) -> bool {
             while end < input.len() && elem_matches(elem, input[end]) {
                 end += 1;
             }
-            let min_end = if *quant == Quant::OneOrMore { pos + 1 } else { pos };
+            let min_end = if *quant == Quant::OneOrMore {
+                pos + 1
+            } else {
+                pos
+            };
             loop {
                 if end < min_end {
                     return false;

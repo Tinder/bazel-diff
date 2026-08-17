@@ -77,8 +77,23 @@ fn top_level_bazel_workspaces(root: &Path) -> Vec<PathBuf> {
     workspaces
 }
 
+/// Root that [`RESOURCES`] is resolved against.
+///
+/// Under Bazel the sources are not on disk at all: the fixtures reach the test
+/// as runfiles, laid out under `$TEST_SRCDIR/$TEST_WORKSPACE` at the same
+/// repo-relative paths. Under `cargo test` there are no runfiles, so fall back
+/// to the crate directory, which is the repo root.
 pub fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    match runfiles_root() {
+        Some(root) => root,
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+    }
+}
+
+fn runfiles_root() -> Option<PathBuf> {
+    let srcdir = std::env::var_os("TEST_SRCDIR")?;
+    let workspace = std::env::var_os("TEST_WORKSPACE")?;
+    Some(PathBuf::from(srcdir).join(workspace))
 }
 
 pub fn bazel() -> PathBuf {
@@ -133,8 +148,22 @@ pub fn supports_mod_show_repo() -> bool {
     version >= (8, 6, 0) && version != (9, 0, 0)
 }
 
+/// The `bazel-diff` binary under test.
+///
+/// `CARGO_BIN_EXE_*` is a cargo-only compile-time variable, so under Bazel the
+/// path comes from `BAZEL_DIFF_TEST_BINARY` (set by the `env` attr of
+/// `//tests:e2e_test` to a runfiles-relative path). Tests run the binary with
+/// `current_dir` set to a temp workspace, so it has to be made absolute here
+/// while the working directory is still the runfiles root.
 pub fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_bazel-diff"))
+    let Some(relative) = std::env::var_os("BAZEL_DIFF_TEST_BINARY") else {
+        return PathBuf::from(env!("CARGO_BIN_EXE_bazel-diff"));
+    };
+    let path = match runfiles_root() {
+        Some(root) => root.join(relative),
+        None => PathBuf::from(relative),
+    };
+    fs::canonicalize(&path).unwrap_or(path)
 }
 
 fn which(name: &str) -> Option<PathBuf> {

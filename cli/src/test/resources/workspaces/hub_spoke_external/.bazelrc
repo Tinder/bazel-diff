@@ -1,0 +1,4 @@
+# The prefix collision under test lives on the WORKSPACE //external: path;
+# run this fixture in WORKSPACE mode.
+common --noenable_bzlmod
+common --enable_workspace

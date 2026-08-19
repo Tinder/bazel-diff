@@ -669,9 +669,15 @@ fn transform_external_input<'a>(
     let is_main = input.starts_with("//") || input.starts_with("@//") || input.starts_with("@@//");
     if !is_main
         && input.starts_with('@')
-        && !fine_grained_repos
-            .iter()
-            .any(|repo| input.starts_with(repo))
+        // Match on the full repo name (up to the `//` boundary), not a bare string prefix: with
+        // hub-and-spoke repos (e.g. rules_python's `@pip` hub and `@pip_<pkg>` spokes), a bare
+        // prefix check makes every spoke label look like it belongs to the fine-grained hub, so it
+        // is never rewritten to its `//external:<spoke>` seed and changes stop propagating.
+        && !fine_grained_repos.iter().any(|repo| {
+            input
+                .strip_prefix(repo.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with("//"))
+        })
     {
         if let Some((repo, _)) = input.split_once("//") {
             return Cow::Owned(format!("//external:{}", repo.trim_start_matches('@')));
@@ -1220,6 +1226,41 @@ mod tests {
         assert_eq!(
             transform_external_input("@maven//:guava", &BTreeSet::new()),
             "//external:maven"
+        );
+    }
+
+    // Hub-and-spoke external repos (e.g. rules_python's `@pip` hub with one `@pip_<pkg>` spoke
+    // repo per package): a spoke label shares the hub name as a string prefix but is a different
+    // repo, so marking the hub fine-grained must not stop spoke inputs from being rewritten to
+    // their `//external:<spoke>` synthetic target -- that target is the only node whose hash flips
+    // when the spoke's pinned version changes.
+    #[test]
+    fn fine_grained_repo_name_does_not_prefix_match_spoke_repos() {
+        let fine_grained = BTreeSet::from(["@pip".to_owned()]);
+        assert_eq!(
+            transform_external_input("@pip_numpy//:lib", &fine_grained),
+            "//external:pip_numpy"
+        );
+        assert_eq!(
+            transform_external_input("@pip//numpy:pkg", &fine_grained),
+            "@pip//numpy:pkg"
+        );
+
+        let rule = Rule {
+            name: "@pip//numpy:pkg".into(),
+            rule_class: "alias".into(),
+            rule_input: vec!["@pip_numpy//:lib".into(), "@pip//numpy:other".into()],
+            ..Default::default()
+        };
+        // The spoke input keeps its raw label and gains the seed; the hub-internal input stays raw
+        // because the hub itself is fine-grained.
+        assert_eq!(
+            rule_inputs(&rule, false, &fine_grained),
+            [
+                "//external:pip_numpy",
+                "@pip//numpy:other",
+                "@pip_numpy//:lib"
+            ]
         );
     }
 

@@ -1929,6 +1929,20 @@ class E2ETest {
         hasModShowRepo)
   }
 
+  /**
+   * Skips the calling test unless the local Bazel still loads WORKSPACE files. Bazel 9 removed
+   * WORKSPACE support outright: `--enable_workspace` is inert there, so a fixture whose repos are
+   * declared in a WORKSPACE file has no `@repo` to query at all.
+   */
+  private fun assumeBazelSupportsWorkspace() {
+    val version = getBazelVersion()
+    org.junit.Assume.assumeNotNull(version)
+    val v = version!!
+    org.junit.Assume.assumeTrue(
+        "Requires a Bazel with WORKSPACE support (current: ${v.first}.${v.second}.${v.third})",
+        v.first < 9)
+  }
+
   @Test
   fun testGenerateHashesIsHermeticAcrossWorkspacePaths() {
     // Two checkouts of byte-identical sources at different absolute paths -- standing in for the
@@ -2684,6 +2698,112 @@ class E2ETest {
     assertThat(consumerImpacted)
         .transform(
             "//:consumer should be impacted (chain: inner_repo/data.txt -> @inner_repo:all_files -> @middle_repo:wrapped -> //:consumer). Got impacted: $impacted") {
+              it
+            }
+        .isEqualTo(true)
+  }
+
+  // ------------------------------------------------------------------------
+  // Fine-grained hub name must not prefix-match spoke repos (hub-and-spoke)
+  // ------------------------------------------------------------------------
+  // Hub-and-spoke external repos -- e.g. rules_python's pip_parse in WORKSPACE mode, with a
+  // `@pip` hub of alias packages and one `@pip_<pkg>` spoke repo per package -- put the
+  // change-detection signal in the spoke: bumping a pinned version rewrites the spoke
+  // repository rule's attrs, so only `//external:pip_<pkg>` flips. Consumers reference the hub
+  // alias (`@pip//numpy:pkg`), so the chain to the flipping seed runs through the alias's
+  // input on the spoke label. Related shape: the alias-wrap chain in issue #197.
+  //
+  // The `hub_spoke_external` fixture wires this up with a custom repository rule (WORKSPACE
+  // mode -- the collision lives on the classic //external: path):
+  //   @pip_numpy   -> spoke repo; `version` attr is the pin literal
+  //   @pip         -> hub repo; numpy/BUILD alias `pkg` -> @pip_numpy//:lib
+  //   //:consumer  -> genrule consuming @pip//numpy:pkg
+  //
+  // With `--fineGrainedHashExternalRepos @pip`, `transformRuleInput` used to match
+  // fine-grained repos by unbounded string prefix, so the alias's spoke input
+  // (`@pip_numpy//:lib`) looked like it belonged to the fine-grained hub and was never
+  // rewritten to `//external:pip_numpy` -- the only node whose hash flips on the version
+  // bump. Consumers were silently dropped from the impacted set. The fix in
+  // `BazelRule.transformRuleInput` matches repo names up to the `//` boundary.
+  @Test
+  fun testHubSpokeVersionBumpImpactsConsumer_fineGrainedHubPrefixCollision() {
+    // WORKSPACE-only fixture: Bazel 9 dropped WORKSPACE, so `@pip` does not exist there at all.
+    // The matching logic itself stays pinned on every version by `BazelRuleTest`.
+    assumeBazelSupportsWorkspace()
+
+    val workspaceA = copyTestWorkspace("hub_spoke_external")
+    val workspaceB = copyTestWorkspace("hub_spoke_external")
+
+    // Bump only the spoke's pinned version in B -- a repository-rule attribute literal, the
+    // same signal a real pip lockfile bump produces.
+    val workspaceFileInB = File(workspaceB, "WORKSPACE")
+    workspaceFileInB.writeText(
+        workspaceFileInB.readText().replace("version = \"1.0\"", "version = \"2.0\""))
+
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "starting_hashes.json")
+    val to = File(outputDir, "final_hashes.json")
+    val impactedTargetsOutput = File(outputDir, "impacted_targets.txt")
+
+    val cli = CommandLine(BazelDiff())
+
+    // Only the hub is listed: users name the repo their BUILD files reference and don't
+    // expect to enumerate every generated spoke behind it.
+    val fineGrained = "@pip"
+
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w",
+                workspaceA.absolutePath,
+                "-b",
+                "bazel",
+                "--fineGrainedHashExternalRepos",
+                fineGrained,
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "--fineGrainedHashExternalRepos",
+                fineGrained,
+                to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                workspaceB.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impactedTargetsOutput.absolutePath))
+        .isEqualTo(0)
+
+    val impacted = impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet()
+
+    // Sanity: the spoke seed must flip on the version bump; if this fails the fixture no
+    // longer reproduces the signal and the regression assertion below proves nothing.
+    val spokeSeedImpacted = impacted.any { it == "//external:pip_numpy" }
+    assertThat(spokeSeedImpacted)
+        .transform(
+            "//external:pip_numpy should be impacted by the spoke version bump. Got impacted: $impacted") {
+              it
+            }
+        .isEqualTo(true)
+
+    val consumerImpacted = impacted.any { it == "//:consumer" || it == "@@//:consumer" }
+    assertThat(consumerImpacted)
+        .transform(
+            "//:consumer should be impacted (chain: @pip//numpy:pkg -> @pip_numpy//:lib -> //external:pip_numpy). Got impacted: $impacted") {
               it
             }
         .isEqualTo(true)

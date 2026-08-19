@@ -1,0 +1,13 @@
+workspace(name = "hub_spoke_external_test")
+
+load("//:fake_pip.bzl", "fake_hub", "fake_spoke")
+
+fake_spoke(
+    name = "pip_numpy",
+    version = "1.0",
+)
+
+fake_hub(
+    name = "pip",
+    spoke = "pip_numpy",
+)

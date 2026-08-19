@@ -145,7 +145,12 @@ class BazelRule(private val rule: Build.Rule) {
   ): String {
     if (isNotMainRepo(ruleInput) &&
         ruleInput.startsWith("@") &&
-        fineGrainedHashExternalRepos.none { ruleInput.startsWith(it) }) {
+        // Match on the full repo name (up to the `//` boundary), not a bare string
+        // prefix: with hub-and-spoke repos (e.g. rules_python's `@pip` hub and
+        // `@pip_<pkg>` spokes), a bare prefix check makes every spoke label look
+        // like it belongs to the fine-grained hub, so it is never rewritten to its
+        // `//external:<spoke>` seed and changes stop propagating.
+        fineGrainedHashExternalRepos.none { ruleInput == it || ruleInput.startsWith("$it//") }) {
       val splitRule = ruleInput.split("//".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
       if (splitRule.size == 2) {
         var externalRule = splitRule[0]

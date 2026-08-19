@@ -189,6 +189,31 @@ class BazelRuleTest {
     assertThat(inputs).isEqualTo(listOf("//:legacy_dep"))
   }
 
+  // Hub-and-spoke external repos (e.g. rules_python's `@pip` hub with one `@pip_<pkg>` spoke
+  // repo per package): a spoke label shares the hub name as a string prefix but is a different
+  // repo, so marking the hub fine-grained must not stop spoke inputs from being rewritten to
+  // their `//external:<spoke>` synthetic target -- that target is the only node whose hash
+  // flips when the spoke's pinned version changes.
+  @Test
+  fun testFineGrainedRepoNameDoesNotPrefixMatchSpokeRepos() {
+    val rule =
+        Rule.newBuilder()
+            .setRuleClass("alias")
+            .setName("@pip//numpy:pkg")
+            .addRuleInput("@pip_numpy//:pkg")
+            .addRuleInput("@pip//numpy:other")
+            .build()
+
+    val inputs =
+        BazelRule(rule)
+            .ruleInputList(useCquery = false, fineGrainedHashExternalRepos = setOf("@pip"))
+
+    // The spoke input is rewritten to its seed; the hub-internal input stays raw because the
+    // hub itself is fine-grained.
+    assertThat(inputs.contains("//external:pip_numpy")).isEqualTo(true)
+    assertThat(inputs.contains("//external:pip")).isEqualTo(false)
+  }
+
   // Pins the round-trip behaviour `RuleHasher` relies on: the full encoded string lives in the
   // hash, and the bare label is what gets looked up in `allRulesMap` / `sourceDigests` and
   // tracked in `deps`. If the round-trip ever drifts the user-facing JSON would start emitting

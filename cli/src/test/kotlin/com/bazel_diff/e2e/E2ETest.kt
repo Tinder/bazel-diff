@@ -1929,6 +1929,20 @@ class E2ETest {
         hasModShowRepo)
   }
 
+  /**
+   * Skips the calling test unless the local Bazel still loads WORKSPACE files. Bazel 9 removed
+   * WORKSPACE support outright: `--enable_workspace` is inert there, so a fixture whose repos are
+   * declared in a WORKSPACE file has no `@repo` to query at all.
+   */
+  private fun assumeBazelSupportsWorkspace() {
+    val version = getBazelVersion()
+    org.junit.Assume.assumeNotNull(version)
+    val v = version!!
+    org.junit.Assume.assumeTrue(
+        "Requires a Bazel with WORKSPACE support (current: ${v.first}.${v.second}.${v.third})",
+        v.first < 9)
+  }
+
   @Test
   fun testGenerateHashesIsHermeticAcrossWorkspacePaths() {
     // Two checkouts of byte-identical sources at different absolute paths -- standing in for the
@@ -2713,6 +2727,10 @@ class E2ETest {
   // `BazelRule.transformRuleInput` matches repo names up to the `//` boundary.
   @Test
   fun testHubSpokeVersionBumpImpactsConsumer_fineGrainedHubPrefixCollision() {
+    // WORKSPACE-only fixture: Bazel 9 dropped WORKSPACE, so `@pip` does not exist there at all.
+    // The matching logic itself stays pinned on every version by `BazelRuleTest`.
+    assumeBazelSupportsWorkspace()
+
     val workspaceA = copyTestWorkspace("hub_spoke_external")
     val workspaceB = copyTestWorkspace("hub_spoke_external")
 

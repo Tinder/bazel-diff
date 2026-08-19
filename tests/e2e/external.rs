@@ -239,6 +239,11 @@ fn remote_proto_bump_impacts_consumer() {
 // rewritten to its seed, silently dropping consumers from the impacted set.
 #[test]
 fn hub_spoke_version_bump_impacts_consumer_behind_fine_grained_hub() {
+    // WORKSPACE-only fixture: Bazel 9 dropped WORKSPACE, so `@pip` does not exist there at all.
+    // The matching logic itself stays pinned on every version by the `hash` unit tests.
+    if !supports_workspace() {
+        return;
+    }
     let first = copy_workspace("hub_spoke_external");
     let second = copy_workspace("hub_spoke_external");
     edit(&second.path().join("WORKSPACE"), |text| {

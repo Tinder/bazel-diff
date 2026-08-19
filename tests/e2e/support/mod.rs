@@ -148,6 +148,12 @@ pub fn supports_mod_show_repo() -> bool {
     version >= (8, 6, 0) && version != (9, 0, 0)
 }
 
+/// Whether the local Bazel still loads WORKSPACE files. Bazel 9 removed WORKSPACE support
+/// outright, so a fixture whose repos are declared in a WORKSPACE file has no `@repo` to query.
+pub fn supports_workspace() -> bool {
+    bazel_version().0 < 9
+}
+
 /// The `bazel-diff` binary under test.
 ///
 /// `CARGO_BIN_EXE_*` is a cargo-only compile-time variable, so under Bazel the

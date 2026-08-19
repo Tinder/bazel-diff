@@ -229,6 +229,35 @@ fn remote_proto_bump_impacts_consumer() {
         .any(|label| label.ends_with("proto_dep//:greeting_java_proto")));
 }
 
+// Hub-and-spoke external repos -- e.g. rules_python's pip_parse in WORKSPACE mode, with a `@pip`
+// hub of alias packages and one `@pip_<pkg>` spoke repo per package -- keep the change-detection
+// signal in the spoke: bumping a pinned version rewrites the spoke repository rule's attrs, so only
+// `//external:pip_numpy` flips. Users list the hub their BUILD files reference (`@pip`) rather than
+// every generated spoke, and the consumer reaches the flipping seed through
+// `@pip//numpy:pkg -> @pip_numpy//:lib -> //external:pip_numpy`. Fine-grained matching used to be an
+// unbounded string prefix, so the spoke label looked like it belonged to the hub and was never
+// rewritten to its seed, silently dropping consumers from the impacted set.
+#[test]
+fn hub_spoke_version_bump_impacts_consumer_behind_fine_grained_hub() {
+    let first = copy_workspace("hub_spoke_external");
+    let second = copy_workspace("hub_spoke_external");
+    edit(&second.path().join("WORKSPACE"), |text| {
+        text.replace("version = \"1.0\"", "version = \"2.0\"")
+    });
+    let impacted = diff_local(
+        first.path(),
+        second.path(),
+        &["--fineGrainedHashExternalRepos", "@pip"],
+    );
+    // Sanity: if the spoke seed stops flipping the fixture no longer reproduces the signal and the
+    // consumer assertion below proves nothing.
+    assert!(impacted.contains("//external:pip_numpy"), "{impacted:?}");
+    assert!(
+        impacted.contains("//:consumer") || impacted.contains("@@//:consumer"),
+        "{impacted:?}"
+    );
+}
+
 fn diff_local(
     first: &std::path::Path,
     second: &std::path::Path,

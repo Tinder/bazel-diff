@@ -74,3 +74,14 @@ build --output_groups=+rustfmt_checks
 # Scoped to the `coverage` command, and Bazel only invokes an LCOV merger in
 # coverage mode anyway, so plain `bazel test` runs are never affected.
 coverage --coverage_output_generator=//tools/coverage:lcov_merger
+
+# Releases run the whole suite on one cold runner (see release.yaml), where the
+# long suites -- //tests:e2e_test (size = "enormous") and //cli:E2ETest
+# (timeout = "eternal") -- have no headroom left: v44.0.0 died on
+# "//tests:e2e_test TIMEOUT in 3600.0s" and published nothing. Per-size timeouts
+# are there to catch hangs on PRs, where each suite gets its own runner and an
+# overrun means something is wrong. A release has no such signal to give, so the
+# only bound left is GitHub's 6h job limit; a single value overrides all four
+# size categories. Not named `release`: `test` inherits `build` configs, so
+# --config=release would drag in -c opt and thin LTO and rebuild the world.
+test:no-test-timeouts --test_timeout=21600

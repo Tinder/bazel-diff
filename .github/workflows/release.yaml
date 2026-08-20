@@ -21,6 +21,10 @@ jobs:
     uses: bazel-contrib/.github/.github/workflows/release_ruleset.yaml@v7.4.0
     with:
       release_files: archives/*.*
+      # Same target pattern as the reusable workflow's default (`bazel test
+      # //...`), restated because the only way to add a flag is to replace the
+      # whole command. --config=no-test-timeouts is in .bazelrc.
+      bazel_test_command: "bazel test //... --config=no-test-timeouts"
       prerelease: false
       draft: true
       tag_name: ${{ inputs.tag_name || github.ref_name }}

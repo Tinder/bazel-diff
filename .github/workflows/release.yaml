@@ -1,6 +1,21 @@
 # Cut a release whenever a new tag is pushed or via workflow_dispatch.
 # Uses bazel-contrib release ruleset: build, attest, and publish to GitHub Releases.
 # A separate matrix job attaches host-native Rust CLI binaries to the draft release.
+#
+# The test suites gate the release from two independent jobs -- `java-tests` and
+# `rust-tests` -- rather than from one `bazel test //...` inside the reusable
+# workflow's build job. They run concurrently on their own runners, so a Kotlin
+# failure no longer cancels the Rust suite's results (or vice versa): a release
+# candidate gets both verdicts from one run instead of one verdict at a time.
+# It also splits the two long suites -- //cli:E2ETest and //tests:e2e_test --
+# across two cold runners, each with its own 6h GitHub job limit.
+#
+# Between them the three test commands cover every test in //...; keep it that
+# way when adding a package:
+#   java-tests  //cli/...                                   (Kotlin/Java)
+#   rust-tests  //src/..., //tests/..., //tools/coverage/..., the Rust lint
+#               gates //:rust_clippy_check and //:rust_format_check
+#   release     //tools:all, //tools/go/...       (Python/Go release tooling)
 name: Release
 on:
   workflow_dispatch:
@@ -17,14 +32,91 @@ permissions:
   attestations: write
   contents: write
 jobs:
+  # The Kotlin/Java half of the release gate. //cli/... is the whole JVM CLI,
+  # including //cli:E2ETest (timeout = "eternal"), which is why this suite gets
+  # a runner to itself. Java is set up explicitly even though .bazelrc pins a
+  # hermetic --java_runtime_version for tests, so this job matches what the
+  # `test-jre21` job in ci.yaml already runs these suites under.
+  java-tests:
+    name: Java tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.ref_name }}
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+      - name: Setup Bazelisk
+        run: |
+          go install github.com/bazelbuild/bazelisk@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      # No USE_BAZEL_VERSION: bazelisk takes the version from .bazelversion,
+      # which is the one a release is cut with. --config=no-test-timeouts is in
+      # .bazelrc; it is what keeps the long suites from timing out on a cold
+      # release runner (see the comment on that config).
+      - name: Run Kotlin/Java tests
+        run: bazelisk test //cli/... --config=no-test-timeouts
+  # The Rust half: the three Rust packages plus the two lint gates, which live
+  # in the root package because they pin their own roots (see //BUILD). The
+  # packages are named recursively rather than through the //:rust_tests suite
+  # ci.yaml uses, so a Rust test added to //src or //tests is in the release
+  # gate whether or not it also gets added to that hand-maintained suite.
+  #
+  # //tests:e2e_test spawns a nested Bazel per fixture workspace, so this job
+  # needs the Java and $BAZEL setup that `rust-candidate-e2e` in ci.yaml uses --
+  # without $BAZEL the suite shells out to the outer Bazel's own binary.
+  rust-tests:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.ref_name }}
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+      - name: Setup Bazelisk
+        run: |
+          go install github.com/bazelbuild/bazelisk@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          echo "BAZEL=$(go env GOPATH)/bin/bazelisk" >> "$GITHUB_ENV"
+      - name: Run Rust tests
+        run: |
+          bazelisk test \
+            //src/... \
+            //tests/... \
+            //tools/coverage/... \
+            //:rust_clippy_check \
+            //:rust_format_check \
+            --config=no-test-timeouts
   release:
+    # Both suites gate the release, but neither gates the other: they run
+    # concurrently and the reusable workflow starts only once both are green.
+    needs: [java-tests, rust-tests]
     uses: bazel-contrib/.github/.github/workflows/release_ruleset.yaml@v7.4.0
     with:
       release_files: archives/*.*
-      # Same target pattern as the reusable workflow's default (`bazel test
-      # //...`), restated because the only way to add a flag is to replace the
-      # whole command. --config=no-test-timeouts is in .bazelrc.
-      bazel_test_command: "bazel test //... --config=no-test-timeouts"
+      # Replaces the reusable workflow's default (`bazel test //...`), which is
+      # the only way to change what its build job runs. The Kotlin and Rust
+      # suites moved to the two jobs above; what is left is the Python and Go
+      # release tooling, which is fast enough to keep here rather than spend a
+      # third runner on. --config=no-test-timeouts is in .bazelrc.
+      bazel_test_command: "bazel test //tools:all //tools/go/... --config=no-test-timeouts"
       prerelease: false
       draft: true
       tag_name: ${{ inputs.tag_name || github.ref_name }}

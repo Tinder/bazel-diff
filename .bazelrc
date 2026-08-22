@@ -75,9 +75,10 @@ build --output_groups=+rustfmt_checks
 # coverage mode anyway, so plain `bazel test` runs are never affected.
 coverage --coverage_output_generator=//tools/coverage:lcov_merger
 
-# Releases run the whole suite on one cold runner (see release.yaml), where the
-# long suites -- //tests:e2e_test (size = "enormous") and //cli:E2ETest
-# (timeout = "eternal") -- have no headroom left: v44.0.0 died on
+# Releases run the suite on cold runners (see release.yaml, which splits it
+# into a Java job and a Rust job), where the long suites -- //tests:e2e_test
+# (size = "enormous") and //cli:E2ETest (timeout = "eternal") -- have no
+# headroom left: v44.0.0 died on
 # "//tests:e2e_test TIMEOUT in 3600.0s" and published nothing. Per-size timeouts
 # are there to catch hangs on PRs, where each suite gets its own runner and an
 # overrun means something is wrong. A release has no such signal to give, so the

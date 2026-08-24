@@ -325,6 +325,9 @@ fn flatten_options(values: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Folds `.` and `..` away lexically. Only meaningful on an absolute path:
+/// applied to a relative one, `.` and a leading `..` have nothing to resolve
+/// against and simply vanish, so callers go through [`parse_normalized_path`].
 fn normalize_path(path: PathBuf) -> PathBuf {
     path.components()
         .fold(PathBuf::new(), |mut normalized, component| {
@@ -339,8 +342,21 @@ fn normalize_path(path: PathBuf) -> PathBuf {
         })
 }
 
+/// Resolves a path argument against the process working directory, then
+/// normalizes it.
+///
+/// Making the path absolute *first* is what keeps a relative argument
+/// meaningful. Normalizing `.` on its own drops its only component and leaves
+/// the empty path, which then fails every `Command::current_dir` with a
+/// `chdir("")` ENOENT that names the Bazel binary rather than the workspace;
+/// normalizing `../sibling` on its own pops nothing and silently yields
+/// `sibling`. Anchoring to the working directory gives both the directory the
+/// user meant, matching the Kotlin CLI. See
+/// <https://github.com/Tinder/bazel-diff/issues/470>.
 fn parse_normalized_path(value: &str) -> Result<PathBuf, String> {
-    Ok(normalize_path(PathBuf::from(value)))
+    let absolute = std::path::absolute(value)
+        .map_err(|error| format!("failed to resolve path {value:?}: {error}"))?;
+    Ok(normalize_path(absolute))
 }
 
 fn read_lines(path: Option<&Path>) -> Result<BTreeSet<PathBuf>> {
@@ -859,70 +875,71 @@ mod tests {
         );
     }
 
-    /// Reproducer for <https://github.com/Tinder/bazel-diff/issues/470>: the
-    /// root cause.
+    /// Regression test for <https://github.com/Tinder/bazel-diff/issues/470>.
     ///
-    /// `--workspacePath` runs through [`parse_normalized_path`], which folds
-    /// every `CurDir` component away. A path that is *made* of `CurDir`
-    /// components -- `.`, `./`, or anything that cancels out via `..` --
-    /// therefore normalizes to the empty `PathBuf` rather than to the
-    /// directory the user named.
-    ///
-    /// The same parser backs `--cacheDir`, so it has the same hole.
-    ///
-    /// Ignored so CI stays green until this is fixed. Run it with
-    /// `cargo test --bin bazel-diff -- --ignored issue_470`.
+    /// `--workspacePath` and `--cacheDir` are anchored to the process working
+    /// directory before they are normalized. Without that, a path built only
+    /// out of `.`/`..` components collapsed to the empty path, and a leading
+    /// `..` was silently dropped.
     #[test]
-    #[ignore = "reproduces Tinder/bazel-diff#470: relative --workspacePath normalizes to the empty path"]
-    fn issue_470_relative_workspace_path_survives_normalization() {
+    fn relative_path_arguments_resolve_against_the_working_directory() {
+        let working_directory = std::env::current_dir().unwrap();
         for value in [".", "./", "./nested/..", "nested/.."] {
-            let parsed = parse_normalized_path(value).unwrap();
-            assert_ne!(
-                parsed,
-                PathBuf::new(),
-                "--workspacePath {value} normalized to the empty path"
+            assert_eq!(
+                parse_normalized_path(value).unwrap(),
+                working_directory,
+                "--workspacePath {value} should be the working directory"
             );
         }
-
-        // A relative path that does not cancel out is left relative, and works,
-        // which is why the empty-path case reads as an unrelated failure.
         assert_eq!(
             parse_normalized_path("nested").unwrap(),
-            PathBuf::from("nested")
+            working_directory.join("nested")
         );
+        assert_eq!(
+            parse_normalized_path("./nested/inner/..").unwrap(),
+            working_directory.join("nested")
+        );
+
+        // A leading `..` has a parent to pop now that the path is absolute.
+        assert_eq!(
+            parse_normalized_path("../sibling").unwrap(),
+            working_directory.parent().unwrap().join("sibling")
+        );
+
+        // Absolute arguments keep the normalization they always had.
+        let absolute = working_directory.join("nested/inner/..");
+        assert_eq!(
+            parse_normalized_path(absolute.to_str().unwrap()).unwrap(),
+            working_directory.join("nested")
+        );
+
+        // The empty path never named a directory; it is now rejected instead of
+        // being passed to `chdir`.
+        assert!(parse_normalized_path("").is_err());
     }
 
-    /// Reproducer for <https://github.com/Tinder/bazel-diff/issues/470>: the
-    /// symptom a user actually sees.
+    /// Regression test for <https://github.com/Tinder/bazel-diff/issues/470>:
+    /// the symptom users hit.
     ///
     /// [`BazelOptions::command`] does `command.current_dir(&self.workspace)`.
-    /// With the empty workspace from the test above, the child's `chdir("")`
-    /// fails with `ENOENT`, and `std::process::Command` reports that as a spawn
-    /// failure -- so the error names the *Bazel binary*, which exists and is
-    /// executable, instead of the workspace:
+    /// When `-w .` normalized to the empty path the child's `chdir("")` failed,
+    /// and `std::process::Command` surfaced that as a spawn failure -- so the
+    /// error named the *Bazel binary*, which exists and is executable, instead
+    /// of the workspace:
     ///
     /// ```text
     /// [Error] failed to execute /path/to/bazel: No such file or directory (os error 2)
     /// ```
-    ///
-    /// Expected: `-w .` either resolves against the process working directory
-    /// (as the Kotlin CLI does) or is rejected with a message naming
-    /// `--workspacePath`.
-    ///
-    /// Ignored so CI stays green until this is fixed. Run it with
-    /// `cargo test --bin bazel-diff -- --ignored issue_470`.
     #[cfg(unix)]
     #[test]
-    #[ignore = "reproduces Tinder/bazel-diff#470: `-w .` makes every Bazel spawn fail with ENOENT"]
-    fn issue_470_relative_workspace_path_spawns_bazel_in_the_workspace() {
+    fn relative_workspace_path_spawns_bazel_in_the_working_directory() {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
         let directory = tempfile::tempdir().unwrap();
         let stub_bazel = directory.path().join("bazel");
-        fs::write(&stub_bazel, "#!/bin/sh\necho 'Build label: 8.0.0'\n").unwrap();
+        fs::write(&stub_bazel, "#!/bin/sh\npwd -P\n").unwrap();
         fs::set_permissions(&stub_bazel, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(stub_bazel.is_file(), "the stub Bazel exists");
 
         let cli = parse(&[
             "bazel-diff",
@@ -938,25 +955,25 @@ mod tests {
         };
         let options = bazel_options(&args.hashing, false).unwrap();
 
-        // Mirrors BazelOptions::command(): the only difference from a working
-        // run is the workspace the child is chdir'd into.
-        let spawned = Command::new(&options.bazel)
+        // Mirrors BazelOptions::command().
+        let output = Command::new(&options.bazel)
             .current_dir(&options.workspace)
             .arg("version")
-            .output();
+            .output()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "`-w .` gave workspace {:?}, so spawning {} failed: {error}",
+                    options.workspace,
+                    options.bazel.display()
+                )
+            });
 
-        match spawned {
-            Ok(output) => assert!(
-                output.status.success(),
-                "stub Bazel should have run: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-            Err(error) => panic!(
-                "`-w .` gave workspace {:?}, so spawning {} failed: {error}",
-                options.workspace,
-                options.bazel.display()
-            ),
-        }
+        assert!(output.status.success());
+        assert_eq!(
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()),
+            std::env::current_dir().unwrap(),
+            "the child should run in the working directory `.` named"
+        );
     }
 
     #[test]

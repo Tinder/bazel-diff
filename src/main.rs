@@ -859,6 +859,106 @@ mod tests {
         );
     }
 
+    /// Reproducer for <https://github.com/Tinder/bazel-diff/issues/470>: the
+    /// root cause.
+    ///
+    /// `--workspacePath` runs through [`parse_normalized_path`], which folds
+    /// every `CurDir` component away. A path that is *made* of `CurDir`
+    /// components -- `.`, `./`, or anything that cancels out via `..` --
+    /// therefore normalizes to the empty `PathBuf` rather than to the
+    /// directory the user named.
+    ///
+    /// The same parser backs `--cacheDir`, so it has the same hole.
+    ///
+    /// Ignored so CI stays green until this is fixed. Run it with
+    /// `cargo test --bin bazel-diff -- --ignored issue_470`.
+    #[test]
+    #[ignore = "reproduces Tinder/bazel-diff#470: relative --workspacePath normalizes to the empty path"]
+    fn issue_470_relative_workspace_path_survives_normalization() {
+        for value in [".", "./", "./nested/..", "nested/.."] {
+            let parsed = parse_normalized_path(value).unwrap();
+            assert_ne!(
+                parsed,
+                PathBuf::new(),
+                "--workspacePath {value} normalized to the empty path"
+            );
+        }
+
+        // A relative path that does not cancel out is left relative, and works,
+        // which is why the empty-path case reads as an unrelated failure.
+        assert_eq!(
+            parse_normalized_path("nested").unwrap(),
+            PathBuf::from("nested")
+        );
+    }
+
+    /// Reproducer for <https://github.com/Tinder/bazel-diff/issues/470>: the
+    /// symptom a user actually sees.
+    ///
+    /// [`BazelOptions::command`] does `command.current_dir(&self.workspace)`.
+    /// With the empty workspace from the test above, the child's `chdir("")`
+    /// fails with `ENOENT`, and `std::process::Command` reports that as a spawn
+    /// failure -- so the error names the *Bazel binary*, which exists and is
+    /// executable, instead of the workspace:
+    ///
+    /// ```text
+    /// [Error] failed to execute /path/to/bazel: No such file or directory (os error 2)
+    /// ```
+    ///
+    /// Expected: `-w .` either resolves against the process working directory
+    /// (as the Kotlin CLI does) or is rejected with a message naming
+    /// `--workspacePath`.
+    ///
+    /// Ignored so CI stays green until this is fixed. Run it with
+    /// `cargo test --bin bazel-diff -- --ignored issue_470`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "reproduces Tinder/bazel-diff#470: `-w .` makes every Bazel spawn fail with ENOENT"]
+    fn issue_470_relative_workspace_path_spawns_bazel_in_the_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let directory = tempfile::tempdir().unwrap();
+        let stub_bazel = directory.path().join("bazel");
+        fs::write(&stub_bazel, "#!/bin/sh\necho 'Build label: 8.0.0'\n").unwrap();
+        fs::set_permissions(&stub_bazel, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(stub_bazel.is_file(), "the stub Bazel exists");
+
+        let cli = parse(&[
+            "bazel-diff",
+            "generate-hashes",
+            "-w",
+            ".",
+            "-b",
+            stub_bazel.to_str().unwrap(),
+            "hashes.json",
+        ]);
+        let Commands::GenerateHashes(args) = cli.command else {
+            panic!("expected generate-hashes");
+        };
+        let options = bazel_options(&args.hashing, false).unwrap();
+
+        // Mirrors BazelOptions::command(): the only difference from a working
+        // run is the workspace the child is chdir'd into.
+        let spawned = Command::new(&options.bazel)
+            .current_dir(&options.workspace)
+            .arg("version")
+            .output();
+
+        match spawned {
+            Ok(output) => assert!(
+                output.status.success(),
+                "stub Bazel should have run: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => panic!(
+                "`-w .` gave workspace {:?}, so spawning {} failed: {error}",
+                options.workspace,
+                options.bazel.display()
+            ),
+        }
+    }
+
     #[test]
     fn reads_and_trims_seed_and_repository_files() {
         let directory = tempfile::tempdir().unwrap();

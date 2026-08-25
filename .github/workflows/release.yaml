@@ -73,6 +73,8 @@ jobs:
   # //tests:e2e_test spawns a nested Bazel per fixture workspace, so this job
   # needs the Java and $BAZEL setup that `rust-candidate-e2e` in ci.yaml uses --
   # without $BAZEL the suite shells out to the outer Bazel's own binary.
+  # USE_BAZEL_VERSION keeps those nested Bazelisk processes on the same exact
+  # release version the outer invocation reads from .bazelversion.
   rust-tests:
     name: Rust tests
     runs-on: ubuntu-latest
@@ -95,6 +97,7 @@ jobs:
           go install github.com/bazelbuild/bazelisk@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           echo "BAZEL=$(go env GOPATH)/bin/bazelisk" >> "$GITHUB_ENV"
+          echo "USE_BAZEL_VERSION=$(<.bazelversion)" >> "$GITHUB_ENV"
       - name: Run Rust tests
         run: |
           bazelisk test \
@@ -103,7 +106,15 @@ jobs:
             //tools/coverage/... \
             //:rust_clippy_check \
             //:rust_format_check \
-            --config=no-test-timeouts
+            --config=no-test-timeouts \
+            --test_output=errors
+      - name: Upload Rust test logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-rust-test-logs
+          path: bazel-testlogs/
+          if-no-files-found: warn
   release:
     # Both suites gate the release, but neither gates the other: they run
     # concurrently and the reusable workflow starts only once both are green.

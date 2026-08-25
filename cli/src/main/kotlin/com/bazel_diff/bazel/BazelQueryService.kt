@@ -110,9 +110,10 @@ class BazelQueryService(
     // targets.
     val compatibleTargetSet =
         if (useCquery) {
-          runQuery(query, useCquery = true, outputCompatibleTargets = true).useLines {
-            it.filter { it.isNotBlank() }.toSet()
-          }
+          val compatibleFile = runQuery(query, useCquery = true, outputCompatibleTargets = true)
+          val set = compatibleFile.useLines { it.filter { it.isNotBlank() }.toSet() }
+          compatibleFile.delete()
+          set
         } else {
           emptySet()
         }
@@ -150,6 +151,7 @@ class BazelQueryService(
           }
         }
 
+    outputFile.delete()
     return targets
   }
 
@@ -160,9 +162,8 @@ class BazelQueryService(
       outputCompatibleTargets: Boolean = false
   ): File {
     val queryFile = Files.createTempFile(null, ".txt").toFile()
-    queryFile.deleteOnExit()
     val outputFile = Files.createTempFile(null, ".bin").toFile()
-    outputFile.deleteOnExit()
+    var cqueryStarlarkFile: File? = null
 
     queryFile.writeText(query)
 
@@ -189,9 +190,9 @@ class BazelQueryService(
             if (outputCompatibleTargets) {
               add("starlark")
               add("--starlark:file")
-              val cqueryStarlarkFile = Files.createTempFile(null, ".cquery").toFile()
-              cqueryStarlarkFile.deleteOnExit()
-              cqueryStarlarkFile.writeText(
+              val starlarkFile = Files.createTempFile(null, ".cquery").toFile()
+              cqueryStarlarkFile = starlarkFile
+              starlarkFile.writeText(
                   """
                     def format(target):
                         if providers(target) == None:
@@ -204,7 +205,7 @@ class BazelQueryService(
                         return ""
                     """
                       .trimIndent())
-              add(cqueryStarlarkFile.toString())
+              add(starlarkFile.toString())
             } else {
               add(if (canUseStreamedProtoWithCquery) "streamed_proto" else "proto")
             }
@@ -261,7 +262,11 @@ class BazelQueryService(
             destroyForcibly = true,
         )
 
+    queryFile.delete()
+    cqueryStarlarkFile?.delete()
+
     if (!allowedExitCodes.contains(result.resultCode)) {
+      outputFile.delete()
       val stderrText = stderrLines.joinToString("\n")
       logger.w { "Bazel query failed with exit code ${result.resultCode}" }
       if (indicatesExternalPackageUnavailable(stderrText)) {
@@ -328,7 +333,6 @@ class BazelQueryService(
       return emptyList()
     }
     val outputFile = Files.createTempFile(null, ".bin").toFile()
-    outputFile.deleteOnExit()
 
     val cmd: MutableList<String> =
         ArrayList<String>().apply {
@@ -354,6 +358,7 @@ class BazelQueryService(
         )
 
     if (result.resultCode != 0) {
+      outputFile.delete()
       logger.w {
         "bazel mod show_repo failed (exit code ${result.resultCode}), skipping bzlmod repos"
       }
@@ -370,6 +375,7 @@ class BazelQueryService(
             }
           }
         }
+    outputFile.delete()
 
     // Discover the bzlmod module-graph edges so we can encode the dep relationships between
     // synthetic //external:* targets. Without this, a target that depends on @outer//... only

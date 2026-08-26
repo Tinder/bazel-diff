@@ -189,6 +189,24 @@ curl 'http://localhost:8080/impacted_targets_with_distances?from=main&to=my-feat
 }
 ```
 
+* `GET /dependency_edges?from=<rev>&to=<rev>` — returns the generate-hashes dependency-edge graph
+  for the **`to` revision**, byte-compatible with `generate-hashes --depEdgesFile`. The body is a JSON
+  object mapping each label to its direct deps — **not** the per-target distance summary from
+  `/impacted_targets_with_distances`, and not wrapped in `from`/`to`/`impactedTargets`. Requires
+  `--trackDeps`; otherwise this endpoint returns `400`. `profile=true` is accepted and ignored so
+  clients can reuse the same query string as the other endpoints. The graph is always the full
+  (unscoped) map; `modifiedFilepaths` on POST does not shrink it.
+
+```bash
+curl 'http://localhost:8080/dependency_edges?from=main&to=my-feature-branch'
+```
+
+```json
+{
+  "//foo:bar": ["//foo:lib", "//bar:baz"]
+}
+```
+
 * `GET /metrics` — returns a JSON snapshot of the instance so callers and monitoring can see its
   identity, liveness, and cache size usage without scraping logs. Unlike the query endpoints it is
   never gated on readiness, so it still responds on an un-ready or lame-ducked instance (the `ready`
@@ -243,7 +261,8 @@ lifecycle policy instead.
 
 Notes and current limitations:
 
-* Distance metrics (`/impacted_targets_with_distances`) require the dependency-edge graph, which is
+* Distance metrics (`/impacted_targets_with_distances`) and the generate-hashes graph
+  (`/dependency_edges`) require the dependency-edge graph, which is
   only tracked when the server is started with `--trackDeps`. Tracking deps grows each cached hash
   entry, so it is opt-in. The flag is folded into the cache key, so enabling or disabling it never
   reuses a previously cached entry of the other kind. This mirrors the `generate-hashes --depEdgesFile`

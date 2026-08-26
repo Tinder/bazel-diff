@@ -91,7 +91,8 @@ open class ServeCommand : Callable<Int> {
       names = ["--requestTimeout"],
       description =
           [
-              "Maximum seconds an /impacted_targets(_with_distances) request may run before the " +
+              "Maximum seconds an /impacted_targets(_with_distances) or /dependency_edges " +
+                  "request may run before the " +
                   "server abandons it and responds 504. 0 (the default) means no timeout. This " +
                   "bounds the request the client waits on; an in-flight bazel query may keep " +
                   "running in the background and still populate the per-SHA cache."],
@@ -298,7 +299,8 @@ open class ServeCommand : Callable<Int> {
       description =
           [
               "Track dependency edges and persist them per commit SHA so build-graph distance " +
-                  "metrics can be served via /impacted_targets_with_distances. Increases cache " +
+                  "metrics can be served via /impacted_targets_with_distances and the " +
+                  "generate-hashes graph via /dependency_edges. Increases cache " +
                   "size and memory. Defaults to false."])
   var trackDeps = false
 

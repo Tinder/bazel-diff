@@ -42,6 +42,11 @@ import org.koin.core.component.inject
  *   form) -- like above but each impacted target is `{"label", "targetDistance",
  *   "packageDistance"}`. Requires the server to have been started with `--trackDeps`; returns `400`
  *   otherwise.
+ * - `GET /dependency_edges?from=<rev>&to=<rev>` (and its `POST` form) -- the generate-hashes
+ *   dependency-edge graph for the `to` revision, byte-compatible with `generate-hashes
+ *   --depEdgesFile`. The body is a JSON object mapping each label to its direct deps -- not wrapped
+ *   in `from`/`to`/`impactedTargets`. Requires `--trackDeps`; returns `400` otherwise.
+ *   `profile=true` is accepted and ignored. `modifiedFilepaths` on POST does not shrink the map.
  * - `GET /metrics` -- a JSON snapshot of the instance (version, uptime, readiness, git engine,
  *   cache size usage, JVM heap) when a [metricsProvider] is wired. Intentionally not gated on
  *   readiness, so a scrape of an un-ready or lame-ducked instance still returns data.
@@ -83,6 +88,7 @@ class BazelDiffServer(
     httpServer.createContext("/impacted_targets", ::handleImpactedTargets)
     httpServer.createContext(
         "/impacted_targets_with_distances", ::handleImpactedTargetsWithDistances)
+    httpServer.createContext("/dependency_edges", ::handleDependencyEdges)
     httpServer.createContext("/metrics", ::handleMetrics)
     httpServer.start()
     server = httpServer
@@ -142,6 +148,11 @@ class BazelDiffServer(
       handleQuery(exchange) { from, to, targetTypes, modifiedFilepaths, profiler ->
         impactedTargetsProvider.getImpactedTargetsWithDistances(
             from, to, targetTypes, modifiedFilepaths, profiler)
+      }
+
+  private fun handleDependencyEdges(exchange: HttpExchange) =
+      handleQuery(exchange) { from, to, _, _, _ ->
+        impactedTargetsProvider.getDependencyEdges(from, to)
       }
 
   /** Normalized inputs for a query, parsed from either a GET query string or a POST JSON body. */
@@ -218,8 +229,8 @@ class BazelDiffServer(
           logger.w { "request exceeded ${requestTimeoutSeconds}s timeout, abandoning" }
           respondJson(
               exchange, 504, mapOf("error" to "request timed out after ${requestTimeoutSeconds}s"))
-        } catch (e: DistancesUnavailableException) {
-          respondJson(exchange, 400, mapOf("error" to (e.message ?: "distances unavailable")))
+        } catch (e: TrackDepsUnavailableException) {
+          respondJson(exchange, 400, mapOf("error" to (e.message ?: "unavailable")))
         } catch (e: GitClientException) {
           logger.e(e) { "git error computing impacted targets" }
           respondJson(exchange, 400, mapOf("error" to "git error: ${e.message}"))

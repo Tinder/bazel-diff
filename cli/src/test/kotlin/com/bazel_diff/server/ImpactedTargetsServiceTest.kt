@@ -319,6 +319,39 @@ class ImpactedTargetsServiceTest : KoinTest {
   }
 
   @Test
+  fun returnsDepEdgesFromToRevisionWithoutScoping() {
+    val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), null)
+    val to =
+        HashFileData(
+            mapOf("//:a" to TargetHash("Rule", "h2", "d2")),
+            null,
+            depEdges = mapOf("//:lib" to listOf("//:dep"), "//:dep" to emptyList()))
+    val provider = FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to))
+    val service = ImpactedTargetsService(IdentityGitClient(), provider, depsTracked = true)
+
+    val graph = service.getDependencyEdges("from-sha", "to-sha")
+
+    assertThat(graph).isEqualTo(mapOf("//:lib" to listOf("//:dep"), "//:dep" to emptyList()))
+    assertThat(provider.modifiedFilepathsByRev.keys).isEqualTo(setOf("to-sha"))
+    assertThat(provider.modifiedFilepathsByRev["to-sha"]).isEqualTo(emptySet())
+  }
+
+  @Test
+  fun dependencyEdgesThrowWhenDepsNotTracked() {
+    val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), null)
+    val to = HashFileData(mapOf("//:a" to TargetHash("Rule", "h2", "d2")), null)
+    val service =
+        ImpactedTargetsService(
+            IdentityGitClient(),
+            FakeHashProvider(mapOf("from-sha" to from, "to-sha" to to)),
+            depsTracked = false)
+
+    org.junit.Assert.assertThrows(DependencyEdgesUnavailableException::class.java) {
+      service.getDependencyEdges("from-sha", "to-sha")
+    }
+  }
+
+  @Test
   fun distancesModuleGraphChangePinsWorkspaceToTo() {
     // Same forced live-query path as the non-distance test, but through the distances method.
     val from = HashFileData(mapOf("//:a" to TargetHash("Rule", "h1", "d1")), "graph-v1")

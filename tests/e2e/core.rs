@@ -217,6 +217,25 @@ fn serve_end_to_end() {
         .unwrap()
         .iter()
         .any(|target| target["label"] == "//:lib" && target["targetDistance"] == 0));
+    let (status, body) = server
+        .get(&format!(
+            "/dependency_edges?from={from}&to={to}&profile=true"
+        ))
+        .unwrap();
+    assert_eq!(status, 200);
+    let graph: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        graph.get("from").is_none() && graph.get("impactedTargets").is_none(),
+        "body must be the generate-hashes graph, got {graph}"
+    );
+    assert!(
+        graph
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|label| label.trim_start_matches("@@") == "//:lib" || label.contains(":lib")),
+        "expected //:lib in dep-edges graph, got {graph}"
+    );
 }
 
 #[test]

@@ -36,10 +36,16 @@ data class ImpactedTargetsWithDistancesResult(
 )
 
 /**
- * Thrown when a distance query arrives but the server was started without `--trackDeps`, so no
- * dependency edges were tracked or cached. The HTTP layer maps this to a `400`.
+ * Thrown when a query that needs the dependency-edge graph arrives but the server was started
+ * without `--trackDeps`. The HTTP layer maps this to a `400`.
  */
-class DistancesUnavailableException(message: String) : Exception(message)
+open class TrackDepsUnavailableException(message: String) : Exception(message)
+
+/** Distances endpoint (`/impacted_targets_with_distances`) requires `--trackDeps`. */
+class DistancesUnavailableException(message: String) : TrackDepsUnavailableException(message)
+
+/** Generate-hashes graph endpoint (`/dependency_edges`) requires `--trackDeps`. */
+class DependencyEdgesUnavailableException(message: String) : TrackDepsUnavailableException(message)
 
 /**
  * Computes the impacted targets between two revisions. Extracted behind an interface so the HTTP
@@ -78,6 +84,16 @@ interface ImpactedTargetsProvider {
       modifiedFilepaths: Set<Path> = emptySet(),
       profiler: QueryProfiler? = null,
   ): ImpactedTargetsWithDistancesResult
+
+  /**
+   * Returns the generate-hashes dependency-edge graph for the **`to` revision** — the same map
+   * `generate-hashes --depEdgesFile` writes. Always the full (unscoped) graph: [modifiedFilepaths]
+   * on the HTTP request must not shrink it. Throws [DependencyEdgesUnavailableException] if the
+   * server was not started with `--trackDeps`.
+   */
+  fun getDependencyEdges(fromRev: String, toRev: String): Map<String, List<String>> {
+    throw UnsupportedOperationException("dependency edges not implemented")
+  }
 }
 
 /**
@@ -170,6 +186,20 @@ class ImpactedTargetsService(
     profiler?.recordDiff(elapsedMillis(diffStartNanos), moduleGraphChanged)
     return ImpactedTargetsWithDistancesResult(
         fromSha, toSha, impacted, profiler?.queryProfile(), profiler?.memoryProfile())
+  }
+
+  override fun getDependencyEdges(fromRev: String, toRev: String): Map<String, List<String>> {
+    if (!depsTracked) {
+      throw DependencyEdgesUnavailableException(
+          "dependency edges unavailable: server started without --trackDeps")
+    }
+    val (_, toSha) = resolveBoth(fromRev, toRev)
+    logger.i { "Fetching dependency-edge graph for $toSha" }
+    // Same graph generate-hashes writes to --depEdgesFile: the end revision's full (unscoped)
+    // dependency map. modifiedFilepaths must not shrink it — clients BFS-walk this file from the
+    // app target and need every edge.
+    val toData = hashProvider.getHashes(toSha, emptySet())
+    return toData.depEdges
   }
 
   /** [resolveBoth], recording its duration (including any on-demand fetches) into [profiler]. */

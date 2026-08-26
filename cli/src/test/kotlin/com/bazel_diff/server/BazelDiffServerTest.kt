@@ -77,6 +77,8 @@ class BazelDiffServerTest : KoinTest {
       var lastTargetTypes: Set<String>? = null,
       var lastModifiedFilepaths: Set<Path> = emptySet(),
       var lastProfiler: QueryProfiler? = null,
+      var depEdges: Map<String, List<String>> = mapOf("//app:rule" to listOf("//app:source")),
+      var depEdgesError: Exception? = null,
   ) : ImpactedTargetsProvider {
     override fun getImpactedTargets(
         fromRev: String,
@@ -103,6 +105,13 @@ class BazelDiffServerTest : KoinTest {
       distancesError?.let { throw it }
       return distancesResult.copy(
           profile = profiler?.queryProfile(), memoryProfile = profiler?.memoryProfile())
+    }
+
+    override fun getDependencyEdges(fromRev: String, toRev: String): Map<String, List<String>> {
+      lastFrom = fromRev
+      lastTo = toRev
+      depEdgesError?.let { throw it }
+      return depEdges
     }
 
     private fun record(
@@ -152,6 +161,9 @@ class BazelDiffServerTest : KoinTest {
         ) =
             provider.getImpactedTargetsWithDistances(
                 fromRev, toRev, targetTypes, modifiedFilepaths, profiler)
+
+        override fun getDependencyEdges(fromRev: String, toRev: String) =
+            provider.getDependencyEdges(fromRev, toRev)
       }
 
   private data class Response(val code: Int, val body: String)
@@ -598,6 +610,38 @@ class BazelDiffServerTest : KoinTest {
     val response = get("/impacted_targets_with_distances?from=a&to=b")
     assertThat(response.code).isEqualTo(400)
     assertThat(response.body).contains("--trackDeps")
+  }
+
+  @Test
+  fun dependencyEdgesReturnsGenerateHashesGraph() {
+    val fixed = FixedProvider()
+    provider = fixed
+    val response = get("/dependency_edges?from=main&to=feature&profile=true")
+    assertThat(response.code).isEqualTo(200)
+    assertThat(fixed.lastFrom).isEqualTo("main")
+    assertThat(fixed.lastTo).isEqualTo("feature")
+    assertThat(response.body).contains("\"//app:rule\"")
+    assertThat(response.body).contains("\"//app:source\"")
+    assertThat(response.body).doesNotContain("impactedTargets")
+    assertThat(response.body).doesNotContain("\"profile\"")
+  }
+
+  @Test
+  fun dependencyEdgesUnavailableReturns400() {
+    provider =
+        FixedProvider(
+            depEdgesError =
+                DependencyEdgesUnavailableException(
+                    "dependency edges unavailable: server started without --trackDeps"))
+    val response = get("/dependency_edges?from=a&to=b")
+    assertThat(response.code).isEqualTo(400)
+    assertThat(response.body).contains("dependency edges unavailable")
+    assertThat(response.body).contains("--trackDeps")
+  }
+
+  @Test
+  fun dependencyEdgesMissingParamsReturns400() {
+    assertThat(get("/dependency_edges?from=main").code).isEqualTo(400)
   }
 
   @Test

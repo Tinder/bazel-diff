@@ -158,8 +158,8 @@ class E2ETest {
   /**
    * End-to-end coverage for the `serve` query service: builds a two-commit git repo from the
    * shell-only `distance_metrics` workspace, runs `bazel-diff serve` (with `--trackDeps`) in a
-   * background thread, then hits `/health`, `/impacted_targets`, and
-   * `/impacted_targets_with_distances` over real HTTP. Exercises the full
+   * background thread, then hits `/health`, `/impacted_targets`,
+   * `/impacted_targets_with_distances`, and `/dependency_edges` over real HTTP. Exercises the full
    * [com.bazel_diff.cli.ServeCommand] path (Koin + hasher wiring, git checkout, real `bazel query`
    * for both revisions, dep-edge tracking, distance computation, and the cache) the same way the
    * other E2E tests cover the CLI commands.
@@ -232,6 +232,17 @@ class E2ETest {
       // Gson decodes JSON numbers as Double.
       assertThat(libEntry["targetDistance"]).isEqualTo(0.0)
       assertThat(libEntry["packageDistance"]).isEqualTo(0.0)
+
+      val (edgesCode, edgesBody) =
+          httpGetServe(
+              "http://localhost:$port/dependency_edges?from=$fromSha&to=$toSha&profile=true")
+      assertThat(edgesCode).isEqualTo(200)
+      val graph: Map<String, Any> =
+          Gson().fromJson(edgesBody, object : TypeToken<Map<String, Any>>() {}.type)
+      assertThat(graph.containsKey("from")).isEqualTo(false)
+      assertThat(graph.containsKey("impactedTargets")).isEqualTo(false)
+      val labels = graph.keys.map { it.removePrefix("@@") }
+      assertThat(labels.any { it == "//:lib" || it.contains(":lib") }).isEqualTo(true)
     } finally {
       serveThread.interrupt()
       serveThread.join(10_000)

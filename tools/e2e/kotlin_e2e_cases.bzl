@@ -13,163 +13,163 @@ KOTLIN_E2E_SUITES = [
         "cases": [
             {
                 "name": "testE2E",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testServeEndToEnd",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testServeDoesNotReuseMacroDigestAcrossRevisions",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testDetermineBazelVersion",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testE2EWithNoKeepGoing",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testE2EIncludingTargetType",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testE2EWithTargetType",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testGenerateHashesWithCqueryStreamedProto",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testExcludeTargetsQueryFiltersManualTargets",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testFineGrainedHashExternalRepo",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testFineGrainedHashBzlMod",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testFineGrainedHashBzlModCquery",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testBzlmodTransitiveDepsQuery",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testBzlmodTransitiveDepsCquery",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testBzlmodCCTransitiveDepsQuery",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testUseCqueryWithExternalDependencyChange",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testUseCqueryWithAndroidCodeChange",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testTargetDistanceMetrics",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testCqueryWithFailingAnalysisTargets",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testKeepGoingSilentlyDropsTargetsOnRepoRuleFailure_reproducerForIssue398",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testUndeclaredWorkspaceReadIsNotImpacted_reproducerForIssue401",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testPackageGroupChangeImpactsConsumers_regressionForIssue441",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testBzlmodShowRepoDetectsModuleBazelChanges",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testExcludeExternalTargetsFiltersBzlmodSyntheticLabels",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testModuleBazelCommentOnlyChangeDoesNotImpactTargets_regressionForIssue83",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testGenerateHashesIsHermeticAcrossWorkspacePaths",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testModuleBazelLockReformatDoesNotImpactTargets",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testBzlmodLocalPathOverrideWorks_regressionForIssue196",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testGoModUpdateImpactsGoTargets_regressionForIssue266",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testMacroBzlChangeImpactsCallers_regressionForIssue259And227",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testRemoteProtoVersionBumpImpactsConsumer",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testExternalGoDepsAppearInHashes_regressionForIssue228",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testTransitiveExternalRepoChangeImpactsConsumer_regressionForIssue184",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testWrappedExternalRepoFileChangeImpactsMainConsumer_regressionForIssue197",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testHubSpokeVersionBumpImpactsConsumer_fineGrainedHubPrefixCollision",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testFineGrainedExternalRepoHashesAreHermeticAcrossWorkspacePaths",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testAddingUnrelatedMacroDoesNotImpactExistingTargets_reproducerForIssue365",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testEditingRuleBzlDoesNotOverInvalidateSamePackageTargets",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testEditingCrossFileMacroImpactsConsumerNotSiblings",
-                "timeout": "short",
+                "timeout": "moderate",
             },
             {
                 "name": "testEditingCrossFileRuleImpactsConsumerNotSiblings",
-                "timeout": "short",
+                "timeout": "moderate",
             },
         ],
     },

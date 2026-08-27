@@ -7,7 +7,7 @@ target means one timeout, one cache entry and one log for the whole suite, so a
 single case's runtime is invisible and a single case's failure re-runs
 everything. This tool inverts that: it reads the test sources and emits one
 entry per case, which //tools/e2e:defs.bzl expands into its own test target with
-its own timeout (60s by default -- see DEFAULT_TIMEOUT).
+its own timeout (300s by default -- see DEFAULT_TIMEOUT).
 
 Nothing about the split is hand-maintained. Add a `@Test` method to any class
 under the Kotlin e2e directory, or a `#[test]` fn to any module under the Rust
@@ -15,11 +15,11 @@ e2e directory, run `make regen-e2e`, and the new target exists. CI runs
 `//tools/e2e:regen_check`, which fails when the checked-in lists no longer match
 the sources.
 
-A case that genuinely cannot run inside the default timeout declares its own
-with a marker comment on the lines directly above it (both languages use `//`,
-so the spelling is the same):
+A case that does not fit the default timeout -- or one quick enough to be held
+to a tighter one -- declares its own with a marker comment on the lines directly
+above it (both languages use `//`, so the spelling is the same):
 
-    // e2e-timeout: moderate
+    // e2e-timeout: long
     @Test
     fun testSomethingSlow() { ... }
 
@@ -43,8 +43,27 @@ from typing import Iterable, Sequence
 # ---------------------------------------------------------------------------
 
 #: Every generated target gets this timeout unless the case overrides it. Bazel
-#: reads "short" as 60 seconds, which is the cap the split exists to enforce.
-DEFAULT_TIMEOUT = "short"
+#: reads "moderate" as 300 seconds.
+#:
+#: Not "short" (60s), which is what a case costs on a fast dev machine and
+#: nowhere near what it costs anywhere else. Two things stretch a case past 60s
+#: even after //tools/e2e:defs.bzl caps how many run at once:
+#:
+#: - A case run as its own target pays ~7s of fixed setup that an in-process run
+#:   amortises across the whole class (testE2E: 10.5s in-suite, 17.3s alone),
+#:   and it overlaps with other cases that are each driving a nested Bazel.
+#:   Measured on a 28-core Apple Silicon Mac with warm caches, the slowest case
+#:   in each suite lands at 130.6s (testFineGrainedHashBzlModCquery) and 126.4s
+#:   (external::fine_grained_bzlmod_repo_cquery).
+#: - CI is slower than that machine. Its macos-latest x Bazel 8.x cell runs the
+#:   JUnit suite in ~1150s against ~460s here, so budget for ~2.5x.
+#:
+#: testFineGrainedHashBzlModCquery alone settles it: 75s warm, in-process and
+#: uncontended, so it cannot fit 60s under any conditions.
+#:
+#: A case is still free to declare "short" with a marker if it is genuinely
+#: quick and worth holding to that bound.
+DEFAULT_TIMEOUT = "moderate"
 
 #: Bazel's timeout vocabulary, with the wall-clock bound each one names.
 VALID_TIMEOUTS = {

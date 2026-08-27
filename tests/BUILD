@@ -11,7 +11,7 @@ load("//tools/e2e:rust_e2e_cases.bzl", "RUST_E2E_SUITES")
 # One Bazel target per `#[test]` fn rather than one for the crate: the suite used
 # to be a single size = "enormous" target, so no individual case had a runtime
 # bound of its own and one failure re-ran all of them. Each generated target runs
-# its case with libtest's `--exact` under a 60s timeout.
+# its case with libtest's `--exact` under a 300s timeout.
 #
 # RUST_E2E_SUITES is generated from the sources by `make regen-e2e`, so adding a
 # `#[test]` fn under tests/e2e/ creates its target with no edit here
@@ -19,10 +19,14 @@ load("//tools/e2e:rust_e2e_cases.bzl", "RUST_E2E_SUITES")
 # with that message if it is missing). //tools/e2e:regen_check fails CI when the
 # generated list and the sources drift.
 #
-# `exclusive` + `local` are inherited from the un-split suite: the cases spawn
-# nested Bazel servers, which must not run under the sandbox and are too heavy to
-# run several at a time. Splitting is for the per-case timeout, cache entry and
-# log, not for concurrency.
+# `local` is inherited from the un-split suite: the cases spawn nested Bazel
+# servers, which cannot run under the sandbox. `exclusive` is not, and that is
+# the point. Serializing the whole suite is what made the split cost more than it
+# saved -- 640s against 250s for the same 38 cases in one process, because
+# `exclusive` throws away the parallelism that is supposed to pay for the
+# per-target setup. Each case reserves 4 CPUs instead (see //tools/e2e:defs.bzl),
+# so a big machine overlaps them and a small one still runs them one at a time.
+# Only :e2e_test_all stays `exclusive`; the macro tags it.
 rust_e2e_tests(
     srcs = glob([
         "e2e.rs",
@@ -55,7 +59,6 @@ rust_e2e_tests(
     suites = RUST_E2E_SUITES,
     # Nested Bazel builds fetch external repos and cannot run under the sandbox.
     tags = [
-        "exclusive",
         "external",
         "local",
     ],

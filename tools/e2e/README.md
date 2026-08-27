@@ -13,8 +13,51 @@ from 5s to 5 minutes is invisible until the suite as a whole blows its ceiling;
 a single failure re-runs every case; and a passing case is re-run on every
 invocation because the suite's result is cached as a unit.
 
-Split, each case gets its own **60-second** timeout (Bazel's `short`), its own
-cache entry, and its own log.
+Split, each case gets its own **300-second** timeout (Bazel's `moderate`), its
+own cache entry, and its own log.
+
+### Why 300 and not 60
+
+Because 60 is what a case costs on a fast dev machine, and that is not the
+machine CI runs on. Measured on a 28-core Apple Silicon Mac with warm caches,
+the JUnit suite runs its 40 cases in ~460s in one process; the same work takes
+~1150s on CI's `macos-latest` × Bazel 8.x cell, so treat CI as **~2.5× slower**
+than a laptop. On top of that, a case run as its own target pays ~7s of fixed
+setup that one process used to amortise across the whole class (`testE2E` is
+10.5s in-suite, 17.3s alone), and it runs alongside other cases that are each
+driving a nested Bazel.
+
+The slowest case in each suite lands at 130.6s and 126.4s on that Mac. And
+`testFineGrainedHashBzlModCquery` needs 75s warm, in-process and uncontended, so
+it could never have fit 60s.
+
+## How many cases run at once
+
+Every case shells out to a nested Bazel, which sizes its own `--jobs` from the
+host's core count and tries to use all of it. Untagged, Bazel starts as many
+cases as the runner has cores and each one spawns a build that thinks it owns
+the machine. On this 28-core Mac that turned a 17s case into a 142s one and made
+the two `serve` cases fail outright — they pick a port with `ServerSocket(0)`,
+close it, and hand the number to the server, so enough concurrency and two of
+them race onto the same port.
+
+So each case reserves **4 CPUs** (`_CASE_CPUS` in `defs.bzl`), which is a
+per-case tag rather than a global `--local_test_jobs` so it travels with the
+targets. A 28-core machine runs 7 at a time; a 4-core CI runner runs one; Bazel
+clamps the request on anything smaller rather than deadlocking.
+
+What it is deliberately *not* is `exclusive`. Serializing the suite also fixes
+the thrash, but it throws away the parallelism that pays for the per-target
+setup — the Rust suite spent 640s that way against 250s for the same 38 cases in
+one process. With the reservation instead:
+
+| suite | one process | split, `exclusive` | split, `cpu:4` |
+| --- | --- | --- | --- |
+| `//cli:E2ETest` | 460s | — | **279s** |
+| `//tests:e2e_test` | 250s | 640s | **213s** |
+
+Only the `_all` targets stay `exclusive`: they *are* the whole suite, so there
+is nothing to overlap them with.
 
 ## Adding an e2e test
 
@@ -39,34 +82,35 @@ One thing the regen cannot do for you: a *new Rust module* still needs its
 all. The generator fails with that message rather than silently skipping the
 file.
 
-## When 60 seconds is not enough
+## When the default is the wrong budget
 
 Declare the case's own timeout with a marker comment directly above it. Both
 languages use `//` comments, so the spelling is the same:
 
 ```kotlin
-// e2e-timeout: moderate
+// e2e-timeout: long
 @Test
 fun testDownloadsAnAndroidSdkFirst() { ... }
 ```
 
 ```rust
-// e2e-timeout: moderate
+// e2e-timeout: long
 #[test]
 fn downloads_an_android_sdk_first() { ... }
 ```
 
-The value is a Bazel timeout: `short` (60s, the default), `moderate` (300s),
-`long` (900s) or `eternal` (3600s). Anything else fails the regen. Treat a
-marker as a note that the case is worth splitting or speeding up, not as the
-normal way to add a test.
+The value is a Bazel timeout: `short` (60s), `moderate` (300s, the default),
+`long` (900s) or `eternal` (3600s). Anything else fails the regen. A marker
+reaching *up* is a note that the case is worth splitting or speeding up, not the
+normal way to add a test; a marker reaching *down* to `short` is how a case that
+really is quick gets held to a bound worth having.
 
 ### Finding the cases that need one
 
 Bazel names them for you. A case over budget fails with
 
 ```
-//cli:E2ETest_testSomething   TIMEOUT in 60.0s
+//cli:E2ETest_testSomething   TIMEOUT in 300.0s
 ```
 
 To see where every case actually lands before it becomes a failure, run the

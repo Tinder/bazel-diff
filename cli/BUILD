@@ -307,7 +307,7 @@ kt_jvm_test(
 # The JUnit e2e suite, one Bazel target per `@Test` method. It used to be a
 # single target with timeout = "eternal", because the class as a whole ran
 # ~1150s on CI's macos-latest x bazel 8.x cell; split, each case gets its own
-# 60s budget, its own cache entry and its own log, and the cases run in
+# 300s budget, its own cache entry and its own log, and the cases run in
 # parallel instead of back to back.
 #
 # KOTLIN_E2E_SUITES is generated from the sources by `make regen-e2e`, so adding

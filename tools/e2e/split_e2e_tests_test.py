@@ -79,7 +79,7 @@ class KotlinParsingTest(unittest.TestCase):
 
         self.assertEqual(["testSkipped"], [case.name for case in suites[0].cases])
 
-    def test_default_timeout_is_the_sixty_second_cap(self):
+    def test_default_timeout_is_the_five_minute_cap(self):
         suites = self.parse(
             """
             package com.bazel_diff.e2e
@@ -91,27 +91,34 @@ class KotlinParsingTest(unittest.TestCase):
             """
         )
 
-        self.assertEqual("short", suites[0].cases[0].timeout)
-        self.assertEqual(60, splitter.VALID_TIMEOUTS[suites[0].cases[0].timeout])
+        self.assertEqual("moderate", suites[0].cases[0].timeout)
+        self.assertEqual(300, splitter.VALID_TIMEOUTS[suites[0].cases[0].timeout])
 
     def test_marker_comment_overrides_the_timeout(self):
+        # Both directions, and neither value is the default -- a marker that
+        # happens to name the default would pass this test without proving the
+        # marker was read at all.
         suites = self.parse(
             """
             package com.bazel_diff.e2e
 
             class SampleTest {
-              // e2e-timeout: moderate
+              // e2e-timeout: long
               @Test
               fun testSlow() {}
 
+              // e2e-timeout: short
               @Test
-              fun testFast() {}
+              fun testQuick() {}
+
+              @Test
+              fun testDefault() {}
             }
             """
         )
 
         self.assertEqual(
-            [("testSlow", "moderate"), ("testFast", "short")],
+            [("testSlow", "long"), ("testQuick", "short"), ("testDefault", "moderate")],
             [(case.name, case.timeout) for case in suites[0].cases],
         )
 
@@ -137,7 +144,7 @@ class KotlinParsingTest(unittest.TestCase):
             package com.bazel_diff.e2e
 
             class SampleTest {
-              // e2e-timeout: moderate
+              // e2e-timeout: long
 
               @Test
               fun testAlpha() {}
@@ -145,7 +152,7 @@ class KotlinParsingTest(unittest.TestCase):
             """
         )
 
-        self.assertEqual("short", suites[0].cases[0].timeout)
+        self.assertEqual("moderate", suites[0].cases[0].timeout)
 
     def test_unknown_timeout_is_rejected(self):
         with self.assertRaisesRegex(splitter.GeneratorError, "unknown e2e-timeout"):
@@ -288,17 +295,25 @@ class RustParsingTest(unittest.TestCase):
     def test_marker_comment_overrides_the_timeout(self):
         cases = self.parse(
             """
-            // e2e-timeout: moderate
+            // e2e-timeout: long
             #[test]
             fn slow_case() {}
 
+            // e2e-timeout: short
             #[test]
-            fn fast_case() {}
+            fn quick_case() {}
+
+            #[test]
+            fn default_case() {}
             """
         )
 
         self.assertEqual(
-            [("core::slow_case", "moderate"), ("core::fast_case", "short")],
+            [
+                ("core::slow_case", "long"),
+                ("core::quick_case", "short"),
+                ("core::default_case", "moderate"),
+            ],
             [(case.name, case.timeout) for case in cases],
         )
 
@@ -461,7 +476,7 @@ class RenderingTest(unittest.TestCase):
                     test_class="com.bazel_diff.e2e.E2ETest",
                     cases=[
                         splitter.Case(name="testAlpha"),
-                        splitter.Case(name="testBeta", timeout="moderate"),
+                        splitter.Case(name="testBeta", timeout="long"),
                     ],
                 )
             ]
@@ -475,8 +490,8 @@ class RenderingTest(unittest.TestCase):
                     "name": "E2ETest",
                     "test_class": "com.bazel_diff.e2e.E2ETest",
                     "cases": [
-                        {"name": "testAlpha", "timeout": "short"},
-                        {"name": "testBeta", "timeout": "moderate"},
+                        {"name": "testAlpha", "timeout": "moderate"},
+                        {"name": "testBeta", "timeout": "long"},
                     ],
                 }
             ],
@@ -491,7 +506,7 @@ class RenderingTest(unittest.TestCase):
         namespace = {}
         exec(compile(rendered, "rust_e2e_cases.bzl", "exec"), namespace)
         self.assertEqual(
-            [{"name": "e2e_test", "cases": [{"name": "core::alpha", "timeout": "short"}]}],
+            [{"name": "e2e_test", "cases": [{"name": "core::alpha", "timeout": "moderate"}]}],
             namespace["RUST_E2E_SUITES"],
         )
 

@@ -15,7 +15,8 @@
 #   java-tests  //cli/...                                   (Kotlin/Java)
 #   rust-tests  //src/..., //tests/..., //tools/coverage/..., the Rust lint
 #               gates //:rust_clippy_check and //:rust_format_check
-#   release     //tools:all, //tools/go/...       (Python/Go release tooling)
+#   release     //tools:all, //tools/e2e/..., //tools/go/...
+#                                                   (Python/Go release tooling)
 name: Release
 on:
   workflow_dispatch:
@@ -127,7 +128,7 @@ jobs:
       # suites moved to the two jobs above; what is left is the Python and Go
       # release tooling, which is fast enough to keep here rather than spend a
       # third runner on. --config=no-test-timeouts is in .bazelrc.
-      bazel_test_command: "bazel test //tools:all //tools/go/... --config=no-test-timeouts"
+      bazel_test_command: "bazel test //tools:all //tools/e2e/... //tools/go/... --config=no-test-timeouts"
       prerelease: false
       draft: true
       tag_name: ${{ inputs.tag_name || github.ref_name }}

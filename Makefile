@@ -46,6 +46,20 @@ format:
 	bazel run //cli/format
 	bazel run //cli/format:rustfmt
 
+# Regenerates the per-case e2e test targets from the e2e sources. Run it after
+# adding, renaming or removing a `@Test` method under
+# cli/src/test/kotlin/com/bazel_diff/e2e/ or a `#[test]` fn under tests/e2e/,
+# and commit the result -- `e2e-split-regen` in ci.yaml fails the build if the
+# checked-in split is stale. See tools/e2e/README.md.
+.PHONY: regen-e2e
+regen-e2e:
+	bazel run //tools/e2e:regen
+
+# What CI runs. Reports staleness; it never rewrites anything.
+.PHONY: regen-e2e-check
+regen-e2e-check:
+	bazel test //tools/e2e:regen_check //tools/e2e:split_e2e_tests_test
+
 .PHONY: generate-readme
 generate-readme:
 	bazel run //tools:generate-readme

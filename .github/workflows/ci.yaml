@@ -63,6 +63,28 @@ jobs:
           USE_BAZEL_VERSION: '8.x'
         run: bazelisk test //tests:e2e_test --enable_bzlmod=true --enable_workspace=false
 
+  # The e2e suites are split into one Bazel test target per case by
+  # //tools/e2e:regen, whose output is checked in. This job is the gate that
+  # keeps the checked-in split honest: :regen_check re-derives the case lists
+  # from the Kotlin and Rust sources and fails when they differ, so an e2e test
+  # added, renamed or removed without `make regen-e2e` cannot merge.
+  # :split_e2e_tests_test covers the generator itself.
+  e2e-split-regen:
+    name: E2E split regen
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest
+      - uses: actions/checkout@v4
+      - name: Check the e2e test split is up to date
+        env:
+          USE_BAZEL_VERSION: '8.x'
+        run: ~/go/bin/bazelisk test //tools/e2e:regen_check //tools/e2e:split_e2e_tests_test --enable_bzlmod=true --enable_workspace=false --test_output=errors
+
   rust-candidate-msrv:
     name: Rust candidate MSRV
     runs-on: ubuntu-latest

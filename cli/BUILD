@@ -1,6 +1,8 @@
 load("@rules_java//java:defs.bzl", "java_binary")
 load("@rules_kotlin//kotlin:jvm.bzl", "kt_jvm_library", "kt_jvm_test")
 load("//tools/coverage:defs.bzl", "coverage_minimum_env")
+load("//tools/e2e:defs.bzl", "kt_jvm_e2e_tests")
+load("//tools/e2e:kotlin_e2e_cases.bzl", "KOTLIN_E2E_SUITES")
 
 config_setting(
     name = "enable_debug",
@@ -302,16 +304,23 @@ kt_jvm_test(
     runtime_deps = [":cli-test-lib"],
 )
 
-kt_jvm_test(
-    name = "E2ETest",
-    # "eternal": the suite runs ~1150s on CI's macos-latest x bazel 8.x cell,
-    # right at the "long" ceiling, so slow-runner jitter was timing it out.
-    timeout = "eternal",
+# The JUnit e2e suite, one Bazel target per `@Test` method. It used to be a
+# single target with timeout = "eternal", because the class as a whole ran
+# ~1150s on CI's macos-latest x bazel 8.x cell; split, each case gets its own
+# 300s budget, its own cache entry and its own log, and the cases run in
+# parallel instead of back to back.
+#
+# KOTLIN_E2E_SUITES is generated from the sources by `make regen-e2e`, so adding
+# a `@Test` method to any class under cli/src/test/kotlin/com/bazel_diff/e2e/
+# creates its target with no edit here. //tools/e2e:regen_check fails CI when
+# the two drift.
+#
+# No per-target coverage minimum: E2E exercises the real binary across the whole
+# main tree, but the repo-wide coverage gate (and primary-owner unit tests) own
+# the 90% floor. Enforcement here would duplicate that gate.
+kt_jvm_e2e_tests(
     data = [":workspaces"],
-    # No per-target coverage minimum: E2E exercises the real binary across the
-    # whole main tree, but the repo-wide coverage gate (and primary-owner unit
-    # tests) own the 90% floor. Enforcement here would duplicate that gate.
-    test_class = "com.bazel_diff.e2e.E2ETest",
+    suites = KOTLIN_E2E_SUITES,
     runtime_deps = [":cli-test-lib"],
 )
 
@@ -453,6 +462,15 @@ kt_jvm_library(
         "@bazel_diff_maven//:software_amazon_awssdk_s3",
         "@bazel_diff_maven//:software_amazon_awssdk_sdk_core",
     ],
+)
+
+# The Kotlin e2e sources //tools/e2e:regen_check re-derives the generated case
+# list from. Globbed, not enumerated: a new e2e class is meant to need no edit
+# here either.
+filegroup(
+    name = "e2e_test_sources",
+    srcs = glob(["src/test/kotlin/com/bazel_diff/e2e/**/*.kt"]),
+    visibility = ["//tools/e2e:__pkg__"],
 )
 
 filegroup(

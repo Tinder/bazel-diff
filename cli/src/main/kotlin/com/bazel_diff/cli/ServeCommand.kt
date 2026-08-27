@@ -83,9 +83,24 @@ open class ServeCommand : Callable<Int> {
 
   @CommandLine.Option(
       names = ["--port"],
-      description = ["Port to listen on. Defaults to 8080."],
+      description =
+          [
+              "Port to listen on. Defaults to 8080. Pass 0 to bind any free port, and " +
+                  "--portFile to find out which one."],
       defaultValue = "8080")
   var port: Int = 8080
+
+  @CommandLine.Option(
+      names = ["--portFile"],
+      description =
+          [
+              "Write the bound port to this file once the server is listening. The point is " +
+                  "'--port 0 --portFile <path>': a caller that picks a port itself has to open a " +
+                  "socket to find a free one and close it again before this process can bind, and " +
+                  "anything else on the machine can take the port in between. Binding 0 and " +
+                  "reporting back has no such window. The file appears only after the bind " +
+                  "succeeds, so waiting for it is also waiting for the listener."])
+  var portFile: Path? = null
 
   @CommandLine.Option(
       names = ["--requestTimeout"],
@@ -407,6 +422,7 @@ open class ServeCommand : Callable<Int> {
           ready.get()
         }
     server.start()
+    writePortFile(server)
     performInitialFetch(gitClient, hashService, ready, server)
     // Start sweeping only after warmup, so the immediate first pass evaluates an already-warm
     // cache.
@@ -467,6 +483,24 @@ open class ServeCommand : Callable<Int> {
       System.err.println(
           "[Error] initial git fetch failed; server is lame-ducked (health will report NOT_READY): ${e.message}")
     }
+  }
+
+  /**
+   * Publishes the bound port to `--portFile`, if one was given.
+   *
+   * Written to a sibling temporary file and moved into place, so a reader that sees the path at all
+   * sees a complete number. That matters because the file doubles as a readiness signal for the
+   * listener: callers poll for it rather than guessing when the bind happened.
+   */
+  fun writePortFile(server: BazelDiffServer) {
+    val destination = portFile ?: return
+    destination.toAbsolutePath().parent?.let { java.nio.file.Files.createDirectories(it) }
+    val temporary =
+        java.nio.file.Files.createTempFile(
+            destination.toAbsolutePath().parent, ".${destination.fileName}", ".tmp")
+    java.nio.file.Files.writeString(temporary, server.boundPort().toString())
+    java.nio.file.Files.move(
+        temporary, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
   }
 
   /**

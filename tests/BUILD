@@ -1,5 +1,6 @@
 load("@bazel_diff_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_test")
+load("//tools/e2e:defs.bzl", "rust_e2e_tests")
+load("//tools/e2e:rust_e2e_cases.bzl", "RUST_E2E_SUITES")
 
 # The Rust behavioral suite, the Bazel equivalent of `cargo test --test e2e`.
 # It drives the real `bazel-diff` binary against real Bazel workspaces, so it is
@@ -7,20 +8,30 @@ load("@rules_rust//rust:defs.bzl", "rust_test")
 # nested `bazel` (see `env_inherit` below), copies fixture workspaces into
 # $TEST_TMPDIR, and builds them.
 #
-# `exclusive` + `local` keep it from running alongside other tests; the
-# `--test-threads=1` below is the same serialization cargo ran it with, so
-# nested Bazel servers don't fight over one output base.
-rust_test(
-    name = "e2e_test",
-    size = "enormous",
-    srcs = [
+# One Bazel target per `#[test]` fn rather than one for the crate: the suite used
+# to be a single size = "enormous" target, so no individual case had a runtime
+# bound of its own and one failure re-ran all of them. Each generated target runs
+# its case with libtest's `--exact` under a 300s timeout.
+#
+# RUST_E2E_SUITES is generated from the sources by `make regen-e2e`, so adding a
+# `#[test]` fn under tests/e2e/ creates its target with no edit here
+# (a new *module* still needs its `mod` line in e2e.rs, and the generator fails
+# with that message if it is missing). //tools/e2e:regen_check fails CI when the
+# generated list and the sources drift.
+#
+# `local` is inherited from the un-split suite: the cases spawn nested Bazel
+# servers, which cannot run under the sandbox. `exclusive` is not, and that is
+# the point. Serializing the whole suite is what made the split cost more than it
+# saved -- 640s against 250s for the same 38 cases in one process, because
+# `exclusive` throws away the parallelism that is supposed to pay for the
+# per-target setup. Each case reserves 4 CPUs instead (see //tools/e2e:defs.bzl),
+# so a big machine overlaps them and a small one still runs them one at a time.
+# Only :e2e_test_all stays `exclusive`; the macro tags it.
+rust_e2e_tests(
+    srcs = glob([
         "e2e.rs",
-        "e2e/core.rs",
-        "e2e/external.rs",
-        "e2e/regressions.rs",
-        "e2e/support/mod.rs",
-    ],
-    args = ["--test-threads=1"],
+        "e2e/**/*.rs",
+    ]),
     crate_root = "e2e.rs",
     data = [
         "//cli:e2e_resources",
@@ -45,17 +56,31 @@ rust_test(
         "PATH",
         "USE_BAZEL_VERSION",
     ],
+    suites = RUST_E2E_SUITES,
     # Nested Bazel builds fetch external repos and cannot run under the sandbox.
     tags = [
-        "exclusive",
         "external",
         "local",
     ],
-    # //:rust_clippy_check and //:rust_format_check name this target directly.
+    # //:rust_clippy_check and //:rust_format_check name :e2e_test_all, the
+    # un-split target this macro also emits, so they check the crate once
+    # instead of once per case.
     visibility = ["//:__pkg__"],
     deps = all_crate_deps(
         package_name = "",
         normal = True,
         normal_dev = True,
     ),
+)
+
+# The Rust e2e sources //tools/e2e:regen_check re-derives the generated case
+# list from -- the crate root included, since the generator checks that every
+# module holding a `#[test]` is declared there.
+filegroup(
+    name = "e2e_test_sources",
+    srcs = glob([
+        "e2e.rs",
+        "e2e/**/*.rs",
+    ]),
+    visibility = ["//tools/e2e:__pkg__"],
 )

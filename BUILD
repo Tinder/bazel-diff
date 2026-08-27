@@ -44,7 +44,10 @@ test_suite(
 _RUST_LINT_ROOTS = [
     "//src:bazel-diff",
     "//src:bazel_diff_lib",
-    "//tests:e2e_test",
+    # The un-split, whole-crate e2e target (//tests:e2e_test is now a
+    # test_suite over one target per case, and the per-case targets carry
+    # no-clippy/no-rustfmt so the crate is linted once rather than 38 times).
+    "//tests:e2e_test_all",
     "//tools/coverage:lcov_merger",
     "//tools/coverage:lcov_merger_test",
 ]

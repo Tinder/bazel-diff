@@ -627,4 +627,72 @@ class ServeCommandTest : KoinTest {
     assertThat(underTest.fakeGit.fetched).isFalse()
     assertThat(underTest.startedServer.get()).isNotNull()
   }
+
+  @Test
+  fun writePortFileIsANoopWithoutTheFlag() {
+    val cmd = command()
+    val server =
+        com.bazel_diff.server
+            .BazelDiffServer(0, NoopImpactedTargets) { true }
+            .also { startedServers += it }
+    server.start()
+
+    // No --portFile: nothing to publish to, and nothing should blow up either.
+    cmd.writePortFile(server)
+
+    assertThat(cmd.portFile).isNull()
+  }
+
+  @Test
+  fun writePortFilePublishesTheActualBoundPortNotTheRequestedOne() {
+    val destination = File(temp.newFolder(), "port")
+    val cmd = command().apply { portFile = destination.toPath() }
+    val server =
+        com.bazel_diff.server
+            .BazelDiffServer(0, NoopImpactedTargets) { true }
+            .also { startedServers += it }
+    server.start()
+
+    cmd.writePortFile(server)
+
+    // The command was asked for port 0; what lands in the file is the port the
+    // OS actually handed out, which is the whole point of the flag.
+    val published = destination.readText().trim().toInt()
+    assertThat(published).isEqualTo(server.boundPort())
+    assertThat(published).isNotEqualTo(0)
+  }
+
+  @Test
+  fun writePortFileCreatesMissingParentDirectories() {
+    val destination = File(temp.newFolder(), "nested/dir/port")
+    val cmd = command().apply { portFile = destination.toPath() }
+    val server =
+        com.bazel_diff.server
+            .BazelDiffServer(0, NoopImpactedTargets) { true }
+            .also { startedServers += it }
+    server.start()
+
+    cmd.writePortFile(server)
+
+    assertThat(destination.readText().trim().toInt()).isEqualTo(server.boundPort())
+  }
+
+  @Test
+  fun writePortFileOverwritesAStaleFileAndLeavesNoTemporaries() {
+    val destination = File(temp.newFolder(), "port")
+    destination.writeText("99999")
+    val cmd = command().apply { portFile = destination.toPath() }
+    val server =
+        com.bazel_diff.server
+            .BazelDiffServer(0, NoopImpactedTargets) { true }
+            .also { startedServers += it }
+    server.start()
+
+    cmd.writePortFile(server)
+
+    assertThat(destination.readText().trim().toInt()).isEqualTo(server.boundPort())
+    // The write goes via a sibling temp file so a reader never sees half a
+    // number; that temp must not survive the move.
+    assertThat(destination.parentFile.listFiles()!!.map { it.name }).isEqualTo(listOf("port"))
+  }
 }

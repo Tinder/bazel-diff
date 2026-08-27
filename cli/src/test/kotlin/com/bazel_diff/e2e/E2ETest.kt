@@ -179,7 +179,7 @@ class E2ETest {
     val toSha = git(workspace, "rev-parse", "HEAD")
 
     val cacheDir = temp.newFolder()
-    val port = java.net.ServerSocket(0).use { it.localPort }
+    val portFile = File(temp.newFolder(), "port")
 
     val serveThread =
         Thread {
@@ -193,7 +193,9 @@ class E2ETest {
                       "--cacheDir",
                       cacheDir.absolutePath,
                       "--port",
-                      port.toString(),
+                      "0",
+                      "--portFile",
+                      portFile.absolutePath,
                       "--no-initial-fetch",
                       "--trackDeps")
             }
@@ -203,7 +205,7 @@ class E2ETest {
             }
 
     try {
-      awaitServeHealthy(port)
+      val port = awaitServeHealthy(portFile)
       val (code, body) =
           httpGetServe("http://localhost:$port/impacted_targets?from=$fromSha&to=$toSha")
       assertThat(code).isEqualTo(200)
@@ -265,7 +267,7 @@ class E2ETest {
     val toSha = git(workspace, "rev-parse", "HEAD")
 
     val cacheDir = temp.newFolder()
-    val port = java.net.ServerSocket(0).use { it.localPort }
+    val portFile = File(temp.newFolder(), "port")
     val serveThread =
         Thread {
               CommandLine(BazelDiff())
@@ -278,7 +280,9 @@ class E2ETest {
                       "--cacheDir",
                       cacheDir.absolutePath,
                       "--port",
-                      port.toString(),
+                      "0",
+                      "--portFile",
+                      portFile.absolutePath,
                       "--no-initial-fetch")
             }
             .apply {
@@ -287,7 +291,7 @@ class E2ETest {
             }
 
     try {
-      awaitServeHealthy(port)
+      val port = awaitServeHealthy(portFile)
       val (code, body) =
           httpGetServe("http://localhost:$port/impacted_targets?from=$fromSha&to=$toSha")
       assertThat(code).isEqualTo(200)
@@ -310,16 +314,40 @@ class E2ETest {
   }
 
   /** Polls `/health` until it returns 200, up to ~30s, failing the test otherwise. */
-  private fun awaitServeHealthy(port: Int) {
-    repeat(60) {
-      try {
-        if (httpGetServe("http://localhost:$port/health").first == 200) return
-      } catch (_: Exception) {
-        // server not up yet
+  /**
+   * Waits for `serve` to publish its port, then for it to answer /health. Returns the port.
+   *
+   * The port comes from the server rather than from the test because the test cannot pick one
+   * safely: finding a free port means opening a socket and closing it again, and between that close
+   * and `serve`'s bind anything on the machine -- including another e2e case running concurrently
+   * -- can take the number. `--port 0 --portFile` has no such window. [ServeCommand.writePortFile]
+   * moves the file into place after the bind, so its appearance is itself the signal that something
+   * is listening.
+   */
+  private fun awaitServeHealthy(portFile: File): Int {
+    // One deadline across both phases, not one each. `serve` builds its storage, git client and
+    // Bazel plumbing before it binds, so on a loaded machine the wait is mostly startup and only
+    // then readiness -- splitting the budget just means whichever phase is slow today fails
+    // against half of it. Generous, because this only ever bounds a hang: the case's own Bazel
+    // timeout is the real limit.
+    val deadline = System.nanoTime() + java.time.Duration.ofMinutes(2).toNanos()
+    var port: Int? = null
+    while (System.nanoTime() < deadline) {
+      if (port == null && portFile.isFile) {
+        port = portFile.readText().trim().toIntOrNull()
+      }
+      if (port != null) {
+        try {
+          if (httpGetServe("http://localhost:$port/health").first == 200) return port
+        } catch (_: Exception) {
+          // listening, but not ready to answer yet
+        }
       }
       Thread.sleep(500)
     }
-    throw AssertionError("serve /health never became ready on port $port")
+    throw AssertionError(
+        if (port == null) "serve never wrote its port to ${portFile.absolutePath}"
+        else "serve /health never became ready on port $port")
   }
 
   private fun httpGetServe(url: String): Pair<Int, String> {

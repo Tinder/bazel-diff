@@ -247,7 +247,8 @@ crate.from_cargo(
     # crate_universe refuses to run from_cargo in a non-root module without a
     # checked-in cargo-bazel lockfile (repinning can't cross module boundaries),
     # so BCR consumers need this file shipped in the release archive.
-    # Regenerate with: CARGO_BAZEL_REPIN=1 bazel sync --only=bazel_diff_crates
+    # Regenerate with: CARGO_BAZEL_REPIN=1 bazel build //:bazel-diff-rust
+    # (`bazel sync` is WORKSPACE-only and this module is bzlmod-only).
     lockfile = "//:cargo-bazel-lock.json",
     manifests = ["//:Cargo.toml"],
 )

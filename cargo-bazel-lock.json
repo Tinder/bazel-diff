@@ -1,5 +1,5 @@
 {
-  "checksum": "81383baeb244c49e4bacf82cb1027f19a216a6c594fe793722976320fa46e4aa",
+  "checksum": "706ee75673bec5e4d514fe0bc1ea91301131838f7d2e0c76e4dac7644a73a68f",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -6502,7 +6502,6 @@
         "crate_features": {
           "common": [
             "attohttpc",
-            "fail-on-err",
             "sync",
             "sync-rustls-tls"
           ],

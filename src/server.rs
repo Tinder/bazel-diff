@@ -5,7 +5,7 @@ use crate::model::{
 use crate::module_graph::impacted_with_module_changes;
 use anyhow::{anyhow, bail, Context, Result};
 use s3::creds::Credentials;
-use s3::error::S3Error;
+use s3::request::ResponseData;
 use s3::{Bucket, Region};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -92,39 +92,51 @@ impl RemoteCache {
 
     /// Reads an entry, degrading to a miss on any failure.
     ///
-    /// Deliberately a bare `GetObject` with no `HeadObject` probe in front of it. Besides costing a
-    /// second round trip on every hit, `head_object` is unusable with this client stack: S3 answers
-    /// a HEAD miss with `404`, `Transfer-Encoding: chunked` and no body, and `rust-s3`'s
-    /// `fail-on-err` feature builds its error by *reading* that body -- so the 404 surfaces as
-    /// `attohttpc: Io Error: unexpected end of file` instead of [`S3Error::HttpFailWithBody`], and
-    /// every miss logs a warning. A GET miss carries a real `NoSuchKey` body, so it classifies.
+    /// Deliberately a bare `GetObject` with no `HeadObject` probe in front of it: besides costing a
+    /// second round trip on every hit, `head_object` cannot report a miss here. S3 answers a HEAD
+    /// miss with `404`, `Transfer-Encoding: chunked` and no body, and every HTTP client on this
+    /// stack fails reading that absent body -- `attohttpc: Io Error: unexpected end of file`. A GET
+    /// miss carries a real `NoSuchKey` body, so it reads back cleanly.
     fn get(&self, key: &str) -> Option<Vec<u8>> {
-        match self.bucket.get_object(self.object_key(key)) {
-            Ok(response) if response.status_code() == 200 => Some(response.to_vec()),
-            Ok(_) => None,
-            Err(error) if is_s3_not_found(&error) => None,
-            Err(error) => {
-                eprintln!(
-                    "[Warn] S3 cache read of {} failed (treating as a miss): {error}",
-                    self.object_key(key)
-                );
-                None
-            }
-        }
+        let failure = match self.bucket.get_object(self.object_key(key)) {
+            Ok(response) if response.status_code() == 200 => return Some(response.to_vec()),
+            Ok(response) if response.status_code() == 404 => return None,
+            Ok(response) => http_failure(&response),
+            Err(error) => error.to_string(),
+        };
+        eprintln!(
+            "[Warn] S3 cache read of {} failed (treating as a miss): {failure}",
+            self.object_key(key)
+        );
+        None
     }
 
     fn put(&self, key: &str, data: &[u8]) {
-        if let Err(error) = self.bucket.put_object(self.object_key(key), data) {
-            eprintln!(
-                "[Warn] S3 cache write of {} failed (entry not shared): {error}",
-                self.object_key(key)
-            );
-        }
+        let failure = match self.bucket.put_object(self.object_key(key), data) {
+            Ok(response) if (200..300).contains(&response.status_code()) => return,
+            Ok(response) => http_failure(&response),
+            Err(error) => error.to_string(),
+        };
+        eprintln!(
+            "[Warn] S3 cache write of {} failed (entry not shared): {failure}",
+            self.object_key(key)
+        );
     }
 }
 
-fn is_s3_not_found(error: &S3Error) -> bool {
-    matches!(error, S3Error::HttpFailWithBody(404, _))
+/// Renders a non-2xx response for a warning, matching how `S3Error::HttpFailWithBody` reads.
+///
+/// Statuses are classified here rather than by `rust-s3`'s `fail-on-err` feature, which is
+/// deliberately off: it turns every non-2xx into an error *after* reading the body, and the read
+/// happens inside `rust-s3`'s `retry!`, so a plain 404 miss cost a duplicate request and a
+/// one-second backoff sleep before being recognized as a miss. `retry!` still covers transport
+/// errors, which are the ones worth retrying.
+fn http_failure(response: &ResponseData) -> String {
+    format!(
+        "Got HTTP {} with content '{}'",
+        response.status_code(),
+        response.as_str().unwrap_or("<non-utf8 body>").trim()
+    )
 }
 
 fn normalize_s3_prefix(prefix: &str) -> String {
@@ -1140,14 +1152,6 @@ mod tests {
         assert_eq!(normalize_s3_prefix(""), "");
         assert_eq!(normalize_s3_prefix("/"), "");
         assert_eq!(normalize_s3_prefix("/team/cache/"), "team/cache/");
-        assert!(is_s3_not_found(&S3Error::HttpFailWithBody(
-            404,
-            "missing".into()
-        )));
-        assert!(!is_s3_not_found(&S3Error::HttpFailWithBody(
-            500,
-            "failure".into()
-        )));
         assert!(RemoteCache::new(&test_config()).unwrap().is_none());
     }
 
@@ -1169,7 +1173,7 @@ mod tests {
             .all(|request| request.url.contains("/bucket/team/repo/sha.fp.json")));
         // A read is a single GET: a HeadObject probe in front of it would double the round trips
         // and, worse, cannot report a miss -- S3 frames a HEAD 404 as chunked with no body, which
-        // `rust-s3` surfaces as `attohttpc: Io Error: unexpected end of file`.
+        // the client surfaces as `attohttpc: Io Error: unexpected end of file`.
         assert_eq!(
             captured
                 .iter()
@@ -1181,27 +1185,34 @@ mod tests {
 
     #[test]
     fn remote_cache_misses_and_errors_degrade_without_failing() {
-        // `rust-s3` wraps each request in its `retry!` macro and, with the `fail-on-err` feature,
-        // treats any non-2xx as an error -- so every failing call here is attempted twice.
-        let missing = b"<Error><Code>NoSuchKey</Code></Error>".to_vec();
         let (remote, requests, handle) = remote_cache_with_responses(
             "",
             vec![
-                (404, missing.clone()),
-                (404, missing),
+                (404, b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
                 (500, b"failure".to_vec()),
-                (500, b"failure".to_vec()),
-                (500, Vec::new()),
                 (500, Vec::new()),
             ],
         );
         assert_eq!(remote.get("missing"), None);
         assert_eq!(remote.get("failure"), None);
         remote.put("failure", b"data");
-        for _ in 0..6 {
+        // Exactly one request per call. `rust-s3`'s `fail-on-err` feature is off precisely so a
+        // non-2xx stays a response: as an error it would enter the crate's `retry!`, and every
+        // miss would cost a second request and a one-second backoff sleep.
+        for _ in 0..3 {
             requests.recv_timeout(Duration::from_secs(5)).unwrap();
         }
+        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn remote_cache_reports_unexpected_statuses_with_their_body() {
+        let response = ResponseData::new("denied".into(), 403, std::collections::HashMap::new());
+        assert_eq!(
+            http_failure(&response),
+            "Got HTTP 403 with content 'denied'"
+        );
     }
 
     #[test]

@@ -79,9 +79,9 @@ rust.toolchain(
     rustfmt_version = "1.90.0",
     # Confine the stock toolchains to platforms that use the system libc. They
     # are only constrained by os and cpu -- rules_rust has no musl constraint --
-    # so on //platforms:linux_x86_64_musl they would match alongside the musl
-    # toolchain below and resolution would silently take whichever of the two
-    # was registered first.
+    # so on //platforms:linux_x86_64_musl / linux_aarch64_musl they would match
+    # alongside the musl toolchain below and resolution would silently take
+    # whichever of the two was registered first.
     target_settings = ["//platforms:is_system_libc"],
     versions = ["1.90.0"],
 )
@@ -89,7 +89,7 @@ use_repo(rust, "rust_toolchains")
 
 register_toolchains("@rust_toolchains//:all")
 
-# Rust std for the statically linked musl release binary, cross-compiled from a
+# Rust std for the statically linked musl release binaries, cross-compiled from a
 # glibc Linux host (the release runner) or from an Apple Silicon Mac (so a
 # maintainer can reproduce the published binary locally). rustc itself is the
 # ordinary glibc build: only the target changes, which is what keeps proc-macro
@@ -107,6 +107,20 @@ rust.repository_set(
     target_settings = ["//platforms:is_musl"],
     target_triple = "x86_64-unknown-linux-musl",
     versions = ["1.90.0"],
+)
+
+# Same exec host, second published Linux asset (arm64 musl). Sharing the set
+# name avoids a second auto-emitted glibc x86_64 exec toolchain. exec_triple,
+# edition, versions, and target_settings may only appear on the first tag for a
+# given name.
+rust.repository_set(
+    name = "rust_musl_linux_x86_64",
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+        "//platforms:musl",
+    ],
+    target_triple = "aarch64-unknown-linux-musl",
 )
 
 # rules_rust also emits a toolchain for a set's own exec triple, so the set
@@ -140,6 +154,43 @@ rust.repository_set(
     target_settings = ["//platforms:is_musl"],
     target_triple = "x86_64-unknown-linux-musl",
     versions = ["1.90.0"],
+)
+
+rust.repository_set(
+    name = "rust_musl_macos_aarch64",
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+        "//platforms:musl",
+    ],
+    target_triple = "aarch64-unknown-linux-musl",
+)
+
+# Native ARM Linux host (Graviton, ubuntu-24.04-arm): same musl aarch64 target
+# as the x86_64-hosted set above, with a companion gnu tag so the auto-emitted
+# exec-triple toolchain does not collide with the stock glibc one.
+rust.repository_set(
+    name = "rust_musl_linux_aarch64",
+    edition = "2021",
+    exec_triple = "aarch64-unknown-linux-gnu",
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+        "//platforms:musl",
+    ],
+    target_settings = ["//platforms:is_musl"],
+    target_triple = "aarch64-unknown-linux-musl",
+    versions = ["1.90.0"],
+)
+
+rust.repository_set(
+    name = "rust_musl_linux_aarch64",
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+        "//platforms:system_libc",
+    ],
+    target_triple = "aarch64-unknown-linux-gnu",
 )
 
 # C toolchain for the musl target: a gcc cross-compiler bundled with musl libc,

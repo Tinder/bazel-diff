@@ -157,13 +157,20 @@ jobs:
         # stdlib rlib ...\librustc_std_workspace_alloc-<hash>.rlib comes to 263
         # characters and the link fails with LNK1181. Keep in sync with the
         # `release-artifacts` job in ci.yaml, which is where this gets exercised
-        # per-PR -- including release_config, which builds the Linux asset
-        # statically against musl so it runs on any distribution rather than
-        # requiring the runner's glibc or newer.
+        # per-PR -- including release_config, which builds the Linux assets
+        # statically against musl so they run on any distribution rather than
+        # requiring the runner's glibc or newer. linux-arm64 is a second Ubuntu
+        # row here (jobs are named by asset) but extra steps in the same CI job
+        # so that check name does not change.
         include:
           - os: ubuntu-latest
             asset: bazel-diff-rust-linux-amd64
             release_config: release-musl
+            bazel_startup_flags: ""
+            bazel_extra_flags: ""
+          - os: ubuntu-latest
+            asset: bazel-diff-rust-linux-arm64
+            release_config: release-musl-arm64
             bazel_startup_flags: ""
             bazel_extra_flags: ""
           - os: macos-latest

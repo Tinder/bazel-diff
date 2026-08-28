@@ -39,16 +39,19 @@ build:release --@rules_rust//rust/settings:lto=thin
 # property of the toolchain, which would change every build, not just releases.
 build:release --@rules_rust//rust/settings:extra_rustc_flags=-Cstrip=symbols
 
-# Linux release artifacts: `bazel build //release:bazel-diff-rust --config=release-musl`.
-# Everything --config=release does, but built for a musl platform, which makes
-# the published Linux binary statically linked: it runs on any distribution
-# instead of requiring the glibc of whatever runner built it. //platforms
-# explains the constraint; MODULE.bazel wires up the Rust and C toolchains it
-# selects. Cross-compiles, so this config works on a glibc Linux host and on an
-# Apple Silicon Mac -- the asset name is derived from the target platform, so it
-# is bazel-diff-rust-linux-amd64 either way.
+# Linux release artifacts: `bazel build //release:bazel-diff-rust --config=release-musl`
+# (amd64) or `--config=release-musl-arm64` (arm64). Everything --config=release
+# does, but built for a musl platform, which makes the published Linux binary
+# statically linked: it runs on any distribution instead of requiring the glibc
+# of whatever runner built it. //platforms explains the constraint; MODULE.bazel
+# wires up the Rust and C toolchains it selects. Cross-compiles, so these
+# configs work on a glibc Linux host and on an Apple Silicon Mac -- the asset
+# name is derived from the target platform.
 build:release-musl --config=release
 build:release-musl --platforms=//platforms:linux_x86_64_musl
+
+build:release-musl-arm64 --config=release
+build:release-musl-arm64 --platforms=//platforms:linux_aarch64_musl
 
 # Avoid cache thrashing, but allow integration tests to find "bazel" on the PATH.
 common --incompatible_strict_action_env

@@ -957,6 +957,10 @@ GitHub Releases also ship prebuilt binaries:
 curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-amd64
 chmod +x bazel-diff-rust
 
+# Linux arm64 (same musl static linking)
+curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-arm64
+chmod +x bazel-diff-rust
+
 # macOS arm64
 curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-macos-arm64
 chmod +x bazel-diff-rust
@@ -971,14 +975,17 @@ whatever lands in `bazel-bin/release/`, so `//release:bazel-diff-rust` names the
 platform it was built for (`bazel-diff-rust-<os>-<arch>`, plus `.exe` on Windows):
 
 ```terminal
-make release_rust_binary         # bazel build //release:bazel-diff-rust --config=release
-make release_rust_binary_linux   # ... --config=release-musl
+make release_rust_binary              # bazel build //release:bazel-diff-rust --config=release
+make release_rust_binary_linux        # ... --config=release-musl
+make release_rust_binary_linux_arm64  # ... --config=release-musl-arm64
 ```
 
-`--config=release-musl` targets `//platforms:linux_x86_64_musl`, which selects a musl Rust std
-and a musl C toolchain, so the Linux asset is statically linked instead of inheriting the build
-runner's glibc as a version floor. It is a cross-compile: the same command produces the same
-`bazel-diff-rust-linux-amd64` on a glibc Linux host and on an Apple Silicon Mac.
+`--config=release-musl` and `--config=release-musl-arm64` target
+`//platforms:linux_x86_64_musl` and `//platforms:linux_aarch64_musl`, which select a musl Rust
+std and a musl C toolchain, so the Linux assets are statically linked instead of inheriting the
+build runner's glibc as a version floor. They are cross-compiles: the same commands produce
+`bazel-diff-rust-linux-amd64` and `bazel-diff-rust-linux-arm64` on a glibc Linux host and on an
+Apple Silicon Mac.
 
 ### Performance gate
 

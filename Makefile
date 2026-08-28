@@ -24,15 +24,22 @@ release_rust_binary:
 		//release:bazel-diff-rust \
 		--config=release
 
-# The published Linux binary, which is not host-native: it is statically linked
-# against musl so it runs on any distribution, and cross-compiles from a glibc
-# Linux host or an Apple Silicon Mac. Same output path and asset name.
+# The published Linux binaries, which are not host-native: they are statically
+# linked against musl so they run on any distribution, and cross-compile from a
+# glibc Linux host or an Apple Silicon Mac. Same output path and asset name.
 .PHONY: release_rust_binary_linux
 release_rust_binary_linux:
 	bazel \
 		build \
 		//release:bazel-diff-rust \
 		--config=release-musl
+
+.PHONY: release_rust_binary_linux_arm64
+release_rust_binary_linux_arm64:
+	bazel \
+		build \
+		//release:bazel-diff-rust \
+		--config=release-musl-arm64
 
 .PHONY: build_rust
 build_rust:

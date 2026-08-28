@@ -198,27 +198,43 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
     return compareBy<String>({ kindRank(it) }, { it })
   }
 
-  fun computeAllDistances(
+  /**
+   * Partitions the impacted labels between [from] and [to] into [ImpactType.DIRECT] (the target's
+   * own [TargetHash.directHash] changed, or the target is new -- i.e. the target is itself a root
+   * cause of the change) and [ImpactType.INDIRECT] (only its transitive hash moved, so the cause
+   * lies upstream in its deps).
+   *
+   * Shared by the distance path ([computeAllDistances]) and the attribution path
+   * ([ExplainImpactInteractor]) so both agree on exactly which targets count as root causes.
+   *
+   * Diffs by hash identity, not the full [TargetHash] -- see [hashIdentities]. The returned keys
+   * still index the original [from]/[to] maps for the `directHash` check.
+   */
+  fun classifyImpactedLabels(
       from: Map<String, TargetHash>,
-      to: Map<String, TargetHash>,
-      depEdges: Map<String, List<String>>
-  ): Map<String, TargetDistanceMetrics> {
-    // Diff by hash identity, not the full TargetHash -- see [hashIdentities]. The keys still index
-    // the original `from`/`to` maps below for the directHash (DIRECT vs INDIRECT) check.
+      to: Map<String, TargetHash>
+  ): Map<String, ImpactType> {
     val difference = Maps.difference(hashIdentities(to), hashIdentities(from))
 
     val newLabels = difference.entriesOnlyOnLeft().keys
     val existingImpactedLabels = difference.entriesDiffering().keys
 
-    val impactedLabels =
-        HashMap<String, ImpactType>().apply {
-          newLabels.forEach { this[it] = ImpactType.DIRECT }
-          existingImpactedLabels.forEach {
-            this[it] =
-                if (from[it]!!.directHash != to[it]!!.directHash) ImpactType.DIRECT
-                else ImpactType.INDIRECT
-          }
-        }
+    return HashMap<String, ImpactType>().apply {
+      newLabels.forEach { this[it] = ImpactType.DIRECT }
+      existingImpactedLabels.forEach {
+        this[it] =
+            if (from[it]!!.directHash != to[it]!!.directHash) ImpactType.DIRECT
+            else ImpactType.INDIRECT
+      }
+    }
+  }
+
+  fun computeAllDistances(
+      from: Map<String, TargetHash>,
+      to: Map<String, TargetHash>,
+      depEdges: Map<String, List<String>>
+  ): Map<String, TargetDistanceMetrics> {
+    val impactedLabels = classifyImpactedLabels(from, to)
 
     val computedResult: ConcurrentMap<String, TargetDistanceMetrics> = ConcurrentHashMap()
 

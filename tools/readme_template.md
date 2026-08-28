@@ -107,6 +107,90 @@ This will produce an impacted targets json list with target label, target distan
 ]
 ```
 
+## Explaining Why a Target Was Impacted
+
+`get-impacted-targets` tells you *that* `//service/a:app` needs rebuilding. It does not tell you
+*why* — and a service can be impacted for several reasons at once: it changed itself, a shared
+module it depends on changed, or both. `explain` answers that question by attributing the target's
+hash change to the upstream target(s) actually responsible, and by showing the dependency path the
+change travelled along. See [issue #479](https://github.com/Tinder/bazel-diff/issues/479).
+
+It reads the same three files `get-impacted-targets` consumes — it runs no `bazel query` and needs
+no workspace — so it is cheap to run after the fact on a CI machine that only kept the artifacts:
+
+```bash
+bazel-diff generate-hashes -w /path/to/workspace -b bazel --depEdgesFile deps.json final_hashes.json
+
+bazel-diff explain \
+  -sh starting_hashes.json \
+  -fh final_hashes.json \
+  -d deps.json \
+  --target //service/a:app
+```
+
+```text
+//service/a:app  [Rule]
+IMPACTED (directly -- this target changed on its own)
+
+Root causes: 3
+
+  1. //service/a:app  [Rule]
+     the rule's own definition or attributes changed
+     0 hops -- this is the queried target itself
+     //service/a:app
+
+  2. //service/a:main.py  [SourceFile]
+     source file content changed
+     1 hop (0 package boundaries crossed)
+     //service/a:main.py -> //service/a:app
+
+  3. //common/data:util.py  [SourceFile]
+     source file content changed
+     3 hops (2 package boundaries crossed)
+     //common/data:util.py -> //common:gen_srcs -> //common:lib -> //service/a:app
+```
+
+A **root cause** is a target whose *own* hash changed — its `directHash` moved, or it is new in the
+final revision. Everything between a root cause and the queried target merely carried the change
+downstream. This is the same DIRECT/INDIRECT classification that backs the distance metrics above,
+so `explain` and `--depEdgesFile` always agree on which targets are roots.
+
+`--depEdgesFile` is required: attribution is a walk over those edges. Generate it with
+`generate-hashes --depEdgesFile` (or, on the query service, fetch it from `GET /dependency_edges`).
+
+### Visualizing the blame graph
+
+`--format dot` and `--format mermaid` emit the blame subgraph — the queried target, the root causes,
+and the targets that carried the change between them. Only that subgraph is rendered, never the
+whole impacted set, which is what keeps the output readable on a monorepo.
+
+```bash
+bazel-diff explain -sh starting_hashes.json -fh final_hashes.json -d deps.json \
+  --target //service/a:app --format dot -o why.dot
+dot -Tsvg why.dot -o why.svg
+```
+
+Edges point in **impact-propagation** direction — root cause at the top, queried target at the
+bottom — so reading downward follows the change as it flows in. (This is the reverse of the
+`--depEdgesFile` orientation, which maps a label to the deps it consumes.)
+
+`--format mermaid` emits a `flowchart TD` that renders inline in a GitHub comment or PR description,
+which is handy for posting "here is why your PR rebuilt these targets" from CI. Each role has its
+own border color *and* node shape *and* an explicit role label, so the graph stays readable in
+monochrome and for viewers who cannot separate the two hues.
+
+`--format json` gives the same data structurally (root causes, paths, nodes, edges) for feeding
+another tool.
+
+### Bounding the output
+
+A target deep in a monorepo can have a great many root causes. Two knobs bound the work, and
+neither ever truncates silently — the full count is always reported:
+
+* `--maxRootCauses` (default `25`) reports only the nearest N root causes. `0` means all of them.
+* `--maxDepth` (default `-1`, unbounded) stops the search N dependency hops above the queried
+  target. When a bound cuts the search short, a warning says so.
+
 ## Query Service (experimental)
 
 Instead of running `generate-hashes` from scratch on every CI invocation, you can run `bazel-diff` as

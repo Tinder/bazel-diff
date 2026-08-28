@@ -11,6 +11,7 @@ import picocli.CommandLine.Spec
         [
             GenerateHashesCommand::class,
             GetImpactedTargetsCommand::class,
+            ExplainCommand::class,
             WarmupCommand::class,
             FingerprintCommand::class,
             ServeCommand::class],

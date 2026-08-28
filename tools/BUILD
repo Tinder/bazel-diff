@@ -6,6 +6,7 @@ genrule(
         "help_root.txt",
         "help_generate_hashes.txt",
         "help_get_impacted_targets.txt",
+        "help_explain.txt",
         "help_serve.txt",
     ],
     cmd = """
@@ -13,6 +14,7 @@ genrule(
         $$BINARY --help > $(location help_root.txt) 2>&1 || true
         $$BINARY generate-hashes --help > $(location help_generate_hashes.txt) 2>&1 || true
         $$BINARY get-impacted-targets --help > $(location help_get_impacted_targets.txt) 2>&1 || true
+        $$BINARY explain --help > $(location help_explain.txt) 2>&1 || true
         $$BINARY serve --help > $(location help_serve.txt) 2>&1 || true
     """,
     tools = ["//cli:bazel-diff"],

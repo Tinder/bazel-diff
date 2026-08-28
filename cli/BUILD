@@ -110,6 +110,33 @@ kt_jvm_test(
 )
 
 kt_jvm_test(
+    name = "ExplainImpactInteractorTest",
+    env = coverage_minimum_env(
+        coverage_include = ["cli/src/main/kotlin/com/bazel_diff/interactor/ExplainImpactInteractor.kt"],
+    ),
+    test_class = "com.bazel_diff.interactor.ExplainImpactInteractorTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "ImpactGraphRendererTest",
+    env = coverage_minimum_env(
+        coverage_include = ["cli/src/main/kotlin/com/bazel_diff/interactor/ImpactGraphRenderer.kt"],
+    ),
+    test_class = "com.bazel_diff.interactor.ImpactGraphRendererTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "ExplainCommandTest",
+    env = coverage_minimum_env(
+        coverage_include = ["cli/src/main/kotlin/com/bazel_diff/cli/ExplainCommand.kt"],
+    ),
+    test_class = "com.bazel_diff.cli.ExplainCommandTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
     name = "CalculateImpactedTargetsInteractorTest",
     env = coverage_minimum_env(
         coverage_include = ["cli/src/main/kotlin/com/bazel_diff/interactor/CalculateImpactedTargetsInteractor.kt"],
@@ -136,6 +163,15 @@ kt_jvm_test(
         coverage_include = ["cli/src/main/kotlin/com/bazel_diff/cli/converter/NormalisingPathConverter.kt"],
     ),
     test_class = "com.bazel_diff.cli.converter.NormalisingPathConverterTest",
+    runtime_deps = [":cli-test-lib"],
+)
+
+kt_jvm_test(
+    name = "ExplainFormatConverterTest",
+    env = coverage_minimum_env(
+        coverage_include = ["cli/src/main/kotlin/com/bazel_diff/cli/converter/ExplainFormatConverter.kt"],
+    ),
+    test_class = "com.bazel_diff.cli.converter.ExplainFormatConverterTest",
     runtime_deps = [":cli-test-lib"],
 )
 

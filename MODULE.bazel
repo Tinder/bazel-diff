@@ -1,6 +1,6 @@
 module(
     name = "bazel-diff",
-    version = "45.2.0",
+    version = "46.0.0",
     compatibility_level = 0,
 )
 
@@ -155,7 +155,6 @@ rust.repository_set(
     target_triple = "x86_64-unknown-linux-musl",
     versions = ["1.90.0"],
 )
-
 rust.repository_set(
     name = "rust_musl_macos_aarch64",
     target_compatible_with = [
@@ -182,7 +181,6 @@ rust.repository_set(
     target_triple = "aarch64-unknown-linux-musl",
     versions = ["1.90.0"],
 )
-
 rust.repository_set(
     name = "rust_musl_linux_aarch64",
     target_compatible_with = [

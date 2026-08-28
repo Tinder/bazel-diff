@@ -11,7 +11,7 @@
 package(default_visibility = ["//visibility:public"])
 
 # `system_libc` is the default, so @platforms//host and every stock platform
-# satisfies it without declaring anything: only the musl platform below opts out.
+# satisfies it without declaring anything: only the musl platforms below opt out.
 constraint_setting(
     name = "libc",
     default_constraint_value = ":system_libc",
@@ -42,15 +42,25 @@ config_setting(
     constraint_values = [":musl"],
 )
 
-# The platform the published Linux binary is built for:
-# `bazel build //release:bazel-diff-rust --config=release-musl`. Statically
-# linked against musl, so the binary does not depend on the glibc version of the
-# machine that runs it. Reachable from a glibc Linux host and from an Apple
-# Silicon Mac -- both the Rust std and the C toolchain cross-compile.
+# Platforms the published Linux binaries are built for:
+# `bazel build //release:bazel-diff-rust --config=release-musl` (amd64) and
+# `--config=release-musl-arm64` (arm64). Statically linked against musl, so the
+# binary does not depend on the glibc version of the machine that runs it.
+# Reachable from a glibc Linux host and from an Apple Silicon Mac -- both the
+# Rust std and the C toolchain cross-compile.
 platform(
     name = "linux_x86_64_musl",
     constraint_values = [
         "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        ":musl",
+    ],
+)
+
+platform(
+    name = "linux_aarch64_musl",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
         "@platforms//os:linux",
         ":musl",
     ],

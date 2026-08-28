@@ -6,9 +6,10 @@
 # in release.yaml (before the asset is uploaded), so a regression cannot reach a
 # release without failing a PR first.
 #
-# The build flag that makes this true is --config=release-musl (see .bazelrc).
-# Losing it does not break the build -- it silently produces a glibc-linked
-# binary -- which is exactly why this is asserted rather than assumed.
+# The build flag that makes this true is --config=release-musl or
+# --config=release-musl-arm64 (see .bazelrc). Losing it does not break the
+# build -- it silently produces a glibc-linked binary -- which is exactly why
+# this is asserted rather than assumed.
 
 set -o errexit -o nounset -o pipefail
 
@@ -48,6 +49,28 @@ if strings -a "$BINARY" | grep -q "GLIBC_"; then
 fi
 
 # Nothing above proves the binary runs, only that it is self-contained.
-"$BINARY" --version
+# Cross-built assets (aarch64 musl on an x86_64 runner) cannot exec here;
+# file/readelf already covered static linking.
+host_arch=$(uname -m)
+elf_machine=$(readelf -h "$BINARY" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')
+can_exec=false
+case "$host_arch" in
+  x86_64|amd64)
+    if [[ "$elf_machine" == *"X86-64"* ]]; then
+      can_exec=true
+    fi
+    ;;
+  aarch64|arm64)
+    if [[ "$elf_machine" == *"AArch64"* ]]; then
+      can_exec=true
+    fi
+    ;;
+esac
+
+if [[ "$can_exec" == true ]]; then
+  "$BINARY" --version
+else
+  echo "Skipping --version: ELF machine '$elf_machine' is not runnable on $host_arch"
+fi
 
 echo "OK: $BINARY is statically linked"

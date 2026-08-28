@@ -40,6 +40,7 @@ http_archive(
 Prebuilt host-native CLIs (attached by the release workflow):
 
 - Linux amd64: https://github.com/Tinder/bazel-diff/releases/download/${TAG}/bazel-diff-rust-linux-amd64
+- Linux arm64: https://github.com/Tinder/bazel-diff/releases/download/${TAG}/bazel-diff-rust-linux-arm64
 - macOS arm64: https://github.com/Tinder/bazel-diff/releases/download/${TAG}/bazel-diff-rust-macos-arm64
 - Windows amd64: https://github.com/Tinder/bazel-diff/releases/download/${TAG}/bazel-diff-rust-windows-amd64.exe
 EOF

@@ -336,11 +336,14 @@ jobs:
         # librustc_std_workspace_alloc-<hash>.rlib comes to 263 characters and
         # the link fails with LNK1181. C:/b buys back 35.
         #
-        # release_config is `release-musl` on Linux: the published Linux binary
-        # is statically linked against musl so it does not inherit the runner's
-        # glibc as a floor on the systems it runs on. It is a cross-compile, not
-        # a different runner, so it stays in this row. macOS and Windows link
-        # their platform's own libc and use the plain `release` config.
+        # release_config is `release-musl` on Linux: the published Linux amd64
+        # binary is statically linked against musl so it does not inherit the
+        # runner's glibc as a floor. It is a cross-compile, not a different
+        # runner, so it stays in this row. The linux-arm64 musl asset is built
+        # in extra steps on this same job (not a second matrix row) so the
+        # check name stays `release-artifacts (ubuntu-latest)`. macOS and
+        # Windows link their platform's own libc and use the plain `release`
+        # config.
         include:
           - os: ubuntu-latest
             java: '11'
@@ -431,4 +434,19 @@ jobs:
         with:
           name: ${{ matrix.rust_asset }}
           path: bazel-bin/release/${{ matrix.rust_asset }}
+          if-no-files-found: error
+      # Second published Linux asset, built in this same job so the status check
+      # stays `release-artifacts (ubuntu-latest)`. A matrix row with the same
+      # `os` would duplicate that name and break branch protection.
+      - name: Build Rust binary (linux-arm64 musl)
+        if: runner.os == 'Linux'
+        run: bazelisk build //release:bazel-diff-rust --config=release-musl-arm64
+      - name: Assert Linux arm64 binary is statically linked
+        if: runner.os == 'Linux'
+        run: .github/workflows/assert_static_binary.sh bazel-bin/release/bazel-diff-rust-linux-arm64
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: bazel-diff-rust-linux-arm64
+          path: bazel-bin/release/bazel-diff-rust-linux-arm64
           if-no-files-found: error

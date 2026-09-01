@@ -191,7 +191,10 @@ neither ever truncates silently — the full count is always reported:
 * `--maxDepth` (default `-1`, unbounded) stops the search N dependency hops above the queried
   target. When a bound cuts the search short, a warning says so.
 
-## Query Service (experimental)
+## Query Service
+
+`bazel-diff serve` is production ready — it has been validated internally in production CI and is
+supported for production use.
 
 Instead of running `generate-hashes` from scratch on every CI invocation, you can run `bazel-diff` as
 a long-running HTTP service that answers affectedness queries between two git revisions and caches
@@ -242,8 +245,8 @@ curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
   as unchanged, turning an O(all source files) content read into O(changed files) — the same
   optimization as `generate-hashes --modified-filepaths`. The list must be a **superset** of what
   actually changed: a truly-changed file left off it is content-skipped on both sides and its
-  impacted targets are missed (hence experimental). Omit it (or send `[]`) for the full-content hash,
-  identical to the GET form. `POST /impacted_targets_with_distances` accepts the same body.
+  impacted targets are missed, so treat the list as a correctness contract. Omit it (or send `[]`)
+  for the full-content hash, identical to the GET form. `POST /impacted_targets_with_distances` accepts the same body.
 
 ```bash
 curl -X POST http://localhost:8080/impacted_targets \
@@ -343,7 +346,7 @@ revision are also harmless — entries are deterministic per key, so last-write-
 content. The `--cacheMax*` pruning flags bound the *local* tier only; bound the bucket with an S3
 lifecycle policy instead.
 
-Notes and current limitations:
+Notes and operational guidance:
 
 * Distance metrics (`/impacted_targets_with_distances`) and the generate-hashes graph
   (`/dependency_edges`) require the dependency-edge graph, which is

@@ -179,7 +179,7 @@ open class GenerateHashesCommand : Callable<Int> {
       names = ["-m", "--modified-filepaths"],
       description =
           [
-              "Experimental: A text file containing a newline separated list of filepaths (relative to the workspace) these filepaths should represent the modified files between the specified revisions and will be used to scope what files are hashed during hash generation."])
+              "A text file containing a newline separated list of filepaths (relative to the workspace) these filepaths should represent the modified files between the specified revisions and will be used to scope what files are hashed during hash generation."])
   var modifiedFilepaths: File? = null
 
   @CommandLine.Option(

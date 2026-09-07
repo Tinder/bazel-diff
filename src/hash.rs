@@ -336,6 +336,7 @@ fn hash_targets_with_environment(
     Ok(HashFileData {
         hashes,
         module_graph_json,
+        dependency_fingerprint: None,
         dep_edges,
     })
 }

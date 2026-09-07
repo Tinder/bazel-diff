@@ -11,6 +11,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Instant;
 use tempfile::NamedTempFile;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -71,6 +72,54 @@ impl BazelOptions {
             .status
             .success()
             .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    pub fn dependency_fingerprint(&self) -> Result<String> {
+        const STREAMED_VERSION: &str = "bzlmod-streamed-proto-v2";
+        const TEXT_FALLBACK_VERSION: &str = "bzlmod-show-repo-text-v1";
+        let total_start = Instant::now();
+        let mut hasher = Sha256::new();
+        if !self.is_bzlmod_enabled() {
+            hasher.update(b"mode:legacy");
+            eprintln!(
+                "[BD-DBG][fingerprint-ms] mode=legacy version={TEXT_FALLBACK_VERSION} mapping=0 show_repo=0 total={}",
+                total_start.elapsed().as_millis()
+            );
+            return Ok(hex::encode(hasher.finalize()));
+        }
+
+        hasher.update(b"mode:bzlmod\0");
+        let module_graph = self.module_graph_json().unwrap_or_default();
+        hasher.update(module_graph.as_bytes());
+        hasher.update(b"\0");
+
+        let mapping_start = Instant::now();
+        let canonical_names = self.canonical_bzlmod_repo_names()?;
+        let mapping_millis = mapping_start.elapsed().as_millis();
+
+        let show_repo_start = Instant::now();
+        let streamed = self.show_repo_streamed_proto(&canonical_names);
+        let show_repo_millis = show_repo_start.elapsed().as_millis();
+        if let Ok(repo_state) = streamed {
+            hasher.update(&repo_state);
+            eprintln!(
+                "[BD-DBG][fingerprint-ms] mode=bzlmod version={STREAMED_VERSION} mapping={mapping_millis} show_repo={show_repo_millis} total={} repoCount={} fallback=false",
+                total_start.elapsed().as_millis(),
+                canonical_names.len(),
+            );
+            return Ok(hex::encode(hasher.finalize()));
+        }
+
+        let fallback_show_repo_start = Instant::now();
+        let repo_state = self.show_repo_fingerprint_text_fallback(&canonical_names)?;
+        let fallback_show_repo_millis = fallback_show_repo_start.elapsed().as_millis();
+        hasher.update(repo_state.as_bytes());
+        eprintln!(
+            "[BD-DBG][fingerprint-ms] mode=bzlmod version={TEXT_FALLBACK_VERSION} mapping={mapping_millis} show_repo={fallback_show_repo_millis} total={} repoCount={} fallback=true",
+            total_start.elapsed().as_millis(),
+            canonical_names.len(),
+        );
+        Ok(hex::encode(hasher.finalize()))
     }
 
     fn version(&self) -> Result<BazelVersion> {
@@ -351,7 +400,86 @@ impl BazelOptions {
             .map(str::to_owned)
             .collect())
     }
+
+    fn canonical_bzlmod_repo_names(&self) -> Result<Vec<String>> {
+        let mapping_output = self.run_capture(&["mod", "dump_repo_mapping", ""])?;
+        if !mapping_output.status.success() {
+            bail!("bazel mod dump_repo_mapping failed");
+        }
+        Ok(parse_repo_mapping(&String::from_utf8_lossy(&mapping_output.stdout))
+            .keys()
+            .filter(|name| name.contains('+') || name.contains('~'))
+            .map(|name| format!("@@{name}"))
+            .collect::<Vec<_>>())
+    }
+
+    fn show_repo_streamed_proto(&self, canonical_names: &[String]) -> Result<Vec<u8>> {
+        if canonical_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut command = self.command();
+        command
+            .arg("mod")
+            .arg("show_repo")
+            .args(canonical_names)
+            .arg("--output=streamed_proto")
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped());
+        eprintln!("[BD-DBG][fingerprint-command] path=streamed_proto_selected cmd={command:?}");
+        if self.verbose {
+            eprintln!("[Info] Command: {command:?}");
+        }
+        let output = command.output().context("execute bazel mod show_repo streamed_proto")?;
+        if !output.status.success() {
+            bail!(
+                "bazel mod show_repo --output=streamed_proto failed with {}",
+                output.status
+            );
+        }
+        Ok(output.stdout)
+    }
+
+    fn show_repo_fingerprint_text_fallback(&self, canonical_names: &[String]) -> Result<String> {
+        let mut all_visible_command = self.command();
+        all_visible_command
+            .arg("mod")
+            .arg("show_repo")
+            .arg("--all_visible_repos")
+            .arg("--output=text");
+        eprintln!(
+            "[BD-DBG][fingerprint-command] path=text_all_visible cmd={all_visible_command:?}"
+        );
+        let output = all_visible_command
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+        }
+
+
+        let mut command = self.command();
+        command.arg("mod").arg("show_repo");
+        if canonical_names.is_empty() {
+            command.arg("--output=text");
+        } else {
+            command.args(&canonical_names).arg("--output=text");
+        }
+        eprintln!("[BD-DBG][fingerprint-command] path=text_selected_repos cmd={command:?}");
+        command.stdin(Stdio::null()).stderr(Stdio::piped());
+        let output = command.output().context("execute bazel mod show_repo")?;
+        if !output.stderr.is_empty() && self.verbose {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        if !output.status.success() {
+            bail!("bazel mod show_repo failed with {}", output.status);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
 }
+
 
 fn parse_repo_mapping(text: &str) -> BTreeMap<String, Vec<String>> {
     let mut canonical_to_apparent = BTreeMap::<String, Vec<String>>::new();

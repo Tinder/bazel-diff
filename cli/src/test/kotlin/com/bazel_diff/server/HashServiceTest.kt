@@ -87,6 +87,10 @@ class HashServiceTest : KoinTest {
   private fun newService(git: GitClient, storage: HashCacheStorage, trackDeps: Boolean = false) =
       HashService(git, storage, "fp", emptySet(), emptySet(), trackDeps)
 
+  private fun stubDependencyFingerprint(value: String = "dep-fp") {
+    runBlocking { whenever(bazelModService.getDependencyFingerprint()).thenReturn(value) }
+  }
+
   @Test
   fun cacheMissGeneratesAndStores() {
     whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
@@ -144,6 +148,7 @@ class HashServiceTest : KoinTest {
     whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
         .thenReturn(sampleHashes)
     runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
+    stubDependencyFingerprint()
     val git = RecordingGitClient()
     val storage = InMemoryStorage()
     val service = newService(git, storage)
@@ -152,8 +157,9 @@ class HashServiceTest : KoinTest {
     val second = service.getHashes("sha1")
 
     assertThat(second.hashes).isEqualTo(sampleHashes)
-    // Only the first call touches the workspace / runs the hasher.
-    assertThat(git.checkouts).isEqualTo(listOf("sha1"))
+    // Cache hits still checkout to validate the dependency fingerprint, but they do not rerun the
+    // hasher.
+    assertThat(git.checkouts).isEqualTo(listOf("sha1", "sha1"))
     verify(buildGraphHasher, times(1))
         .hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull())
   }
@@ -163,6 +169,7 @@ class HashServiceTest : KoinTest {
     whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
         .thenReturn(sampleHashes)
     runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
+    stubDependencyFingerprint()
     val service = newService(RecordingGitClient(), InMemoryStorage())
 
     val missProfiler = QueryProfiler()
@@ -204,6 +211,7 @@ class HashServiceTest : KoinTest {
     whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
         .thenReturn(sampleHashes)
     runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn("""{"graph":1}""") }
+    stubDependencyFingerprint()
     val storage = InMemoryStorage()
 
     // Generate once, then read back through a fresh service over the same storage (cache hit path).
@@ -219,6 +227,7 @@ class HashServiceTest : KoinTest {
     whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
         .thenReturn(sampleHashesWithDeps)
     runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
+    stubDependencyFingerprint()
     val storage = InMemoryStorage()
 
     val generated = newService(RecordingGitClient(), storage, trackDeps = true).getHashes("sha1")
@@ -281,6 +290,8 @@ class HashServiceTest : KoinTest {
 
   @Test
   fun deserializeLegacyFlatCacheEntry() {
+    whenever(buildGraphHasher.hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull()))
+        .thenReturn(sampleHashes)
     val storage = InMemoryStorage()
     storage.entries["sha1.fp"] = """{"//:a":"Rule#h~d"}""".toByteArray(StandardCharsets.UTF_8)
 
@@ -289,8 +300,8 @@ class HashServiceTest : KoinTest {
     assertThat(data.hashes).isEqualTo(sampleHashes)
     assertThat(data.moduleGraphJson).isNull()
     assertThat(data.depEdges).isEqualTo(emptyMap())
-    // No generation on a pure cache hit.
-    verify(buildGraphHasher, times(0))
+    // Legacy cache entries without dependencyFingerprint are now recomputed.
+    verify(buildGraphHasher, times(1))
         .hashAllBazelTargetsAndSourcefiles(any(), any(), any(), anyOrNull())
   }
 
@@ -307,6 +318,7 @@ class HashServiceTest : KoinTest {
           sampleHashes
         }
     runBlocking { whenever(bazelModService.getModuleGraphJson()).thenReturn(null) }
+    stubDependencyFingerprint()
 
     val service = newService(RecordingGitClient(), InMemoryStorage())
     val missDone = CountDownLatch(1)

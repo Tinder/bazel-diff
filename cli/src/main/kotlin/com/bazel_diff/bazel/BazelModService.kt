@@ -1,135 +1,97 @@
-package com.bazel_diff.bazel
+package com.bazel_diff.interactor
 
-import com.bazel_diff.log.Logger
-import com.bazel_diff.process.Redirect
-import com.bazel_diff.process.process
-import java.nio.file.Path
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.runBlocking
+import com.bazel_diff.hash.TargetHash
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import com.google.gson.reflect.TypeToken
+import java.io.File
+import java.io.FileReader
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
-/**
- * Service that runs `bazel mod` to detect whether Bzlmod is enabled in the workspace. Used to
- * decide whether to query //external:all-targets (disabled when Bzlmod is active).
- */
-class BazelModService(
-    private val workingDirectory: Path,
-    private val bazelPath: Path,
-    private val startupOptions: List<String>,
-    private val noBazelrc: Boolean,
-) : KoinComponent {
-  private val logger: Logger by inject()
+data class HashFileData(
+    val hashes: Map<String, TargetHash>,
+    val moduleGraphJson: String?,
+    val depEdges: Map<String, List<String>> = emptyMap(),
+    val dependencyFingerprint: String? = null,
+)
+
+class DeserialiseHashesInteractor : KoinComponent {
+  private val gson: Gson by inject()
 
   /**
-   * True if Bzlmod is enabled (e.g. `bazel mod graph` succeeds). When true, //external is not
-   * available.
+   * @param file path to file that has been pre-validated
+   * @param targetTypes the target types to filter. If null, all targets will be returned
+   * @return HashFileData containing hashes and optional module graph JSON
    */
-  val isBzlmodEnabled: Boolean by lazy { runBlocking { checkBzlmodEnabled() } }
+  fun executeTargetHashWithMetadata(file: File): HashFileData {
+    return parseHashFileData(gson.fromJson(FileReader(file), JsonObject::class.java))
+  }
 
   /**
-   * Returns the module dependency graph as a string for hashing purposes. This captures all module
-   * dependencies and their versions, allowing bazel-diff to detect when MODULE.bazel changes (e.g.,
-   * when a module version is updated).
-   *
-   * @return The output of `bazel mod graph` if bzlmod is enabled, or null if disabled/error.
+   * Parses hash data from an in-memory JSON [json] string. Used by the query service to read cached
+   * hash JSON without round-tripping through a temp file. Accepts the same two shapes as
+   * [executeTargetHashWithMetadata] (new format with metadata, or the legacy flat map).
    */
-  @OptIn(ExperimentalCoroutinesApi::class)
-  suspend fun getModuleGraph(): String? {
-    if (!isBzlmodEnabled) {
-      return null
-    }
+  fun executeTargetHashWithMetadataFromString(json: String): HashFileData {
+    return parseHashFileData(gson.fromJson(json, JsonObject::class.java))
+  }
 
-    val cmd =
-        mutableListOf<String>().apply {
-          add(bazelPath.toString())
-          if (noBazelrc) {
-            add("--bazelrc=/dev/null")
-          }
-          addAll(startupOptions)
-          add("mod")
-          add("graph")
-        }
-    logger.i { "Executing Bazel mod graph for hashing: ${cmd.joinToString()}" }
-    val result =
-        process(
-            *cmd.toTypedArray(),
-            stdout = Redirect.CAPTURE,
-            stderr = Redirect.SILENT,
-            workingDirectory = workingDirectory.toFile(),
-            destroyForcibly = true,
-        )
+  private fun parseHashFileData(jsonObject: JsonObject): HashFileData {
+    // Check if this is the new format with metadata
+    if (jsonObject.has("hashes") && jsonObject.has("metadata")) {
+      // New format
+      val hashesShape = object : TypeToken<Map<String, String>>() {}.type
+      val hashesMap: Map<String, String> = gson.fromJson(jsonObject.get("hashes"), hashesShape)
+      val hashes = hashesMap.mapValues { TargetHash.fromJson(it.value) }
 
-    return if (result.resultCode == 0) {
-      result.output.joinToString("\n").trim()
+      val metadata = jsonObject.getAsJsonObject("metadata")
+      val moduleGraphJson = metadata?.get("moduleGraphJson")?.asString
+      val dependencyFingerprint = metadata?.get("dependencyFingerprint")?.asString
+
+      // The query service persists the dependency-edge adjacency list (label -> direct dep labels)
+      // under metadata.depEdges when started with --trackDeps, so build-graph distance metrics can
+      // be computed on a cache hit without re-tracking deps. Absent for CLI-produced hashes.
+      val depEdges: Map<String, List<String>> =
+          metadata?.get("depEdges")?.let {
+            val depShape = object : TypeToken<Map<String, List<String>>>() {}.type
+            gson.fromJson<Map<String, List<String>>>(it, depShape)
+          } ?: emptyMap()
+
+      return HashFileData(hashes, moduleGraphJson, depEdges, dependencyFingerprint)
     } else {
-      logger.w { "Failed to get module graph" }
-      null
+      // Legacy format - just a flat map of hashes
+      val shape = object : TypeToken<Map<String, String>>() {}.type
+      val result: Map<String, String> = gson.fromJson(jsonObject, shape)
+      val hashes = result.mapValues { TargetHash.fromJson(it.value) }
+      return HashFileData(hashes, null)
     }
   }
 
   /**
-   * Returns the module dependency graph in JSON format for precise change detection.
-   *
-   * @return The JSON output of `bazel mod graph --output=json` if bzlmod is enabled, or null if
-   *   disabled/error.
+   * @param file path to file that has been pre-validated
+   * @param targetTypes the target types to filter. If null, all targets will be returned
    */
-  @OptIn(ExperimentalCoroutinesApi::class)
-  suspend fun getModuleGraphJson(): String? {
-    if (!isBzlmodEnabled) {
-      return null
-    }
-
-    val cmd =
-        mutableListOf<String>().apply {
-          add(bazelPath.toString())
-          if (noBazelrc) {
-            add("--bazelrc=/dev/null")
-          }
-          addAll(startupOptions)
-          add("mod")
-          add("graph")
-          add("--output=json")
-        }
-    logger.i { "Executing Bazel mod graph JSON: ${cmd.joinToString()}" }
-    val result =
-        process(
-            *cmd.toTypedArray(),
-            stdout = Redirect.CAPTURE,
-            stderr = Redirect.SILENT,
-            workingDirectory = workingDirectory.toFile(),
-            destroyForcibly = true,
-        )
-
-    return if (result.resultCode == 0) {
-      result.output.joinToString("\n").trim()
-    } else {
-      logger.w { "Failed to get module graph JSON" }
-      null
-    }
+  fun executeTargetHash(file: File): Map<String, TargetHash> {
+    return executeTargetHashWithMetadata(file).hashes
   }
 
-  @OptIn(ExperimentalCoroutinesApi::class)
-  private suspend fun checkBzlmodEnabled(): Boolean {
-    val cmd =
-        mutableListOf<String>().apply {
-          add(bazelPath.toString())
-          if (noBazelrc) {
-            add("--bazelrc=/dev/null")
-          }
-          addAll(startupOptions)
-          add("mod")
-          add("graph")
-        }
-    logger.i { "Executing Bazel mod graph: ${cmd.joinToString()}" }
-    val result =
-        process(
-            *cmd.toTypedArray(),
-            stdout = Redirect.CAPTURE,
-            stderr = Redirect.CAPTURE,
-            workingDirectory = workingDirectory.toFile(),
-            destroyForcibly = true,
-        )
-    return result.resultCode == 0
+  /**
+   * Deserializes hashes from the given file.
+   *
+   * Used for deserializing the content hashes of files, which are represented as a map of file
+   * paths to their content hashes.
+   *
+   * @param file The path to the file that has been pre-validated.
+   * @return A map containing the deserialized hashes.
+   */
+  fun executeSimple(file: File): Map<String, String> {
+    val shape = object : TypeToken<Map<String, String>>() {}.type
+    return gson.fromJson(FileReader(file), shape)
+  }
+
+  fun deserializeDeps(file: File): Map<String, List<String>> {
+    val shape = object : TypeToken<Map<String, List<String>>>() {}.type
+    return gson.fromJson(FileReader(file), shape)
   }
 }

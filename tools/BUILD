@@ -101,6 +101,7 @@ py_library(
     name = "perf_gate_lib",
     srcs = [
         "perf_gate.py",
+        "perf_serve.py",
         "perf_workload.py",
     ],
     imports = ["."],
@@ -115,6 +116,7 @@ py_binary(
     name = "perf-gate",
     srcs = [
         "perf_gate.py",
+        "perf_serve.py",
         "perf_workload.py",
     ],
     data = [
@@ -137,6 +139,17 @@ py_binary(
 py_test(
     name = "perf_gate_test",
     srcs = ["perf_gate_test.py"],
+    python_version = "PY3",
+    deps = [":perf_gate_lib"],
+)
+
+# perf_serve.py's own unit tests use a stub HTTP server (Python's http.server), never a
+# real bazel-diff binary or a real bazel query -- same hermetic-stub philosophy as
+# perf_gate_test.py, applied to the start/health-wait/request/parity pipeline instead of
+# the one-shot-process pipeline.
+py_test(
+    name = "perf_serve_test",
+    srcs = ["perf_serve_test.py"],
     python_version = "PY3",
     deps = [":perf_gate_lib"],
 )

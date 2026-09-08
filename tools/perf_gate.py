@@ -36,6 +36,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import platform
@@ -891,6 +892,22 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         type=Path,
         help="keep generated fixtures here instead of a temporary directory",
     )
+    parser.add_argument(
+        "--skip-serve",
+        action="store_true",
+        help="skip the serve workloads (starting two HTTP servers is much slower "
+        "than the hermetic process workloads)",
+    )
+    parser.add_argument(
+        "--serve-requests",
+        type=int,
+        help="override the requests fired per implementation per serve round",
+    )
+    parser.add_argument(
+        "--serve-concurrency",
+        type=int,
+        help="override the concurrent requests in flight during a serve round",
+    )
     parser.add_argument("--json", type=Path, help="write the full report as JSON")
     args = parser.parse_args(argv)
     if args.rounds < 1:
@@ -905,15 +922,42 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         parser.error("--min-win-rate must be within [0, 1]")
     if args.max_rss_ratio is not None and args.rss_runs < 1:
         parser.error("--max-rss-ratio requires --rss-runs")
+    if args.serve_requests is not None and args.serve_requests < 1:
+        parser.error("--serve-requests must be at least 1")
+    if args.serve_concurrency is not None and args.serve_concurrency < 1:
+        parser.error("--serve-concurrency must be at least 1")
     return args
+
+
+def _serve_specs_and_names():
+    """Import lazily: ``perf_serve`` imports back from this module."""
+    from perf_serve import default_serve_specs
+
+    return default_serve_specs
 
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     specs = default_workload_specs(args.scale)
+    default_serve_specs = _serve_specs_and_names()
+    serve_overrides = {
+        key: value
+        for key, value in (
+            ("request_count", args.serve_requests),
+            ("concurrency", args.serve_concurrency),
+        )
+        if value is not None
+    }
+    serve_specs = [
+        dataclasses.replace(spec, **serve_overrides) if serve_overrides else spec
+        for spec in default_serve_specs(args.scale)
+    ]
     if args.list_workloads:
         for spec in specs:
             print(f"{spec.name:32} {spec.description}")
+        if not args.skip_serve:
+            for serve_spec in serve_specs:
+                print(f"{serve_spec.name:32} {serve_spec.description}")
         return 0
     thresholds = Thresholds(
         min_speedup=args.min_speedup,
@@ -921,15 +965,27 @@ def main(argv: Sequence[str]) -> int:
         min_logic_speedup=args.min_logic_speedup,
         max_rss_ratio=args.max_rss_ratio,
     )
+    serve_names = [name for name in args.workloads if name in {spec.name for spec in serve_specs}]
+    process_names = [name for name in args.workloads if name not in serve_names]
     try:
-        selected = select_workloads(specs, args.workloads)
+        selected = select_workloads(specs, process_names)
+        if args.skip_serve:
+            selected_serve: list = []
+        elif args.workloads and not serve_names:
+            # An explicit --workload selection that names no serve workload means
+            # "only run these", matching select_workloads' semantics for the rest.
+            selected_serve = []
+        else:
+            selected_serve = [
+                spec for spec in serve_specs if not serve_names or spec.name in serve_names
+            ]
         binaries = resolve_binaries(args.kotlin_binary, args.rust_binary)
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
     def gate(root: Path) -> list[WorkloadReport]:
-        return run_gate(
+        reports = run_gate(
             selected,
             binaries,
             root,
@@ -938,6 +994,21 @@ def main(argv: Sequence[str]) -> int:
             thresholds=thresholds,
             rss_runs=args.rss_runs,
         )
+        if selected_serve:
+            from perf_serve import measure_serve_workload
+
+            for serve_spec in selected_serve:
+                directory = root / serve_spec.name
+                directory.mkdir(parents=True, exist_ok=True)
+                report = measure_serve_workload(
+                    serve_spec,
+                    binaries,
+                    directory,
+                    rounds=args.rounds,
+                    env=os.environ.copy(),
+                )
+                reports.append(evaluate(report, thresholds, is_startup=False))
+        return reports
 
     try:
         if args.fixture_dir:

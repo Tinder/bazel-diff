@@ -51,9 +51,39 @@ bytes and any difference in timing is a difference in code.
 | `generate-hashes-large` | 24,000 targets: the same path where per-target cost dominates |
 | `get-impacted-targets` | diffing 150,000 hashed targets |
 | `get-impacted-targets-distances` | the same diff plus build-graph distance metrics over dependency edges |
+| `serve-small` | `serve`: time-to-ready plus `/impacted_targets` request latency against a small workspace |
+| `serve-large` | the same, against a larger workspace with more requests fired |
 
 `--scale` multiplies the sizes; `--workload` restricts the run (the `startup` baseline is
-always measured, because the other workloads' adjusted numbers derive from it).
+always measured, because the other workloads' adjusted numbers derive from it). Pass
+`--skip-serve` to leave out `serve-small`/`serve-large` -- starting two HTTP servers per
+round is much slower than the hermetic process workloads, which matters most for fast
+local iteration. `--serve-requests`/`--serve-concurrency` override the request volume and
+concurrency the serve workloads run with.
+
+### The `serve` workloads
+
+`serve` does not fit the "run once, time it, diff the output" shape every other workload
+uses: it is a long-running HTTP query server, so the measurement is "start it, wait for
+`/health`, fire many requests, then kill it" instead. `tools/perf_serve.py` is the parallel
+pipeline for that: it builds a small real git repository (via
+`perf_workload.write_git_workspace` -- unlike the replay-`bazel`-shim workloads, `serve`
+actually clones and checks out real revisions), starts both servers against it one at a
+time (alternating which one starts first each round, for the same anti-drift reason as the
+other workloads), fires a batch of `/impacted_targets` requests at each with a thread pool,
+and diffs the JSON responses for parity before comparing latency.
+
+Its report reuses the request latency's median for the primary speedup and win-rate
+columns, and repurposes the "logic" (startup-adjusted) column to carry each server's
+**time-to-ready** (first `/health` 200) instead -- server boot (git operations, port bind,
+HTTP server init) is a different cost from request latency, not the same "subtract process
+start-up" adjustment the process workloads make, so read that column as "who starts up
+faster," not "who processes faster once warm."
+
+Rust's `serve` has no `--portFile` flag (Kotlin's exists for OS-assigned ephemeral ports).
+Both implementations are therefore driven through a pre-picked free port
+(`bind(("127.0.0.1", 0))`, read the port, close, reuse the number) -- the same small
+bind/release race already accepted by the Rust end-to-end test harness.
 
 `tools/perf_workload.py` builds the fixtures:
 
@@ -148,3 +178,7 @@ faster -- a run against the real binaries can only ever show that it passes. It 
 checks the fixture encoder against an independent protobuf decoder and runs the replay
 shim. It is hermetic and fast, and runs in the standard CI matrix alongside
 `//tools:benchmark_test`.
+
+`//tools:perf_serve_test` covers the serve pipeline the same way, but the stand-in is a
+stub HTTP server (Python's `http.server`) rather than a stub script that exits -- `serve`
+has no output file to diff, so parity is checked over request/response bodies instead.

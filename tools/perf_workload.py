@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -637,3 +638,66 @@ def write_hash_files(
         dep_edges_path = directory / "dep-edges.json"
         dep_edges_path.write_text(json.dumps(build_dep_edges(labels, spec), sort_keys=True))
     return starting_path, final_path, dep_edges_path
+
+
+# --------------------------------------------------------------------------
+# Git workspace for the ``serve`` workload
+# --------------------------------------------------------------------------
+
+_GIT_IDENTITY = (
+    "-c",
+    "user.name=perf-gate",
+    "-c",
+    "user.email=perf-gate@example.com",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "init.defaultBranch=master",
+)
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *_GIT_IDENTITY, *args],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {result.stdout}")
+    return result.stdout.strip()
+
+
+def write_git_workspace(root: Path, spec: GraphSpec, *, revisions: int = 2) -> tuple[Path, list[str]]:
+    """Init a local git repo containing a hermetic workspace with ``revisions`` commits.
+
+    ``serve`` git-clones and checks out real revisions -- unlike the replay-bazel-shim
+    workloads, there is no shortcut here. Each commit after the first mutates a small
+    slice of source files so a from/to diff has non-trivial (but bounded, deterministic)
+    work to do; both implementations get byte-identical history so their answers can be
+    compared. No git daemon is needed: ``serve`` can clone from a plain filesystem path,
+    and only the functional/stress harnesses' ``git://`` fetch-path tests need a live
+    daemon.
+
+    Returns ``(repo_path, shas)`` with ``shas`` oldest first.
+    """
+    if revisions < 1:
+        raise ValueError(f"revisions must be at least 1, got {revisions}")
+    write_workspace(root, spec)
+    _git(root, "init", "-q")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "revision 0")
+    shas = [_git(root, "rev-parse", "HEAD")]
+    # Touch one source file per package on later revisions -- enough to make every
+    # package's rule digest change without rewriting the whole tree each time.
+    for revision in range(1, revisions):
+        for package in range(spec.packages):
+            package_dir = root / package_name(package)
+            (package_dir / "src_0_0.txt").write_text(
+                _source_text(package, 0, 0, spec) + f"# revision {revision}\n"
+            )
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", f"revision {revision}")
+        shas.append(_git(root, "rev-parse", "HEAD"))
+    return root, shas

@@ -406,11 +406,13 @@ impl BazelOptions {
         if !mapping_output.status.success() {
             bail!("bazel mod dump_repo_mapping failed");
         }
-        Ok(parse_repo_mapping(&String::from_utf8_lossy(&mapping_output.stdout))
-            .keys()
-            .filter(|name| name.contains('+') || name.contains('~'))
-            .map(|name| format!("@@{name}"))
-            .collect::<Vec<_>>())
+        Ok(
+            parse_repo_mapping(&String::from_utf8_lossy(&mapping_output.stdout))
+                .keys()
+                .filter(|name| name.contains('+') || name.contains('~'))
+                .map(|name| format!("@@{name}"))
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn show_repo_streamed_proto(&self, canonical_names: &[String]) -> Result<Vec<u8>> {
@@ -429,7 +431,9 @@ impl BazelOptions {
         if self.verbose {
             eprintln!("[Info] Command: {command:?}");
         }
-        let output = command.output().context("execute bazel mod show_repo streamed_proto")?;
+        let output = command
+            .output()
+            .context("execute bazel mod show_repo streamed_proto")?;
         if !output.status.success() {
             bail!(
                 "bazel mod show_repo --output=streamed_proto failed with {}",
@@ -459,13 +463,12 @@ impl BazelOptions {
             }
         }
 
-
         let mut command = self.command();
         command.arg("mod").arg("show_repo");
         if canonical_names.is_empty() {
             command.arg("--output=text");
         } else {
-            command.args(&canonical_names).arg("--output=text");
+            command.args(canonical_names).arg("--output=text");
         }
         eprintln!("[BD-DBG][fingerprint-command] path=text_selected_repos cmd={command:?}");
         command.stdin(Stdio::null()).stderr(Stdio::piped());
@@ -479,7 +482,6 @@ impl BazelOptions {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 }
-
 
 fn parse_repo_mapping(text: &str) -> BTreeMap<String, Vec<String>> {
     let mut canonical_to_apparent = BTreeMap::<String, Vec<String>>::new();

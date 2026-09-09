@@ -161,6 +161,13 @@ struct QueryInputs {
     profile: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum QueryKind {
+    Labels,
+    Distances,
+    DepEdges,
+}
+
 pub fn parse_duration(value: &str) -> Result<Duration> {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -318,7 +325,7 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
             }
             respond_json(request, 200, &metrics(state))
         }
-        "/impacted_targets" | "/impacted_targets_with_distances" => {
+        "/impacted_targets" | "/impacted_targets_with_distances" | "/dependency_edges" => {
             if !state.ready.load(Ordering::Acquire) {
                 return respond_json(request, 503, &json!({"error": "service not ready"}));
             }
@@ -335,19 +342,29 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
                     return respond_json(request, 400, &json!({"error": error.to_string()}))
                 }
             };
-            let distances = path.ends_with("_with_distances");
-            if distances && !state.config.track_deps {
+            let kind = match path {
+                "/dependency_edges" => QueryKind::DepEdges,
+                "/impacted_targets_with_distances" => QueryKind::Distances,
+                _ => QueryKind::Labels,
+            };
+            if matches!(kind, QueryKind::Distances | QueryKind::DepEdges)
+                && !state.config.track_deps
+            {
+                let unavailable = match kind {
+                    QueryKind::DepEdges => "dependency edges unavailable",
+                    _ => "distances unavailable",
+                };
                 return respond_json(
                     request,
                     400,
-                    &json!({"error": "distances unavailable: server started without --trackDeps"}),
+                    &json!({"error": format!("{unavailable}: server started without --trackDeps")}),
                 );
             }
             let timeout = state.config.request_timeout;
             let state_for_compute = Arc::clone(state);
             let (sender, receiver) = mpsc::sync_channel(1);
             std::thread::spawn(move || {
-                let _ = sender.send(compute_query(&state_for_compute, inputs, distances));
+                let _ = sender.send(compute_query(&state_for_compute, inputs, kind));
             });
             let computed = if timeout.is_zero() {
                 receiver
@@ -444,7 +461,7 @@ fn normalized_types(types: Option<Vec<String>>) -> Option<HashSet<String>> {
         .filter(|types| !types.is_empty())
 }
 
-fn compute_query(state: &Arc<State>, inputs: QueryInputs, distances: bool) -> Result<Value> {
+fn compute_query(state: &Arc<State>, inputs: QueryInputs, kind: QueryKind) -> Result<Value> {
     let started = Instant::now();
     let _guard = state
         .workspace_lock
@@ -453,6 +470,14 @@ fn compute_query(state: &Arc<State>, inputs: QueryInputs, distances: bool) -> Re
     let resolve_started = Instant::now();
     let (from_sha, to_sha) = resolve_both(state, &inputs.from, &inputs.to)?;
     let resolve_millis = resolve_started.elapsed().as_millis() as u64;
+    if matches!(kind, QueryKind::DepEdges) {
+        // Same graph generate-hashes writes to --depEdgesFile: the end revision's
+        // full (unscoped) dependency map. modifiedFilepaths must not shrink it —
+        // PRI/CRI BFS-walk this file from the app target and need every edge.
+        let (to, _) = get_hashes_locked(state, &to_sha, &BTreeSet::new())?;
+        prune_cache(state)?;
+        return Ok(serde_json::to_value(&to.dep_edges)?);
+    }
     let from_started = Instant::now();
     let (from, from_hit) = get_hashes_locked(state, &from_sha, &inputs.modified_filepaths)?;
     let from_millis = from_started.elapsed().as_millis() as u64;
@@ -464,7 +489,7 @@ fn compute_query(state: &Arc<State>, inputs: QueryInputs, distances: bool) -> Re
     let exclude_external = state.config.hash_options.bazel.is_bzlmod_enabled();
     let impacted =
         impacted_with_module_changes(&from, &to, Some(&state.config.hash_options.bazel))?;
-    let impacted_value = if distances {
+    let impacted_value = if matches!(kind, QueryKind::Distances) {
         let hash_impacted = impacted_targets(&from.hashes, &to.hashes, None, false)?
             .into_iter()
             .collect::<BTreeSet<_>>();
@@ -583,15 +608,16 @@ fn get_hashes_locked(
     options.modified_filepaths = modified.clone();
     options.track_deps = state.config.track_deps;
     let mut data = generate_hashes(&options)?;
-    data.dependency_fingerprint = current_dependency_fingerprint.take().or_else(|| {
-        match dependency_fingerprint_for_workspace(state) {
-            Ok(value) => Some(value),
-            Err(error) => {
-                eprintln!("[Warn] {error:#}");
-                None
-            }
-        }
-    });
+    data.dependency_fingerprint =
+        current_dependency_fingerprint.take().or_else(
+            || match dependency_fingerprint_for_workspace(state) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    eprintln!("[Warn] {error:#}");
+                    None
+                }
+            },
+        );
     match data.dependency_fingerprint.as_deref() {
         Some(fingerprint) => eprintln!(
             "[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp={}",
@@ -618,9 +644,7 @@ fn cache_entry_matches_dependency_fingerprint(
     current_dependency_fingerprint: &mut Option<String>,
 ) -> Result<bool> {
     let Some(cached_fingerprint) = data.dependency_fingerprint.as_deref() else {
-        eprintln!(
-            "[BD-DBG][cache-guard-no-fingerprint] scope={scope} sha={sha} policy=recompute"
-        );
+        eprintln!("[BD-DBG][cache-guard-no-fingerprint] scope={scope} sha={sha} policy=recompute");
         return Ok(false);
     };
     if current_dependency_fingerprint.is_none() {
@@ -664,9 +688,7 @@ fn dependency_fingerprint_for_workspace(state: &State) -> Result<String> {
         .bazel
         .dependency_fingerprint()
         .map_err(|error| {
-            anyhow!(
-                "failed to compute dependency fingerprint for cache guard: {error:#}"
-            )
+            anyhow!("failed to compute dependency fingerprint for cache guard: {error:#}")
         })
 }
 
@@ -1430,6 +1452,12 @@ mod tests {
         let (repo, _, sha) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
         let state = state_for_repo(repo.path(), cache.path(), true);
+        let dependency_fingerprint = state
+            .config
+            .hash_options
+            .bazel
+            .dependency_fingerprint()
+            .unwrap();
         let data = HashFileData {
             hashes: std::collections::BTreeMap::from([(
                 "//app:lib".into(),
@@ -1439,6 +1467,7 @@ mod tests {
                 "//app:lib".into(),
                 vec!["//dep:lib".into()],
             )]),
+            dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
         let key = cache_key(&state, &sha, &BTreeSet::new());
@@ -1456,20 +1485,22 @@ mod tests {
     fn remote_cache_hit_is_backfilled_and_next_read_is_local() {
         let (repo, _, sha) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.path().to_path_buf();
+        config.git_path = PathBuf::from("git");
+        config.cache_dir = cache.path().to_path_buf();
+        let dependency_fingerprint = config.hash_options.bazel.dependency_fingerprint().unwrap();
         let data = HashFileData {
             hashes: std::collections::BTreeMap::from([(
                 "//app:lib".into(),
                 hash("Rule", "overall", "direct"),
             )]),
+            dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
         let (remote, requests, handle) =
             remote_cache_with_responses("", vec![(200, Vec::new()), (200, bytes)]);
-        let mut config = test_config();
-        config.hash_options.bazel.workspace = repo.path().to_path_buf();
-        config.git_path = PathBuf::from("git");
-        config.cache_dir = cache.path().to_path_buf();
         let fingerprint = configuration_fingerprint(&config);
         let state = Arc::new(State {
             config,
@@ -1500,11 +1531,18 @@ mod tests {
         let (repo, first, second) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
         let state = state_for_repo(repo.path(), cache.path(), true);
+        let dependency_fingerprint = state
+            .config
+            .hash_options
+            .bazel
+            .dependency_fingerprint()
+            .unwrap();
         let from = HashFileData {
             hashes: std::collections::BTreeMap::from([
                 ("//app:source".into(), hash("SourceFile", "old", "old")),
                 ("//app:rule".into(), hash("Rule", "old-rule", "same-direct")),
             ]),
+            dependency_fingerprint: Some(dependency_fingerprint.clone()),
             ..Default::default()
         };
         let to = HashFileData {
@@ -1516,6 +1554,7 @@ mod tests {
                 "//app:rule".into(),
                 vec!["//app:source".into()],
             )]),
+            dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
         for (sha, data) in [(&first, &from), (&second, &to)] {
@@ -1533,7 +1572,7 @@ mod tests {
             modified_filepaths: BTreeSet::new(),
             profile: true,
         };
-        let result = compute_query(&state, inputs, true).unwrap();
+        let result = compute_query(&state, inputs, QueryKind::Distances).unwrap();
         assert_eq!(result["to"], second);
         assert_eq!(result["impactedTargets"].as_array().unwrap().len(), 2);
         assert_eq!(result["profile"]["hashRetrievals"][0]["cacheHit"], true);
@@ -1668,6 +1707,13 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 400"));
         assert!(response.contains("distances unavailable"));
+
+        let response = request(
+            &state,
+            "GET /dependency_edges?from=a&to=b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.contains("dependency edges unavailable"));
     }
 
     #[test]
@@ -1675,11 +1721,18 @@ mod tests {
         let (repo, first, second) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
         let state = state_for_repo(repo.path(), cache.path(), true);
+        let dependency_fingerprint = state
+            .config
+            .hash_options
+            .bazel
+            .dependency_fingerprint()
+            .unwrap();
         let from = HashFileData {
             hashes: std::collections::BTreeMap::from([
                 ("//app:source".into(), hash("SourceFile", "old", "old")),
                 ("//app:rule".into(), hash("Rule", "old-rule", "same-direct")),
             ]),
+            dependency_fingerprint: Some(dependency_fingerprint.clone()),
             ..Default::default()
         };
         let to = HashFileData {
@@ -1691,6 +1744,7 @@ mod tests {
                 "//app:rule".into(),
                 vec!["//app:source".into()],
             )]),
+            dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
         for (sha, data) in [(&first, &from), (&second, &to)] {
@@ -1722,6 +1776,23 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("\"targetDistance\":1"));
         assert!(!response.contains("\"profile\""));
+
+        let response = request(
+            &state,
+            &format!(
+                "GET /dependency_edges?from={first}&to={second}&profile=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"//app:rule\":[\"//app:source\"]"));
+        assert!(
+            !response.contains("\"impactedTargets\""),
+            "body must be the generate-hashes graph, not a wrapped query response: {response}"
+        );
+        assert!(
+            !response.contains("\"profile\""),
+            "profile=true must not wrap the graph body: {response}"
+        );
     }
 
     #[test]

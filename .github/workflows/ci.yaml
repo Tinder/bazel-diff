@@ -25,7 +25,13 @@ jobs:
         with:
           go-version: ^1.17
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
       - uses: actions/checkout@v4
       - name: Check Bazel build and tests
         env:
@@ -53,7 +59,11 @@ jobs:
         # which ignores USE_BAZEL_VERSION. It reaches the test through the
         # target's env_inherit.
         run: |
-          go install github.com/bazelbuild/bazelisk@latest
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           echo "BAZEL=$(go env GOPATH)/bin/bazelisk" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
@@ -78,7 +88,13 @@ jobs:
         with:
           go-version: ^1.17
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
       - uses: actions/checkout@v4
       - name: Check the e2e test split is up to date
         env:
@@ -94,7 +110,13 @@ jobs:
         with:
           go-version: ^1.17
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
       - uses: actions/checkout@v4
       # Builds the crate with the toolchain pinned to `rust-version` in
       # Cargo.toml instead of the repo default. --extra_toolchains outranks the
@@ -143,7 +165,14 @@ jobs:
           go-version: ^1.17
         id: go
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
+          export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
       - name: Free disk space on Ubuntu
         if: runner.os == 'Linux'
@@ -167,12 +196,19 @@ jobs:
       - name: Run bazel-diff tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
+        # Retries guard against flaky E2E tests that hit the network (e.g. bazel mod
+        # show_repo / BCR calls) failing the whole job on a transient blip.
         run: |
           BAZEL_STARTUP=()
           if [ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]; then
             BAZEL_STARTUP=(--output_user_root="${BAZEL_OUTPUT_USER_ROOT}")
           fi
-          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false
+          for i in 1 2 3; do
+            ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false && break
+            if [ "$i" = 3 ]; then exit 1; fi
+            echo "coverage run failed (attempt $i); retrying in 15s..."
+            sleep 15
+          done
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         if: always()
@@ -273,12 +309,24 @@ jobs:
         id: go
       - name: Setup Bazelisk (Linux/macOS)
         if: runner.os != 'Windows'
-        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
+          export PATH=$PATH:$(go env GOPATH)/bin
       - name: Setup Bazelisk (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          go install github.com/bazelbuild/bazelisk@latest
+          for ($i = 1; $i -le 3; $i++) {
+            go install github.com/bazelbuild/bazelisk@latest
+            if ($LASTEXITCODE -eq 0) { break }
+            Write-Host "bazelisk install failed (attempt $i); retrying in 10s..."
+            Start-Sleep -Seconds 10
+          }
           $env:PATH = "$env:PATH;$(go env GOPATH)\bin"
           echo "$env:USERPROFILE\go\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/checkout@v4
@@ -291,7 +339,15 @@ jobs:
           BAZEL_DIFF_DISABLE_WORKSPACE: ${{ matrix.disable_workspace }}
           BAZEL_DIFF_FORCE_CHECKOUT: true
           BAZEL_EXTRA_COMMAND_OPTIONS: ${{ matrix.extra_flags }}
-        run: ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
+        # Retries guard against transient release-asset fetch errors (e.g. a 500 from
+        # GitHub Releases downloading rules_kotlin/other Bazel module deps).
+        run: |
+          for i in 1 2 3; do
+            ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD) && break
+            if [ "$i" = 3 ]; then exit 1; fi
+            echo "example script failed (attempt $i); retrying in 15s..."
+            sleep 15
+          done
       - name: Run bazel-diff example script (Windows)
         if: runner.os == 'Windows'
         env:
@@ -300,10 +356,18 @@ jobs:
           BAZEL_DIFF_FORCE_CHECKOUT: true
           BAZEL_EXTRA_COMMAND_OPTIONS: ${{ matrix.extra_flags }}
         shell: pwsh
+        # Retries guard against transient release-asset fetch errors (e.g. a 500 from
+        # GitHub Releases downloading rules_kotlin/other Bazel module deps).
         run: |
           $prevRev = git rev-parse HEAD~1
           $currRev = git rev-parse HEAD
-          .\bazel-diff-example.ps1 -WorkspacePath "$env:GITHUB_WORKSPACE" -BazelPath "$env:USERPROFILE\go\bin\bazelisk.exe" -PreviousRevision $prevRev -FinalRevision $currRev
+          for ($i = 1; $i -le 3; $i++) {
+            .\bazel-diff-example.ps1 -WorkspacePath "$env:GITHUB_WORKSPACE" -BazelPath "$env:USERPROFILE\go\bin\bazelisk.exe" -PreviousRevision $prevRev -FinalRevision $currRev
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($i -eq 3) { exit 1 }
+            Write-Host "example script failed (attempt $i); retrying in 15s..."
+            Start-Sleep -Seconds 15
+          }
   # Verifies per-PR that everything a release ships still builds, on every
   # platform it ships for. It publishes nothing: release.yaml owns that, via
   # release_prep.sh (JAR + source archive) and its rust-binaries matrix. This
@@ -380,14 +444,24 @@ jobs:
         id: go
       - name: Setup Bazelisk (Linux/macOS)
         if: runner.os != 'Windows'
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
         run: |
-          go install github.com/bazelbuild/bazelisk@latest
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Setup Bazelisk (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          go install github.com/bazelbuild/bazelisk@latest
+          for ($i = 1; $i -le 3; $i++) {
+            go install github.com/bazelbuild/bazelisk@latest
+            if ($LASTEXITCODE -eq 0) { break }
+            Write-Host "bazelisk install failed (attempt $i); retrying in 10s..."
+            Start-Sleep -Seconds 10
+          }
           echo "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/checkout@v4
       - name: Build deployable JAR

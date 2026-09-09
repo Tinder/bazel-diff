@@ -50,7 +50,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = REPO_ROOT / "bazel-bin" / "cli" / "bazel-diff"
+# Overridable so callers (e.g. serve_stress.py --target) can point the harness at the Rust
+# launcher (bazel-bin/src/bazel-diff) instead of the default Kotlin one.
+LAUNCHER = Path(os.environ.get("BAZEL_DIFF_LAUNCHER", str(REPO_ROOT / "bazel-bin" / "cli" / "bazel-diff")))
 DEFAULT_BRANCH = "master"
 
 # ----------------------------------------------------------------------------------------------

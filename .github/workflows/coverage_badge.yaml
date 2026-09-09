@@ -27,12 +27,27 @@ jobs:
           go-version: ^1.17
         id: go
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+        # Retries guard against transient proxy.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
+          export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
       - name: Run bazel-diff tests with coverage
         env:
           USE_BAZEL_VERSION: '9.x'
-        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test --enable_bzlmod=true --enable_workspace=false
+        # Retries guard against flaky E2E tests that hit the network (e.g. bazel mod
+        # show_repo / BCR calls in the go_mod_change fixture) failing the whole daily cron.
+        run: |
+          for i in 1 2 3; do
+            ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test --enable_bzlmod=true --enable_workspace=false && break
+            if [ "$i" = 3 ]; then exit 1; fi
+            echo "coverage run failed (attempt $i); retrying in 15s..."
+            sleep 15
+          done
       - name: Regenerate coverage badge
         env:
           USE_BAZEL_VERSION: '9.x'

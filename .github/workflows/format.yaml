@@ -28,7 +28,14 @@ jobs:
           go-version: ^1.17
         id: go
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+        # Retries guard against transient proxy.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
+          export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
       - name: Run ktfmt
         # Pinned to the repo's .bazelversion (no USE_BAZEL_VERSION) and run with

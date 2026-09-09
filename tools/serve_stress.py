@@ -905,8 +905,9 @@ def build_metrics_json(ctx: Ctx, wall_seconds: float, quick: bool, failures: int
 
 
 def build_summary_md(data: dict) -> str:
-    lines = ["# `bazel-diff serve` stress run", ""]
     meta = data["meta"]
+    impl_label = f" ({meta['impl']})" if meta.get("impl") else ""
+    lines = [f"# `bazel-diff serve` stress run{impl_label}", ""]
     verdict = "✅ all checks passed" if data["failures"] == 0 else f"❌ {data['failures']} check(s) failed"
     profile_label = "real-repo" if meta.get("mode") == "real" else (
         "quick" if meta["quick"] else "full")
@@ -1309,6 +1310,9 @@ def fold_flag_values(argv: list, opts: tuple = FLAG_VALUED_OPTS) -> list:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Stress `bazel-diff serve` and capture metrics.")
     ap.add_argument("--skip-build", action="store_true", help="reuse existing bazel-bin launcher")
+    ap.add_argument("--target", default="//cli:bazel-diff",
+                     help="bazel-diff build target to stress, e.g. //cli:bazel-diff (Kotlin, "
+                          "default) or //src:bazel-diff (Rust)")
     ap.add_argument("--quick", action="store_true", help="reduced request counts")
     ap.add_argument("--only", default="", help="run only phases whose name contains this")
     ap.add_argument("--keep-artifacts", action="store_true", help="keep the temp workdir")
@@ -1349,9 +1353,14 @@ def main() -> int:
         base.log(f"{base.C.RED}--real-repo-url requires --real-from and --real-to{base.C.RESET}")
         return 2
 
+    # //src:bazel-diff (Rust) builds a launcher at bazel-bin/src/bazel-diff; every other target
+    # (the Kotlin default, //cli:bazel-diff) keeps base.LAUNCHER's existing bazel-bin/cli path.
+    if args.target == "//src:bazel-diff":
+        base.LAUNCHER = base.REPO_ROOT / "bazel-bin" / "src" / "bazel-diff"
+
     if not args.skip_build:
-        base.log(f"{base.C.BOLD}Building //cli:bazel-diff ...{base.C.RESET}")
-        base.run([base.BAZEL, "build", "//cli:bazel-diff"], cwd=base.REPO_ROOT)
+        base.log(f"{base.C.BOLD}Building {args.target} ...{base.C.RESET}")
+        base.run([base.BAZEL, "build", args.target], cwd=base.REPO_ROOT)
     if not base.LAUNCHER.exists():
         base.log(f"{base.C.RED}launcher not found at {base.LAUNCHER}; run without --skip-build{base.C.RESET}")
         return 2
@@ -1365,6 +1374,7 @@ def main() -> int:
     remote = None
     prober = None
     ctx = None
+    impl = "rust" if args.target == "//src:bazel-diff" else "kotlin"
     try:
         if real_mode:
             ctx = run_real(args, profile, root, rep, metrics)  # manages its own serve + prober
@@ -1407,6 +1417,8 @@ def main() -> int:
     fails = rep.summary()
     wall = time.perf_counter() - t_run
 
+    if ctx:
+        ctx.meta_extra = {**(ctx.meta_extra or {}), "impl": impl}
     data = build_metrics_json(ctx, wall, args.quick, fails) if ctx else {"failures": fails}
     if args.metrics_out:
         Path(args.metrics_out).write_text(json.dumps(data, indent=2))

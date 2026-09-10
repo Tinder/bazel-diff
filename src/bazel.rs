@@ -1012,6 +1012,8 @@ mod tests {
     use super::*;
     use crate::proto::analysis::{ConfiguredTarget, CqueryResult};
     use crate::proto::blaze_query::{attribute, EnvironmentGroup, GeneratedFile, SourceFile};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn rule_target(name: &str) -> Target {
         let mut target = Target::default();
@@ -1540,5 +1542,76 @@ mod tests {
             .unwrap();
         assert_eq!(dep.rule_class, "http_archive");
         assert_eq!(dep.rule_input, ["//external:child"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dependency_fingerprint_fallback_chain_covers_streamed_and_text_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("MODULE.bazel"),
+            "module(name = \"test\")\n",
+        )
+        .unwrap();
+
+        let selected_repos_marker = workspace.path().join("selected-repos-called");
+        let script = workspace.path().join("fake-bazel.sh");
+        let body = format!(
+            r#"#!/bin/sh
+args="$*"
+if echo "$args" | grep -q "mod graph --output=json"; then
+  printf '{{"modules":["m"]}}\n'
+  exit 0
+fi
+if echo "$args" | grep -q "mod graph"; then
+  echo "root"
+  exit 0
+fi
+if echo "$args" | grep -q "mod dump_repo_mapping"; then
+  echo '{{"pip":"rules_python+0.31.0","local":"local~override","main":"main"}}'
+  exit 0
+fi
+if echo "$args" | grep -q "mod show_repo" && echo "$args" | grep -q -- "--output=streamed_proto"; then
+  exit 2
+fi
+if echo "$args" | grep -q "mod show_repo" && echo "$args" | grep -q -- "--all_visible_repos" && echo "$args" | grep -q -- "--output=text"; then
+  exit 3
+fi
+if echo "$args" | grep -q "mod show_repo" && echo "$args" | grep -q -- "--output=text"; then
+  : > "{}"
+  echo "selected-repos-text"
+  exit 0
+fi
+exit 1
+"#,
+            selected_repos_marker.display(),
+        );
+        fs::write(&script, body).unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let options = BazelOptions {
+            workspace: workspace.path().to_path_buf(),
+            bazel: script,
+            startup_options: Vec::new(),
+            command_options: Vec::new(),
+            cquery_options: Vec::new(),
+            use_cquery: false,
+            cquery_expression: None,
+            keep_going: false,
+            fine_grained_external_repos: BTreeSet::new(),
+            exclude_external_targets: false,
+            exclude_targets_query: None,
+            no_bazelrc: false,
+            verbose: false,
+        };
+
+        let fingerprint = options.dependency_fingerprint().unwrap();
+        assert_eq!(fingerprint.len(), 64);
+        assert!(fingerprint
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()));
+        assert!(selected_repos_marker.is_file());
     }
 }

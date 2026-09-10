@@ -4,6 +4,7 @@ import assertk.assertThat
 import assertk.assertions.contains
 import assertk.assertions.isEqualTo
 import assertk.assertions.isFalse
+import assertk.assertions.isNotNull
 import assertk.assertions.isNull
 import assertk.assertions.isTrue
 import com.bazel_diff.SilentLogger
@@ -243,6 +244,92 @@ class BazelModServiceTest : KoinTest {
       service.getModuleGraph()
       val args = argsFile.readText()
       assertThat(args.contains("--bazelrc=/dev/null")).isEqualTo(false)
+    }
+  }
+
+  @Test
+  fun getDependencyFingerprint_usesStreamedProto_whenAvailable() {
+    val workspaceDir = workspaceWithModule()
+    val allVisibleMarker = File(temp.root, "all-visible-called.txt")
+    val bazel =
+        fakeBazel(
+            body =
+                """
+                args="${'$'}*"
+                case " ${'$'}args " in
+                  *" mod graph --output=json "*)
+                    printf '{"modules":["m"]}\n'
+                    exit 0
+                    ;;
+                  *" mod graph "*)
+                    echo 'root'
+                    exit 0
+                    ;;
+                  *" mod dump_repo_mapping "*)
+                    echo '{"@foo":"rules_python+0.31.0","@bar":"local~override","@main":"main"}'
+                    exit 0
+                    ;;
+                  *" mod show_repo "*" --output=streamed_proto "*)
+                    printf 'STREAMED_PROTO_BYTES'
+                    exit 0
+                    ;;
+                  *" mod show_repo "*" --all_visible_repos "*" --output=text "*)
+                    echo called > '${allVisibleMarker.absolutePath}'
+                    exit 0
+                    ;;
+                  *)
+                    exit 1
+                    ;;
+                esac
+                """
+                    .trimIndent())
+
+    withService(workspaceDir, bazel) { service ->
+      val fingerprint = service.getDependencyFingerprint()
+      assertThat(fingerprint).isNotNull()
+      assertThat(allVisibleMarker.exists()).isFalse()
+    }
+  }
+
+  @Test
+  fun getDependencyFingerprint_returnsNull_whenAllShowRepoModesFail() {
+    val workspaceDir = workspaceWithModule()
+    val bazel =
+        fakeBazel(
+            body =
+                """
+                args="${'$'}*"
+                case " ${'$'}args " in
+                  *" mod graph --output=json "*)
+                    printf '{"modules":[]}\n'
+                    exit 0
+                    ;;
+                  *" mod graph "*)
+                    echo 'root'
+                    exit 0
+                    ;;
+                  *" mod dump_repo_mapping "*)
+                    echo '{"@foo":"rules_python+0.31.0"}'
+                    exit 0
+                    ;;
+                  *" mod show_repo "*" --output=streamed_proto "*)
+                    exit 2
+                    ;;
+                  *" mod show_repo "*" --all_visible_repos "*" --output=text "*)
+                    exit 3
+                    ;;
+                  *" mod show_repo "*" --output=text "*)
+                    exit 4
+                    ;;
+                  *)
+                    exit 1
+                    ;;
+                esac
+                """
+                    .trimIndent())
+
+    withService(workspaceDir, bazel) { service ->
+      assertThat(service.getDependencyFingerprint()).isNull()
     }
   }
 }

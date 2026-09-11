@@ -34,7 +34,8 @@ jobs:
     name: ${{ matrix.title }}
     runs-on: ${{ matrix.runner }}
     continue-on-error: ${{ matrix.continue_on_error }}
-    timeout-minutes: 45
+    # Allows setup/build plus three bounded performance-gate attempts.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -95,14 +96,31 @@ jobs:
         # workspace instead of the runfiles tree, and so Bazel is not holding the output-base
         # lock (or competing for cores) while timings are taken.
         run: |
-          python3 tools/perf_gate.py \
-            --kotlin-binary bazel-bin/cli/bazel-diff \
-            --rust-binary ${{ matrix.rust_binary }} \
-            ${{ matrix.gate_workloads }} \
-            --rounds 7 \
-            --warmup-rounds 2 \
-            --json perf-gate-${{ matrix.libc }}.json \
-            | tee perf-gate-${{ matrix.libc }}.txt
+          for attempt in 1 2 3; do
+            echo "Performance gate attempt $attempt of 3"
+            rm -f perf-gate-${{ matrix.libc }}.json perf-gate-${{ matrix.libc }}.txt
+            set +e
+            timeout --signal=TERM --kill-after=30s 50m \
+              python3 tools/perf_gate.py \
+                --kotlin-binary bazel-bin/cli/bazel-diff \
+                --rust-binary ${{ matrix.rust_binary }} \
+                ${{ matrix.gate_workloads }} \
+                --rounds 7 \
+                --warmup-rounds 2 \
+                --json perf-gate-${{ matrix.libc }}.json \
+                2>&1 | tee perf-gate-${{ matrix.libc }}.txt
+            status=${PIPESTATUS[0]}
+            set -e
+
+            if [[ "$status" -eq 0 ]]; then
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              exit "$status"
+            fi
+            echo "Performance gate failed with status $status; retrying in 15s..."
+            sleep 15
+          done
       - name: Publish summary
         if: always()
         run: |

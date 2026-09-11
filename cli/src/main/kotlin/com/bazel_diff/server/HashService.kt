@@ -192,7 +192,8 @@ class HashService(
       val writeStartNanos = System.nanoTime()
       val depEdges = depEdgesOf(hashes)
       val dependencyFingerprint =
-          guard.currentDependencyFingerprint ?: runBlocking { bazelModService.getDependencyFingerprint() }
+          guard.currentDependencyFingerprint
+              ?: runBlocking { bazelModService.getDependencyFingerprint() }
       storage.put(
           key,
           serialize(hashes, moduleGraphJson, depEdges, dependencyFingerprint)
@@ -249,7 +250,6 @@ class HashService(
     guard.computed = true
   }
 
-
   private fun elapsedMillis(startNanos: Long): Long = (System.nanoTime() - startNanos) / 1_000_000
 
   /**
@@ -279,7 +279,8 @@ class HashService(
           val metadata = mutableMapOf<String, Any>()
           if (moduleGraphJson != null) metadata["moduleGraphJson"] = moduleGraphJson
           if (depEdges.isNotEmpty()) metadata["depEdges"] = depEdges
-          if (dependencyFingerprint != null) metadata["dependencyFingerprint"] = dependencyFingerprint
+          if (dependencyFingerprint != null)
+              metadata["dependencyFingerprint"] = dependencyFingerprint
           mapOf("hashes" to serializedHashes, "metadata" to metadata)
         } else {
           serializedHashes

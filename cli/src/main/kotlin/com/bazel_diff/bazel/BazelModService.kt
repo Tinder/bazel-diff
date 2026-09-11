@@ -117,8 +117,8 @@ class BazelModService(
    * Computes a stable fingerprint of the currently resolved external dependency state.
    *
    * The hash includes:
-   *  - bzlmod mode marker + `bazel mod graph --output=json`
-   *  - repository-definition bytes from `bazel mod show_repo` (streamed proto when available)
+   * - bzlmod mode marker + `bazel mod graph --output=json`
+   * - repository-definition bytes from `bazel mod show_repo` (streamed proto when available)
    */
   suspend fun getDependencyFingerprint(): String? {
     if (!isBzlmodEnabled) {
@@ -152,8 +152,8 @@ class BazelModService(
   }
 
   /**
-   * Returns canonical bzlmod repo names in @@<canonical> form, discovered from
-   * `bazel mod dump_repo_mapping ""`.
+   * Returns canonical bzlmod repo names in @@<canonical> form, discovered from `bazel mod
+   * dump_repo_mapping ""`.
    */
   private fun discoverCanonicalBzlmodRepos(): List<String> {
     val output = runBazelRaw(listOf("mod", "dump_repo_mapping", "")) ?: return emptyList()
@@ -222,7 +222,8 @@ class BazelModService(
           addAll(args)
         }
     return try {
-      val nullDevice = if (System.getProperty("os.name").startsWith("Windows")) "NUL" else "/dev/null"
+      val nullDevice =
+          if (System.getProperty("os.name").startsWith("Windows")) "NUL" else "/dev/null"
       val process =
           ProcessBuilder(command)
               .directory(workingDirectory.toFile())

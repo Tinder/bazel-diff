@@ -1,9 +1,9 @@
 name: Format
 
-# Runs ktfmt over the codebase on a daily schedule and opens a PR only if the
-# formatter produced changes. Mirrors the coverage-badge cron: it force-pushes a
-# dedicated, bot-owned branch so re-runs reuse one PR instead of accumulating
-# stale branches, and it never touches master directly.
+# Runs ktfmt and rustfmt over the codebase on a daily schedule and opens a PR
+# only if a formatter produced changes. Mirrors the coverage-badge cron: it
+# force-pushes a dedicated, bot-owned branch so re-runs reuse one PR instead of
+# accumulating stale branches, and it never touches master directly.
 on:
   schedule:
     # 12:00 UTC daily (one hour before the coverage-badge cron).
@@ -42,6 +42,8 @@ jobs:
         # --lockfile_mode=off so MODULE.bazel.lock is never rewritten, keeping the
         # generated PR limited to formatting-only changes.
         run: ~/go/bin/bazelisk run //cli/format --enable_bzlmod=true --enable_workspace=false --lockfile_mode=off
+      - name: Run rustfmt
+        run: ~/go/bin/bazelisk run //cli/format:rustfmt --enable_bzlmod=true --enable_workspace=false --lockfile_mode=off
       - name: Open PR if formatting changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -50,12 +52,12 @@ jobs:
             echo "No formatting changes; nothing to do."
             exit 0
           fi
-          BRANCH="ci/ktfmt-format"
+          BRANCH="ci/format"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$BRANCH"
           git add -A
-          git commit -m "ci: apply ktfmt formatting"
+          git commit -m "ci: apply ktfmt and rustfmt formatting"
           # Force-push the dedicated, bot-owned branch so re-runs reuse one PR
           # instead of accumulating stale branches. This never touches master.
           git push --force origin "$BRANCH"
@@ -65,6 +67,6 @@ jobs:
             gh pr create \
               --base master \
               --head "$BRANCH" \
-              --title "ci: apply ktfmt formatting" \
-              --body "Automated ktfmt run via \`bazel run //cli/format\`. This PR contains formatting-only changes."
+              --title "ci: apply ktfmt and rustfmt formatting" \
+              --body "Automated ktfmt and rustfmt run via \`bazel run //cli/format\` and \`bazel run //cli/format:rustfmt\`. This PR contains formatting-only changes."
           fi

@@ -17,9 +17,10 @@ format_multirun(
 
 # The fixer for the rustfmt gate. //:rust_format_check only reports (it fails
 # the build, it does not rewrite files), so `bazel run //cli/format:rustfmt` is
-# how you satisfy it. Kept separate from `format` for the same reason
-# `buildifier` is: one language per target, so a cron on one never rewrites
-# another's files.
+# how you satisfy it. Kept as its own target so Makefile / CI can run one
+# language without the other; the daily format cron runs it after `format`.
+# buildifier stays on a separate cron so Starlark rewrites never land in the
+# ktfmt/rustfmt PR.
 #
 # `upstream_wrapper:rustfmt` is plain rustfmt from the registered toolchain --
 # not //tools/rustfmt, which is a Bazel-target-driven wrapper that does not take

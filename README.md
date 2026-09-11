@@ -1125,7 +1125,7 @@ Apple Silicon Mac.
 
 ### Performance gate
 
-The Rust candidate is expected to be faster than Kotlin, and CI enforces it. `make perf-gate`
+The Rust candidate is expected to be faster than Kotlin, and a nightly CI cron enforces it. `make perf-gate`
 runs both binaries over generated workloads -- a synthetic `streamed_proto` graph plus hash-file
 pairs, with no real workspace, Bazel server or Hyperfine involved -- and exits non-zero unless
 Rust wins on median wall time, on start-up-adjusted wall time, and in every paired round.

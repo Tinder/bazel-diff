@@ -8,14 +8,14 @@ name: Performance Gate
 # built `-c opt`, because comparing a debug build against an optimized one measures the build
 # flags rather than the code.
 #
-# Runs on every pull request: "Rust is faster" is a property of the code, and a regression is
-# cheapest to catch in the change that caused it. The gate pairs its measurements (both binaries
-# every round, alternating which goes first) and takes medians over several rounds rather than
-# trusting a single timing.
+# Nightly cron (plus on-demand from the Actions tab): the gate is too long and
+# runner-sensitive to block pull requests. A regression still shows up within a day.
+# The gate pairs its measurements (both binaries every round, alternating which goes
+# first) and takes medians over several rounds rather than trusting a single timing.
 #
 # Two legs (see the matrix below):
-#   * glibc -- the host-native dynamic build. Stable on any runner, so it is the blocking gate
-#     that proves the Rust logic is faster than Kotlin.
+#   * glibc -- the host-native dynamic build. Stable on any runner, so it is the
+#     check that proves the Rust logic is faster than Kotlin.
 #   * musl  -- the statically-linked binary actually published for Linux. musl's single-arena
 #     malloc would serialize the parallel proto decode, so this leg guards allocator scalability:
 #     the release links mimalloc as its #[global_allocator], and this leg keeps it that way. It
@@ -23,10 +23,9 @@ name: Performance Gate
 #     runs on a larger runner over the allocator-sensitive workload.
 # See docs/kotlin-rust-perf-gate.md for the protocol and for what to do when this job fails.
 on:
-  push:
-    branches: [ master ]
-  pull_request:
-    branches: [ master ]
+  schedule:
+    # Daily, offset from the serve-stress crons (06:30 / 08:30 UTC).
+    - cron: "0 7 * * *"
   workflow_dispatch:
 
 jobs:
@@ -34,8 +33,8 @@ jobs:
     name: ${{ matrix.title }}
     runs-on: ${{ matrix.runner }}
     continue-on-error: ${{ matrix.continue_on_error }}
-    # Allows setup/build plus three bounded performance-gate attempts.
-    timeout-minutes: 180
+    # Setup/build plus three one-hour measurement attempts.
+    timeout-minutes: 210
     strategy:
       fail-fast: false
       matrix:
@@ -100,7 +99,7 @@ jobs:
             echo "Performance gate attempt $attempt of 3"
             rm -f perf-gate-${{ matrix.libc }}.json perf-gate-${{ matrix.libc }}.txt
             set +e
-            timeout --signal=TERM --kill-after=30s 50m \
+            timeout --signal=TERM --kill-after=30s 60m \
               python3 tools/perf_gate.py \
                 --kotlin-binary bazel-bin/cli/bazel-diff \
                 --rust-binary ${{ matrix.rust_binary }} \

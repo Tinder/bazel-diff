@@ -10,7 +10,7 @@ It is not the same tool as [`docs/kotlin-vs-rust-benchmark.md`](kotlin-vs-rust-b
 | --- | --- | --- |
 | Question | how much faster is Rust on *this* repository? | is Rust still faster than Kotlin at all? |
 | Inputs | a real checkout, Bazel, Hyperfine | none -- fixtures are generated |
-| Runs in CI | no (manual, needs a workspace) | yes, on every pull request |
+| Runs in CI | no (manual, needs a workspace) | nightly cron (and `workflow_dispatch`) |
 | Output | a report | a report **and an exit code** |
 
 ## Running it
@@ -122,10 +122,10 @@ at the static-musl release on a many-core machine, or approximate it with a glib
 `MALLOC_ARENA_MAX=1`. The smaller graphs do not reach a high enough concurrent allocation
 rate to surface it, which is why the dense graph exists as a separate load.
 
-The default CI run builds the host **glibc** binary, which is stable on any runner and never
+The nightly CI run builds the host **glibc** binary, which is stable on any runner and never
 storms -- so it would not catch an allocator regression by itself. The gate therefore runs as
-two legs (see `.github/workflows/perf-gate.yaml`): the glibc leg is the blocking "Rust is
-faster" gate, and a second leg builds the published `--config=release-musl` binary and runs
+two legs (see `.github/workflows/perf-gate.yaml`): the glibc leg is the "Rust is faster"
+check, and a second leg builds the published `--config=release-musl` binary and runs
 the dense load against it. That leg needs a **many-core runner** -- the storm does not appear
 below ~8 cores, so a 2-vCPU runner would pass it regardless of the allocator. Locally,
 `make perf-gate-musl` reproduces it on a many-core host.

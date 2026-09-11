@@ -512,7 +512,7 @@
     "//:extensions.bzl%non_module_repositories": {
       "general": {
         "bzlTransitiveDigest": "zCfz5Y/Y2oEPiKR8kMtWhPJvz8pncvnqG4M0okjVuwc=",
-        "usagesDigest": "rMJem8yEaCNmOFnOVAi+uhfYYw6wqV3nm+4EYd/4K7k=",
+        "usagesDigest": "/H76v8NTgGSnO7xO7wmEhEJlyRvvSqpsFxLVjXM3Vnw=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},

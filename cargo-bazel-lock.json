@@ -1,5 +1,5 @@
 {
-  "checksum": "706ee75673bec5e4d514fe0bc1ea91301131838f7d2e0c76e4dac7644a73a68f",
+  "checksum": "3e82b6e041284d57ac71bde0287bb29854b98f09fbade93a88d92536503e2310",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -870,6 +870,10 @@
             {
               "id": "hex 0.4.3",
               "target": "hex"
+            },
+            {
+              "id": "mimalloc 0.1.52",
+              "target": "mimalloc"
             },
             {
               "id": "rayon 1.12.0",
@@ -2896,7 +2900,7 @@
             ],
             "cfg(windows)": [
               {
-                "id": "windows-sys 0.52.0",
+                "id": "windows-sys 0.61.2",
                 "target": "windows_sys"
               }
             ]
@@ -4699,6 +4703,83 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "libmimalloc-sys 0.1.49": {
+      "name": "libmimalloc-sys",
+      "version": "0.1.49",
+      "package_url": "https://github.com/purpleprotocol/mimalloc_rust/tree/master/libmimalloc-sys",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/libmimalloc-sys/0.1.49/download",
+          "sha256": "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "libmimalloc_sys",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        },
+        {
+          "BuildScript": {
+            "crate_name": "build_script_build",
+            "crate_root": "build.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "libmimalloc_sys",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "extra_deps": {
+          "common": [
+            ":build_script_build"
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "0.1.49"
+      },
+      "build_script_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "compile_data_glob_excludes": [
+          "**/*.rs"
+        ],
+        "data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "cc 1.4.0",
+              "target": "cc"
+            }
+          ],
+          "selects": {}
+        },
+        "links": "mimalloc"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE.txt"
+    },
     "linux-raw-sys 0.12.1": {
       "name": "linux-raw-sys",
       "version": "0.12.1",
@@ -4980,6 +5061,59 @@
         "Unlicense"
       ],
       "license_file": "LICENSE-MIT"
+    },
+    "mimalloc 0.1.52": {
+      "name": "mimalloc",
+      "version": "0.1.52",
+      "package_url": "https://github.com/purpleprotocol/mimalloc_rust",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/mimalloc/0.1.52/download",
+          "sha256": "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "mimalloc",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "mimalloc",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "libmimalloc-sys 0.1.49",
+              "target": "libmimalloc_sys"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "0.1.52"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE.txt"
     },
     "miniz_oxide 0.8.9": {
       "name": "miniz_oxide",
@@ -6713,7 +6847,7 @@
                 "alias": "libc_errno"
               },
               {
-                "id": "windows-sys 0.52.0",
+                "id": "windows-sys 0.61.2",
                 "target": "windows_sys"
               }
             ],
@@ -8144,7 +8278,7 @@
             ],
             "cfg(windows)": [
               {
-                "id": "windows-sys 0.52.0",
+                "id": "windows-sys 0.61.2",
                 "target": "windows_sys"
               }
             ],
@@ -9384,7 +9518,7 @@
           "selects": {
             "cfg(windows)": [
               {
-                "id": "windows-sys 0.52.0",
+                "id": "windows-sys 0.61.2",
                 "target": "windows_sys"
               }
             ]
@@ -9468,19 +9602,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "Win32",
-            "Win32_Foundation",
-            "Win32_Storage",
-            "Win32_Storage_FileSystem",
-            "Win32_System",
-            "Win32_System_Console",
-            "Win32_System_SystemInformation",
-            "default"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -9593,8 +9714,11 @@
           "common": [
             "Win32",
             "Win32_Foundation",
+            "Win32_Storage",
+            "Win32_Storage_FileSystem",
             "Win32_System",
             "Win32_System_Console",
+            "Win32_System_SystemInformation",
             "default"
           ],
           "selects": {}
@@ -11148,6 +11272,7 @@
     "buffa-build 0.9.1",
     "clap 4.6.5",
     "hex 0.4.3",
+    "mimalloc 0.1.52",
     "protoc-bin-vendored 3.2.0",
     "rayon 1.12.0",
     "rust-s3 0.36.0",

@@ -14,6 +14,11 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// The static-musl release shares one malloc arena, which serializes the parallel proto
+// decode in generate-hashes; mimalloc's per-thread heaps keep it scaling on many-core hosts.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "bazel-diff",

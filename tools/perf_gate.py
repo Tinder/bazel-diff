@@ -277,6 +277,13 @@ def default_workload_specs(scale: float) -> list[WorkloadSpec]:
     """
     small_graph = GraphSpec(packages=400).scaled(scale)
     large_graph = GraphSpec(packages=2000).scaled(scale)
+    # High fan-in makes each rule decode into many `rule_input` heap allocations, so the
+    # parallel proto decode sustains enough concurrent allocation to expose an allocator
+    # that does not scale across threads (e.g. musl's single-arena malloc in the static
+    # release build) -- a dimension the uniform small/large graphs do not reach.
+    dense_graph = GraphSpec(
+        packages=12000, rules_per_package=4, sources_per_rule=2, fanin=12
+    ).scaled(scale)
     diff_spec = HashFileSpec(targets=150_000).scaled(scale)
     distance_spec = HashFileSpec(targets=40_000, deps_per_target=4).scaled(scale)
     return [
@@ -302,6 +309,18 @@ def default_workload_specs(scale: float) -> list[WorkloadSpec]:
                 "generate-hashes-large",
                 f"hash a {large_graph.target_count}-target graph",
                 large_graph,
+                directory,
+            ),
+        ),
+        WorkloadSpec(
+            name="generate-hashes-dense",
+            description=(
+                f"hash a dependency-dense {dense_graph.target_count}-target graph"
+            ),
+            prepare=lambda directory: _prepare_generate_hashes(
+                "generate-hashes-dense",
+                f"hash a dependency-dense {dense_graph.target_count}-target graph",
+                dense_graph,
                 directory,
             ),
         ),

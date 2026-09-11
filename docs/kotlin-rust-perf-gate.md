@@ -49,6 +49,7 @@ bytes and any difference in timing is a difference in code.
 | `startup` | `--version`: the fixed cost of launching each CLI (JVM boot vs `exec`) |
 | `generate-hashes-small` | 4,800 targets: proto decode, rule/source hashing, transitive digests |
 | `generate-hashes-large` | 24,000 targets: the same path where per-target cost dominates |
+| `generate-hashes-dense` | 192,000 targets, fan-in 12: sustained concurrent allocation in the parallel proto decode -- stresses allocator scalability (see below) |
 | `get-impacted-targets` | diffing 150,000 hashed targets |
 | `get-impacted-targets-distances` | the same diff plus build-graph distance metrics over dependency edges |
 | `serve-small` | `serve`: time-to-ready plus `/impacted_targets` request latency against a small workspace |
@@ -98,6 +99,36 @@ bind/release race already accepted by the Rust end-to-end test harness.
   fixture. No Bazel server starts, so the measured wall time is bazel-diff's own work;
 * **hash-file pairs** for the diff commands, where the second revision changes, adds and
   removes targets.
+
+### Allocator scalability (`generate-hashes-dense`)
+
+`generate-hashes` decodes the `streamed_proto` stream in parallel: each batch of messages
+is decoded across the Rayon pool, and every proto field (`rule_class`, each attribute, and
+one `rule_input` per dependency) becomes a short-lived heap allocation. With enough targets
+and fan-in, all worker threads allocate at once, so the run's speed becomes a function of
+how well the global allocator scales under concurrency.
+
+An allocator with per-thread arenas (glibc's default) absorbs this and the Rust build stays
+several times faster than Kotlin. An allocator with a single global lock serializes every
+worker on that lock; system time explodes and throughput scales *negatively* with core
+count. The published Rust release is a **static musl** binary, and musl's malloc uses a
+single arena -- so on a many-core host this workload would make the release binary as slow
+as, or slower than, Kotlin, while a glibc build of the same source passed comfortably. The
+release therefore links **mimalloc** as its `#[global_allocator]` (see `src/main.rs`), whose
+per-thread heaps restore scaling; this workload exists to keep it that way.
+
+To reproduce the underlying problem, drop the `#[global_allocator]` and point `--rust-binary`
+at the static-musl release on a many-core machine, or approximate it with a glibc build under
+`MALLOC_ARENA_MAX=1`. The smaller graphs do not reach a high enough concurrent allocation
+rate to surface it, which is why the dense graph exists as a separate load.
+
+The default CI run builds the host **glibc** binary, which is stable on any runner and never
+storms -- so it would not catch an allocator regression by itself. The gate therefore runs as
+two legs (see `.github/workflows/perf-gate.yaml`): the glibc leg is the blocking "Rust is
+faster" gate, and a second leg builds the published `--config=release-musl` binary and runs
+the dense load against it. That leg needs a **many-core runner** -- the storm does not appear
+below ~8 cores, so a 2-vCPU runner would pass it regardless of the allocator. Locally,
+`make perf-gate-musl` reproduces it on a many-core host.
 
 ## Protocol
 

@@ -9,10 +9,19 @@ name: Performance Gate
 # flags rather than the code.
 #
 # Runs on every pull request: "Rust is faster" is a property of the code, and a regression is
-# cheapest to catch in the change that caused it. The runner is a shared 2-vCPU VM, so the gate
-# pairs its measurements (both binaries every round, alternating which goes first) and takes
-# medians over several rounds rather than trusting a single timing. See
-# docs/kotlin-rust-perf-gate.md for the protocol and for what to do when this job fails.
+# cheapest to catch in the change that caused it. The gate pairs its measurements (both binaries
+# every round, alternating which goes first) and takes medians over several rounds rather than
+# trusting a single timing.
+#
+# Two legs (see the matrix below):
+#   * glibc -- the host-native dynamic build. Stable on any runner, so it is the blocking gate
+#     that proves the Rust logic is faster than Kotlin.
+#   * musl  -- the statically-linked binary actually published for Linux. musl's single-arena
+#     malloc would serialize the parallel proto decode, so this leg guards allocator scalability:
+#     the release links mimalloc as its #[global_allocator], and this leg keeps it that way. It
+#     only reproduces with enough cores (>= 8; the free 2-vCPU runner cannot surface it), so it
+#     runs on a larger runner over the allocator-sensitive workload.
+# See docs/kotlin-rust-perf-gate.md for the protocol and for what to do when this job fails.
 on:
   push:
     branches: [ master ]
@@ -22,9 +31,32 @@ on:
 
 jobs:
   perf-gate:
-    name: Rust vs Kotlin performance gate
-    runs-on: ubuntu-latest
+    name: ${{ matrix.title }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.continue_on_error }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - title: Rust (glibc) vs Kotlin performance gate
+            libc: glibc
+            runner: ubuntu-latest
+            rust_build: -c opt //src:bazel-diff
+            rust_binary: bazel-bin/src/bazel-diff
+            gate_workloads: ""
+            continue_on_error: false
+          # `ubuntu-latest-8-cores` must map to an org-provisioned larger runner (or a
+          # self-hosted one) with at least 8 vCPUs -- the allocator storm does not appear
+          # below that, so a 2-vCPU runner here would be a false green. Rename to match the
+          # label your org exposes.
+          - title: Rust (musl) allocator-scalability gate
+            libc: musl
+            runner: ubuntu-latest-8-cores
+            rust_build: --config=release-musl //release:bazel-diff-rust
+            rust_binary: bazel-bin/release/bazel-diff-rust-linux-amd64
+            gate_workloads: --workload generate-hashes-dense
+            continue_on_error: false
     steps:
       # No host Rust toolchain: the Rust binary is built by Bazel, which brings
       # its own rustc pinned in MODULE.bazel.
@@ -41,15 +73,20 @@ jobs:
         run: go install github.com/bazelbuild/bazelisk@latest
       - uses: actions/checkout@v4
       - name: Unit-test the gate itself
+        # Implementation-agnostic, so run it once on the cheap runner only.
+        if: matrix.libc == 'glibc'
         env:
           USE_BAZEL_VERSION: '8.x'
           CARGO_BAZEL_ISOLATED: 'false'
         run: ~/go/bin/bazelisk test //tools:perf_gate_test
-      - name: Build both implementations
+      - name: Build Kotlin and Rust binaries
         env:
           USE_BAZEL_VERSION: '8.x'
           CARGO_BAZEL_ISOLATED: 'false'
-        run: ~/go/bin/bazelisk build -c opt //cli:bazel-diff //src:bazel-diff
+        # Kotlin is always the host build; only the Rust target/config varies per leg.
+        run: |
+          ~/go/bin/bazelisk build -c opt //cli:bazel-diff
+          ~/go/bin/bazelisk build ${{ matrix.rust_build }}
       - name: Run the performance gate
         env:
           USE_BAZEL_VERSION: '8.x'
@@ -60,26 +97,27 @@ jobs:
         run: |
           python3 tools/perf_gate.py \
             --kotlin-binary bazel-bin/cli/bazel-diff \
-            --rust-binary bazel-bin/src/bazel-diff \
+            --rust-binary ${{ matrix.rust_binary }} \
+            ${{ matrix.gate_workloads }} \
             --rounds 7 \
             --warmup-rounds 2 \
-            --json perf-gate.json \
-            | tee perf-gate.txt
+            --json perf-gate-${{ matrix.libc }}.json \
+            | tee perf-gate-${{ matrix.libc }}.txt
       - name: Publish summary
         if: always()
         run: |
           {
-            echo '## Rust vs Kotlin performance gate'
+            echo '## ${{ matrix.title }}'
             echo '```'
-            cat perf-gate.txt || echo 'the gate produced no report'
+            cat perf-gate-${{ matrix.libc }}.txt || echo 'the gate produced no report'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: perf-gate-report
+          name: perf-gate-report-${{ matrix.libc }}
           path: |
-            perf-gate.json
-            perf-gate.txt
+            perf-gate-${{ matrix.libc }}.json
+            perf-gate-${{ matrix.libc }}.txt
           if-no-files-found: ignore

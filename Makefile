@@ -124,6 +124,24 @@ perf-gate:
 		$(if $(RSS_RUNS),--rss-runs "$(RSS_RUNS)",) \
 		$(if $(JSON),--json "$(JSON)",)
 
+# The gate against the statically-linked musl binary that actually ships for Linux, not the
+# host glibc build `perf-gate` uses. musl's single-arena malloc serializes the parallel proto
+# decode, so this exposes allocator-scalability regressions -- but only on a many-core host
+# (>= 8 cores); on a 2-core machine there is too little contention and it passes regardless.
+# Defaults to the allocator-sensitive workload; override with WORKLOAD= to run others.
+.PHONY: perf-gate-musl
+perf-gate-musl:
+	$(or $(BAZEL),bazel) build //cli:bazel-diff -c opt
+	$(or $(BAZEL),bazel) build //release:bazel-diff-rust --config=release-musl
+	python3 tools/perf_gate.py \
+		--kotlin-binary bazel-bin/cli/bazel-diff \
+		--rust-binary bazel-bin/release/bazel-diff-rust-linux-amd64 \
+		--workload "$(or $(WORKLOAD),generate-hashes-dense)" \
+		--rounds "$(or $(ROUNDS),7)" \
+		--warmup-rounds "$(or $(WARMUP),2)" \
+		--scale "$(or $(SCALE),1)" \
+		$(if $(JSON),--json "$(JSON)",)
+
 .PHONY: perf-gate-test
 perf-gate-test:
 	$(or $(BAZEL),bazel) test //tools:perf_gate_test

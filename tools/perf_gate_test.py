@@ -827,6 +827,7 @@ class WorkloadSelectionTest(unittest.TestCase):
         names = [spec.name for spec in default_workload_specs(1.0)]
         self.assertIn(STARTUP_WORKLOAD, names)
         self.assertIn("generate-hashes-large", names)
+        self.assertIn("generate-hashes-dense", names)
         self.assertIn("get-impacted-targets", names)
         self.assertIn("get-impacted-targets-distances", names)
 

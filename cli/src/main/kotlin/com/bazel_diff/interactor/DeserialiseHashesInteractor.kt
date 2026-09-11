@@ -12,7 +12,8 @@ import org.koin.core.component.inject
 data class HashFileData(
     val hashes: Map<String, TargetHash>,
     val moduleGraphJson: String?,
-    val depEdges: Map<String, List<String>> = emptyMap()
+    val depEdges: Map<String, List<String>> = emptyMap(),
+    val dependencyFingerprint: String? = null,
 )
 
 class DeserialiseHashesInteractor : KoinComponent {
@@ -46,6 +47,7 @@ class DeserialiseHashesInteractor : KoinComponent {
 
       val metadata = jsonObject.getAsJsonObject("metadata")
       val moduleGraphJson = metadata?.get("moduleGraphJson")?.asString
+      val dependencyFingerprint = metadata?.get("dependencyFingerprint")?.asString
 
       // The query service persists the dependency-edge adjacency list (label -> direct dep labels)
       // under metadata.depEdges when started with --trackDeps, so build-graph distance metrics can
@@ -56,7 +58,7 @@ class DeserialiseHashesInteractor : KoinComponent {
             gson.fromJson<Map<String, List<String>>>(it, depShape)
           } ?: emptyMap()
 
-      return HashFileData(hashes, moduleGraphJson, depEdges)
+      return HashFileData(hashes, moduleGraphJson, depEdges, dependencyFingerprint)
     } else {
       // Legacy format - just a flat map of hashes
       val shape = object : TypeToken<Map<String, String>>() {}.type

@@ -115,6 +115,11 @@ class HashService(
       val generation: HashGenerationBreakdown? = null,
   )
 
+  private data class GuardState(
+      var currentDependencyFingerprint: String? = null,
+      var computed: Boolean = false,
+  )
+
   override fun getHashes(
       sha: String,
       modifiedFilepaths: Set<Path>,
@@ -135,20 +140,11 @@ class HashService(
 
   /**
    * Returns the hash data plus whether it was served from the cache. "Hit" includes the
-   * waited-behind-another-generation case (the after-lock re-check): this request itself ran no
-   * checkout/query, though its duration then includes the lock wait.
+   * waited-behind-another-generation case (the after-lock re-check). Cache hits may still do a
+   * checkout to validate the dependency fingerprint, but they do not rerun the hasher.
    */
   private fun retrieve(sha: String, modifiedFilepaths: Set<Path>): Retrieval {
     val key = cacheKey(sha, modifiedFilepaths)
-    val readStartNanos = System.nanoTime()
-    storage.get(key)?.let { bytes ->
-      val data =
-          deserialiser.executeTargetHashWithMetadataFromString(
-              String(bytes, StandardCharsets.UTF_8))
-      val readMillis = elapsedMillis(readStartNanos)
-      logger.i { "Hash cache hit for $sha (read+deserialize ${readMillis}ms)" }
-      return Retrieval(data, cacheHit = true, cacheReadMillis = readMillis)
-    }
     return generate(sha, modifiedFilepaths, key)
   }
 
@@ -160,6 +156,7 @@ class HashService(
 
   private fun generate(sha: String, modifiedFilepaths: Set<Path>, key: String): Retrieval {
     val lockStartNanos = System.nanoTime()
+    val guard = GuardState()
     synchronized(generationLock) {
       val lockWaitMillis = elapsedMillis(lockStartNanos)
       // Re-check under the lock: another thread may have generated this revision while we waited.
@@ -168,17 +165,19 @@ class HashService(
         val data =
             deserialiser.executeTargetHashWithMetadataFromString(String(it, StandardCharsets.UTF_8))
         val readMillis = elapsedMillis(readStartNanos)
-        logger.i {
-          "Hash cache hit for $sha (after ${lockWaitMillis}ms lock wait, " +
-              "read+deserialize ${readMillis}ms)"
+        if (cacheEntryMatchesDependencyFingerprint(sha, data, guard)) {
+          logger.i {
+            "Hash cache hit for $sha (after ${lockWaitMillis}ms lock wait, " +
+                "read+deserialize ${readMillis}ms)"
+          }
+          return Retrieval(
+              data, cacheHit = true, lockWaitMillis = lockWaitMillis, cacheReadMillis = readMillis)
         }
-        return Retrieval(
-            data, cacheHit = true, lockWaitMillis = lockWaitMillis, cacheReadMillis = readMillis)
       }
       logger.i { "Hash cache miss for $sha - generating hashes" }
 
       val checkoutStartNanos = System.nanoTime()
-      gitClient.checkout(sha)
+      ensureWorkspaceAndFingerprintForSha(sha, guard)
       val checkoutMillis = elapsedMillis(checkoutStartNanos)
 
       val hasherTimings = HasherPhaseTimings()
@@ -192,8 +191,12 @@ class HashService(
 
       val writeStartNanos = System.nanoTime()
       val depEdges = depEdgesOf(hashes)
+      val dependencyFingerprint =
+          guard.currentDependencyFingerprint ?: runBlocking { bazelModService.getDependencyFingerprint() }
       storage.put(
-          key, serialize(hashes, moduleGraphJson, depEdges).toByteArray(StandardCharsets.UTF_8))
+          key,
+          serialize(hashes, moduleGraphJson, depEdges, dependencyFingerprint)
+              .toByteArray(StandardCharsets.UTF_8))
       val cacheWriteMillis = elapsedMillis(writeStartNanos)
 
       val breakdown =
@@ -218,12 +221,34 @@ class HashService(
             "targets=${hashes.size}"
       }
       return Retrieval(
-          HashFileData(hashes, moduleGraphJson, depEdges),
+          HashFileData(hashes, moduleGraphJson, depEdges, dependencyFingerprint),
           cacheHit = false,
           lockWaitMillis = lockWaitMillis,
           generation = breakdown)
     }
   }
+
+  private fun cacheEntryMatchesDependencyFingerprint(
+      sha: String,
+      data: HashFileData,
+      guard: GuardState,
+  ): Boolean {
+    val cachedFingerprint = data.dependencyFingerprint
+    if (cachedFingerprint == null) {
+      return false
+    }
+    ensureWorkspaceAndFingerprintForSha(sha, guard)
+    val current = guard.currentDependencyFingerprint
+    return current != null && current == cachedFingerprint
+  }
+
+  private fun ensureWorkspaceAndFingerprintForSha(sha: String, guard: GuardState) {
+    if (guard.computed) return
+    gitClient.checkout(sha)
+    guard.currentDependencyFingerprint = runBlocking { bazelModService.getDependencyFingerprint() }
+    guard.computed = true
+  }
+
 
   private fun elapsedMillis(startNanos: Long): Long = (System.nanoTime() - startNanos) / 1_000_000
 
@@ -245,14 +270,16 @@ class HashService(
   private fun serialize(
       hashes: Map<String, TargetHash>,
       moduleGraphJson: String?,
-      depEdges: Map<String, List<String>>
+      depEdges: Map<String, List<String>>,
+      dependencyFingerprint: String?,
   ): String {
     val serializedHashes = hashes.mapValues { it.value.toJson(true) }
     val output =
-        if (moduleGraphJson != null || depEdges.isNotEmpty()) {
+        if (moduleGraphJson != null || depEdges.isNotEmpty() || dependencyFingerprint != null) {
           val metadata = mutableMapOf<String, Any>()
           if (moduleGraphJson != null) metadata["moduleGraphJson"] = moduleGraphJson
           if (depEdges.isNotEmpty()) metadata["depEdges"] = depEdges
+          if (dependencyFingerprint != null) metadata["dependencyFingerprint"] = dependencyFingerprint
           mapOf("hashes" to serializedHashes, "metadata" to metadata)
         } else {
           serializedHashes

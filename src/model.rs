@@ -107,10 +107,15 @@ impl Serialize for SerializedMetadata<'_> {
         let include_dep_edges = self.include_deps && !self.data.dep_edges.is_empty();
         let mut state = serializer.serialize_struct(
             "HashMetadata",
-            usize::from(self.data.module_graph_json.is_some()) + usize::from(include_dep_edges),
+            usize::from(self.data.module_graph_json.is_some())
+                + usize::from(include_dep_edges)
+                + usize::from(self.data.dependency_fingerprint.is_some()),
         )?;
         if let Some(module_graph_json) = &self.data.module_graph_json {
             state.serialize_field("moduleGraphJson", module_graph_json)?;
+        }
+        if let Some(dependency_fingerprint) = &self.data.dependency_fingerprint {
+            state.serialize_field("dependencyFingerprint", dependency_fingerprint)?;
         }
         if include_dep_edges {
             state.serialize_field("depEdges", &self.data.dep_edges)?;
@@ -135,6 +140,7 @@ impl Serialize for SerializedHashFile<'_> {
             include_target_type: self.include_target_type,
         };
         if self.data.module_graph_json.is_none()
+            && self.data.dependency_fingerprint.is_none()
             && (!self.include_deps || self.data.dep_edges.is_empty())
         {
             return hashes.serialize(serializer);
@@ -156,6 +162,7 @@ impl Serialize for SerializedHashFile<'_> {
 pub struct HashFileData {
     pub hashes: BTreeMap<String, TargetHash>,
     pub module_graph_json: Option<String>,
+    pub dependency_fingerprint: Option<String>,
     pub dep_edges: BTreeMap<String, Vec<String>>,
 }
 
@@ -205,6 +212,10 @@ impl HashFileData {
             .and_then(|value| value.get("moduleGraphJson"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let dependency_fingerprint = metadata
+            .and_then(|value| value.get("dependencyFingerprint"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let dep_edges = metadata
             .and_then(|value| value.get("depEdges"))
             .map(|value| serde_json::from_value(value.clone()))
@@ -214,6 +225,7 @@ impl HashFileData {
         Ok(Self {
             hashes,
             module_graph_json,
+            dependency_fingerprint,
             dep_edges,
         })
     }
@@ -229,7 +241,10 @@ impl HashFileData {
                 )
             })
             .collect::<Map<_, _>>();
-        if self.module_graph_json.is_none() && (!include_deps || self.dep_edges.is_empty()) {
+        if self.module_graph_json.is_none()
+            && self.dependency_fingerprint.is_none()
+            && (!include_deps || self.dep_edges.is_empty())
+        {
             return Value::Object(hashes);
         }
         let mut metadata = Map::new();
@@ -237,6 +252,12 @@ impl HashFileData {
             metadata.insert(
                 "moduleGraphJson".to_owned(),
                 Value::String(module_graph_json.clone()),
+            );
+        }
+        if let Some(dependency_fingerprint) = &self.dependency_fingerprint {
+            metadata.insert(
+                "dependencyFingerprint".to_owned(),
+                Value::String(dependency_fingerprint.clone()),
             );
         }
         if include_deps && !self.dep_edges.is_empty() {
@@ -538,6 +559,13 @@ mod tests {
         data.dep_edges = BTreeMap::from([("//a:a".into(), vec!["//b:b".into()])]);
         let streamed = serde_json::to_value(data.serialized(true, true)).unwrap();
         assert_eq!(streamed, data.to_value(true, true));
+
+        data.module_graph_json = None;
+        data.dep_edges.clear();
+        data.dependency_fingerprint = Some("dep-fp".into());
+        let streamed = serde_json::to_value(data.serialized(true, false)).unwrap();
+        assert_eq!(streamed, data.to_value(true, false));
+        assert!(streamed.get("metadata").is_some());
     }
 
     #[test]
@@ -545,16 +573,19 @@ mod tests {
         let legacy = HashFileData::from_slice(br#"{"//a:a":"Rule#overall~direct"}"#).unwrap();
         assert_eq!(legacy.hashes["//a:a"], target("Rule", "overall", "direct"));
         assert!(legacy.module_graph_json.is_none());
+        assert!(legacy.dependency_fingerprint.is_none());
 
         let bytes = br#"{
           "hashes": {"//a:a": "Rule#overall~direct"},
           "metadata": {
             "moduleGraphJson": "{\"root\":true}",
+            "dependencyFingerprint": "dep-fp",
             "depEdges": {"//a:a": ["//b:b"]}
           }
         }"#;
         let parsed = HashFileData::from_slice(bytes).unwrap();
         assert_eq!(parsed.module_graph_json.as_deref(), Some("{\"root\":true}"));
+        assert_eq!(parsed.dependency_fingerprint.as_deref(), Some("dep-fp"));
         assert_eq!(parsed.dep_edges["//a:a"], ["//b:b"]);
 
         let mut file = tempfile::NamedTempFile::new().unwrap();

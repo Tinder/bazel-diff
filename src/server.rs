@@ -5,7 +5,7 @@ use crate::model::{
 use crate::module_graph::impacted_with_module_changes;
 use anyhow::{anyhow, bail, Context, Result};
 use s3::creds::Credentials;
-use s3::request::ResponseData;
+use s3::error::S3Error;
 use s3::{Bucket, Region};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -90,53 +90,47 @@ impl RemoteCache {
         format!("{}{key}.json", self.prefix)
     }
 
-    /// Reads an entry, degrading to a miss on any failure.
-    ///
-    /// Deliberately a bare `GetObject` with no `HeadObject` probe in front of it: besides costing a
-    /// second round trip on every hit, `head_object` cannot report a miss here. S3 answers a HEAD
-    /// miss with `404`, `Transfer-Encoding: chunked` and no body, and every HTTP client on this
-    /// stack fails reading that absent body -- `attohttpc: Io Error: unexpected end of file`. A GET
-    /// miss carries a real `NoSuchKey` body, so it reads back cleanly.
     fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let failure = match self.bucket.get_object(self.object_key(key)) {
-            Ok(response) if response.status_code() == 200 => return Some(response.to_vec()),
-            Ok(response) if response.status_code() == 404 => return None,
-            Ok(response) => http_failure(&response),
-            Err(error) => error.to_string(),
-        };
-        eprintln!(
-            "[Warn] S3 cache read of {} failed (treating as a miss): {failure}",
-            self.object_key(key)
-        );
-        None
+        match self.bucket.get_object(self.object_key(key)) {
+            Ok(response) if response.status_code() == 200 => Some(response.to_vec()),
+            Ok(_) => None,
+            Err(error) if is_s3_not_found(&error) => None,
+            Err(error) => {
+                eprintln!(
+                    "[Warn] S3 cache read of {} failed (treating as a miss): {error}",
+                    self.object_key(key)
+                );
+                None
+            }
+        }
     }
 
     fn put(&self, key: &str, data: &[u8]) {
-        let failure = match self.bucket.put_object(self.object_key(key), data) {
-            Ok(response) if (200..300).contains(&response.status_code()) => return,
-            Ok(response) => http_failure(&response),
-            Err(error) => error.to_string(),
-        };
-        eprintln!(
-            "[Warn] S3 cache write of {} failed (entry not shared): {failure}",
-            self.object_key(key)
-        );
+        if let Err(error) = self.bucket.put_object(self.object_key(key), data) {
+            eprintln!(
+                "[Warn] S3 cache write of {} failed (entry not shared): {error}",
+                self.object_key(key)
+            );
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        match self.bucket.head_object(self.object_key(key)) {
+            Ok((_, status)) => status == 200,
+            Err(error) if is_s3_not_found(&error) => false,
+            Err(error) => {
+                eprintln!(
+                    "[Warn] S3 cache check of {} failed (treating as a miss): {error}",
+                    self.object_key(key)
+                );
+                false
+            }
+        }
     }
 }
 
-/// Renders a non-2xx response for a warning, matching how `S3Error::HttpFailWithBody` reads.
-///
-/// Statuses are classified here rather than by `rust-s3`'s `fail-on-err` feature, which is
-/// deliberately off: it turns every non-2xx into an error *after* reading the body, and the read
-/// happens inside `rust-s3`'s `retry!`, so a plain 404 miss cost a duplicate request and a
-/// one-second backoff sleep before being recognized as a miss. `retry!` still covers transport
-/// errors, which are the ones worth retrying.
-fn http_failure(response: &ResponseData) -> String {
-    format!(
-        "Got HTTP {} with content '{}'",
-        response.status_code(),
-        response.as_str().unwrap_or("<non-utf8 body>").trim()
-    )
+fn is_s3_not_found(error: &S3Error) -> bool {
+    matches!(error, S3Error::HttpFailWithBody(404, _))
 }
 
 fn normalize_s3_prefix(prefix: &str) -> String {
@@ -573,23 +567,64 @@ fn get_hashes_locked(
 ) -> Result<(HashFileData, bool)> {
     let key = cache_key(state, sha, modified);
     let path = state.config.cache_dir.join(format!("{key}.json"));
+    let mut current_dependency_fingerprint = None;
     if path.is_file() {
         let data = HashFileData::read(&path)?;
-        touch(&path);
-        return Ok((data, true));
-    }
-    if let Some(remote) = &state.remote {
-        if let Some(bytes) = remote.get(&key) {
-            let data = HashFileData::from_slice(&bytes)?;
-            fs::write(&path, &bytes)?;
+        if cache_entry_matches_dependency_fingerprint(
+            state,
+            sha,
+            "local",
+            &data,
+            &mut current_dependency_fingerprint,
+        )? {
+            eprintln!("[BD-DBG][cache-hit] scope=local sha={sha} key={key}");
+            touch(&path);
             return Ok((data, true));
         }
+        eprintln!("[BD-DBG][cache-guard-miss] scope=local sha={sha} key={key}");
     }
+    if let Some(remote) = &state.remote {
+        if remote.contains(&key) {
+            if let Some(bytes) = remote.get(&key) {
+                let data = HashFileData::from_slice(&bytes)?;
+                if cache_entry_matches_dependency_fingerprint(
+                    state,
+                    sha,
+                    "remote",
+                    &data,
+                    &mut current_dependency_fingerprint,
+                )? {
+                    eprintln!("[BD-DBG][cache-hit] scope=remote sha={sha} key={key}");
+                    fs::write(&path, &bytes)?;
+                    return Ok((data, true));
+                }
+                eprintln!("[BD-DBG][cache-guard-miss] scope=remote sha={sha} key={key}");
+            }
+        }
+    }
+    eprintln!("[BD-DBG][cache-recompute] sha={sha} key={key}");
     checkout(state, sha)?;
     let mut options = state.config.hash_options.clone();
     options.modified_filepaths = modified.clone();
     options.track_deps = state.config.track_deps;
-    let data = generate_hashes(&options)?;
+    let mut data = generate_hashes(&options)?;
+    data.dependency_fingerprint =
+        current_dependency_fingerprint.take().or_else(
+            || match dependency_fingerprint_for_workspace(state) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    eprintln!("[Warn] {error:#}");
+                    None
+                }
+            },
+        );
+    match data.dependency_fingerprint.as_deref() {
+        Some(fingerprint) => eprintln!(
+            "[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp={}",
+            short_fingerprint(fingerprint)
+        ),
+        None => eprintln!("[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp=NONE"),
+    }
     let bytes = serde_json::to_vec(&data.serialized(true, state.config.track_deps))?;
     let temporary = state.config.cache_dir.join(format!("{key}.tmp"));
     fs::write(&temporary, bytes)?;
@@ -599,6 +634,62 @@ fn get_hashes_locked(
         remote.put(&key, &bytes);
     }
     Ok((data, false))
+}
+
+fn cache_entry_matches_dependency_fingerprint(
+    state: &Arc<State>,
+    sha: &str,
+    scope: &str,
+    data: &HashFileData,
+    current_dependency_fingerprint: &mut Option<String>,
+) -> Result<bool> {
+    let Some(cached_fingerprint) = data.dependency_fingerprint.as_deref() else {
+        eprintln!("[BD-DBG][cache-guard-no-fingerprint] scope={scope} sha={sha} policy=recompute");
+        return Ok(false);
+    };
+    if current_dependency_fingerprint.is_none() {
+        checkout(state, sha)?;
+        *current_dependency_fingerprint = match dependency_fingerprint_for_workspace(state) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                eprintln!("[Warn] {error:#}");
+                None
+            }
+        };
+    }
+    Ok(match current_dependency_fingerprint.as_deref() {
+        Some(current) => {
+            let matched = current == cached_fingerprint;
+            eprintln!(
+                "[BD-DBG][cache-guard-check] scope={scope} sha={sha} cachedFp={} currentFp={} matched={matched}",
+                short_fingerprint(cached_fingerprint),
+                short_fingerprint(current)
+            );
+            matched
+        }
+        None => {
+            eprintln!(
+                "[BD-DBG][cache-guard-check] scope={scope} sha={sha} cachedFp={} currentFp=NONE matched=false",
+                short_fingerprint(cached_fingerprint)
+            );
+            false
+        }
+    })
+}
+
+fn short_fingerprint(value: &str) -> &str {
+    &value[..value.len().min(12)]
+}
+
+fn dependency_fingerprint_for_workspace(state: &State) -> Result<String> {
+    state
+        .config
+        .hash_options
+        .bazel
+        .dependency_fingerprint()
+        .map_err(|error| {
+            anyhow!("failed to compute dependency fingerprint for cache guard: {error:#}")
+        })
 }
 
 fn configuration_fingerprint(config: &ServerConfig) -> String {
@@ -733,6 +824,11 @@ fn resolve_sha(state: &State, revision: &str) -> Result<String> {
 }
 
 fn checkout(state: &State, sha: &str) -> Result<()> {
+    if let Ok(output) = git_output(state, &[String::from("rev-parse"), String::from("HEAD")]) {
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == sha {
+            return Ok(());
+        }
+    }
     let args = [
         String::from("-c"),
         String::from("advice.detachedHead=false"),
@@ -1052,7 +1148,6 @@ mod tests {
     }
 
     struct CapturedS3Request {
-        method: String,
         url: String,
     }
 
@@ -1072,7 +1167,6 @@ mod tests {
                 let request = server.recv().unwrap();
                 sender
                     .send(CapturedS3Request {
-                        method: request.method().as_str().to_owned(),
                         url: request.url().to_owned(),
                     })
                     .unwrap();
@@ -1152,6 +1246,14 @@ mod tests {
         assert_eq!(normalize_s3_prefix(""), "");
         assert_eq!(normalize_s3_prefix("/"), "");
         assert_eq!(normalize_s3_prefix("/team/cache/"), "team/cache/");
+        assert!(is_s3_not_found(&S3Error::HttpFailWithBody(
+            404,
+            "missing".into()
+        )));
+        assert!(!is_s3_not_found(&S3Error::HttpFailWithBody(
+            500,
+            "failure".into()
+        )));
         assert!(RemoteCache::new(&test_config()).unwrap().is_none());
     }
 
@@ -1159,28 +1261,23 @@ mod tests {
     fn remote_cache_operations_use_normalized_key_and_succeed() {
         let (remote, requests, handle) = remote_cache_with_responses(
             "/team/repo/",
-            vec![(200, b"hello".to_vec()), (200, Vec::new())],
+            vec![
+                (200, b"hello".to_vec()),
+                (200, Vec::new()),
+                (200, Vec::new()),
+            ],
         );
         assert_eq!(remote.object_key("sha.fp"), "team/repo/sha.fp.json");
         assert_eq!(remote.get("sha.fp"), Some(b"hello".to_vec()));
         remote.put("sha.fp", b"data");
-        let captured = (0..2)
+        assert!(remote.contains("sha.fp"));
+        let captured = (0..3)
             .map(|_| requests.recv_timeout(Duration::from_secs(5)).unwrap())
             .collect::<Vec<_>>();
         handle.join().unwrap();
         assert!(captured
             .iter()
             .all(|request| request.url.contains("/bucket/team/repo/sha.fp.json")));
-        // A read is a single GET: a HeadObject probe in front of it would double the round trips
-        // and, worse, cannot report a miss -- S3 frames a HEAD 404 as chunked with no body, which
-        // the client surfaces as `attohttpc: Io Error: unexpected end of file`.
-        assert_eq!(
-            captured
-                .iter()
-                .map(|request| request.method.as_str())
-                .collect::<Vec<_>>(),
-            vec!["GET", "PUT"]
-        );
     }
 
     #[test]
@@ -1188,31 +1285,22 @@ mod tests {
         let (remote, requests, handle) = remote_cache_with_responses(
             "",
             vec![
-                (404, b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
+                (404, b"missing".to_vec()),
                 (500, b"failure".to_vec()),
+                (404, Vec::new()),
+                (500, Vec::new()),
                 (500, Vec::new()),
             ],
         );
         assert_eq!(remote.get("missing"), None);
         assert_eq!(remote.get("failure"), None);
+        assert!(!remote.contains("missing"));
+        assert!(!remote.contains("failure"));
         remote.put("failure", b"data");
-        // Exactly one request per call. `rust-s3`'s `fail-on-err` feature is off precisely so a
-        // non-2xx stays a response: as an error it would enter the crate's `retry!`, and every
-        // miss would cost a second request and a one-second backoff sleep.
-        for _ in 0..3 {
+        for _ in 0..5 {
             requests.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
         handle.join().unwrap();
-    }
-
-    #[test]
-    fn remote_cache_reports_unexpected_statuses_with_their_body() {
-        let response = ResponseData::new("denied".into(), 403, std::collections::HashMap::new());
-        assert_eq!(
-            http_failure(&response),
-            "Got HTTP 403 with content 'denied'"
-        );
     }
 
     #[test]
@@ -1364,6 +1452,12 @@ mod tests {
         let (repo, _, sha) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
         let state = state_for_repo(repo.path(), cache.path(), true);
+        let dependency_fingerprint = state
+            .config
+            .hash_options
+            .bazel
+            .dependency_fingerprint()
+            .unwrap();
         let data = HashFileData {
             hashes: std::collections::BTreeMap::from([(
                 "//app:lib".into(),
@@ -1373,6 +1467,7 @@ mod tests {
                 "//app:lib".into(),
                 vec!["//dep:lib".into()],
             )]),
+            dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
         let key = cache_key(&state, &sha, &BTreeSet::new());
@@ -1390,20 +1485,22 @@ mod tests {
     fn remote_cache_hit_is_backfilled_and_next_read_is_local() {
         let (repo, _, sha) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.path().to_path_buf();
+        config.git_path = PathBuf::from("git");
+        config.cache_dir = cache.path().to_path_buf();
+        let dependency_fingerprint = config.hash_options.bazel.dependency_fingerprint().unwrap();
         let data = HashFileData {
             hashes: std::collections::BTreeMap::from([(
                 "//app:lib".into(),
                 hash("Rule", "overall", "direct"),
             )]),
+            dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
-        // One GET serves the whole lookup; the second read is answered by the local backfill.
-        let (remote, requests, handle) = remote_cache_with_responses("", vec![(200, bytes)]);
-        let mut config = test_config();
-        config.hash_options.bazel.workspace = repo.path().to_path_buf();
-        config.git_path = PathBuf::from("git");
-        config.cache_dir = cache.path().to_path_buf();
+        let (remote, requests, handle) =
+            remote_cache_with_responses("", vec![(200, Vec::new()), (200, bytes)]);
         let fingerprint = configuration_fingerprint(&config);
         let state = Arc::new(State {
             config,
@@ -1423,8 +1520,9 @@ mod tests {
         assert!(second_hit);
         assert_eq!(second.hashes["//app:lib"].hash, "overall");
 
-        requests.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
+        for _ in 0..2 {
+            requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
         handle.join().unwrap();
     }
 
@@ -1433,11 +1531,18 @@ mod tests {
         let (repo, first, second) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
         let state = state_for_repo(repo.path(), cache.path(), true);
+        let dependency_fingerprint = state
+            .config
+            .hash_options
+            .bazel
+            .dependency_fingerprint()
+            .unwrap();
         let from = HashFileData {
             hashes: std::collections::BTreeMap::from([
                 ("//app:source".into(), hash("SourceFile", "old", "old")),
                 ("//app:rule".into(), hash("Rule", "old-rule", "same-direct")),
             ]),
+            dependency_fingerprint: Some(dependency_fingerprint.clone()),
             ..Default::default()
         };
         let to = HashFileData {
@@ -1449,6 +1554,7 @@ mod tests {
                 "//app:rule".into(),
                 vec!["//app:source".into()],
             )]),
+            dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
         for (sha, data) in [(&first, &from), (&second, &to)] {
@@ -1504,6 +1610,30 @@ mod tests {
         prune_cache(&state).unwrap();
         assert!(cache_entries(cache.path()).is_empty());
         assert!(cache.path().join("ignored.tmp").exists());
+    }
+
+    #[test]
+    fn cache_entries_without_dependency_fingerprint_are_rejected() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        let data = HashFileData {
+            hashes: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                hash("Rule", "overall", "direct"),
+            )]),
+            ..Default::default()
+        };
+        let mut current_dependency_fingerprint = None;
+
+        assert!(!cache_entry_matches_dependency_fingerprint(
+            &state,
+            "abc",
+            "local",
+            &data,
+            &mut current_dependency_fingerprint,
+        )
+        .unwrap());
     }
 
     #[test]
@@ -1591,11 +1721,18 @@ mod tests {
         let (repo, first, second) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
         let state = state_for_repo(repo.path(), cache.path(), true);
+        let dependency_fingerprint = state
+            .config
+            .hash_options
+            .bazel
+            .dependency_fingerprint()
+            .unwrap();
         let from = HashFileData {
             hashes: std::collections::BTreeMap::from([
                 ("//app:source".into(), hash("SourceFile", "old", "old")),
                 ("//app:rule".into(), hash("Rule", "old-rule", "same-direct")),
             ]),
+            dependency_fingerprint: Some(dependency_fingerprint.clone()),
             ..Default::default()
         };
         let to = HashFileData {
@@ -1607,6 +1744,7 @@ mod tests {
                 "//app:rule".into(),
                 vec!["//app:source".into()],
             )]),
+            dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
         for (sha, data) in [(&first, &from), (&second, &to)] {

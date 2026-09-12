@@ -31,15 +31,15 @@ from coverage_check import (
 #   - one main-source file at 0%  (0/5)
 #   - one TEST source that should be stripped entirely
 SIMPLE_LCOV = """\
-SF:cli/src/main/kotlin/com/bazel_diff/A.kt
+SF:src/a.rs
 LF:10
 LH:9
 end_of_record
-SF:cli/src/main/kotlin/com/bazel_diff/B.kt
+SF:src/b.rs
 LF:5
 LH:0
 end_of_record
-SF:cli/src/test/kotlin/com/bazel_diff/ATest.kt
+SF:tests/e2e/a.rs
 LF:20
 LH:20
 end_of_record
@@ -50,7 +50,7 @@ class ParseLcovTest(unittest.TestCase):
     def test_extracts_per_file_records(self):
         records = parse_lcov(SIMPLE_LCOV)
         self.assertEqual(len(records), 3)
-        self.assertEqual(records[0].path, "cli/src/main/kotlin/com/bazel_diff/A.kt")
+        self.assertEqual(records[0].path, "src/a.rs")
         self.assertEqual(records[0].lines_found, 10)
         self.assertEqual(records[0].lines_hit, 9)
         self.assertAlmostEqual(records[0].pct, 90.0)
@@ -58,7 +58,7 @@ class ParseLcovTest(unittest.TestCase):
     def test_ignores_non_line_lcov_fields(self):
         # FN/FNDA/DA/BRF lines should be skipped without disturbing the LF/LH read.
         text = (
-            "SF:foo.kt\n"
+            "SF:foo.rs\n"
             "FN:1,foo\n"
             "FNDA:0,foo\n"
             "FNF:1\n"
@@ -83,7 +83,7 @@ class ParseLcovTest(unittest.TestCase):
         # If end_of_record is missing, we drop the record rather than emit a half-
         # parsed FileCoverage. Otherwise a truncated LCOV blob would silently inflate
         # the line count.
-        self.assertEqual(parse_lcov("SF:foo.kt\nLF:10\nLH:5\n"), [])
+        self.assertEqual(parse_lcov("SF:foo.rs\nLF:10\nLH:5\n"), [])
 
     def test_malformed_lf_falls_back_to_zero(self):
         # A garbage LF payload must not raise; the file is still recorded but with
@@ -99,27 +99,27 @@ class ParseLcovTest(unittest.TestCase):
 class FilterMainSourceTest(unittest.TestCase):
     def test_keeps_only_matching_prefixes(self):
         records = parse_lcov(SIMPLE_LCOV)
-        filtered = filter_main_source(records, ["cli/src/main/"])
+        filtered = filter_main_source(records, ["src/"])
         self.assertEqual(
             [r.path for r in filtered],
             [
-                "cli/src/main/kotlin/com/bazel_diff/A.kt",
-                "cli/src/main/kotlin/com/bazel_diff/B.kt",
+                "src/a.rs",
+                "src/b.rs",
             ],
         )
 
     def test_multiple_prefixes_are_unioned(self):
         records = [
-            FileCoverage("cli/src/main/a.kt", 1, 1),
+            FileCoverage("src/a.rs", 1, 1),
             FileCoverage("tools/coverage_check.py", 1, 1),
-            FileCoverage("cli/src/test/a.kt", 1, 1),
+            FileCoverage("tests/a.rs", 1, 1),
         ]
         filtered = filter_main_source(
-            records, ["cli/src/main/", "tools/coverage_check.py"]
+            records, ["src/", "tools/coverage_check.py"]
         )
         self.assertEqual(
             [r.path for r in filtered],
-            ["cli/src/main/a.kt", "tools/coverage_check.py"],
+            ["src/a.rs", "tools/coverage_check.py"],
         )
 
     def test_empty_include_returns_empty(self):
@@ -132,28 +132,28 @@ class FilterMainSourceTest(unittest.TestCase):
         # as "no data" rather than "0% covered" to avoid tanking the threshold
         # on files that the toolchain just doesn't have instrumentation for.
         records = [
-            FileCoverage("cli/src/main/has_data.kt", 10, 5),
-            FileCoverage("cli/src/main/no_data.kt", 0, 0),
+            FileCoverage("src/has_data.rs", 10, 5),
+            FileCoverage("src/no_data.rs", 0, 0),
             FileCoverage("tools/coverage_check.py", 0, 0),
         ]
         filtered = filter_main_source(
-            records, ["cli/src/main/", "tools/coverage_check.py"]
+            records, ["src/", "tools/coverage_check.py"]
         )
-        self.assertEqual([r.path for r in filtered], ["cli/src/main/has_data.kt"])
+        self.assertEqual([r.path for r in filtered], ["src/has_data.rs"])
 
 
 class FormatReportTest(unittest.TestCase):
     def test_includes_overall_summary(self):
-        records = [FileCoverage("a.kt", 10, 9), FileCoverage("b.kt", 10, 1)]
+        records = [FileCoverage("a.rs", 10, 9), FileCoverage("b.rs", 10, 1)]
         out = format_report(records, total_lh=10, total_lf=20, threshold=90.0)
         self.assertIn("Overall main-source line coverage: 50.00% (10 / 20)", out)
         self.assertIn("Threshold:                         90.00%", out)
 
     def test_sorts_worst_covered_first(self):
-        records = [FileCoverage("a.kt", 10, 9), FileCoverage("b.kt", 10, 1)]
+        records = [FileCoverage("a.rs", 10, 9), FileCoverage("b.rs", 10, 1)]
         out = format_report(records, total_lh=10, total_lf=20, threshold=90.0)
-        a_idx = out.index("a.kt")
-        b_idx = out.index("b.kt")
+        a_idx = out.index("a.rs")
+        b_idx = out.index("b.rs")
         self.assertLess(b_idx, a_idx, "Worst-covered file should sort first")
 
     def test_empty_records_still_prints_summary(self):
@@ -206,10 +206,10 @@ class MainTest(unittest.TestCase):
     def test_no_main_source_lines_exits_2(self):
         # Only a test source -- nothing matches the default include prefix.
         path = self._write_lcov(
-            "SF:cli/src/test/kotlin/com/bazel_diff/ATest.kt\n"
+            "SF:tests/e2e/a.rs\n"
             "LF:5\nLH:5\nend_of_record\n"
         )
-        rc, _, stderr = self._run_main([path, "--include", "cli/src/main/"])
+        rc, _, stderr = self._run_main([path, "--include", "src/"])
         self.assertEqual(rc, 2)
         self.assertIn("no instrumented production-source lines", stderr)
 

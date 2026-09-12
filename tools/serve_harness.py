@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Integration harness that fully exercises the `bazel-diff serve` query service.
 
-Unlike the in-process `E2ETest#testServeEndToEnd` unit test (which only ever uses a
-single full, local, `--no-initial-fetch` repo), this harness drives the *real* built
+Unlike the `serve_end_to_end` e2e case (which only ever uses a single full, local,
+`--no-initial-fetch` repo), this harness drives the *real* built
 `bazel-diff` binary as a subprocess against a *live git remote* served over `git://`,
 across the combinations that actually break in production:
 
@@ -19,7 +19,7 @@ does not have -- fetch and serve correctly rather than failing like:
 
 Usage:
     tools/serve_harness.py                 # build, then run the full matrix
-    tools/serve_harness.py --skip-build    # reuse an existing bazel-bin/cli/bazel-diff
+    tools/serve_harness.py --skip-build    # reuse an existing bazel-bin/src/bazel-diff
     tools/serve_harness.py --only shallow  # run only cases whose name contains "shallow"
     tools/serve_harness.py --keep-artifacts# leave the temp workdir on disk for inspection
     tools/serve_harness.py -v              # stream serve/git output as it happens
@@ -50,9 +50,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-# Overridable so callers (e.g. serve_stress.py --target) can point the harness at the Rust
-# launcher (bazel-bin/src/bazel-diff) instead of the default Kotlin one.
-LAUNCHER = Path(os.environ.get("BAZEL_DIFF_LAUNCHER", str(REPO_ROOT / "bazel-bin" / "cli" / "bazel-diff")))
+# Overridable (BAZEL_DIFF_LAUNCHER) so a caller can point the harness at a binary that was not
+# built into this checkout's bazel-bin, e.g. a downloaded release asset.
+LAUNCHER = Path(os.environ.get("BAZEL_DIFF_LAUNCHER", str(REPO_ROOT / "bazel-bin" / "src" / "bazel-diff")))
+BUILD_TARGET = "//src:bazel-diff"
 DEFAULT_BRANCH = "master"
 
 # ----------------------------------------------------------------------------------------------
@@ -907,8 +908,8 @@ def main() -> int:
     BAZEL = args.bazel
 
     if not args.skip_build:
-        log(f"{C.BOLD}Building //cli:bazel-diff ...{C.RESET}")
-        run([BAZEL, "build", "//cli:bazel-diff"], cwd=REPO_ROOT)
+        log(f"{C.BOLD}Building {BUILD_TARGET} ...{C.RESET}")
+        run([BAZEL, "build", BUILD_TARGET], cwd=REPO_ROOT)
     if not LAUNCHER.exists():
         log(f"{C.RED}launcher not found at {LAUNCHER}; run without --skip-build{C.RESET}")
         return 2

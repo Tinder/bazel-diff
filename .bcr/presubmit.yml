@@ -76,5 +76,4 @@ bcr_test_module:
       build_targets:
       - '//:bazel-diff-rust'
       test_targets:
-      - '//cli/...'
       - '//:rust_tests'

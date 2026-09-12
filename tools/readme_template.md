@@ -7,7 +7,7 @@
 
 `bazel-diff` offers several key advantages over rolling your own target diffing solution
 
-1. `bazel-diff` is designed for very large Bazel projects. We use Java Protobuf's `parseDelimitedFrom` method alongside Bazel Query's `streamed_proto` output option. These two together allow you to parse Gigabyte or larger protobuf messages. We have tested it with projects containing tens of thousands of targets.
+1. `bazel-diff` is designed for very large Bazel projects. We stream Bazel Query's `streamed_proto` output message by message instead of loading it whole, which allows you to parse Gigabyte or larger protobuf outputs. We have tested it with projects containing hundreds of thousands of targets.
 2. We avoid usage of large command line query lists when interacting with Bazel, [issue here](https://github.com/bazelbuild/bazel/issues/8609). When you interact with Bazel with thousands of query parameters you can reach an upper maximum limit, seeing this error `bash: /usr/local/bin/bazel: Argument list too long`. `bazel-diff` is smart enough to avoid these errors.
 3. `bazel-diff` has been tested with file renames, deletions, and modifications. Works on `bzl` files, `WORKSPACE` files, `BUILD` files and regular files
 
@@ -25,8 +25,7 @@ This approach was inspired by the [following BazelConf talk](https://www.youtube
 ## Prerequisites
 
 * Git
-* Bazel 3.3.0 or higher
-* Java 8 JDK or higher (Bazel requires this)
+* Bazel 7 or higher (Bazel itself needs a JDK; `bazel-diff` is a single static binary and does not)
 
 ## Getting Started
 
@@ -398,11 +397,33 @@ content of the file are converted into a SHA256 value.
 
 ## Installing
 
-### Integrate into your project (recommended)
+### Prebuilt binaries (recommended)
 
-First, add the following snippet to your project:
+Every [release](https://github.com/Tinder/bazel-diff/releases) ships a single self-contained
+binary per platform. The Linux binaries are statically linked against musl, so they run on any
+distribution (including Alpine and images older than the build runner) with no libc or JVM
+requirement:
 
-#### Bzlmod snippet
+```terminal
+# Linux amd64
+curl -Lo bazel-diff https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-amd64
+chmod +x bazel-diff
+
+# Linux arm64
+curl -Lo bazel-diff https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-arm64
+chmod +x bazel-diff
+
+# macOS arm64
+curl -Lo bazel-diff https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-macos-arm64
+chmod +x bazel-diff
+```
+
+Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
+[latest release](https://github.com/Tinder/bazel-diff/releases/latest).
+
+### Integrate into your project
+
+Add the following to your `MODULE.bazel`:
 
 ```bazel
 bazel_dep(name = "bazel-diff", version = "{{BAZEL_DIFF_VERSION}}")
@@ -411,48 +432,11 @@ bazel_dep(name = "bazel-diff", version = "{{BAZEL_DIFF_VERSION}}")
 You can now run the tool with:
 
 ```terminal
-bazel run @bazel-diff//cli:bazel-diff
+bazel run @bazel-diff//:bazel-diff -- --help
 ```
 
-#### WORKSPACE snippet
-
-```bazel
-http_jar = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
-http_jar(
-    name = "bazel-diff",
-    urls = [
-        "https://github.com/Tinder/bazel-diff/releases/download/7.0.0/bazel-diff_deploy.jar"
-    ],
-    sha256 = "0b9e32f9c20e570846b083743fe967ae54d13e2a1f7364983e0a7792979442be",
-)
-```
-
-Second, add in your root `BUILD.bazel` file:
-
-```bazel
-load("@rules_java//java:defs.bzl", "java_binary")
-
-java_binary(
-    name = "bazel-diff",
-    main_class = "com.bazel_diff.Main",
-    runtime_deps = ["@bazel-diff//jar"],
-)
-```
-
-That's it! You can now run the tool with:
-
-```terminal
-bazel run //:bazel-diff
-```
-
-> Note, in releases prior to 2.0.0 the value for the `main_class` attribute is just `BazelDiff`
-
-### Run Via JAR Release
-
-```terminal
-curl -Lo bazel-diff.jar https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff_deploy.jar
-java -jar bazel-diff.jar -h
-```
+(`@bazel-diff//:bazel-diff-rust` still resolves to the same binary for projects that adopted
+it under that name.) bazel-diff is bzlmod-only; there is no `WORKSPACE` integration.
 
 ### Build from Source
 
@@ -461,61 +445,31 @@ After cloning down the repo, you are good to go, Bazel will handle the rest
 To run the project
 
 ```terminal
-bazel run :bazel-diff -- bazel-diff -h
+bazel run :bazel-diff -- --help
 ```
+
+To build the same binaries a release publishes (Bazel names the output for the platform it
+was built for, `bazel-bin/release/bazel-diff-rust-<os>-<arch>[.exe]`):
+
+```terminal
+make release_rust_binary              # bazel build //release:bazel-diff-rust --config=release
+make release_rust_binary_linux        # ... --config=release-musl
+make release_rust_binary_linux_arm64  # ... --config=release-musl-arm64
+```
+
+`--config=release-musl` and `--config=release-musl-arm64` target
+`//platforms:linux_x86_64_musl` and `//platforms:linux_aarch64_musl`, which select a musl Rust
+std and a musl C toolchain, so the Linux assets are statically linked instead of inheriting the
+build runner's glibc as a version floor. They are cross-compiles: the same commands produce
+`bazel-diff-rust-linux-amd64` and `bazel-diff-rust-linux-arm64` on a glibc Linux host and on an
+Apple Silicon Mac.
 
 #### Debugging (when running from source)
 
 To run `bazel-diff` with debug logging, run your commands with the `verbose` config like so:
 
 ```terminal
-bazel run :bazel-diff --config=verbose -- bazel-diff -h
-```
-
-### Build your own deployable JAR
-
-```terminal
-bazel build //cli:bazel-diff_deploy.jar
-java -jar bazel-bin/cli/bazel-diff_deploy.jar # This JAR can be run anywhere
-```
-
-### Build from source in your Bazel Project
-
-Add the following to your `WORKSPACE` file to add the external repositories, replacing the `RELEASE_ARCHIVE_URL` with the archive url of the bazel-diff release you wish to depend on:
-
-```bazel
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-
-http_archive(
-  name = "bazel-diff",
-  urls = [
-        "RELEASE_ARCHIVE_URL",
-    ],
-    sha256 = "UPDATE_ME",
-    strip_prefix = "UPDATE_ME"
-)
-
-load("@bazel-diff//:repositories.bzl", "bazel_diff_dependencies")
-
-bazel_diff_dependencies()
-
-load("@rules_jvm_external//:defs.bzl", "maven_install")
-load("@bazel-diff//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
-
-maven_install(
-    name = "bazel_diff_maven",
-    artifacts = BAZEL_DIFF_MAVEN_ARTIFACTS,
-    repositories = [
-        "http://uk.maven.org/maven2",
-        "https://jcenter.bintray.com/",
-    ],
-)
-```
-
-Now you can simply run `bazel-diff` from your project:
-
-```terminal
-bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
+bazel run :bazel-diff --config=verbose -- --help
 ```
 
 ## Contributors
@@ -544,93 +498,34 @@ Precision CI at Scale: Target-Aware Workflows with Bazel Diff - Maxwell Elliott 
 
 ## Running the tests
 
-To run the tests simply run
+The unit tests, lint gates and tooling tests:
 
 ```terminal
-bazel test //...
+bazel test //:rust_tests //:rust_clippy_check //:rust_format_check //tools/...
 ```
 
-## Experimental Rust candidate
-
-This branch includes a proposed Rust implementation at `//:bazel-diff-rust`. The existing Kotlin
-implementation remains the default `//:bazel-diff` target and the released JAR.
+The end-to-end suite drives the real binary against fixture workspaces with a nested Bazel,
+one target per case (see [`tools/e2e/README.md`](tools/e2e/README.md)):
 
 ```terminal
-bazel run //:bazel-diff-rust -- --help
+bazel test //tests:e2e_test
 ```
-
-GitHub Releases also ship prebuilt binaries:
-
-```terminal
-# Linux amd64 (statically linked against musl -- no glibc requirement, so it
-# runs on any distribution, including Alpine and images older than the runner)
-curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-amd64
-chmod +x bazel-diff-rust
-
-# Linux arm64 (same musl static linking)
-curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-arm64
-chmod +x bazel-diff-rust
-
-# macOS arm64
-curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-macos-arm64
-chmod +x bazel-diff-rust
-```
-
-Windows amd64: download
-`bazel-diff-rust-windows-amd64.exe` from the
-[latest release](https://github.com/Tinder/bazel-diff/releases/latest).
-
-Those assets are produced by Bazel alone -- CI runs nothing but the commands below and uploads
-whatever lands in `bazel-bin/release/`, so `//release:bazel-diff-rust` names the binary for the
-platform it was built for (`bazel-diff-rust-<os>-<arch>`, plus `.exe` on Windows):
-
-```terminal
-make release_rust_binary              # bazel build //release:bazel-diff-rust --config=release
-make release_rust_binary_linux        # ... --config=release-musl
-make release_rust_binary_linux_arm64  # ... --config=release-musl-arm64
-```
-
-`--config=release-musl` and `--config=release-musl-arm64` target
-`//platforms:linux_x86_64_musl` and `//platforms:linux_aarch64_musl`, which select a musl Rust
-std and a musl C toolchain, so the Linux assets are statically linked instead of inheriting the
-build runner's glibc as a version floor. They are cross-compiles: the same commands produce
-`bazel-diff-rust-linux-amd64` and `bazel-diff-rust-linux-arm64` on a glibc Linux host and on an
-Apple Silicon Mac.
-
-### Performance gate
-
-The Rust candidate is expected to be faster than Kotlin, and CI enforces it. `make perf-gate`
-runs both binaries over generated workloads -- a synthetic `streamed_proto` graph plus hash-file
-pairs, with no real workspace, Bazel server or Hyperfine involved -- and exits non-zero unless
-Rust wins on median wall time, on start-up-adjusted wall time, and in every paired round.
-
-```terminal
-make perf-gate
-make perf-gate SCALE=4 ROUNDS=9 JSON=/tmp/perf-gate.json
-```
-
-Outputs are compared before timings are reported, so a "speedup" can never come from the two
-implementations doing different work. See
-[`docs/kotlin-rust-perf-gate.md`](docs/kotlin-rust-perf-gate.md) for the protocol, the workload
-list and what to do when the gate fails. For measuring the two implementations against a real
-repository instead, see [`docs/kotlin-vs-rust-benchmark.md`](docs/kotlin-vs-rust-benchmark.md).
 
 ## Code coverage
 
-CI enforces a minimum **90% line coverage** on production sources. Kotlin
-(`cli/src/main/...`), Go (`tools/go/...`), and the experimental Rust
-implementation (`src/...`) are gated **independently** at 90% each, so thin
-coverage in one language can't hide behind well-covered code in another. To
-run the same checks locally:
+CI enforces a minimum **90% line coverage** on production sources. Rust
+(`src/...`, `tools/coverage/src/...`) and Go (`tools/go/...`) are gated
+**independently** at 90% each, so thin coverage in one language can't hide
+behind well-covered code in another. To run the same checks locally:
 
 ```terminal
 make coverage
 ```
 
 This invokes
-`bazel coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...`
+`bazel coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...`
 and then runs `//tools:coverage-check` twice against the resulting LCOV report — once for
-the Kotlin main sources and once scoped to `tools/go/` (`--include tools/go/`). The check is
+the Rust sources and once scoped to `tools/go/` (`--include tools/go/`). The check is
 a Python `py_binary` ([`tools/coverage_check.py`](tools/coverage_check.py)) that prints a
 per-file table sorted by coverage (worst first), the overall percentage, and exits
 non-zero if the scoped coverage is below the threshold.
@@ -663,14 +558,11 @@ coverage_enforced_test(
 ```
 
 The default minimum is 90%. Go (`//tools/go/sample:sample_test`), the Rust
-LCOV merger (`//tools/coverage:lcov_merger_test`), the experimental Rust
-implementation (`//src:cli_tests` and `//src:rust_tests`), and the
-primary-owner Kotlin/JVM tests under `//cli` all carry minimums. When a
+LCOV merger (`//tools/coverage:lcov_merger_test`) and the CLI itself
+(`//src:cli_tests` and `//src:rust_tests`) all carry minimums. When a
 target's merged report falls below its minimum, the coverage run fails that
 target and the test log contains a per-file breakdown. See
 [`tools/coverage/README.md`](tools/coverage/README.md) for details.
-The Kotlin-to-Rust applicability and parity decisions are tracked in
-[`docs/kotlin-rust-test-parity.md`](docs/kotlin-rust-test-parity.md).
 
 For an interactive HTML report (annotated source with covered/uncovered lines
 highlighted), use `make coverage-html`. This requires the `lcov` package

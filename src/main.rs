@@ -1,12 +1,13 @@
 use anyhow::{bail, Context, Result};
 use bazel_diff::bazel::BazelOptions;
+use bazel_diff::explain::{self, ExplainFormat, ExplainLimits};
 use bazel_diff::fingerprint;
 use bazel_diff::hash::{generate_hashes, HashOptions};
 use bazel_diff::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
 };
 use bazel_diff::module_graph::impacted_with_module_changes;
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
@@ -46,6 +47,12 @@ enum Commands {
         about = "Compare two hash files and report impacted targets"
     )]
     GetImpactedTargets(GetImpactedTargetsArgs),
+    #[command(
+        about = "Explain why a target was impacted: the upstream target(s) whose own hash \
+                 changed, and the dependency path from each down to the queried target. \
+                 Renders as text, JSON, Graphviz DOT, or a Mermaid flowchart."
+    )]
+    Explain(ExplainArgs),
     #[command(about = "Warm Bazel and write snapshot hashes and fingerprint metadata")]
     Warmup(WarmupArgs),
     #[command(about = "Compute the snapshot/cache fingerprint for the current workspace")]
@@ -226,6 +233,65 @@ struct GetImpactedTargetsArgs {
     exclude_external_targets: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ExplainFormatArg {
+    Text,
+    Json,
+    /// A Graphviz node-link graph of the blame subgraph, edges from root cause to queried target.
+    Dot,
+    /// A Mermaid `flowchart TD` of the same graph.
+    Mermaid,
+}
+
+impl From<ExplainFormatArg> for ExplainFormat {
+    fn from(value: ExplainFormatArg) -> Self {
+        match value {
+            ExplainFormatArg::Text => ExplainFormat::Text,
+            ExplainFormatArg::Json => ExplainFormat::Json,
+            ExplainFormatArg::Dot => ExplainFormat::Dot,
+            ExplainFormatArg::Mermaid => ExplainFormat::Mermaid,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct ExplainArgs {
+    /// The JSON file of target hashes for the initial revision, from `generate-hashes`.
+    #[arg(long = "startingHashes")]
+    starting_hashes: PathBuf,
+
+    /// The JSON file of target hashes for the final revision, from `generate-hashes`.
+    #[arg(long = "finalHashes")]
+    final_hashes: PathBuf,
+
+    /// The dependency-edges file written by `generate-hashes --depEdgesFile`. Required:
+    /// attribution is a walk over these edges.
+    #[arg(short = 'd', long = "depEdgesFile")]
+    dep_edges_file: PathBuf,
+
+    /// The impacted Bazel label to explain, e.g. '//service/a:app'.
+    #[arg(short = 't', long = "target")]
+    target: String,
+
+    /// Output format.
+    #[arg(short = 'f', long = "format", value_enum, ignore_case = true, default_value_t = ExplainFormatArg::Text)]
+    format: ExplainFormatArg,
+
+    /// Filepath to write the explanation to. Defaults to STDOUT.
+    #[arg(short = 'o', long = "output")]
+    output: Option<PathBuf>,
+
+    /// Report at most this many root causes, nearest first. The full count is always
+    /// reported alongside. 0 means no limit.
+    #[arg(long = "maxRootCauses", default_value_t = 25)]
+    max_root_causes: usize,
+
+    /// Stop searching this many dependency hops above the queried target. Root causes
+    /// further upstream are then not reported (a warning is printed). -1 means no bound.
+    #[arg(long = "maxDepth", default_value_t = -1, allow_hyphen_values = true)]
+    max_depth: i64,
+}
+
 #[derive(Debug, Args)]
 struct FingerprintArgs {
     #[command(flatten)]
@@ -356,7 +422,7 @@ fn normalize_path(path: PathBuf) -> PathBuf {
 /// `chdir("")` ENOENT that names the Bazel binary rather than the workspace;
 /// normalizing `../sibling` on its own pops nothing and silently yields
 /// `sibling`. Anchoring to the working directory gives both the directory the
-/// user meant, matching the Kotlin CLI. See
+/// user meant. See
 /// <https://github.com/Tinder/bazel-diff/issues/470>.
 fn parse_normalized_path(value: &str) -> Result<PathBuf, String> {
     let absolute = std::path::absolute(value)
@@ -631,6 +697,38 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
     Ok(())
 }
 
+fn run_explain(args: &ExplainArgs, verbose: bool) -> Result<()> {
+    let from = HashFileData::read(&args.starting_hashes)
+        .context("Incorrect starting hashes: file doesn't exist or can't be read.")?;
+    let to = HashFileData::read(&args.final_hashes)
+        .context("Incorrect final hashes: file doesn't exist or can't be read.")?;
+    let dep_edges: BTreeMap<String, Vec<String>> = serde_json::from_slice(
+        &fs::read(&args.dep_edges_file)
+            .context("Incorrect dep edges file: file doesn't exist or can't be read.")?,
+    )
+    .context("Incorrect dep edges file: expected a JSON object mapping labels to label arrays")?;
+    let limits = ExplainLimits {
+        max_depth: usize::try_from(args.max_depth).ok(),
+        max_roots: args.max_root_causes,
+    };
+    let outcome = explain::explain(&from.hashes, &to.hashes, &dep_edges, &args.target, limits)?;
+    for warning in &outcome.warnings {
+        eprintln!("[Warning] {warning}");
+    }
+    if verbose {
+        for note in &outcome.notes {
+            eprintln!("[Info] {note}");
+        }
+    }
+    let rendered = explain::render(&outcome.explanation, args.format.into());
+    match &args.output {
+        Some(path) => fs::write(path, rendered)
+            .with_context(|| format!("failed to write {}", path.display()))?,
+        None => print!("{rendered}"),
+    }
+    Ok(())
+}
+
 fn run_fingerprint(args: &FingerprintArgs) -> Result<()> {
     let flags = fingerprint_flags(&args.hashing, args.include_target_type, &args.target_type);
     let inputs = fingerprint::gather(
@@ -763,6 +861,7 @@ fn run() -> Result<()> {
             run_generate(args, cli.verbose)?;
         }
         Commands::GetImpactedTargets(args) => run_get_impacted(args, cli.verbose)?,
+        Commands::Explain(args) => run_explain(args, cli.verbose)?,
         Commands::Fingerprint(args) => run_fingerprint(args)?,
         Commands::Warmup(args) => run_warmup(args, cli.verbose)?,
         Commands::Serve(args) => {
@@ -1334,6 +1433,121 @@ mod tests {
         assert_eq!(values[0].target_distance, 0);
         assert_eq!(values[1].label, "//app:top");
         assert_eq!(values[1].target_distance, 1);
+    }
+
+    fn explain_fixture(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        // //common:util.py -> //common:lib -> //service/a:app
+        let from = dir.join("from.json");
+        let to = dir.join("to.json");
+        let deps = dir.join("deps.json");
+        fs::write(
+            &from,
+            r#"{"//service/a:app": "Rule#app~app-direct", "//common:lib": "Rule#lib~lib-direct", "//common:util.py": "SourceFile#util~util"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &to,
+            r#"{"//service/a:app": "Rule#app2~app-direct", "//common:lib": "Rule#lib2~lib-direct", "//common:util.py": "SourceFile#util2~util2"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &deps,
+            r#"{"//service/a:app": ["//common:lib"], "//common:lib": ["//common:util.py"]}"#,
+        )
+        .unwrap();
+        (from, to, deps)
+    }
+
+    fn explain_args(dir: &Path, extra: &[&str]) -> ExplainArgs {
+        let (from, to, deps) = explain_fixture(dir);
+        let mut arguments = vec![
+            "bazel-diff".to_owned(),
+            "explain".to_owned(),
+            "-sh".to_owned(),
+            from.display().to_string(),
+            "-fh".to_owned(),
+            to.display().to_string(),
+            "-d".to_owned(),
+            deps.display().to_string(),
+            "-t".to_owned(),
+            "//service/a:app".to_owned(),
+        ];
+        arguments.extend(extra.iter().map(|argument| (*argument).to_owned()));
+        let cli = Cli::try_parse_from(arguments.into_iter().map(normalize_argument)).unwrap();
+        let Commands::Explain(args) = cli.command else {
+            panic!("expected explain");
+        };
+        args
+    }
+
+    #[test]
+    fn explain_defaults_and_writes_the_chosen_format_to_the_output_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("explain.txt");
+
+        let args = explain_args(dir.path(), &[]);
+        assert_eq!(args.max_root_causes, 25);
+        assert_eq!(args.max_depth, -1);
+        assert_eq!(args.format, ExplainFormatArg::Text);
+
+        let mut text = explain_args(dir.path(), &[]);
+        text.output = Some(output.clone());
+        run_explain(&text, false).unwrap();
+        let rendered = fs::read_to_string(&output).unwrap();
+        assert!(rendered.contains("IMPACTED (indirectly"));
+        assert!(rendered.contains("//common:util.py -> //common:lib -> //service/a:app"));
+
+        let mut dot = explain_args(dir.path(), &["--format", "DOT"]);
+        dot.output = Some(output.clone());
+        run_explain(&dot, false).unwrap();
+        let rendered = fs::read_to_string(&output).unwrap();
+        assert!(rendered.contains("digraph bazel_diff_impact {"));
+        assert!(rendered.contains("(root cause)"));
+
+        let mut mermaid = explain_args(dir.path(), &["-f", "mermaid"]);
+        mermaid.output = Some(output.clone());
+        run_explain(&mermaid, false).unwrap();
+        assert!(fs::read_to_string(&output)
+            .unwrap()
+            .contains("classDef rootCause"));
+
+        let mut json = explain_args(dir.path(), &["--format", "json"]);
+        json.output = Some(output.clone());
+        run_explain(&json, true).unwrap();
+        let rendered = fs::read_to_string(&output).unwrap();
+        assert!(rendered.contains("\"rootCauses\""));
+        assert!(rendered.contains("\"packageHops\""));
+
+        // util.py is 2 hops up; a 1-hop budget cannot reach it.
+        let mut shallow = explain_args(dir.path(), &["--maxDepth", "1"]);
+        shallow.output = Some(output.clone());
+        run_explain(&shallow, false).unwrap();
+        assert!(fs::read_to_string(&output)
+            .unwrap()
+            .contains("No root cause could be attributed"));
+    }
+
+    #[test]
+    fn explain_reports_usage_errors_for_bad_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut typo = explain_args(dir.path(), &[]);
+        typo.target = "//typo:nope".to_owned();
+        let error = run_explain(&typo, false).unwrap_err().to_string();
+        assert!(
+            error.contains("is not present in either hash file"),
+            "{error}"
+        );
+
+        let mut missing_hashes = explain_args(dir.path(), &[]);
+        missing_hashes.starting_hashes = dir.path().join("missing.json");
+        let error = format!("{:#}", run_explain(&missing_hashes, false).unwrap_err());
+        assert!(error.contains("Incorrect starting hashes"), "{error}");
+
+        let mut missing_deps = explain_args(dir.path(), &[]);
+        missing_deps.dep_edges_file = dir.path().join("missing-deps.json");
+        let error = format!("{:#}", run_explain(&missing_deps, false).unwrap_err());
+        assert!(error.contains("Incorrect dep edges file"), "{error}");
     }
 
     #[test]

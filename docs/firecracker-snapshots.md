@@ -2,14 +2,14 @@
 
 **Status:** Draft
 **Audience:** bazel-diff maintainers / contributors
-**Scope decided:** CLI hooks in the Kotlin tool + a Go orchestration tool, capturing a
+**Scope decided:** CLI hooks in the bazel-diff CLI + a Go orchestration tool, capturing a
 *full warm Bazel server*, targeting *self-hosted CI* (we control the host kernel and CPU model).
 
 ---
 
 ## 1. Motivation
 
-bazel-diff's own JVM CLI starts in well under a second. That is not where the time goes. The
+bazel-diff's own CLI starts in milliseconds. That is not where the time goes. The
 canonical workflow ([`bazel-diff-example.sh`](../bazel-diff-example.sh)) is:
 
 1. `bazel run :bazel-diff` — build the tool
@@ -20,9 +20,8 @@ canonical workflow ([`bazel-diff-example.sh`](../bazel-diff-example.sh)) is:
 The cost is the `bazel query` in steps 2/3, which forces:
 
 - **Bazel server startup** (JVM warmup).
-- **External-repo / bzlmod resolution + repository-cache fetch.** `BazelQueryService` even shells
-  out to `bazel mod dump_repo_mapping` and `bazel mod show_repo`
-  ([`BazelQueryService.kt`](../cli/src/main/kotlin/com/bazel_diff/bazel/BazelQueryService.kt)).
+- **External-repo / bzlmod resolution + repository-cache fetch.** The query layer even shells
+  out to `bazel mod dump_repo_mapping` and `bazel mod show_repo` ([`src/bazel.rs`](../src/bazel.rs)).
 - **Full Skyframe graph load + package analysis** for `deps(//...)`.
 
 On a large monorepo this is minutes per cold start. A Firecracker microVM snapshot lets us capture
@@ -37,12 +36,12 @@ build graph loaded and external repos fetched.
 ## 2. Key architectural split
 
 The Firecracker record/restore itself is a **host-level concern** — it talks to the Firecracker REST
-API over a unix socket (optionally via `jailer`). It is *not* something the Kotlin CLI does. The work
+API over a unix socket (optionally via `jailer`). It is *not* something the bazel-diff CLI does. The work
 therefore splits into two pieces:
 
 | Piece | Where | Responsibility |
 | --- | --- | --- |
-| **CLI hooks** | Kotlin (`cli/`) | Make snapshots deterministic and *safe*: warm-then-signal, emit a cache key, bake base hashes. |
+| **CLI hooks** | Rust (`src/`) | Make snapshots deterministic and *safe*: warm-then-signal, emit a cache key, bake base hashes. |
 | **Orchestration tool** | Go (`tools/firecracker/`) | Boot/warm/snapshot and restore/checkout/run the microVM via the Firecracker API. |
 
 Consume needs **no new bazel-diff command** — it is the existing `generate-hashes` +
@@ -80,9 +79,8 @@ host: extract impacted targets ──► discard overlay
 
 ## 4. New CLI surface
 
-Both new subcommands slot into the existing picocli `subcommands` list in
-[`BazelDiff.kt`](../cli/src/main/kotlin/com/bazel_diff/cli/BazelDiff.kt) alongside
-`GenerateHashesCommand` and `GetImpactedTargetsCommand`.
+Both new subcommands slot into the existing subcommand list in
+[`src/main.rs`](../src/main.rs) alongside `generate-hashes` and `get-impacted-targets`.
 
 ### 4.1 `bazel-diff warmup`
 
@@ -93,7 +91,7 @@ The record-side entrypoint. Effectively `generate-hashes` for the base revision,
 - Exits `0` **only** once the query has completed and the server is warm + quiesced. The host
   watches for this clean exit as the "safe to snapshot" signal.
 
-Implementation reuses `GenerateHashesCommand`'s plumbing; warmup is essentially generate-hashes with
+Implementation reuses `generate-hashes`' plumbing; warmup is essentially generate-hashes with
 metadata side-effects and a clear success contract.
 
 ### 4.2 `bazel-diff fingerprint`
@@ -202,7 +200,7 @@ bazel-diff-snap consume --workspace <path> --target-sha <sha> --store <dir> --ou
 
 ## 9. Phasing
 
-1. **CLI hooks** — `fingerprint` + `warmup` subcommands, pure Kotlin, fully unit-testable, no VM
+1. **CLI hooks** — `fingerprint` + `warmup` subcommands, fully unit-testable, no VM
    required. Lands value independently (the fingerprint is useful for any snapshot/caching scheme).
 2. **Orchestration tool** — `tools/firecracker/` in Go: `record` / `consume`.
 3. **Correctness canary + docs** — snapshot-vs-cold equality check in CI; README section.

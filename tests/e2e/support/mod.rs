@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-pub const RESOURCES: &str = "cli/src/test/resources";
+pub const RESOURCES: &str = "tests/resources";
 
 pub struct TestWorkspace {
     temp_dir: TempDir,

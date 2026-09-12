@@ -20,8 +20,7 @@ which is the channel these helpers use to declare a minimum:
     )
 
 The default minimum is 90%. Any rule with the standard `env` attribute
-works (`go_test`, `rust_test`, `kt_jvm_test`, `java_test`, `py_test`,
-...). A target whose merged report falls below its minimum fails the
+works (`go_test`, `rust_test`, `py_test`, ...). A target whose merged report falls below its minimum fails the
 coverage run with the merger's per-file breakdown in the test log; plain
 `bazel test` runs are untouched.
 """
@@ -39,11 +38,11 @@ def coverage_minimum_env(min_line_coverage = DEFAULT_MIN_LINE_COVERAGE, coverage
     through `coverage_enforced_test`, e.g. to splice into an existing
     `env` dict:
 
-        kt_jvm_test(
-            name = "FooTest",
+        rust_test(
+            name = "foo_test",
             ...
             env = coverage_minimum_env(
-                coverage_include = ["cli/src/main/kotlin/foo/"],
+                coverage_include = ["src/foo/"],
             ),
         )
 
@@ -80,7 +79,7 @@ def coverage_enforced_test(
 
     Args:
       rule: any test rule with the standard `env` attribute
-        (`go_test`, `rust_test`, `kt_jvm_test`, `py_test`, ...).
+        (`go_test`, `rust_test`, `py_test`, ...).
       name: forwarded to the rule.
       min_line_coverage: see `coverage_minimum_env` (defaults to 90).
       coverage_include: see `coverage_minimum_env`.

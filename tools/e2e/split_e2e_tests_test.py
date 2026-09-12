@@ -16,218 +16,6 @@ import unittest
 import split_e2e_tests as splitter
 
 
-class KotlinParsingTest(unittest.TestCase):
-    def parse(self, source, path="cli/src/test/kotlin/com/bazel_diff/e2e/Sample.kt"):
-        return splitter.parse_kotlin_source(textwrap.dedent(source), path)
-
-    def test_collects_test_methods_and_qualifies_the_class(self):
-        suites = self.parse(
-            """
-            package com.bazel_diff.e2e
-
-            class SampleTest {
-              @Test
-              fun testAlpha() {}
-
-              @Test
-              fun testBeta() {}
-            }
-            """
-        )
-
-        self.assertEqual(1, len(suites))
-        self.assertEqual("SampleTest", suites[0].name)
-        self.assertEqual("com.bazel_diff.e2e.SampleTest", suites[0].test_class)
-        self.assertEqual(["testAlpha", "testBeta"], [case.name for case in suites[0].cases])
-
-    def test_ignores_helper_methods(self):
-        suites = self.parse(
-            """
-            package com.bazel_diff.e2e
-
-            class SampleTest {
-              private fun helper() {}
-
-              @Test
-              fun testAlpha() {
-                helper()
-              }
-
-              private fun anotherHelper(): String = "x"
-            }
-            """
-        )
-
-        self.assertEqual(["testAlpha"], [case.name for case in suites[0].cases])
-
-    def test_test_annotation_survives_intervening_annotations(self):
-        # E2ETest really does have a @Test whose fun is four lines below it,
-        # separated by a multi-line @org.junit.Ignore.
-        suites = self.parse(
-            """
-            package com.bazel_diff.e2e
-
-            class SampleTest {
-              @Test
-              @org.junit.Ignore(
-                  "fixture pins an old Bazel layout " +
-                      "that no longer loads")
-              fun testSkipped() {}
-            }
-            """
-        )
-
-        self.assertEqual(["testSkipped"], [case.name for case in suites[0].cases])
-
-    def test_default_timeout_is_the_five_minute_cap(self):
-        suites = self.parse(
-            """
-            package com.bazel_diff.e2e
-
-            class SampleTest {
-              @Test
-              fun testAlpha() {}
-            }
-            """
-        )
-
-        self.assertEqual("moderate", suites[0].cases[0].timeout)
-        self.assertEqual(300, splitter.VALID_TIMEOUTS[suites[0].cases[0].timeout])
-
-    def test_marker_comment_overrides_the_timeout(self):
-        # Both directions, and neither value is the default -- a marker that
-        # happens to name the default would pass this test without proving the
-        # marker was read at all.
-        suites = self.parse(
-            """
-            package com.bazel_diff.e2e
-
-            class SampleTest {
-              // e2e-timeout: long
-              @Test
-              fun testSlow() {}
-
-              // e2e-timeout: short
-              @Test
-              fun testQuick() {}
-
-              @Test
-              fun testDefault() {}
-            }
-            """
-        )
-
-        self.assertEqual(
-            [("testSlow", "long"), ("testQuick", "short"), ("testDefault", "moderate")],
-            [(case.name, case.timeout) for case in suites[0].cases],
-        )
-
-    def test_marker_reaches_past_a_doc_comment(self):
-        suites = self.parse(
-            """
-            package com.bazel_diff.e2e
-
-            class SampleTest {
-              // e2e-timeout: long
-              // Downloads an Android SDK before it can assert anything.
-              @Test
-              fun testSlow() {}
-            }
-            """
-        )
-
-        self.assertEqual("long", suites[0].cases[0].timeout)
-
-    def test_marker_does_not_leak_across_a_blank_line(self):
-        suites = self.parse(
-            """
-            package com.bazel_diff.e2e
-
-            class SampleTest {
-              // e2e-timeout: long
-
-              @Test
-              fun testAlpha() {}
-            }
-            """
-        )
-
-        self.assertEqual("moderate", suites[0].cases[0].timeout)
-
-    def test_unknown_timeout_is_rejected(self):
-        with self.assertRaisesRegex(splitter.GeneratorError, "unknown e2e-timeout"):
-            self.parse(
-                """
-                package com.bazel_diff.e2e
-
-                class SampleTest {
-                  // e2e-timeout: quick
-                  @Test
-                  fun testAlpha() {}
-                }
-                """
-            )
-
-    def test_several_classes_in_one_file_become_several_suites(self):
-        suites = self.parse(
-            """
-            package com.bazel_diff.e2e
-
-            class FirstTest {
-              @Test
-              fun testAlpha() {}
-            }
-
-            class SecondTest {
-              @Test
-              fun testBeta() {}
-            }
-            """
-        )
-
-        self.assertEqual(["FirstTest", "SecondTest"], [suite.name for suite in suites])
-        self.assertEqual(["testBeta"], [case.name for case in suites[1].cases])
-
-    def test_classes_without_tests_are_dropped(self):
-        suites = self.parse(
-            """
-            package com.bazel_diff.e2e
-
-            class Fixtures {
-              fun helper() {}
-            }
-            """
-        )
-
-        self.assertEqual([], suites)
-
-    def test_missing_package_is_rejected(self):
-        with self.assertRaisesRegex(splitter.GeneratorError, "no package declaration"):
-            self.parse(
-                """
-                class SampleTest {
-                  @Test
-                  fun testAlpha() {}
-                }
-                """
-            )
-
-    def test_backtick_name_is_rejected(self):
-        # JUnit allows it; a Bazel target name does not, so fail loudly rather
-        # than emitting a label Bazel will reject with no explanation.
-        with self.assertRaisesRegex(splitter.GeneratorError, "spaces in its name"):
-            self.parse(
-                """
-                package com.bazel_diff.e2e
-
-                class SampleTest {
-                  @Test
-                  fun `impacted targets are hermetic`() {}
-                }
-                """
-            )
-
-
 class RustParsingTest(unittest.TestCase):
     def parse(self, source, prefix="core"):
         return splitter.parse_rust_source(textwrap.dedent(source), prefix)
@@ -378,12 +166,6 @@ class CollectionTest(unittest.TestCase):
         root = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)
 
-        kotlin_dir = root / splitter.KOTLIN_E2E_DIR
-        kotlin_dir.mkdir(parents=True)
-        (kotlin_dir / "SampleTest.kt").write_text(
-            "package com.bazel_diff.e2e\n\nclass SampleTest {\n  @Test\n  fun testAlpha() {}\n}\n"
-        )
-
         rust_dir = root / splitter.RUST_E2E_DIR
         rust_dir.mkdir(parents=True)
         (root / splitter.RUST_CRATE_ROOT).write_text(rust_crate_root)
@@ -391,14 +173,12 @@ class CollectionTest(unittest.TestCase):
             (rust_dir / name).write_text(body)
         return root
 
-    def test_collects_both_languages(self):
+    def test_collects_cases_under_the_module_prefix(self):
         root = self.build_repo(
             '#[path = "e2e/core.rs"]\nmod core;\n',
             {"core.rs": "#[test]\nfn alpha() {}\n"},
         )
 
-        kotlin = splitter.collect_kotlin_suites(root)
-        self.assertEqual(["testAlpha"], [case.name for case in kotlin[0].cases])
         self.assertEqual(
             ["core::alpha"], [case.name for case in splitter.collect_rust_suites(root)[0].cases]
         )
@@ -417,22 +197,6 @@ class CollectionTest(unittest.TestCase):
         with self.assertRaisesRegex(splitter.GeneratorError, "mod orphan;` is missing"):
             splitter.collect_rust_suites(root)
 
-    def test_case_named_all_would_shadow_the_unsplit_target(self):
-        # kt_jvm_e2e_tests also emits `<Suite>_all`, so a `@Test fun all()`
-        # would redefine it -- Bazel reports that as a bare "rule 'SampleTest_all'
-        # is already defined", with no hint at which test caused it.
-        root = self.build_repo(
-            '#[path = "e2e/core.rs"]\nmod core;\n',
-            {"core.rs": "#[test]\nfn alpha() {}\n"},
-        )
-        kotlin_dir = root / splitter.KOTLIN_E2E_DIR
-        (kotlin_dir / "SampleTest.kt").write_text(
-            "package com.bazel_diff.e2e\n\nclass SampleTest {\n  @Test\n  fun all() {}\n}\n"
-        )
-
-        with self.assertRaisesRegex(splitter.GeneratorError, "SampleTest_all"):
-            splitter.collect_kotlin_suites(root)
-
     def test_helper_module_without_tests_needs_no_mod_line(self):
         root = self.build_repo(
             '#[path = "e2e/core.rs"]\nmod core;\n',
@@ -448,12 +212,6 @@ class CollectionTest(unittest.TestCase):
 
 
 class TargetNameTest(unittest.TestCase):
-    def test_kotlin_target_name(self):
-        suite = splitter.KotlinSuite(name="E2ETest", test_class="com.bazel_diff.e2e.E2ETest")
-        self.assertEqual(
-            "E2ETest_testE2E", splitter.kotlin_target_name(suite, splitter.Case(name="testE2E"))
-        )
-
     def test_rust_target_name_flattens_the_module_path(self):
         self.assertEqual(
             "e2e_test_core_integration_golden",
@@ -468,36 +226,6 @@ class TargetNameTest(unittest.TestCase):
 
 
 class RenderingTest(unittest.TestCase):
-    def test_kotlin_render_is_loadable_starlark_shaped_python(self):
-        rendered = splitter.render_kotlin_bzl(
-            [
-                splitter.KotlinSuite(
-                    name="E2ETest",
-                    test_class="com.bazel_diff.e2e.E2ETest",
-                    cases=[
-                        splitter.Case(name="testAlpha"),
-                        splitter.Case(name="testBeta", timeout="long"),
-                    ],
-                )
-            ]
-        )
-
-        namespace = {}
-        exec(compile(rendered, "kotlin_e2e_cases.bzl", "exec"), namespace)
-        self.assertEqual(
-            [
-                {
-                    "name": "E2ETest",
-                    "test_class": "com.bazel_diff.e2e.E2ETest",
-                    "cases": [
-                        {"name": "testAlpha", "timeout": "moderate"},
-                        {"name": "testBeta", "timeout": "long"},
-                    ],
-                }
-            ],
-            namespace["KOTLIN_E2E_SUITES"],
-        )
-
     def test_rust_render_is_loadable_starlark_shaped_python(self):
         rendered = splitter.render_rust_bzl(
             [splitter.RustSuite(name="e2e_test", cases=[splitter.Case(name="core::alpha")])]
@@ -521,9 +249,7 @@ class RepoConsistencyTest(unittest.TestCase):
 
     def test_every_declared_timeout_is_a_bazel_timeout(self):
         repo_root = splitter.find_repo_root()
-        suites = splitter.collect_kotlin_suites(repo_root)
-        cases = [case for suite in suites for case in suite.cases]
-        cases += splitter.collect_rust_suites(repo_root)[0].cases
+        cases = splitter.collect_rust_suites(repo_root)[0].cases
 
         self.assertTrue(cases, "the repo should have e2e cases to split")
         for case in cases:

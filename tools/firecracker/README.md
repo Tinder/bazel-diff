@@ -13,7 +13,7 @@ This directory contains everything needed to build, validate, and run that:
 | --- | --- | --- |
 | `bench/gen_project.py` | Synthetic large-Bazel-project generator (no external toolchains) | anywhere |
 | `bench/bench.py` | Cold-vs-warm analysis-time benchmark (the addressable win) | anywhere |
-| `bazel-diff fingerprint` / `warmup` | CLI hooks (Kotlin, in `//cli`) | anywhere |
+| `bazel-diff fingerprint` / `warmup` | CLI hooks (in `//src`) | anywhere |
 | `bazel-diff-snap` (this Go module) | `record` / `consume` orchestrator | Linux+KVM (real), anywhere (local driver) |
 
 ## Why the cold-vs-warm benchmark proves the win
@@ -64,21 +64,21 @@ The whole flow above also runs in a Linux container — the actual CI target OS 
 via [`bench/run_docker_bench.sh`](bench/run_docker_bench.sh):
 
 ```bash
-bazel build //cli:bazel-diff_deploy.jar
+make release_rust_binary_linux_arm64   # bazel-bin/release/bazel-diff-rust-linux-arm64
 (cd tools/firecracker && GOOS=linux GOARCH=arm64 go build -o /tmp/bazel-diff-snap-linux-arm64 .)
 ARCH=arm64 SNAP=/tmp/bazel-diff-snap-linux-arm64 \
     tools/firecracker/bench/run_docker_bench.sh 11500 2   # ~150k targets, 2 iters
 # results land in .bench-results/ (report.json, target_count.txt, impacted.txt)
 ```
 
-The image bundles a JDK, bazelisk, git, the bazel-diff fat jar, and the Go
-orchestrator. It does **not** run Firecracker itself — that needs `/dev/kvm`,
+The image bundles a JDK (for Bazel), bazelisk, git, the statically linked
+bazel-diff binary, and the Go orchestrator. It does **not** run Firecracker itself — that needs `/dev/kvm`,
 which Docker-for-Mac does not expose; real microVM record/consume runs on the
 self-hosted Linux+KVM host.
 
-## CLI hooks (`//cli`)
+## CLI hooks (`//src`)
 
-Two picocli subcommands implement RFC §4 (Phase 1, pure Kotlin, unit-tested):
+Two subcommands implement RFC §4 (Phase 1, unit-tested):
 
 - **`bazel-diff fingerprint`** — computes the snapshot cache key over the inputs
   that affect the build graph (bazel version, `MODULE.bazel.lock`, `.bazelrc`,
@@ -140,7 +140,7 @@ sudo tools/firecracker/bench/setup_tap.sh         # fc-tap0, host 172.16.0.1/30
 
 # 2. kernel + rootfs.base.ext4 with JDK + bazel + git + bazel-diff + workspace
 sudo -E OUT=/tmp/fc-image \
-    BAZEL_DIFF_JAR=bazel-bin/cli/bazel-diff_deploy.jar \
+    BAZEL_DIFF_BIN=bazel-bin/release/bazel-diff-rust-linux-arm64 \
     BAZEL_BIN=$(which bazelisk) WORKSPACE_SRC=/tmp/bigproj \
     SSH_PUBKEY=~/.ssh/fc_guest.pub \
     tools/firecracker/bench/build_guest_image.sh

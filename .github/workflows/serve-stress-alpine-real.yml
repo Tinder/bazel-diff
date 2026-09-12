@@ -70,12 +70,14 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest
       - uses: actions/checkout@v4
-      - name: Build bazel-diff deploy jar (glibc host)
-        run: ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar
+      # The same statically linked musl asset the release publishes for Linux amd64, so the
+      # container needs no JDK or libc for bazel-diff itself.
+      - name: Build bazel-diff (static musl binary, cross-built on the glibc host)
+        run: ~/go/bin/bazelisk build //release:bazel-diff-rust --config=release-musl
       - name: Stage container inputs
         run: |
           mkdir -p "$STAGE/tools"
-          cp bazel-bin/cli/bazel-diff_deploy.jar "$STAGE/bazel-diff.jar"
+          cp -L bazel-bin/release/bazel-diff-rust-linux-amd64 "$STAGE/bazel-diff"
           cp tools/serve_stress.py tools/serve_harness.py tools/serve_stress_alpine.sh "$STAGE/tools/"
           cp .bazelversion "$STAGE/"
           FALLBACK_BV=$(tr -d '[:space:]' < .bazelversion)

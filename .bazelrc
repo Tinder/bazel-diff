@@ -12,6 +12,13 @@ build:macos --host_cxxopt=-std=c++17
 # Use MSVC syntax for Windows
 build:windows --cxxopt=/std:c++17
 build:windows --host_cxxopt=/std:c++17
+# On Windows the `ring` crate's build script (pulled in by rust-s3's rustls
+# backend) only finds its generated headers through the legacy external
+# runfiles layout; without this it fails with "Cannot open include file:
+# 'ring_core_generated/prefix_symbols.h'". `run` and `test` inherit `build`,
+# `query` does not, so the nested Bazel the CLI shells out to is unaffected.
+# The release and BCR-presubmit Windows builds pass the same flag explicitly.
+build:windows --legacy_external_runfiles
 
 # Release artifacts: `bazel build //release:bazel-diff-rust --config=release`.
 # CI uses nothing but this config, so the flags a published binary is built with

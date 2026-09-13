@@ -332,7 +332,15 @@ jobs:
         shell: pwsh
         # Retries guard against transient release-asset fetch errors (e.g. a 500 from
         # GitHub Releases downloading Bazel module deps).
+        #
+        # The system bazelrc shortens the output root for every Bazel the example
+        # script runs (the outer build and the nested queries alike): MSVC's link.exe
+        # is MAX_PATH-bound (260), and under the default root the Rust stdlib rlib
+        # path overflows it with LNK1181. Same fix as bazel_startup_flags in the
+        # release-artifacts job below; a startup option cannot live in a --config.
         run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData" | Out-Null
+          Add-Content -Path "$env:ProgramData\bazel.bazelrc" -Value "startup --output_user_root=C:/b"
           $prevRev = git rev-parse HEAD~1
           $currRev = git rev-parse HEAD
           for ($i = 1; $i -le 3; $i++) {

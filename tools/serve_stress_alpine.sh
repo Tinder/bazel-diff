@@ -92,17 +92,33 @@ chmod +x "$STAGE/bazel-bin/src/bazel-diff"
 # up -- the two distinct ways a glibc bazel can die on musl. Also proves the loading phase
 # (package parsing) works, which is all `serve` asks of bazel. The server is shut down after
 # so probe servers never linger into the measured phases.
+#
+# The probe query pulls Bazel's implicit module deps (rules_java etc.) from GitHub Releases, so
+# a 5xx/timeout there is a network flake, not a musl incompatibility. Those failures are retried
+# a few times before the flavor is declared broken; any other failure gives up immediately so a
+# genuinely non-working binary still falls through to the next flavor quickly.
 probe_bazel() {
     pd=/tmp/bazel-probe/ws
-    rm -rf /tmp/bazel-probe
-    mkdir -p "$pd"
-    printf 'module(name = "probe", version = "0.0.0")\n' > "$pd/MODULE.bazel"
-    printf 'filegroup(name = "x")\n' > "$pd/BUILD.bazel"
-    if (cd "$pd" && timeout 600 "$1" --output_user_root=/tmp/bazel-probe/root query //:x); then
-        (cd "$pd" && timeout 60 "$1" --output_user_root=/tmp/bazel-probe/root shutdown) || true
-        return 0
-    fi
-    return 1
+    plog=/tmp/bazel-probe.log
+    attempt=1
+    while :; do
+        rm -rf /tmp/bazel-probe
+        mkdir -p "$pd"
+        printf 'module(name = "probe", version = "0.0.0")\n' > "$pd/MODULE.bazel"
+        printf 'filegroup(name = "x")\n' > "$pd/BUILD.bazel"
+        if (cd "$pd" && timeout 600 "$1" --output_user_root=/tmp/bazel-probe/root query //:x) > "$plog" 2>&1; then
+            cat "$plog"
+            (cd "$pd" && timeout 60 "$1" --output_user_root=/tmp/bazel-probe/root shutdown) || true
+            return 0
+        fi
+        cat "$plog"
+        if [ "$attempt" -ge 4 ] || ! grep -Eq 'Error downloading|GET returned 5[0-9][0-9]|Gateway Time-out|Connection reset|timed out|Unknown host' "$plog"; then
+            return 1
+        fi
+        echo "WARN: bazel probe hit a transient download error (attempt $attempt/4); retrying in $((attempt * 15))s" >&2
+        sleep $((attempt * 15))
+        attempt=$((attempt + 1))
+    done
 }
 
 BAZEL=""

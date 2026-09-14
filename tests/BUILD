@@ -35,6 +35,9 @@ rust_e2e_tests(
     crate_root = "e2e.rs",
     data = [
         ":e2e_resources",
+        # The README's getting-started script; example.rs runs it against the
+        # binary under test via its BAZEL_DIFF_BINARY override.
+        "//:bazel-diff-example.sh",
         "//src:bazel-diff",
     ],
     edition = "2021",

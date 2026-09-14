@@ -10,6 +10,13 @@ exports_files(
     visibility = ["//src:__pkg__"],
 )
 
+# The README's getting-started script. //tests:e2e_test runs it end to end
+# (tests/e2e/example.rs), so it has to reach that test as a runfile.
+exports_files(
+    ["bazel-diff-example.sh"],
+    visibility = ["//tests:__pkg__"],
+)
+
 alias(
     name = "bazel-diff",
     actual = "//src:bazel-diff",

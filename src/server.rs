@@ -244,22 +244,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
     });
     prune_cache(&state)?;
     start_cache_pruner(&state)?;
-    if !state.config.no_initial_fetch {
-        git(
-            &state,
-            &[
-                String::from("fetch"),
-                String::from("--all"),
-                String::from("--tags"),
-            ],
-        )?;
-    }
-    for revision in &state.config.warmup_revisions {
-        if let Err(error) = warm_revision(&state, revision) {
-            eprintln!("[Warn] failed to warm revision {revision}: {error:#}");
-        }
-    }
-    state.ready.store(true, Ordering::Release);
+    perform_initial_fetch(&state);
     let server = Server::http(("0.0.0.0", state.config.port))
         .map_err(|error| anyhow!("failed to bind HTTP server: {error}"))?;
     eprintln!(
@@ -271,6 +256,32 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         std::thread::spawn(move || handle_request(request, state));
     }
     Ok(())
+}
+
+/// Performs the startup git fetch (unless `--noInitialFetch`) and warmup, then flips `ready`
+/// once the clone is known good. On a fetch failure the server is left running but un-ready
+/// ("lame duck") so `/health` reports 503 and a load balancer removes the instance rather than
+/// us attempting a risky in-place repair; `/metrics` keeps answering with `ready: false`.
+fn perform_initial_fetch(state: &Arc<State>) {
+    if !state.config.no_initial_fetch {
+        let fetch = [
+            String::from("fetch"),
+            String::from("--all"),
+            String::from("--tags"),
+        ];
+        if let Err(error) = git(state, &fetch) {
+            eprintln!(
+                "[Error] initial git fetch failed; server is lame-ducked (health will report NOT_READY): {error:#}"
+            );
+            return;
+        }
+    }
+    for revision in &state.config.warmup_revisions {
+        if let Err(error) = warm_revision(state, revision) {
+            eprintln!("[Warn] failed to warm revision {revision}: {error:#}");
+        }
+    }
+    state.ready.store(true, Ordering::Release);
 }
 
 fn start_cache_pruner(state: &Arc<State>) -> Result<()> {
@@ -849,6 +860,10 @@ fn checkout(state: &State, sha: &str) -> Result<()> {
         bail!("git checkout failed for revision {sha}");
     }
     fs::remove_file(&index_lock).context("failed to remove stale .git/index.lock")?;
+    eprintln!(
+        "[Warn] cleared stale git index.lock in {}; retrying checkout of {sha}",
+        state.config.hash_options.bazel.workspace.display()
+    );
     git(state, &args)
 }
 
@@ -1340,6 +1355,55 @@ mod tests {
                 &BTreeSet::from([PathBuf::from("a"), PathBuf::from("b")])
             )
         );
+    }
+
+    #[test]
+    fn initial_fetch_failure_lame_ducks_instead_of_exiting() {
+        let (repo, _first, _second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        // A remote nobody listens on: the startup fetch must fail, and the instance must stay
+        // un-ready (503 health, 503 queries, /metrics still served) rather than crash.
+        git_command(
+            repo.path(),
+            &["remote", "add", "origin", "git://127.0.0.1:1/nothing.git"],
+        );
+        let unready_state = |no_initial_fetch: bool| {
+            let mut config = test_config();
+            config.no_initial_fetch = no_initial_fetch;
+            config.hash_options.bazel.workspace = repo.path().to_path_buf();
+            config.git_path = PathBuf::from("git");
+            config.cache_dir = cache.path().to_path_buf();
+            let fingerprint = configuration_fingerprint(&config);
+            Arc::new(State {
+                config,
+                ready: AtomicBool::new(false),
+                workspace_lock: Mutex::new(()),
+                started: Instant::now(),
+                fingerprint,
+                remote: None,
+            })
+        };
+
+        let lame_duck = unready_state(false);
+        perform_initial_fetch(&lame_duck);
+        assert!(!lame_duck.ready.load(Ordering::Acquire));
+        assert!(
+            request(&lame_duck, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                .starts_with("HTTP/1.1 503")
+        );
+        assert!(request(
+            &lame_duck,
+            "GET /impacted_targets?from=a&to=b HTTP/1.1\r\nHost: x\r\n\r\n"
+        )
+        .starts_with("HTTP/1.1 503"));
+        let metrics = request(&lame_duck, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(metrics.starts_with("HTTP/1.1 200"));
+        assert!(metrics.contains("\"ready\":false"));
+
+        // With the fetch skipped the same clone comes up ready.
+        let skipped = unready_state(true);
+        perform_initial_fetch(&skipped);
+        assert!(skipped.ready.load(Ordering::Acquire));
     }
 
     #[test]

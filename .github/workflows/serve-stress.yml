@@ -6,12 +6,6 @@ name: Serve Stress
 # storm, a git-remote outage, lame-duck startup) and captures throughput / response-time
 # metrics for every phase. Complements the functional matrix in serve-harness.yml.
 #
-# Runs the hermetic profile against both bazel-diff implementations (Kotlin //cli:bazel-diff
-# and Rust //src:bazel-diff, which implement the same `serve` subcommand) so their throughput /
-# latency can be compared leg-by-leg; fail-fast:false so a regression in one implementation
-# doesn't hide the other's results. A final job downloads both legs' metrics and prints a
-# side-by-side comparison into the run's step summary.
-#
 # Scheduled runs use the full profile; on-demand runs from the Actions tab can select the
 # reduced quick profile. Note: scheduled + dispatched workflows run from the default branch,
 # so this must land on master before the cron fires.
@@ -28,15 +22,6 @@ on:
 
 jobs:
   ServeStress:
-    strategy:
-      fail-fast: false  # a regression in one implementation must not hide the other's data
-      matrix:
-        include:
-          - impl: kotlin
-            target: "//cli:bazel-diff"
-          - impl: rust
-            target: "//src:bazel-diff"
-    name: ServeStress (${{ matrix.impl }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -53,56 +38,29 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest
       - uses: actions/checkout@v4
-      - name: Run serve stress harness (${{ matrix.impl }})
+      - name: Run serve stress harness
         # git daemon ships with git (preinstalled on the runner); python3 is preinstalled.
         # --bazel points the harness (and the serve subprocesses it spawns) at bazelisk; the
         # bazel version comes from .bazelversion, which the harness copies into its workspaces.
         run: >
           python3 tools/serve_stress.py
           --bazel "$HOME/go/bin/bazelisk"
-          --target "${{ matrix.target }}"
-          --metrics-out "serve-stress-${{ matrix.impl }}-metrics.json"
-          --summary-out "serve-stress-${{ matrix.impl }}-summary.md"
+          --metrics-out "serve-stress-metrics.json"
+          --summary-out "serve-stress-summary.md"
           ${{ inputs.quick && '--quick' || '' }}
       - name: Publish step summary
         if: always()
         run: |
-          if [ -f "serve-stress-${{ matrix.impl }}-summary.md" ]; then
-            cat "serve-stress-${{ matrix.impl }}-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "serve-stress-summary.md" ]; then
+            cat "serve-stress-summary.md" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Upload metrics artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: serve-stress-${{ matrix.impl }}-${{ github.run_id }}
+          name: serve-stress-${{ github.run_id }}
           path: |
-            serve-stress-${{ matrix.impl }}-metrics.json
-            serve-stress-${{ matrix.impl }}-summary.md
+            serve-stress-metrics.json
+            serve-stress-summary.md
           if-no-files-found: warn
           retention-days: 90
-
-  CompareImplementations:
-    name: Compare Rust vs Kotlin
-    needs: ServeStress
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download Kotlin metrics
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: serve-stress-kotlin-${{ github.run_id }}
-          path: kotlin-metrics
-      - name: Download Rust metrics
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: serve-stress-rust-${{ github.run_id }}
-          path: rust-metrics
-      - name: Build comparison summary
-        run: |
-          python3 tools/serve_stress_compare.py \
-            --kotlin kotlin-metrics/serve-stress-kotlin-metrics.json \
-            --rust rust-metrics/serve-stress-rust-metrics.json \
-            >> "$GITHUB_STEP_SUMMARY"

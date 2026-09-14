@@ -191,7 +191,7 @@ mod tests {
         assert!(!matches("/usr/bin/.+", "tools/usr/bin/x"));
         assert!(matches("/usr/include.+", "/usr/include/stdio.h"));
         assert!(matches("/Applications/.+", "/Applications/Xcode.app/x.h"));
-        assert!(!matches("/Applications/.+", "cli/src/main/kotlin/Main.kt"));
+        assert!(!matches("/Applications/.+", "src/main.rs"));
     }
 
     #[test]

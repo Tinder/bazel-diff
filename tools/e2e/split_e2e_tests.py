@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-"""Regenerates the per-case Bazel test lists that split the e2e suites.
+"""Regenerates the per-case Bazel test list that splits the e2e suite.
 
-Both e2e suites in this repo are single Bazel targets that run dozens of cases
-in one process: `//cli:E2ETest` (JUnit) and `//tests:e2e_test` (libtest). One
-target means one timeout, one cache entry and one log for the whole suite, so a
-single case's runtime is invisible and a single case's failure re-runs
-everything. This tool inverts that: it reads the test sources and emits one
-entry per case, which //tools/e2e:defs.bzl expands into its own test target with
-its own timeout (300s by default -- see DEFAULT_TIMEOUT).
+The e2e suite, `//tests:e2e_test`, is a libtest crate that runs dozens of cases
+in one process. One Bazel target for the crate would mean one timeout, one cache
+entry and one log for the whole suite, so a single case's runtime is invisible
+and a single case's failure re-runs everything. This tool inverts that: it reads
+the test sources and emits one entry per case, which //tools/e2e:defs.bzl
+expands into its own test target with its own timeout (300s by default -- see
+DEFAULT_TIMEOUT).
 
-Nothing about the split is hand-maintained. Add a `@Test` method to any class
-under the Kotlin e2e directory, or a `#[test]` fn to any module under the Rust
-e2e directory, run `make regen-e2e`, and the new target exists. CI runs
-`//tools/e2e:regen_check`, which fails when the checked-in lists no longer match
-the sources.
+Nothing about the split is hand-maintained. Add a `#[test]` fn to any module
+under the e2e directory, run `make regen-e2e`, and the new target exists. CI
+runs `//tools/e2e:regen_check`, which fails when the checked-in list no longer
+matches the sources.
 
 A case that does not fit the default timeout -- or one quick enough to be held
 to a tighter one -- declares its own with a marker comment on the lines directly
-above it (both languages use `//`, so the spelling is the same):
+above it:
 
     // e2e-timeout: long
-    @Test
-    fun testSomethingSlow() { ... }
+    #[test]
+    fn something_slow() { ... }
 
 Usage:
     python3 tools/e2e/split_e2e_tests.py           # rewrite the generated files
@@ -49,17 +48,16 @@ from typing import Iterable, Sequence
 #: nowhere near what it costs anywhere else. Two things stretch a case past 60s
 #: even after //tools/e2e:defs.bzl caps how many run at once:
 #:
-#: - A case run as its own target pays ~7s of fixed setup that an in-process run
-#:   amortises across the whole class (testE2E: 10.5s in-suite, 17.3s alone),
-#:   and it overlaps with other cases that are each driving a nested Bazel.
-#:   Measured on a 28-core Apple Silicon Mac with warm caches, the slowest case
-#:   in each suite lands at 130.6s (testFineGrainedHashBzlModCquery) and 126.4s
+#: - A case run as its own target pays several seconds of fixed setup that an
+#:   in-process run amortises across the whole crate, and it overlaps with
+#:   other cases that are each driving a nested Bazel. Measured on a 28-core
+#:   Apple Silicon Mac with warm caches, the slowest case lands at 126.4s
 #:   (external::fine_grained_bzlmod_repo_cquery).
-#: - CI is slower than that machine. Its macos-latest x Bazel 8.x cell runs the
-#:   JUnit suite in ~1150s against ~460s here, so budget for ~2.5x.
+#: - CI is slower than that machine: budget for ~2.5x.
 #:
-#: testFineGrainedHashBzlModCquery alone settles it: 75s warm, in-process and
-#: uncontended, so it cannot fit 60s under any conditions.
+#: external::fine_grained_bzlmod_repo_cquery alone settles it: well over 60s
+#: warm, in-process and uncontended, so it cannot fit `short` under any
+#: conditions.
 #:
 #: A case is still free to declare "short" with a marker if it is genuinely
 #: quick and worth holding to that bound.
@@ -72,13 +70,6 @@ VALID_TIMEOUTS = {
     "long": 900,
     "eternal": 3600,
 }
-
-#: Where the Kotlin e2e classes live. Any `*.kt` below this directory is scanned.
-KOTLIN_E2E_DIR = "cli/src/test/kotlin/com/bazel_diff/e2e"
-
-#: The Bazel package whose BUILD file declares the Kotlin targets, and the name
-#: the un-split suite target keeps.
-KOTLIN_GENERATED_BZL = "tools/e2e/kotlin_e2e_cases.bzl"
 
 #: Crate root of the Rust e2e integration test, and the directory holding its
 #: modules. `tests/e2e.rs` itself only declares `mod`s; the cases live below.
@@ -105,20 +96,11 @@ class GeneratorError(Exception):
 
 @dataclass(frozen=True)
 class Case:
-    """One test case: a JUnit method or a libtest function."""
+    """One libtest test function."""
 
-    #: JUnit method name, or the Rust path (`core::integration_golden`).
+    #: The Rust path (`core::integration_golden`).
     name: str
     timeout: str = DEFAULT_TIMEOUT
-
-
-@dataclass
-class KotlinSuite:
-    """One JUnit test class, and the cases it declares."""
-
-    name: str
-    test_class: str
-    cases: list[Case] = field(default_factory=list)
 
 
 @dataclass
@@ -137,9 +119,9 @@ class RustSuite:
 def _timeout_from_preceding_lines(lines: Sequence[str], index: int) -> str:
     """Reads the `// e2e-timeout:` marker attached to the declaration at *index*.
 
-    The marker may sit anywhere in the unbroken run of comment/annotation lines
+    The marker may sit anywhere in the unbroken run of comment/attribute lines
     directly above the declaration, so it survives being written above or below
-    a doc comment or an `@Ignore`. A blank line ends the run: a marker further
+    a doc comment or an `#[ignore]`. A blank line ends the run: a marker further
     up belongs to whatever came before, not to this case.
     """
     for line in reversed([line.strip() for line in lines[:index]]):
@@ -155,91 +137,10 @@ def _timeout_from_preceding_lines(lines: Sequence[str], index: int) -> str:
                     )
                 )
             return timeout
-        if not (line.startswith("//") or line.startswith("#[") or line.startswith("@")
+        if not (line.startswith("//") or line.startswith("#[")
                 or line.startswith("*") or line.startswith("/*")):
             return DEFAULT_TIMEOUT
     return DEFAULT_TIMEOUT
-
-
-# ---------------------------------------------------------------------------
-# Kotlin
-# ---------------------------------------------------------------------------
-
-_KOTLIN_PACKAGE = re.compile(r"^package\s+([\w.]+)\s*$")
-_KOTLIN_CLASS = re.compile(r"^(?:(?:public|internal|open|abstract|final|sealed)\s+)*class\s+(\w+)")
-_KOTLIN_TEST_ANNOTATION = re.compile(r"^@(?:org\.junit\.)?Test\b")
-_KOTLIN_FUN = re.compile(r"\bfun\s+`?([\w ]+?)`?\s*\(")
-
-
-def parse_kotlin_source(text: str, source_path: str) -> list[KotlinSuite]:
-    """Extracts every `@Test`-annotated method, grouped by declaring class.
-
-    Deliberately line-based rather than a real Kotlin parse: the only shapes it
-    has to recognise are a top-level `class` declaration and a `fun` preceded by
-    `@Test`, both of which are unambiguous at column 0 / after an annotation.
-    Private helpers are invisible to it precisely because they carry no `@Test`.
-    """
-    lines = text.splitlines()
-
-    package = ""
-    for line in lines:
-        match = _KOTLIN_PACKAGE.match(line.strip())
-        if match:
-            package = match.group(1)
-            break
-    if not package:
-        raise GeneratorError("{}: no package declaration".format(source_path))
-
-    suites: list[KotlinSuite] = []
-    current: KotlinSuite | None = None
-    pending_test_at: int | None = None
-
-    for index, raw in enumerate(lines):
-        stripped = raw.strip()
-
-        # Only column-0 classes are suites; a nested class cannot be a JUnit
-        # test_class on its own without an outer-class-qualified name, and this
-        # repo has none.
-        if not raw[:1].isspace():
-            class_match = _KOTLIN_CLASS.match(stripped)
-            if class_match:
-                current = KotlinSuite(
-                    name=class_match.group(1),
-                    test_class="{}.{}".format(package, class_match.group(1)),
-                )
-                suites.append(current)
-                pending_test_at = None
-                continue
-
-        if _KOTLIN_TEST_ANNOTATION.match(stripped):
-            pending_test_at = index
-            continue
-
-        if pending_test_at is None:
-            continue
-
-        fun_match = _KOTLIN_FUN.search(stripped)
-        if not fun_match:
-            continue
-
-        method = fun_match.group(1)
-        if current is None:
-            raise GeneratorError(
-                "{}: @Test fun {} is not inside a top-level class".format(source_path, method)
-            )
-        if " " in method:
-            # Backtick-quoted names cannot round-trip through a Bazel target
-            # name, and a JUnit filter regex would need escaping too.
-            raise GeneratorError(
-                "{}: @Test fun `{}` has spaces in its name; the split needs a plain "
-                "identifier so it can name a Bazel target after it".format(source_path, method)
-            )
-        current.cases.append(
-            Case(name=method, timeout=_timeout_from_preceding_lines(lines, pending_test_at))
-        )
-        pending_test_at = None
-
-    return [suite for suite in suites if suite.cases]
 
 
 # ---------------------------------------------------------------------------
@@ -339,10 +240,6 @@ def rust_declared_modules(crate_root_text: str) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-def kotlin_target_name(suite: KotlinSuite, case: Case) -> str:
-    return "{}_{}".format(suite.name, case.name)
-
-
 def rust_target_name(suite_name: str, case: Case) -> str:
     return "{}_{}".format(suite_name, case.name.replace("::", "_"))
 
@@ -373,30 +270,6 @@ def _render_cases(cases: Sequence[Case], indent: str) -> list[str]:
     return out
 
 
-def render_kotlin_bzl(suites: Sequence[KotlinSuite]) -> str:
-    lines = [
-        GENERATED_HEADER,
-        '"""Every JUnit e2e case under {}, one entry each.'.format(KOTLIN_E2E_DIR),
-        "",
-        "//tools/e2e:defs.bzl turns each entry into its own kt_jvm_test target, so a",
-        "case's runtime is bounded by its own timeout instead of the whole class's.",
-        'Run `make regen-e2e` after adding, renaming or removing a `@Test` method.',
-        '"""',
-        "",
-        "KOTLIN_E2E_SUITES = [",
-    ]
-    for suite in suites:
-        lines.append("    {")
-        lines.append('        "name": "{}",'.format(suite.name))
-        lines.append('        "test_class": "{}",'.format(suite.test_class))
-        lines.append('        "cases": [')
-        lines.extend(_render_cases(suite.cases, "            "))
-        lines.append("        ],")
-        lines.append("    },")
-    lines.append("]")
-    return "\n".join(lines) + "\n"
-
-
 def render_rust_bzl(suites: Sequence[RustSuite]) -> str:
     lines = [
         GENERATED_HEADER,
@@ -424,28 +297,6 @@ def render_rust_bzl(suites: Sequence[RustSuite]) -> str:
 # ---------------------------------------------------------------------------
 # Collection
 # ---------------------------------------------------------------------------
-
-
-def collect_kotlin_suites(repo_root: Path) -> list[KotlinSuite]:
-    directory = repo_root / KOTLIN_E2E_DIR
-    if not directory.is_dir():
-        raise GeneratorError("{} does not exist".format(KOTLIN_E2E_DIR))
-
-    suites: list[KotlinSuite] = []
-    for path in sorted(directory.rglob("*.kt")):
-        rel = path.relative_to(repo_root).as_posix()
-        suites.extend(parse_kotlin_source(path.read_text(encoding="utf-8"), rel))
-
-    suites.sort(key=lambda suite: suite.name)
-    # The suite's own test_suite and its `_all` escape hatch share the namespace
-    # with the per-case targets, so they belong in the uniqueness check: a
-    # `@Test fun all()` would otherwise silently redefine `<Suite>_all`.
-    _assert_unique_targets(
-        [suite.name for suite in suites]
-        + ["{}_all".format(suite.name) for suite in suites]
-        + [kotlin_target_name(suite, case) for suite in suites for case in suite.cases]
-    )
-    return suites
 
 
 def collect_rust_suites(repo_root: Path) -> list[RustSuite]:
@@ -502,10 +353,7 @@ def find_repo_root() -> Path:
 
 def generate(repo_root: Path) -> dict[str, str]:
     """Renders every generated file, keyed by its repo-relative path."""
-    return {
-        KOTLIN_GENERATED_BZL: render_kotlin_bzl(collect_kotlin_suites(repo_root)),
-        RUST_GENERATED_BZL: render_rust_bzl(collect_rust_suites(repo_root)),
-    }
+    return {RUST_GENERATED_BZL: render_rust_bzl(collect_rust_suites(repo_root))}
 
 
 def main(argv: Sequence[str]) -> int:

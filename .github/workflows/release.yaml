@@ -4,10 +4,10 @@
 #
 # The whole test suite gates the release from inside the reusable workflow's
 # build job, through `bazel_test_command` below: one `bazel test //...` on one
-# runner, and nothing runs twice. It used to be split across separate
-# `java-tests` and `rust-tests` jobs (#469) because //tests:e2e_test and
-# //cli:E2ETest were single targets that could time out a whole run; both
-# suites are now one Bazel target per case (#476), so a single job has the
+# runner, and nothing runs twice. It used to be split across a `rust-tests`
+# job of our own and the reusable workflow's build job (#469) because
+# //tests:e2e_test was a single target that could time out a whole run; the
+# suite is now one Bazel target per case (#476), so a single job has the
 # headroom the split was bought for.
 name: Release
 on:
@@ -38,7 +38,7 @@ jobs:
       # --build_tests_only: build what the tests need and nothing else -- the
       #   release binary itself comes from the rust-binaries matrix below.
       # --config=no-test-timeouts is in .bazelrc; it is what keeps the long
-      #   suites from timing out on a cold release runner.
+      #   e2e suite from timing out on a cold release runner.
       # --test_output=errors: the failing test's log goes to the job output,
       #   which is the only place it can go from inside the reusable workflow.
       # BAZEL / USE_BAZEL_VERSION: //tests:e2e_test spawns a nested Bazel per
@@ -46,7 +46,10 @@ jobs:
       #   the bazelisk that bazel-contrib/setup-bazel installs; without $BAZEL
       #   the suite shells out to the outer Bazel's own binary, and without
       #   USE_BAZEL_VERSION the nested bazelisk ignores the .bazelversion the
-      #   outer invocation read, since the fixture workspaces have none.
+      #   outer invocation read, since the fixture workspaces have none. The
+      #   fixtures with Java targets use the JDK the ubuntu-latest image ships
+      #   with (JAVA_HOME is inherited too); a reusable workflow has no step
+      #   of ours to install one.
       bazel_test_command: >-
         BAZEL="$(command -v bazel)" USE_BAZEL_VERSION="$(cat .bazelversion)"
         bazel test //... --build_tests_only --config=no-test-timeouts --test_output=errors
@@ -109,11 +112,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag_name || github.ref_name }}
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:

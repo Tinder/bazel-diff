@@ -270,10 +270,10 @@ class ArgParsingTest(unittest.TestCase):
 
     def test_serve_arg_is_repeatable_and_accepts_flag_shaped_values(self):
         args = sc.parse_args(
-            ["--serve-arg", "--fineGrainedHashExternalRepos=@rules_kotlin", "--serve-arg", "-k"]
+            ["--serve-arg", "--fineGrainedHashExternalRepos=@rules_go", "--serve-arg", "-k"]
         )
         self.assertEqual(
-            args.serve_arg, ["--fineGrainedHashExternalRepos=@rules_kotlin", "-k"]
+            args.serve_arg, ["--fineGrainedHashExternalRepos=@rules_go", "-k"]
         )
 
     def test_flag_shaped_option_value_is_folded(self):

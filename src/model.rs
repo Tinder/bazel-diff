@@ -270,8 +270,10 @@ impl HashFileData {
     }
 }
 
+/// How a label's hash moved between two revisions: its own `directHash`
+/// changed (or it is new), or only its transitive hash did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ImpactType {
+pub enum ImpactType {
     Direct,
     Indirect,
 }
@@ -364,7 +366,10 @@ pub fn filter_and_sort_labels(
     Ok(impacted)
 }
 
-fn impacted_types(
+/// Classifies every label whose hash moved between `from` and `to`. Labels
+/// absent from `to` (deleted targets) are never impacted: there is nothing
+/// left to build.
+pub fn impacted_types(
     from: &BTreeMap<String, TargetHash>,
     to: &BTreeMap<String, TargetHash>,
 ) -> HashMap<String, ImpactType> {

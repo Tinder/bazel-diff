@@ -1,6 +1,6 @@
 ---
 name: improve-coverage
-description: Use when you need to raise main-source line coverage in the bazel-diff repo, write tests for an under-covered Kotlin file, fix a CI failure on the 90% coverage gate, or pick the highest-leverage files to test next. Triggers on requests like "the coverage gate is failing, fix it", "write tests for X", "we need more coverage", or "what should I test to get to 90%".
+description: Use when you need to raise main-source line coverage in the bazel-diff repo, write tests for an under-covered Rust module, fix a CI failure on the 90% coverage gate, or pick the highest-leverage files to test next. Triggers on requests like "the coverage gate is failing, fix it", "write tests for X", "we need more coverage", or "what should I test to get to 90%".
 ---
 
 # Improving coverage to clear the 90% gate
@@ -11,52 +11,37 @@ bazel-diff enforces a 90% main-source line-coverage gate on every PR (see [cover
 
 Run `make coverage` (or check the latest CI artifact) and look at the top of the sorted table. Prioritise files by **uncovered-lines-per-test-effort**, not by lowest percentage:
 
-- **Highest-leverage**: small files at 0% (e.g. enum classes, value objects, single-method utilities) — one short unit test usually moves the needle without much code.
-- **Highest absolute gain**: large files with moderate coverage (e.g. `BazelQueryService.kt` at 303 lines / 93%) — closing a small percentage gap covers many lines.
-- **Lowest leverage**: tiny files at 50–80% where the remaining branches are error paths needing fault injection or refactors.
-
-A worked example: the PR that added the gate ([#356](https://github.com/Tinder/bazel-diff/pull/356)) raised coverage from 88.76% → 90.37% by adding five small files of tests — `BazelTargetTypeTest`, `VersionProviderTest`, `BazelDiffTest`, `StderrLoggerTest`, `BazelTargetTest` — for a total of 26 newly-covered lines.
+- **Highest-leverage**: small, pure functions at low coverage (label normalisation, path handling, converters) — one short `#[test]` usually moves the needle without much code.
+- **Highest absolute gain**: large modules with moderate coverage (`src/hash.rs`, `src/server.rs`) — closing a small percentage gap covers many lines.
+- **Lowest leverage**: error paths that need fault injection (a Bazel subprocess failing mid-stream, an S3 request erroring) — reach for them only once the cheap lines are gone.
 
 ## 2. Write the test
 
 Existing tests follow a consistent shape:
 
-- Live under `cli/src/test/kotlin/...` mirroring the main source path.
-- Use **JUnit 4** (`@Test`, `@Before`, `@After`, `org.junit.Assert.assertThrows`).
-- Use **assertk** for assertions (`assertk.assertThat`, with explicit imports for each assertion like `assertk.assertions.isEqualTo`). Forgetting `import assertk.assertions.contains` on a `String.contains` assertion produces a confusing receiver-mismatch error — import every assertion you use.
-- Use **mockito-kotlin** when mocking is required (existing examples: `cli/src/test/kotlin/com/bazel_diff/bazel/BazelClientTest.kt`).
-- Use **koin** for DI-test setup (existing pattern: `cli/src/test/kotlin/com/bazel_diff/interactor/CalculateImpactedTargetsInteractorIssue335Test.kt`).
+- Unit tests live in a `#[cfg(test)] mod tests` at the bottom of the module they cover (`src/*.rs`). They run as `//src:rust_tests`; tests of `main.rs` itself run as `//src:cli_tests`.
+- Plain `assert!`/`assert_eq!`; no assertion crate.
+- Build proto inputs (`Target`, `Rule`, `Attribute`) by hand with the generated structs rather than parsing text — see the helpers already in `src/hash.rs`'s test module.
+- Anything that needs a filesystem uses `tempfile::tempdir()`; nothing in a unit test shells out to Bazel. Behaviour that needs a real Bazel belongs in `tests/e2e/` (and does **not** count toward the coverage number, because the e2e suite runs the binary as a subprocess).
 
-Tiny files (enums, value objects, small command classes) usually only need a few targeted tests. Looking at the bytes via `assertThat(BazelTargetType.entries).hasSize(N).containsExactlyInAnyOrder(...)` is enough to cover an enum's declaration lines.
+## 3. No BUILD edit needed
 
-## 3. Register the test target in cli/BUILD
-
-Every test needs its own `kt_jvm_test` entry:
-
-```python
-kt_jvm_test(
-    name = "BazelTargetTypeTest",
-    test_class = "com.bazel_diff.bazel.BazelTargetTypeTest",
-    runtime_deps = [":cli-test-lib"],
-)
-```
-
-The `:cli-test-lib` glob picks up the new test source automatically; the explicit `kt_jvm_test` rule is what makes it executable via `bazel test //cli:<name>`.
+`//src:bazel_diff_lib` globs `src/**/*.rs`, so a new `#[test]` is picked up by `//src:rust_tests` automatically. A new e2e case needs `make regen-e2e` instead (see [tools/e2e/README.md](../../../tools/e2e/README.md)).
 
 ## 4. Verify locally before pushing
 
 ```bash
-bazel test //cli:<YourNewTest>        # one-off run of the new test
-make coverage                          # full gate
+bazel test //src:rust_tests --test_arg=<test_name_substring>   # one-off run of the new test
+make coverage                                                   # full gate
 ```
 
-The local number may be lower than CI's because `//cli:E2ETest` often fails or is excluded on dev machines (JDK-env sandbox issues). If you've added tests for a file that's also exercised by E2E (e.g. `BazelQueryService.kt`), the CI delta will be smaller than the local delta — count only the lines that weren't already covered by E2E.
+`bazel coverage` also enforces per-target minimums (90% on `//src:rust_tests` scoped to `src/`), so a target can fail the coverage run even when the repo-wide number passes; the test log carries the per-file breakdown.
 
 ## 5. Things that don't work / aren't worth attempting
 
-- **`Main.kt`** — calls `exitProcess(...)` which kills the JVM; can't be tested in-process without a SecurityManager hack or refactor. Stays at 0%; the threshold tolerates it.
-- **`throw IllegalArgumentException(...)` branches in resource-loading code** like `VersionProvider.kt` — the production code resolves the classloader from `this::class.java`, with no injection seam to swap it for one missing the resource. Refactor or skip.
-- **`else -> BazelTargetType.UNKNOWN` branches** — only reachable when Bazel's `Build.Target.Discriminator` adds a new enum value the production code doesn't recognise. Triggering today would require a hand-forged proto with a reserved discriminator number, which the protobuf builder rejects.
+- **`fn main()` in `src/main.rs`** — exits the process; the argument parsing it delegates to is what `//src:cli_tests` covers. Stays uncovered; the threshold tolerates it.
+- **Bazel/git subprocess failure branches** in `src/bazel.rs` and `src/server.rs` — need a real failing subprocess. Cover them from an e2e case if the behaviour matters; don't chase them for the number.
+- **Match arms for proto enum values Bazel does not emit** — only reachable with a hand-forged discriminator. Skip.
 
 ## When the gate fails on a flake, not on a coverage drop
 

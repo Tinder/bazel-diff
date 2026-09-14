@@ -16,8 +16,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Use temp directory for intermediate files
-$TempDir = $env:TEMP
+# Where the hash files and the impacted-target list are written. Defaults to
+# the user's temp directory; set BAZEL_DIFF_OUTPUT_DIR to keep a run's outputs
+# apart from another's.
+$TempDir = if ($env:BAZEL_DIFF_OUTPUT_DIR) { $env:BAZEL_DIFF_OUTPUT_DIR } else { $env:TEMP }
 $StartingHashesJson = Join-Path $TempDir "starting_hashes.json"
 $FinalHashesJson = Join-Path $TempDir "final_hashes.json"
 $ImpactedTargetsPath = Join-Path $TempDir "impacted_targets.txt"
@@ -49,16 +51,22 @@ if ($env:BAZEL_DIFF_FORCE_CHECKOUT -eq "true") {
     $GitCheckoutFlags = @("--force", "--quiet")
 }
 
-# Build bazel-diff first to ensure it's ready
-Write-Host "Building bazel-diff..."
+# Build bazel-diff from this checkout, unless BAZEL_DIFF_BINARY names a
+# prebuilt one (the same override bazel-diff-example.sh honours). Everyday use
+# leaves it unset.
 $BazelExtraOptions = @()
 if ($env:BAZEL_EXTRA_COMMAND_OPTIONS) {
     $BazelExtraOptions = $env:BAZEL_EXTRA_COMMAND_OPTIONS.Split(" ")
 }
 
-& $BazelPath build @BazelExtraOptions //:bazel-diff
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to build bazel-diff"
+if ($env:BAZEL_DIFF_BINARY) {
+    Write-Host "Using prebuilt bazel-diff binary: $env:BAZEL_DIFF_BINARY"
+} else {
+    Write-Host "Building bazel-diff..."
+    & $BazelPath build @BazelExtraOptions //:bazel-diff
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to build bazel-diff"
+    }
 }
 
 # Helper function to run bazel-diff commands
@@ -66,7 +74,11 @@ function Run-BazelDiff {
     param(
         [string[]]$Arguments
     )
-    & $BazelPath run @BazelExtraOptions //:bazel-diff -- @Arguments
+    if ($env:BAZEL_DIFF_BINARY) {
+        & $env:BAZEL_DIFF_BINARY @Arguments
+    } else {
+        & $BazelPath run @BazelExtraOptions //:bazel-diff -- @Arguments
+    }
     return $LASTEXITCODE
 }
 

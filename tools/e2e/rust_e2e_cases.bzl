@@ -52,6 +52,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "example::example_script_reports_impacted_targets",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::bzlmod_cc_transitive_deps_query",
                 "timeout": "moderate",
             },

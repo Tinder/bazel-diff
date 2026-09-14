@@ -11,10 +11,14 @@ previous_revision=$3
 # Final Revision SHA
 final_revision=$4
 
-starting_hashes_json="/tmp/starting_hashes.json"
-final_hashes_json="/tmp/final_hashes.json"
-impacted_targets_path="/tmp/impacted_targets.txt"
-bazel_diff="/tmp/bazel_diff"
+# Where the hash files, the impacted-target list and the built bazel-diff
+# launcher are written. Defaults to /tmp; set BAZEL_DIFF_OUTPUT_DIR to keep a
+# run's outputs apart from another's.
+output_dir="${BAZEL_DIFF_OUTPUT_DIR:-/tmp}"
+starting_hashes_json="$output_dir/starting_hashes.json"
+final_hashes_json="$output_dir/final_hashes.json"
+impacted_targets_path="$output_dir/impacted_targets.txt"
+bazel_diff="$output_dir/bazel_diff"
 
 # Set appropriate flags based on environment variable
 bazel_diff_flags=""
@@ -39,8 +43,17 @@ if [ "${BAZEL_DIFF_FORCE_CHECKOUT:-false}" = "true" ]; then
   git_checkout_flags="--force --quiet"
 fi
 
-# shellcheck disable=SC2086
-"$bazel_path" run ${BAZEL_EXTRA_COMMAND_OPTIONS:-} :bazel-diff --script_path="$bazel_diff"
+# Build bazel-diff from this checkout, unless BAZEL_DIFF_BINARY names a
+# prebuilt one. The override is what lets the e2e suite (tests/e2e/example.rs)
+# drive this script against the binary it is already testing: under `bazel test`
+# there is no source tree to `bazel run` from. Everyday use leaves it unset.
+if [ -n "${BAZEL_DIFF_BINARY:-}" ]; then
+  echo "Using prebuilt bazel-diff binary: $BAZEL_DIFF_BINARY"
+  bazel_diff="$BAZEL_DIFF_BINARY"
+else
+  # shellcheck disable=SC2086
+  "$bazel_path" run ${BAZEL_EXTRA_COMMAND_OPTIONS:-} :bazel-diff --script_path="$bazel_diff"
+fi
 
 # shellcheck disable=SC2086
 git -C "$workspace_path" checkout $git_checkout_flags "$previous_revision"

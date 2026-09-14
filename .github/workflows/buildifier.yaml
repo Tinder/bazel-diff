@@ -1,7 +1,7 @@
 name: Buildifier
 
 # Runs buildifier over all Starlark/BUILD files on a daily schedule and opens a
-# PR only if the formatter produced changes. Mirrors the ktfmt format cron: it
+# PR only if the formatter produced changes. Mirrors the rustfmt format cron: it
 # force-pushes a dedicated, bot-owned branch so re-runs reuse one PR instead of
 # accumulating stale branches, and it never touches master directly.
 #
@@ -10,7 +10,7 @@ name: Buildifier
 # generated PR limited to formatting-only changes.
 on:
   schedule:
-    # 12:30 UTC daily (between the ktfmt format and coverage-badge crons).
+    # 12:30 UTC daily (between the rustfmt format and coverage-badge crons).
     - cron: '30 12 * * *'
   workflow_dispatch:
 
@@ -21,11 +21,6 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
@@ -35,7 +30,7 @@ jobs:
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
       - name: Run buildifier
-        run: ~/go/bin/bazelisk run //cli/format:buildifier --enable_bzlmod=true --enable_workspace=false --lockfile_mode=off
+        run: ~/go/bin/bazelisk run //tools/format:buildifier --enable_bzlmod=true --enable_workspace=false --lockfile_mode=off
       - name: Open PR if formatting changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -60,5 +55,5 @@ jobs:
               --base master \
               --head "$BRANCH" \
               --title "ci: apply buildifier formatting" \
-              --body "Automated buildifier run via \`bazel run //cli/format:buildifier\`. This PR contains formatting-only changes to BUILD/Starlark files."
+              --body "Automated buildifier run via \`bazel run //tools/format:buildifier\`. This PR contains formatting-only changes to BUILD/Starlark files."
           fi

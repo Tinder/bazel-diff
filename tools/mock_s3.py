@@ -2,7 +2,7 @@
 """A recording, in-memory mock of the small slice of S3 that `bazel-diff serve` uses.
 
 `S3HashCacheStorage` only ever issues GetObject, PutObject and HeadObject against a single bucket
-(see cli/src/main/kotlin/com/bazel_diff/server/S3HashCacheStorage.kt), so a few hundred lines of
+(see the S3 cache tier in src/server.rs), so a few hundred lines of
 stdlib `http.server` stand in for MinIO/LocalStack with no container and no third-party dependency
 -- and, unlike a real bucket, this one *records every request*. That recording is the point: it is
 what lets `serve_consistency.py` compare the hash payloads several `serve` instances independently

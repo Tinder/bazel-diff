@@ -15,8 +15,8 @@ coverage --coverage_output_generator=//tools/coverage:lcov_merger
 
 In coverage mode Bazel wraps every test in `collect_coverage.sh`, which
 finishes by invoking the configured LCOV merger to combine the raw
-per-runner tracefiles (Jacoco emits LCOV for JVM targets, rules_go converts
-Go cover profiles to LCOV, rules_rust's llvm-cov toolchain exports LCOV)
+per-runner tracefiles (rules_go converts Go cover profiles to LCOV,
+rules_rust's llvm-cov toolchain exports LCOV)
 into the `coverage.dat` that Bazel publishes for the test. Two properties
 fall out of that placement:
 
@@ -26,18 +26,10 @@ fall out of that placement:
    so it sees the target's `env` attribute — that is how a target declares
    its minimum, without any global configuration or custom test rules.
 
-One caveat: rules_kotlin hardcodes `kt_jvm_test`'s `_lcov_merger` attribute
-to Bazel's built-in merger instead of reading the configuration field that
-`--coverage_output_generator` sets, which would silently bypass enforcement
-for Kotlin targets. `MODULE.bazel` carries a `single_version_override` patch
-([`rules_kotlin_lcov_merger.patch`](rules_kotlin_lcov_merger.patch)) that
-makes it use the configuration field, like rules_go/rules_rust/rules_java
-already do.
-
 ## Declaring a minimum
 
 Wrap any test rule that has the standard `env` attribute (`go_test`,
-`rust_test`, `kt_jvm_test`, `java_test`, `py_test`, ...):
+`rust_test`, `py_test`, ...):
 
 ```starlark
 load("//tools/coverage:defs.bzl", "coverage_enforced_test")
@@ -57,11 +49,11 @@ or splice the env vars into an existing target with `coverage_minimum_env`:
 ```starlark
 load("//tools/coverage:defs.bzl", "coverage_minimum_env")
 
-kt_jvm_test(
-    name = "DurationConverterTest",
+rust_test(
+    name = "rust_tests",
     ...
     env = coverage_minimum_env(
-        coverage_include = ["cli/src/main/kotlin/com/bazel_diff/cli/converter/"],
+        coverage_include = ["src/"],
     ),
 )
 ```
@@ -71,10 +63,9 @@ kt_jvm_test(
   the target below it, with a per-file breakdown in the test log;
   `bazel test` is unaffected.
 - `coverage_include` — optional path prefixes scoping which source files
-  count. Essential for JVM targets: Jacoco instruments the whole library
-  on the test's classpath, so an unscoped percentage would dilute a focused
-  unit test's coverage with every other file in the library. Scope each
-  target to the code it is responsible for covering.
+  count. Scope each target to the code it is responsible for covering, so
+  an unscoped percentage cannot dilute a focused test's coverage with files
+  it never exercises.
 - `coverage_exclude` — optional path prefixes to drop (e.g. generated code).
 
 Under the hood these become `LCOV_MERGER_MIN_LINE_COVERAGE`,

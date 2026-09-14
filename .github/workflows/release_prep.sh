@@ -8,10 +8,6 @@ TAG=$1
 
 "$(dirname "$0")/pack_release_archive.sh" archives/release.tar.gz
 
-make release_deploy_jar &> /dev/null
-
-cp bazel-bin/cli/bazel-diff_deploy.jar archives/bazel-diff_deploy.jar
-
 SHA=$(shasum -a 256 archives/release.tar.gz | awk '{print $1}')
 
 cat << EOF
@@ -23,21 +19,14 @@ Add to your \`MODULE.bazel\` file:
 bazel_dep(name = "bazel-diff", version = "${TAG#v}")
 \`\`\`
 
-## Using WORKSPACE
+Then run the tool with \`bazel run @bazel-diff//:bazel-diff\`.
 
-\`\`\`starlark
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-http_archive(
-  name = "bazel-diff",
-  sha256 = "${SHA}",
-  strip_prefix = "",
-  url = "https://github.com/Tinder/bazel-diff/releases/download/${TAG}/release.tar.gz",
-)
-\`\`\`
+Source archive SHA-256: \`${SHA}\`
 
-## Experimental Rust binary
+## Prebuilt binaries
 
-Prebuilt host-native CLIs (attached by the release workflow):
+Statically linked (Linux) and host-native (macOS, Windows) CLIs, attached by the
+release workflow:
 
 - Linux amd64: https://github.com/Tinder/bazel-diff/releases/download/${TAG}/bazel-diff-rust-linux-amd64
 - Linux arm64: https://github.com/Tinder/bazel-diff/releases/download/${TAG}/bazel-diff-rust-linux-arm64

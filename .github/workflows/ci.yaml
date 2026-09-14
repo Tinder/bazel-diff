@@ -6,12 +6,18 @@ on:
   pull_request:
     branches: [ master ]
 
+# Job ids and display names are load-bearing: branch protection on master
+# requires them by name (`Rust candidate (Bazel 8.x)`, `test-jre21 (...)`,
+# `test-jre11-run-example (...)`, `release-artifacts (...)`). Several predate
+# the Kotlin implementation's removal and no longer describe what they run;
+# rename them only together with the branch-protection rule.
 jobs:
   # Every Rust check here runs through Bazel, with no cargo and no host Rust
   # toolchain: rules_rust downloads the compiler pinned in MODULE.bazel, so CI
   # and a local `bazel test` agree on the exact rustc. //:rust_clippy_check and
   # //:rust_format_check below stand in for `cargo clippy -- -D warnings` and
-  # `cargo fmt --all -- --check`.
+  # `cargo fmt --all -- --check`. //tools/... is the Python/Go release, e2e-split
+  # and coverage tooling.
   rust-candidate:
     name: Rust candidate (Bazel ${{ matrix.bazel }})
     runs-on: ubuntu-latest
@@ -37,12 +43,15 @@ jobs:
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           CARGO_BAZEL_ISOLATED: 'false'
-        run: ~/go/bin/bazelisk test //:rust_tests //:rust_clippy_check //:rust_format_check //tools:benchmark_test //tools:perf_gate_test --enable_bzlmod=true --enable_workspace=false
+        run: ~/go/bin/bazelisk test //:rust_tests //:rust_clippy_check //:rust_format_check //tools/... --enable_bzlmod=true --enable_workspace=false
 
   rust-candidate-e2e:
     name: Rust candidate E2E
     runs-on: ubuntu-latest
     steps:
+      # bazel-diff itself needs no JDK, but the suite drives a nested Bazel over
+      # fixture workspaces with Java targets, and Bazel's default
+      # --java_runtime_version=local_jdk wants a host JDK for those.
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
@@ -75,9 +84,9 @@ jobs:
 
   # The e2e suites are split into one Bazel test target per case by
   # //tools/e2e:regen, whose output is checked in. This job is the gate that
-  # keeps the checked-in split honest: :regen_check re-derives the case lists
-  # from the Kotlin and Rust sources and fails when they differ, so an e2e test
-  # added, renamed or removed without `make regen-e2e` cannot merge.
+  # keeps the checked-in split honest: :regen_check re-derives the case list
+  # from the sources and fails when they differ, so an e2e test added, renamed
+  # or removed without `make regen-e2e` cannot merge.
   # :split_e2e_tests_test covers the generator itself.
   e2e-split-regen:
     name: E2E split regen
@@ -139,6 +148,9 @@ jobs:
             --output_groups=-clippy_checks,-rustfmt_checks \
             --enable_bzlmod=true --enable_workspace=false
 
+  # The coverage gate. The job id is historical (it used to run the JVM suites
+  # on a JDK 21) and is kept because branch protection requires the
+  # `test-jre21 (<os>, <bazel>)` checks by that name.
   test-jre21:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -154,11 +166,6 @@ jobs:
           - os: macos-latest
             bazel: '9.x'
     steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
@@ -174,37 +181,17 @@ jobs:
           done
           export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
-      - name: Free disk space on Ubuntu
-        if: runner.os == 'Linux'
-        run: |
-          # //cli:E2ETest plus coverage can exhaust the default ubuntu-latest image.
-          # Reclaim space from preinstalled toolchains this job does not use.
-          # Keep /usr/local/lib/android: rules_android resolves ANDROID_HOME there.
-          sudo rm -rf /usr/share/dotnet /opt/ghc
-          sudo docker image prune --all --force || true
-          # /mnt has more headroom than / on hosted runners; keep Bazel outputs off root.
-          if [ -d /mnt ]; then
-            sudo mkdir -p /mnt/bazel-output
-            sudo chown "$USER" /mnt/bazel-output
-            echo "BAZEL_OUTPUT_USER_ROOT=/mnt/bazel-output" >> "$GITHUB_ENV"
-          fi
-          df -h / /mnt 2>/dev/null || df -h /
       - name: Build license target
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
         run: ~/go/bin/bazelisk build //:license --enable_bzlmod=true --enable_workspace=false
-      - name: Run bazel-diff tests
+      - name: Run bazel-diff tests with coverage
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        # Retries guard against flaky E2E tests that hit the network (e.g. bazel mod
-        # show_repo / BCR calls) failing the whole job on a transient blip.
+        # Retries guard against transient toolchain/crate fetch errors failing the whole job.
         run: |
-          BAZEL_STARTUP=()
-          if [ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]; then
-            BAZEL_STARTUP=(--output_user_root="${BAZEL_OUTPUT_USER_ROOT}")
-          fi
           for i in 1 2 3; do
-            ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false && break
+            ~/go/bin/bazelisk coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false && break
             if [ "$i" = 3 ]; then exit 1; fi
             echo "coverage run failed (attempt $i); retrying in 15s..."
             sleep 15
@@ -218,32 +205,21 @@ jobs:
           if-no-files-found: warn
       - name: Enforce coverage threshold (>= 90% main-source line coverage)
         env:
-          # Must match the `Run bazel-diff tests` step above, otherwise bazelisk
-          # downloads the default bazel from .bazelversion and starts a fresh
-          # server whose output base loses track of the coverage report symlink
-          # (seen flaking on macos-latest x bazel 9.x).
+          # Must match the coverage step above, otherwise bazelisk downloads the
+          # default bazel from .bazelversion and starts a fresh server whose
+          # output base loses track of the coverage report symlink (seen flaking
+          # on macos-latest x bazel 9.x).
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           COVERAGE_THRESHOLD: '90'
-        run: |
-          BAZEL_STARTUP=()
-          if [ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]; then
-            BAZEL_STARTUP=(--output_user_root="${BAZEL_OUTPUT_USER_ROOT}")
-          fi
-          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+        run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
       - name: Enforce Go coverage threshold (>= 90% line coverage under tools/go/)
         env:
-          # Must match the `Run bazel-diff tests` step above; see the note on the
-          # Kotlin enforcement step for why USE_BAZEL_VERSION has to be pinned here.
+          # Must match the coverage step above; see the note on the previous step.
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        # Gate Go independently of the Kotlin overall so thin Go coverage can't hide
-        # behind well-covered Kotlin (and vice versa). --include scopes the report to
+        # Gate Go independently of the Rust overall so thin Go coverage can't hide
+        # behind well-covered Rust (and vice versa). --include scopes the report to
         # Go production source only (tools/go/, which excludes tools/coverage_check.py).
-        run: |
-          BAZEL_STARTUP=()
-          if [ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]; then
-            BAZEL_STARTUP=(--output_user_root="${BAZEL_OUTPUT_USER_ROOT}")
-          fi
-          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
+        run: ~/go/bin/bazelisk run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()
@@ -251,6 +227,10 @@ jobs:
           name: test-logs-jre21-${{ matrix.os }}-bazel-${{ matrix.bazel }}
           path: bazel-testlogs/
           if-no-files-found: warn
+  # Runs the example script end to end against this repository, on every Bazel
+  # version and workspace mode the tool supports. The job id is historical (the
+  # JVM CLI was exercised on a JDK 11 here) and is kept because branch protection
+  # requires the `test-jre11-run-example (...)` checks by that name.
   test-jre11-run-example:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -296,12 +276,6 @@ jobs:
             disable_workspace: 'true'
             extra_flags: ''
     steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '11'
-        id: java
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
@@ -340,7 +314,7 @@ jobs:
           BAZEL_DIFF_FORCE_CHECKOUT: true
           BAZEL_EXTRA_COMMAND_OPTIONS: ${{ matrix.extra_flags }}
         # Retries guard against transient release-asset fetch errors (e.g. a 500 from
-        # GitHub Releases downloading rules_kotlin/other Bazel module deps).
+        # GitHub Releases downloading Bazel module deps).
         run: |
           for i in 1 2 3; do
             ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD) && break
@@ -357,8 +331,16 @@ jobs:
           BAZEL_EXTRA_COMMAND_OPTIONS: ${{ matrix.extra_flags }}
         shell: pwsh
         # Retries guard against transient release-asset fetch errors (e.g. a 500 from
-        # GitHub Releases downloading rules_kotlin/other Bazel module deps).
+        # GitHub Releases downloading Bazel module deps).
+        #
+        # The system bazelrc shortens the output root for every Bazel the example
+        # script runs (the outer build and the nested queries alike): MSVC's link.exe
+        # is MAX_PATH-bound (260), and under the default root the Rust stdlib rlib
+        # path overflows it with LNK1181. Same fix as bazel_startup_flags in the
+        # release-artifacts job below; a startup option cannot live in a --config.
         run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData" | Out-Null
+          Add-Content -Path "$env:ProgramData\bazel.bazelrc" -Value "startup --output_user_root=C:/b"
           $prevRev = git rev-parse HEAD~1
           $currRev = git rev-parse HEAD
           for ($i = 1; $i -le 3; $i++) {
@@ -370,7 +352,7 @@ jobs:
           }
   # Verifies per-PR that everything a release ships still builds, on every
   # platform it ships for. It publishes nothing: release.yaml owns that, via
-  # release_prep.sh (JAR + source archive) and its rust-binaries matrix. This
+  # release_prep.sh (source archive) and its rust-binaries matrix. This
   # job predates that flow -- it used to *be* the deploy -- so its uploads are
   # a build check whose output happens to be downloadable, nothing more.
   release-artifacts:
@@ -410,33 +392,24 @@ jobs:
         # config.
         include:
           - os: ubuntu-latest
-            java: '11'
             rust_asset: bazel-diff-rust-linux-amd64
             release_config: release-musl
             bazel_startup_flags: ''
             bazel_extra_flags: ''
-            upload_jar_and_archive: true
+            upload_archive: true
           - os: macos-latest
-            java: '11'
             rust_asset: bazel-diff-rust-macos-arm64
             release_config: release
             bazel_startup_flags: ''
             bazel_extra_flags: ''
-            upload_jar_and_archive: false
+            upload_archive: false
           - os: windows-latest
-            java: '11'
             rust_asset: bazel-diff-rust-windows-amd64.exe
             release_config: release
             bazel_startup_flags: '--output_user_root=C:/b'
             bazel_extra_flags: '--legacy_external_runfiles'
-            upload_jar_and_archive: false
+            upload_archive: false
     steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: ${{ matrix.java }}
-        id: java
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
@@ -464,24 +437,15 @@ jobs:
           }
           echo "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/checkout@v4
-      - name: Build deployable JAR
-        if: matrix.upload_jar_and_archive
-        run: bazelisk build //cli:bazel-diff_deploy.jar
-      - uses: actions/upload-artifact@v4
-        if: matrix.upload_jar_and_archive
-        with:
-          name: bazel-diff_deploy.jar
-          path: bazel-bin/cli/bazel-diff_deploy.jar
-          if-no-files-found: error
       # The same script release_prep.sh packs the shipped archive with, so this
       # check can't pass on an archive the release would not produce. It used to
       # call `make release_source_archive`, a second tar recipe that had already
       # drifted (no __pycache__/*.pyc excludes).
       - name: Build release source archive
-        if: matrix.upload_jar_and_archive
+        if: matrix.upload_archive
         run: .github/workflows/pack_release_archive.sh archives/release.tar.gz
       - uses: actions/upload-artifact@v4
-        if: matrix.upload_jar_and_archive
+        if: matrix.upload_archive
         with:
           name: release.tar.gz
           path: archives/release.tar.gz

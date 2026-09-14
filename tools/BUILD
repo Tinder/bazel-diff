@@ -10,14 +10,14 @@ genrule(
         "help_serve.txt",
     ],
     cmd = """
-        BINARY=$(location //cli:bazel-diff)
+        BINARY=$(location //src:bazel-diff)
         $$BINARY --help > $(location help_root.txt) 2>&1 || true
         $$BINARY generate-hashes --help > $(location help_generate_hashes.txt) 2>&1 || true
         $$BINARY get-impacted-targets --help > $(location help_get_impacted_targets.txt) 2>&1 || true
         $$BINARY explain --help > $(location help_explain.txt) 2>&1 || true
         $$BINARY serve --help > $(location help_serve.txt) 2>&1 || true
     """,
-    tools = ["//cli:bazel-diff"],
+    tools = ["//src:bazel-diff"],
 )
 
 py_binary(
@@ -57,106 +57,9 @@ py_test(
     deps = [":coverage_check_lib"],
 )
 
-py_library(
-    name = "benchmark_lib",
-    srcs = ["benchmark.py"],
-    imports = ["."],
-    visibility = ["//visibility:private"],
-    deps = ["@rules_python//python/runfiles"],
-)
-
-py_binary(
-    name = "benchmark",
-    srcs = ["benchmark.py"],
-    data = [
-        "//cli:bazel-diff",
-        "//src:bazel-diff",
-    ],
-    main = "benchmark.py",
-    python_version = "PY3",
-    visibility = ["//visibility:public"],
-    deps = ["@rules_python//python/runfiles"],
-)
-
-py_test(
-    name = "benchmark_test",
-    srcs = ["benchmark_test.py"],
-    data = [
-        "//cli:bazel-diff",
-        "//src:bazel-diff",
-    ],
-    python_version = "PY3",
-    deps = [":benchmark_lib"],
-)
-
-# Performance gate: asserts the Rust implementation is faster than the Kotlin one on
-# hermetic, synthetic workloads (no real workspace, no Bazel server, no Hyperfine --
-# see tools/benchmark.py for the real-workspace measurement instead).
-#
-# Deliberately a py_binary and not a test target: `bazel test` runs targets concurrently
-# in a sandbox, and timing two binaries against each other while other actions compete
-# for the same cores measures the scheduler, not the implementations. Run it on its own:
-# `make perf-gate` / `bazel run -c opt //tools:perf-gate`.
-py_library(
-    name = "perf_gate_lib",
-    srcs = [
-        "perf_gate.py",
-        "perf_serve.py",
-        "perf_workload.py",
-    ],
-    imports = ["."],
-    visibility = ["//visibility:private"],
-    deps = [
-        ":benchmark_lib",
-        "@rules_python//python/runfiles",
-    ],
-)
-
-py_binary(
-    name = "perf-gate",
-    srcs = [
-        "perf_gate.py",
-        "perf_serve.py",
-        "perf_workload.py",
-    ],
-    data = [
-        "//cli:bazel-diff",
-        "//src:bazel-diff",
-    ],
-    main = "perf_gate.py",
-    python_version = "PY3",
-    visibility = ["//visibility:public"],
-    deps = [
-        ":benchmark_lib",
-        "@rules_python//python/runfiles",
-    ],
-)
-
-# The gate's own unit tests are hermetic and fast: they drive the runner with stub
-# binaries whose relative speed the test controls, so they can assert that the gate
-# fails when Rust is not faster -- something a run against the real binaries can never
-# prove.
-py_test(
-    name = "perf_gate_test",
-    srcs = ["perf_gate_test.py"],
-    python_version = "PY3",
-    deps = [":perf_gate_lib"],
-)
-
-# perf_serve.py's own unit tests use a stub HTTP server (Python's http.server), never a
-# real bazel-diff binary or a real bazel query -- same hermetic-stub philosophy as
-# perf_gate_test.py, applied to the start/health-wait/request/parity pipeline instead of
-# the one-shot-process pipeline.
-py_test(
-    name = "perf_serve_test",
-    srcs = ["perf_serve_test.py"],
-    python_version = "PY3",
-    deps = [":perf_gate_lib"],
-)
-
 # Note: the serve integration harnesses (serve_harness.py, serve_stress.py, serve_consistency.py)
 # are intentionally NOT wrapped in py_binary targets. They shell out to
-# `bazel build //cli:bazel-diff`, which would deadlock on the output-base lock if they were
+# `bazel build //src:bazel-diff`, which would deadlock on the output-base lock if they were
 # themselves launched via `bazel run` (nested bazel, same output base). Run them directly:
 # `python3 tools/serve_harness.py` / `python3 tools/serve_stress.py` /
 # `python3 tools/serve_consistency.py` (see their module docstrings). Python stdlib only.

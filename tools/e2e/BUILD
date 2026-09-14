@@ -1,7 +1,7 @@
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
-# Regenerates the per-case lists in kotlin_e2e_cases.bzl and rust_e2e_cases.bzl
-# from the e2e test sources. `make regen-e2e` is the entry point; this target is
+# Regenerates the per-case list in rust_e2e_cases.bzl from the e2e test
+# sources. `make regen-e2e` is the entry point; this target is
 # what it runs. Writes through $BUILD_WORKSPACE_DIRECTORY, so it only works under
 # `bazel run`, never `bazel build`.
 py_binary(
@@ -19,22 +19,20 @@ py_library(
     visibility = ["//visibility:private"],
 )
 
-# The CI gate: re-derives the case lists from the sources in the runfiles tree
-# and fails if they differ from the checked-in ones. This is what makes the
+# The CI gate: re-derives the case list from the sources in the runfiles tree
+# and fails if it differs from the checked-in one. This is what makes the
 # split self-maintaining -- an e2e test added, renamed or deleted without a
 # regen cannot merge.
 #
-# The `data` are the inputs the generator reads: the two e2e source trees and
-# the two files it produces. They reach the test as runfiles at their
+# The `data` are the inputs the generator reads: the e2e source tree and the
+# file it produces. They reach the test as runfiles at their
 # repo-relative paths, which is where find_repo_root() looks under
 # $TEST_SRCDIR/$TEST_WORKSPACE.
 py_test(
     name = "regen_check",
     srcs = ["regen_check.py"],
     data = [
-        "kotlin_e2e_cases.bzl",
         "rust_e2e_cases.bzl",
-        "//cli:e2e_test_sources",
         "//tests:e2e_test_sources",
     ],
     python_version = "PY3",
@@ -51,10 +49,7 @@ py_test(
     srcs = ["split_e2e_tests_test.py"],
     # RepoConsistencyTest runs the collectors over the repo's own e2e sources,
     # so it needs the same runfiles :regen_check does.
-    data = [
-        "//cli:e2e_test_sources",
-        "//tests:e2e_test_sources",
-    ],
+    data = ["//tests:e2e_test_sources"],
     python_version = "PY3",
     deps = [":split_e2e_tests_lib"],
 )

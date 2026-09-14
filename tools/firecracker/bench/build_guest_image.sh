@@ -3,9 +3,10 @@
 # `firecracker` driver boots, warms, and snapshots.
 #
 # The rootfs bakes in everything `bazel-diff warmup` / `generate-hashes` needs so
-# the guest is self-contained and offline: a JDK, a pinned `bazel` binary, git,
-# the bazel-diff fat jar (wrapped as `/usr/local/bin/bazel-diff`), the workspace,
-# an sshd that trusts the operator key, and the /snap dir warmup writes to.
+# the guest is self-contained and offline: a JDK (for Bazel itself), a pinned
+# `bazel` binary, git, the statically linked bazel-diff binary (as
+# `/usr/local/bin/bazel-diff`), the workspace, an sshd that trusts the operator
+# key, and the /snap dir warmup writes to.
 # fcDriver.baseRootfs() expects the rootfs at <kernel-dir>/rootfs.base.ext4, so
 # both land in OUT together.
 #
@@ -17,7 +18,7 @@
 # access for the one-time base download + apt install into the chroot.
 #
 #   OUT=/tmp/fc-image \
-#   BAZEL_DIFF_JAR=bazel-bin/cli/bazel-diff_deploy.jar \
+#   BAZEL_DIFF_BIN=bazel-bin/release/bazel-diff-rust-linux-arm64 \
 #   BAZEL_BIN=$(which bazelisk) \
 #   WORKSPACE_SRC=/tmp/fcbench \
 #   SSH_PUBKEY=~/.ssh/fc_guest.pub \
@@ -31,7 +32,9 @@ OUT="${OUT:-/tmp/fc-image}"
 SIZE_MB="${SIZE_MB:-6144}"
 JDK_PKG="${JDK_PKG:-openjdk-21-jdk-headless}"
 
-BAZEL_DIFF_JAR="${BAZEL_DIFF_JAR:?set BAZEL_DIFF_JAR to the bazel-diff_deploy.jar}"
+# The musl-static Linux release binary for $ARCH (make release_rust_binary_linux
+# / release_rust_binary_linux_arm64): it has no libc dependency on the guest.
+BAZEL_DIFF_BIN="${BAZEL_DIFF_BIN:?set BAZEL_DIFF_BIN to the statically linked bazel-diff Linux binary}"
 BAZEL_BIN="${BAZEL_BIN:?set BAZEL_BIN to a bazel/bazelisk binary to bake in}"
 WORKSPACE_SRC="${WORKSPACE_SRC:?set WORKSPACE_SRC to the git workspace to bake in}"
 SSH_PUBKEY="${SSH_PUBKEY:?set SSH_PUBKEY to the public key the guest should trust}"
@@ -98,13 +101,7 @@ chroot "$WORK" /bin/bash -euxc "
 
 echo ">> [5/6] bake bazel + bazel-diff + workspace"
 install -m 755 "$BAZEL_BIN" "$WORK/usr/local/bin/bazel"
-install -d -m 755 "$WORK/opt/bazel-diff"
-install -m 644 "$BAZEL_DIFF_JAR" "$WORK/opt/bazel-diff/bazel-diff_deploy.jar"
-cat > "$WORK/usr/local/bin/bazel-diff" <<'EOF'
-#!/bin/sh
-exec java -jar /opt/bazel-diff/bazel-diff_deploy.jar "$@"
-EOF
-chmod 755 "$WORK/usr/local/bin/bazel-diff"
+install -m 755 "$BAZEL_DIFF_BIN" "$WORK/usr/local/bin/bazel-diff"
 # Bake the workspace (git repo) under /work. record/consume `git checkout` here.
 # Own it as root (the guest runs commands as root) so git doesn't reject the repo
 # with "detected dubious ownership" (exit 128) when the source uid differs.

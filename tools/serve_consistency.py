@@ -52,7 +52,7 @@ Exit code is non-zero if any gating check fails. Requires git (with `git daemon`
 binary. Pure Python stdlib, no third-party deps.
 
 Run it directly (`python3 tools/serve_consistency.py`), never via `bazel run` -- it shells out to
-`bazel build //cli:bazel-diff` and nested bazel deadlocks on the output-base lock. See tools/BUILD.
+`bazel build //src:bazel-diff` and nested bazel deadlocks on the output-base lock. See tools/BUILD.
 """
 
 from __future__ import annotations
@@ -1237,7 +1237,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ARG",
         help="extra `serve` flag applied identically to every instance; repeatable. Use the `=` "
         "spelling for flag-shaped values, e.g. "
-        "--serve-arg=--fineGrainedHashExternalRepos=@rules_kotlin",
+        "--serve-arg=--fineGrainedHashExternalRepos=@rules_go",
     )
     ap.add_argument("--metrics-out", default="", help="write the run's metrics JSON here")
     ap.add_argument("--summary-out", default="", help="write a markdown summary here")
@@ -1266,8 +1266,8 @@ def main() -> int:
         return 2
 
     if not args.skip_build:
-        base.log(f"{base.C.BOLD}Building //cli:bazel-diff ...{base.C.RESET}")
-        base.run([base.BAZEL, "build", "//cli:bazel-diff"], cwd=base.REPO_ROOT)
+        base.log(f"{base.C.BOLD}Building {base.BUILD_TARGET} ...{base.C.RESET}")
+        base.run([base.BAZEL, "build", base.BUILD_TARGET], cwd=base.REPO_ROOT)
     if not base.LAUNCHER.exists():
         base.log(f"{base.C.RED}launcher not found at {base.LAUNCHER}; drop --skip-build{base.C.RESET}")
         return 2

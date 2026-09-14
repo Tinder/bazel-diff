@@ -1,7 +1,7 @@
 name: Format
 
-# Runs ktfmt and rustfmt over the codebase on a daily schedule and opens a PR
-# only if a formatter produced changes. Mirrors the coverage-badge cron: it
+# Runs rustfmt over the codebase on a daily schedule and opens a PR only if
+# the formatter produced changes. Mirrors the coverage-badge cron: it
 # force-pushes a dedicated, bot-owned branch so re-runs reuse one PR instead of
 # accumulating stale branches, and it never touches master directly.
 on:
@@ -17,11 +17,6 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
@@ -37,13 +32,11 @@ jobs:
           done
           export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
-      - name: Run ktfmt
+      - name: Run rustfmt
         # Pinned to the repo's .bazelversion (no USE_BAZEL_VERSION) and run with
         # --lockfile_mode=off so MODULE.bazel.lock is never rewritten, keeping the
         # generated PR limited to formatting-only changes.
-        run: ~/go/bin/bazelisk run //cli/format --enable_bzlmod=true --enable_workspace=false --lockfile_mode=off
-      - name: Run rustfmt
-        run: ~/go/bin/bazelisk run //cli/format:rustfmt --enable_bzlmod=true --enable_workspace=false --lockfile_mode=off
+        run: ~/go/bin/bazelisk run //tools/format:rustfmt --enable_bzlmod=true --enable_workspace=false --lockfile_mode=off
       - name: Open PR if formatting changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -57,7 +50,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$BRANCH"
           git add -A
-          git commit -m "ci: apply ktfmt and rustfmt formatting"
+          git commit -m "ci: apply rustfmt formatting"
           # Force-push the dedicated, bot-owned branch so re-runs reuse one PR
           # instead of accumulating stale branches. This never touches master.
           git push --force origin "$BRANCH"
@@ -67,6 +60,6 @@ jobs:
             gh pr create \
               --base master \
               --head "$BRANCH" \
-              --title "ci: apply ktfmt and rustfmt formatting" \
-              --body "Automated ktfmt and rustfmt run via \`bazel run //cli/format\` and \`bazel run //cli/format:rustfmt\`. This PR contains formatting-only changes."
+              --title "ci: apply rustfmt formatting" \
+              --body "Automated rustfmt run via \`bazel run //tools/format:rustfmt\`. This PR contains formatting-only changes."
           fi

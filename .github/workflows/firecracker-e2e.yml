@@ -82,11 +82,14 @@ jobs:
           sudo chmod 666 /dev/kvm
           ls -l /dev/kvm
 
-      - name: Build bazel-diff (deploy jar + launcher)
+      # Two builds of the same crate: the host-native binary drives the local
+      # (cold) leg, and the static musl amd64 asset is baked into the guest
+      # rootfs, where it needs no libc.
+      - name: Build bazel-diff (host binary + static guest binary)
         run: |
-          ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar
+          ~/go/bin/bazelisk build //release:bazel-diff-rust --config=release-musl
           ~/go/bin/bazelisk run //:bazel-diff --script_path=/tmp/bazel_diff
-          ls -l bazel-bin/cli/bazel-diff_deploy.jar /tmp/bazel_diff
+          ls -l bazel-bin/release/bazel-diff-rust-linux-amd64 /tmp/bazel_diff
 
       - name: Build + unit-test the orchestrator
         working-directory: tools/firecracker
@@ -131,7 +134,7 @@ jobs:
         run: |
           sudo -E env \
             ARCH="$ARCH" KERNEL_VER="$KERNEL_VER" OUT="$IMG" SIZE_MB="$SIZE_MB" \
-            BAZEL_DIFF_JAR="$PWD/bazel-bin/cli/bazel-diff_deploy.jar" \
+            BAZEL_DIFF_BIN="$(readlink -f bazel-bin/release/bazel-diff-rust-linux-amd64)" \
             BAZEL_BIN="${{ steps.bazel.outputs.bin }}" \
             WORKSPACE_SRC="$WS" SSH_PUBKEY=/tmp/fc_guest.pub \
             tools/firecracker/bench/build_guest_image.sh

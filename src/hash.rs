@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 const CONFIGURED_INPUT_SEPARATOR: char = '|';
 type DigestBytes = [u8; 32];
@@ -113,8 +114,27 @@ struct SourceTarget {
     subincludes: Vec<String>,
 }
 
+/// Wall-clock breakdown of one hash generation, in pipeline order: the `bazel query` for all
+/// targets (including proto parsing), the `bazel mod graph --output=json` call (0 when Bzlmod is
+/// off), and seeding plus hashing every source file and target.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GenerationTimings {
+    pub bazel_query_millis: u64,
+    pub module_graph_millis: u64,
+    pub target_hash_millis: u64,
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis() as u64
+}
+
 pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
+    generate_hashes_timed(options).map(|(data, _)| data)
+}
+
+pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, GenerationTimings)> {
     let mut definition_digests = HashMap::new();
+    let query_started = Instant::now();
     let targets = options.bazel.query_all_targets_with(|target| {
         let Some(rule) = target.rule.as_option_mut() else {
             return;
@@ -124,27 +144,39 @@ pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
             prehash_rule(rule, &options.ignored_attributes),
         );
     })?;
-    hash_targets_with_digests(options, targets, definition_digests)
+    let bazel_query_millis = elapsed_millis(query_started);
+    let (data, mut timings) = hash_targets_with_digests(options, targets, definition_digests)?;
+    timings.bazel_query_millis = bazel_query_millis;
+    Ok((data, timings))
 }
 
 pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashFileData> {
-    hash_targets_with_digests(options, targets, HashMap::new())
+    hash_targets_with_digests(options, targets, HashMap::new()).map(|(data, _)| data)
 }
 
 fn hash_targets_with_digests(
     options: &HashOptions,
     targets: Vec<Target>,
     definition_digests: HashMap<String, DigestBytes>,
-) -> Result<HashFileData> {
+) -> Result<(HashFileData, GenerationTimings)> {
+    let hash_started = Instant::now();
     let external_resolver = ExternalRepoResolver::new(&options.bazel)?;
+    let module_graph_started = Instant::now();
     let module_graph_json = options.bazel.module_graph_json();
-    hash_targets_with_environment(
+    let module_graph_millis = elapsed_millis(module_graph_started);
+    let data = hash_targets_with_environment(
         options,
         targets,
         definition_digests,
         external_resolver,
         module_graph_json,
-    )
+    )?;
+    let timings = GenerationTimings {
+        bazel_query_millis: 0,
+        module_graph_millis,
+        target_hash_millis: elapsed_millis(hash_started).saturating_sub(module_graph_millis),
+    };
+    Ok((data, timings))
 }
 
 fn hash_targets_with_environment(

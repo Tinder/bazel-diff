@@ -354,6 +354,17 @@ Notes and operational guidance:
   reuses a previously cached entry of the other kind. This mirrors the `generate-hashes --depEdgesFile`
   / `get-impacted-targets --depEdgesFile` flow used by the CLI.
 
+* Dependency fingerprinting (`--dependencyFingerprint`) is opt-in. When enabled, every generated
+  cache entry records a fingerprint of the workspace's external-dependency state (the bzlmod module
+  graph and the resolved repository definitions, via `bazel mod`), and a cached entry -- local or
+  S3 -- is only served when that fingerprint still matches the checked-out revision; entries
+  without a fingerprint, or with a stale one, are regenerated. This catches hashes that went stale
+  because an external repository changed underneath an unchanged commit, at the cost of a checkout
+  and a `bazel mod` round trip on every cache lookup. It is off by default, in which case a cache
+  entry is trusted on its key alone and the fingerprint is neither computed nor stored. The flag is
+  not part of the cache key: a guarded server rewrites unguarded entries with a fingerprint as it
+  regenerates them, and an unguarded server serves guarded entries as-is.
+
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
   so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.

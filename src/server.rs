@@ -5,7 +5,7 @@ use crate::model::{
 use crate::module_graph::impacted_with_module_changes;
 use anyhow::{anyhow, bail, Context, Result};
 use s3::creds::Credentials;
-use s3::error::S3Error;
+use s3::request::ResponseData;
 use s3::{Bucket, Region};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -28,6 +28,8 @@ pub struct ServerConfig {
     pub request_timeout: Duration,
     pub cache_dir: PathBuf,
     pub track_deps: bool,
+    /// Opt-in: guard cache hits with a fingerprint of the workspace's external-dependency state.
+    pub dependency_fingerprint: bool,
     pub no_initial_fetch: bool,
     pub warmup_revisions: Vec<String>,
     pub cache_max_age: Option<Duration>,
@@ -90,47 +92,53 @@ impl RemoteCache {
         format!("{}{key}.json", self.prefix)
     }
 
+    /// Reads an entry, degrading to a miss on any failure.
+    ///
+    /// Deliberately a bare `GetObject` with no `HeadObject` probe in front of it: besides costing a
+    /// second round trip on every hit, `head_object` cannot report a miss here. S3 answers a HEAD
+    /// miss with `404`, `Transfer-Encoding: chunked` and no body, and every HTTP client on this
+    /// stack fails reading that absent body -- `attohttpc: Io Error: unexpected end of file`. A GET
+    /// miss carries a real `NoSuchKey` body, so it reads back cleanly.
     fn get(&self, key: &str) -> Option<Vec<u8>> {
-        match self.bucket.get_object(self.object_key(key)) {
-            Ok(response) if response.status_code() == 200 => Some(response.to_vec()),
-            Ok(_) => None,
-            Err(error) if is_s3_not_found(&error) => None,
-            Err(error) => {
-                eprintln!(
-                    "[Warn] S3 cache read of {} failed (treating as a miss): {error}",
-                    self.object_key(key)
-                );
-                None
-            }
-        }
+        let failure = match self.bucket.get_object(self.object_key(key)) {
+            Ok(response) if response.status_code() == 200 => return Some(response.to_vec()),
+            Ok(response) if response.status_code() == 404 => return None,
+            Ok(response) => http_failure(&response),
+            Err(error) => error.to_string(),
+        };
+        eprintln!(
+            "[Warn] S3 cache read of {} failed (treating as a miss): {failure}",
+            self.object_key(key)
+        );
+        None
     }
 
     fn put(&self, key: &str, data: &[u8]) {
-        if let Err(error) = self.bucket.put_object(self.object_key(key), data) {
-            eprintln!(
-                "[Warn] S3 cache write of {} failed (entry not shared): {error}",
-                self.object_key(key)
-            );
-        }
-    }
-
-    fn contains(&self, key: &str) -> bool {
-        match self.bucket.head_object(self.object_key(key)) {
-            Ok((_, status)) => status == 200,
-            Err(error) if is_s3_not_found(&error) => false,
-            Err(error) => {
-                eprintln!(
-                    "[Warn] S3 cache check of {} failed (treating as a miss): {error}",
-                    self.object_key(key)
-                );
-                false
-            }
-        }
+        let failure = match self.bucket.put_object(self.object_key(key), data) {
+            Ok(response) if (200..300).contains(&response.status_code()) => return,
+            Ok(response) => http_failure(&response),
+            Err(error) => error.to_string(),
+        };
+        eprintln!(
+            "[Warn] S3 cache write of {} failed (entry not shared): {failure}",
+            self.object_key(key)
+        );
     }
 }
 
-fn is_s3_not_found(error: &S3Error) -> bool {
-    matches!(error, S3Error::HttpFailWithBody(404, _))
+/// Renders a non-2xx response for a warning, matching how `S3Error::HttpFailWithBody` reads.
+///
+/// Statuses are classified here rather than by `rust-s3`'s `fail-on-err` feature, which is
+/// deliberately off: it turns every non-2xx into an error *after* reading the body, and the read
+/// happens inside `rust-s3`'s `retry!`, so a plain 404 miss cost a duplicate request and a
+/// one-second backoff sleep before being recognized as a miss. `retry!` still covers transport
+/// errors, which are the ones worth retrying.
+fn http_failure(response: &ResponseData) -> String {
+    format!(
+        "Got HTTP {} with content '{}'",
+        response.status_code(),
+        response.as_str().unwrap_or("<non-utf8 body>").trim()
+    )
 }
 
 fn normalize_s3_prefix(prefix: &str) -> String {
@@ -581,60 +589,59 @@ fn get_hashes_locked(
     let mut current_dependency_fingerprint = None;
     if path.is_file() {
         let data = HashFileData::read(&path)?;
-        if cache_entry_matches_dependency_fingerprint(
+        if cache_entry_is_servable(
             state,
             sha,
             "local",
+            &key,
             &data,
             &mut current_dependency_fingerprint,
         )? {
-            eprintln!("[BD-DBG][cache-hit] scope=local sha={sha} key={key}");
             touch(&path);
             return Ok((data, true));
         }
-        eprintln!("[BD-DBG][cache-guard-miss] scope=local sha={sha} key={key}");
     }
     if let Some(remote) = &state.remote {
-        if remote.contains(&key) {
-            if let Some(bytes) = remote.get(&key) {
-                let data = HashFileData::from_slice(&bytes)?;
-                if cache_entry_matches_dependency_fingerprint(
-                    state,
-                    sha,
-                    "remote",
-                    &data,
-                    &mut current_dependency_fingerprint,
-                )? {
-                    eprintln!("[BD-DBG][cache-hit] scope=remote sha={sha} key={key}");
-                    fs::write(&path, &bytes)?;
-                    return Ok((data, true));
-                }
-                eprintln!("[BD-DBG][cache-guard-miss] scope=remote sha={sha} key={key}");
+        if let Some(bytes) = remote.get(&key) {
+            let data = HashFileData::from_slice(&bytes)?;
+            if cache_entry_is_servable(
+                state,
+                sha,
+                "remote",
+                &key,
+                &data,
+                &mut current_dependency_fingerprint,
+            )? {
+                fs::write(&path, &bytes)?;
+                return Ok((data, true));
             }
         }
     }
-    eprintln!("[BD-DBG][cache-recompute] sha={sha} key={key}");
+    if state.config.dependency_fingerprint {
+        eprintln!("[BD-DBG][cache-recompute] sha={sha} key={key}");
+    }
     checkout(state, sha)?;
     let mut options = state.config.hash_options.clone();
     options.modified_filepaths = modified.clone();
     options.track_deps = state.config.track_deps;
     let mut data = generate_hashes(&options)?;
-    data.dependency_fingerprint =
-        current_dependency_fingerprint.take().or_else(
-            || match dependency_fingerprint_for_workspace(state) {
+    if state.config.dependency_fingerprint {
+        data.dependency_fingerprint = current_dependency_fingerprint.take().or_else(|| {
+            match dependency_fingerprint_for_workspace(state) {
                 Ok(value) => Some(value),
                 Err(error) => {
                     eprintln!("[Warn] {error:#}");
                     None
                 }
-            },
-        );
-    match data.dependency_fingerprint.as_deref() {
-        Some(fingerprint) => eprintln!(
-            "[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp={}",
-            short_fingerprint(fingerprint)
-        ),
-        None => eprintln!("[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp=NONE"),
+            }
+        });
+        match data.dependency_fingerprint.as_deref() {
+            Some(fingerprint) => eprintln!(
+                "[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp={}",
+                short_fingerprint(fingerprint)
+            ),
+            None => eprintln!("[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp=NONE"),
+        }
     }
     let bytes = serde_json::to_vec(&data.serialized(true, state.config.track_deps))?;
     let temporary = state.config.cache_dir.join(format!("{key}.tmp"));
@@ -645,6 +652,39 @@ fn get_hashes_locked(
         remote.put(&key, &bytes);
     }
     Ok((data, false))
+}
+
+/// Decides whether a cached entry may be served for `sha`.
+///
+/// Without `--dependencyFingerprint` every entry is trusted, as it was before the guard existed:
+/// the cache key already covers the SHA and the hash-affecting configuration. With the flag on,
+/// the entry must carry a dependency fingerprint that matches the workspace's current
+/// external-dependency state, which costs a checkout plus `bazel mod` calls per lookup.
+fn cache_entry_is_servable(
+    state: &Arc<State>,
+    sha: &str,
+    scope: &str,
+    key: &str,
+    data: &HashFileData,
+    current_dependency_fingerprint: &mut Option<String>,
+) -> Result<bool> {
+    if !state.config.dependency_fingerprint {
+        return Ok(true);
+    }
+    let matched = cache_entry_matches_dependency_fingerprint(
+        state,
+        sha,
+        scope,
+        data,
+        current_dependency_fingerprint,
+    )?;
+    let outcome = if matched {
+        "cache-hit"
+    } else {
+        "cache-guard-miss"
+    };
+    eprintln!("[BD-DBG][{outcome}] scope={scope} sha={sha} key={key}");
+    Ok(matched)
 }
 
 fn cache_entry_matches_dependency_fingerprint(
@@ -898,6 +938,7 @@ fn metrics(state: &State) -> Value {
         "ready": state.ready.load(Ordering::Acquire),
         "gitEngine": "subprocess",
         "trackDeps": state.config.track_deps,
+        "dependencyFingerprint": state.config.dependency_fingerprint,
         "cache": {
             "directory": state.config.cache_dir.to_string_lossy(),
             "remote": state.config.remote_cache,
@@ -1064,6 +1105,7 @@ mod tests {
             request_timeout: Duration::ZERO,
             cache_dir: PathBuf::from("."),
             track_deps: false,
+            dependency_fingerprint: false,
             no_initial_fetch: true,
             warmup_revisions: Vec::new(),
             cache_max_age: None,
@@ -1134,6 +1176,7 @@ mod tests {
         config.cache_dir = cache.to_path_buf();
         config.track_deps = track_deps;
         config.hash_options.track_deps = track_deps;
+        config.dependency_fingerprint = true;
         let fingerprint = configuration_fingerprint(&config);
         Arc::new(State {
             config,
@@ -1261,14 +1304,6 @@ mod tests {
         assert_eq!(normalize_s3_prefix(""), "");
         assert_eq!(normalize_s3_prefix("/"), "");
         assert_eq!(normalize_s3_prefix("/team/cache/"), "team/cache/");
-        assert!(is_s3_not_found(&S3Error::HttpFailWithBody(
-            404,
-            "missing".into()
-        )));
-        assert!(!is_s3_not_found(&S3Error::HttpFailWithBody(
-            500,
-            "failure".into()
-        )));
         assert!(RemoteCache::new(&test_config()).unwrap().is_none());
     }
 
@@ -1276,17 +1311,12 @@ mod tests {
     fn remote_cache_operations_use_normalized_key_and_succeed() {
         let (remote, requests, handle) = remote_cache_with_responses(
             "/team/repo/",
-            vec![
-                (200, b"hello".to_vec()),
-                (200, Vec::new()),
-                (200, Vec::new()),
-            ],
+            vec![(200, b"hello".to_vec()), (200, Vec::new())],
         );
         assert_eq!(remote.object_key("sha.fp"), "team/repo/sha.fp.json");
         assert_eq!(remote.get("sha.fp"), Some(b"hello".to_vec()));
         remote.put("sha.fp", b"data");
-        assert!(remote.contains("sha.fp"));
-        let captured = (0..3)
+        let captured = (0..2)
             .map(|_| requests.recv_timeout(Duration::from_secs(5)).unwrap())
             .collect::<Vec<_>>();
         handle.join().unwrap();
@@ -1300,22 +1330,31 @@ mod tests {
         let (remote, requests, handle) = remote_cache_with_responses(
             "",
             vec![
-                (404, b"missing".to_vec()),
+                (404, b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
                 (500, b"failure".to_vec()),
-                (404, Vec::new()),
-                (500, Vec::new()),
                 (500, Vec::new()),
             ],
         );
         assert_eq!(remote.get("missing"), None);
         assert_eq!(remote.get("failure"), None);
-        assert!(!remote.contains("missing"));
-        assert!(!remote.contains("failure"));
         remote.put("failure", b"data");
-        for _ in 0..5 {
+        // Exactly one request per call. `rust-s3`'s `fail-on-err` feature is off precisely so a
+        // non-2xx stays a response: as an error it would enter the crate's `retry!`, and every
+        // miss would cost a second request and a one-second backoff sleep.
+        for _ in 0..3 {
             requests.recv_timeout(Duration::from_secs(5)).unwrap();
         }
+        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn remote_cache_reports_unexpected_statuses_with_their_body() {
+        let response = ResponseData::new("denied".into(), 403, std::collections::HashMap::new());
+        assert_eq!(
+            http_failure(&response),
+            "Got HTTP 403 with content 'denied'"
+        );
     }
 
     #[test]
@@ -1553,6 +1592,7 @@ mod tests {
         config.hash_options.bazel.workspace = repo.path().to_path_buf();
         config.git_path = PathBuf::from("git");
         config.cache_dir = cache.path().to_path_buf();
+        config.dependency_fingerprint = true;
         let dependency_fingerprint = config.hash_options.bazel.dependency_fingerprint().unwrap();
         let data = HashFileData {
             hashes: std::collections::BTreeMap::from([(
@@ -1563,8 +1603,7 @@ mod tests {
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
-        let (remote, requests, handle) =
-            remote_cache_with_responses("", vec![(200, Vec::new()), (200, bytes)]);
+        let (remote, requests, handle) = remote_cache_with_responses("", vec![(200, bytes)]);
         let fingerprint = configuration_fingerprint(&config);
         let state = Arc::new(State {
             config,
@@ -1584,9 +1623,7 @@ mod tests {
         assert!(second_hit);
         assert_eq!(second.hashes["//app:lib"].hash, "overall");
 
-        for _ in 0..2 {
-            requests.recv_timeout(Duration::from_secs(5)).unwrap();
-        }
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
         handle.join().unwrap();
     }
 
@@ -1701,6 +1738,81 @@ mod tests {
     }
 
     #[test]
+    fn dependency_fingerprint_guard_is_off_unless_opted_in() {
+        let (repo, _, sha) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let mut state = state_for_repo(repo.path(), cache.path(), false);
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .dependency_fingerprint = false;
+        // Neither a missing fingerprint nor a stale one may block a hit when the guard is off.
+        for cached_fingerprint in [None, Some("stale".to_owned())] {
+            let data = HashFileData {
+                hashes: std::collections::BTreeMap::from([(
+                    "//app:lib".into(),
+                    hash("Rule", "overall", "direct"),
+                )]),
+                dependency_fingerprint: cached_fingerprint,
+                ..Default::default()
+            };
+            let key = cache_key(&state, &sha, &BTreeSet::new());
+            write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
+            let (loaded, hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+            assert!(hit);
+            assert_eq!(loaded.hashes["//app:lib"].hash, "overall");
+        }
+
+        // The remote tier is trusted the same way: a fingerprint-less entry is a hit.
+        let remote_cache = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.path().to_path_buf();
+        config.git_path = PathBuf::from("git");
+        config.cache_dir = remote_cache.path().to_path_buf();
+        let data = HashFileData {
+            hashes: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                hash("Rule", "overall", "direct"),
+            )]),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
+        let (remote, requests, handle) = remote_cache_with_responses("", vec![(200, bytes)]);
+        let fingerprint = configuration_fingerprint(&config);
+        let state = Arc::new(State {
+            config,
+            ready: AtomicBool::new(true),
+            workspace_lock: Mutex::new(()),
+            started: Instant::now(),
+            fingerprint,
+            remote: Some(remote),
+        });
+        let (loaded, hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(hit);
+        assert_eq!(loaded.hashes["//app:lib"].hash, "overall");
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+
+        // With the guard on, the same fingerprint-less entry is rejected, and since bazel is
+        // `/bin/false` here the recompute fails rather than silently serving stale hashes.
+        let mut guarded = state_for_repo(repo.path(), cache.path(), false);
+        Arc::get_mut(&mut guarded)
+            .unwrap()
+            .config
+            .dependency_fingerprint = true;
+        let data = HashFileData {
+            hashes: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                hash("Rule", "overall", "direct"),
+            )]),
+            ..Default::default()
+        };
+        let key = cache_key(&guarded, &sha, &BTreeSet::new());
+        write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
+        assert!(get_hashes_locked(&guarded, &sha, &BTreeSet::new()).is_err());
+    }
+
+    #[test]
     fn metrics_and_human_sizes_report_cache_state() {
         let repo = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -1709,6 +1821,7 @@ mod tests {
         let value = metrics(&state);
         assert_eq!(value["ready"], true);
         assert_eq!(value["trackDeps"], true);
+        assert_eq!(value["dependencyFingerprint"], true);
         assert_eq!(value["cache"]["entries"], 1);
         assert_eq!(value["cache"]["sizeHuman"], "1.5 KB");
         assert_eq!(human_bytes(0), "0 B");

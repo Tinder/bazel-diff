@@ -353,6 +353,17 @@ struct ServeArgs {
     )]
     track_deps: bool,
 
+    /// Opt-in: only serve cached entries whose external-dependency fingerprint still matches
+    #[arg(
+        long = "dependencyFingerprint",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = false
+    )]
+    dependency_fingerprint: bool,
+
     #[arg(long = "no-initial-fetch")]
     no_initial_fetch: bool,
 
@@ -802,6 +813,7 @@ impl ServeArgs {
             request_timeout: Duration::from_secs(self.request_timeout),
             cache_dir: self.cache_dir.clone(),
             track_deps: self.track_deps,
+            dependency_fingerprint: self.dependency_fingerprint,
             no_initial_fetch: self.no_initial_fetch,
             warmup_revisions: self.warmup_revisions.clone(),
             cache_max_age: self
@@ -843,6 +855,7 @@ fn normalize_argument(argument: String) -> String {
         "--no-excludeExternalTargets" => "--excludeExternalTargets=false".to_owned(),
         "--no-noBazelrc" => "--noBazelrc=false".to_owned(),
         "--no-trackDeps" => "--trackDeps=false".to_owned(),
+        "--no-dependencyFingerprint" => "--dependencyFingerprint=false".to_owned(),
         _ => argument,
     }
 }
@@ -1200,6 +1213,7 @@ mod tests {
             "--cacheDir",
             "/tmp/cache",
             "--trackDeps",
+            "--dependencyFingerprint",
             "--requestTimeout",
             "30",
             "--cacheMaxAge",
@@ -1225,6 +1239,7 @@ mod tests {
         };
         let config = args.to_config(true).unwrap();
         assert!(config.track_deps);
+        assert!(config.dependency_fingerprint);
         assert_eq!(config.request_timeout, Duration::from_secs(30));
         assert_eq!(config.cache_max_age, Some(Duration::from_secs(7 * 86_400)));
         assert_eq!(config.cache_max_size, Some(10 * 1024u64.pow(3)));
@@ -1237,6 +1252,30 @@ mod tests {
         assert_eq!(config.warmup_revisions, ["main", "release"]);
         assert!(config.s3_force_path_style);
         assert!(config.hash_options.bazel.verbose);
+    }
+
+    #[test]
+    fn serve_dependency_fingerprint_guard_is_opt_in() {
+        let serve_config = |extra: &[&str]| {
+            let mut argv = vec![
+                "bazel-diff",
+                "serve",
+                "--workspacePath",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+            ];
+            argv.extend_from_slice(extra);
+            let Commands::Serve(args) = parse(&argv).command else {
+                panic!("expected serve");
+            };
+            args.to_config(false).unwrap()
+        };
+        assert!(!serve_config(&[]).dependency_fingerprint);
+        assert!(serve_config(&["--dependencyFingerprint"]).dependency_fingerprint);
+        assert!(serve_config(&["--dependencyFingerprint=true"]).dependency_fingerprint);
+        assert!(!serve_config(&["--dependencyFingerprint=false"]).dependency_fingerprint);
+        assert!(!serve_config(&["--no-dependencyFingerprint"]).dependency_fingerprint);
     }
 
     #[test]

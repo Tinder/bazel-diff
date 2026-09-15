@@ -28,6 +28,8 @@ pub struct ServerConfig {
     pub request_timeout: Duration,
     pub cache_dir: PathBuf,
     pub track_deps: bool,
+    /// Opt-in: guard cache hits with a fingerprint of the workspace's external-dependency state.
+    pub dependency_fingerprint: bool,
     pub no_initial_fetch: bool,
     pub warmup_revisions: Vec<String>,
     pub cache_max_age: Option<Duration>,
@@ -581,60 +583,61 @@ fn get_hashes_locked(
     let mut current_dependency_fingerprint = None;
     if path.is_file() {
         let data = HashFileData::read(&path)?;
-        if cache_entry_matches_dependency_fingerprint(
+        if cache_entry_is_servable(
             state,
             sha,
             "local",
+            &key,
             &data,
             &mut current_dependency_fingerprint,
         )? {
-            eprintln!("[BD-DBG][cache-hit] scope=local sha={sha} key={key}");
             touch(&path);
             return Ok((data, true));
         }
-        eprintln!("[BD-DBG][cache-guard-miss] scope=local sha={sha} key={key}");
     }
     if let Some(remote) = &state.remote {
         if remote.contains(&key) {
             if let Some(bytes) = remote.get(&key) {
                 let data = HashFileData::from_slice(&bytes)?;
-                if cache_entry_matches_dependency_fingerprint(
+                if cache_entry_is_servable(
                     state,
                     sha,
                     "remote",
+                    &key,
                     &data,
                     &mut current_dependency_fingerprint,
                 )? {
-                    eprintln!("[BD-DBG][cache-hit] scope=remote sha={sha} key={key}");
                     fs::write(&path, &bytes)?;
                     return Ok((data, true));
                 }
-                eprintln!("[BD-DBG][cache-guard-miss] scope=remote sha={sha} key={key}");
             }
         }
     }
-    eprintln!("[BD-DBG][cache-recompute] sha={sha} key={key}");
+    if state.config.dependency_fingerprint {
+        eprintln!("[BD-DBG][cache-recompute] sha={sha} key={key}");
+    }
     checkout(state, sha)?;
     let mut options = state.config.hash_options.clone();
     options.modified_filepaths = modified.clone();
     options.track_deps = state.config.track_deps;
     let mut data = generate_hashes(&options)?;
-    data.dependency_fingerprint =
-        current_dependency_fingerprint.take().or_else(
-            || match dependency_fingerprint_for_workspace(state) {
+    if state.config.dependency_fingerprint {
+        data.dependency_fingerprint = current_dependency_fingerprint.take().or_else(|| {
+            match dependency_fingerprint_for_workspace(state) {
                 Ok(value) => Some(value),
                 Err(error) => {
                     eprintln!("[Warn] {error:#}");
                     None
                 }
-            },
-        );
-    match data.dependency_fingerprint.as_deref() {
-        Some(fingerprint) => eprintln!(
-            "[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp={}",
-            short_fingerprint(fingerprint)
-        ),
-        None => eprintln!("[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp=NONE"),
+            }
+        });
+        match data.dependency_fingerprint.as_deref() {
+            Some(fingerprint) => eprintln!(
+                "[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp={}",
+                short_fingerprint(fingerprint)
+            ),
+            None => eprintln!("[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp=NONE"),
+        }
     }
     let bytes = serde_json::to_vec(&data.serialized(true, state.config.track_deps))?;
     let temporary = state.config.cache_dir.join(format!("{key}.tmp"));
@@ -645,6 +648,39 @@ fn get_hashes_locked(
         remote.put(&key, &bytes);
     }
     Ok((data, false))
+}
+
+/// Decides whether a cached entry may be served for `sha`.
+///
+/// Without `--dependencyFingerprint` every entry is trusted, as it was before the guard existed:
+/// the cache key already covers the SHA and the hash-affecting configuration. With the flag on,
+/// the entry must carry a dependency fingerprint that matches the workspace's current
+/// external-dependency state, which costs a checkout plus `bazel mod` calls per lookup.
+fn cache_entry_is_servable(
+    state: &Arc<State>,
+    sha: &str,
+    scope: &str,
+    key: &str,
+    data: &HashFileData,
+    current_dependency_fingerprint: &mut Option<String>,
+) -> Result<bool> {
+    if !state.config.dependency_fingerprint {
+        return Ok(true);
+    }
+    let matched = cache_entry_matches_dependency_fingerprint(
+        state,
+        sha,
+        scope,
+        data,
+        current_dependency_fingerprint,
+    )?;
+    let outcome = if matched {
+        "cache-hit"
+    } else {
+        "cache-guard-miss"
+    };
+    eprintln!("[BD-DBG][{outcome}] scope={scope} sha={sha} key={key}");
+    Ok(matched)
 }
 
 fn cache_entry_matches_dependency_fingerprint(
@@ -898,6 +934,7 @@ fn metrics(state: &State) -> Value {
         "ready": state.ready.load(Ordering::Acquire),
         "gitEngine": "subprocess",
         "trackDeps": state.config.track_deps,
+        "dependencyFingerprint": state.config.dependency_fingerprint,
         "cache": {
             "directory": state.config.cache_dir.to_string_lossy(),
             "remote": state.config.remote_cache,
@@ -1064,6 +1101,7 @@ mod tests {
             request_timeout: Duration::ZERO,
             cache_dir: PathBuf::from("."),
             track_deps: false,
+            dependency_fingerprint: false,
             no_initial_fetch: true,
             warmup_revisions: Vec::new(),
             cache_max_age: None,
@@ -1134,6 +1172,7 @@ mod tests {
         config.cache_dir = cache.to_path_buf();
         config.track_deps = track_deps;
         config.hash_options.track_deps = track_deps;
+        config.dependency_fingerprint = true;
         let fingerprint = configuration_fingerprint(&config);
         Arc::new(State {
             config,
@@ -1553,6 +1592,7 @@ mod tests {
         config.hash_options.bazel.workspace = repo.path().to_path_buf();
         config.git_path = PathBuf::from("git");
         config.cache_dir = cache.path().to_path_buf();
+        config.dependency_fingerprint = true;
         let dependency_fingerprint = config.hash_options.bazel.dependency_fingerprint().unwrap();
         let data = HashFileData {
             hashes: std::collections::BTreeMap::from([(
@@ -1701,6 +1741,84 @@ mod tests {
     }
 
     #[test]
+    fn dependency_fingerprint_guard_is_off_unless_opted_in() {
+        let (repo, _, sha) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let mut state = state_for_repo(repo.path(), cache.path(), false);
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .dependency_fingerprint = false;
+        // Neither a missing fingerprint nor a stale one may block a hit when the guard is off.
+        for cached_fingerprint in [None, Some("stale".to_owned())] {
+            let data = HashFileData {
+                hashes: std::collections::BTreeMap::from([(
+                    "//app:lib".into(),
+                    hash("Rule", "overall", "direct"),
+                )]),
+                dependency_fingerprint: cached_fingerprint,
+                ..Default::default()
+            };
+            let key = cache_key(&state, &sha, &BTreeSet::new());
+            write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
+            let (loaded, hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+            assert!(hit);
+            assert_eq!(loaded.hashes["//app:lib"].hash, "overall");
+        }
+
+        // The remote tier is trusted the same way: a fingerprint-less entry is a hit.
+        let remote_cache = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.path().to_path_buf();
+        config.git_path = PathBuf::from("git");
+        config.cache_dir = remote_cache.path().to_path_buf();
+        let data = HashFileData {
+            hashes: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                hash("Rule", "overall", "direct"),
+            )]),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
+        let (remote, requests, handle) =
+            remote_cache_with_responses("", vec![(200, Vec::new()), (200, bytes)]);
+        let fingerprint = configuration_fingerprint(&config);
+        let state = Arc::new(State {
+            config,
+            ready: AtomicBool::new(true),
+            workspace_lock: Mutex::new(()),
+            started: Instant::now(),
+            fingerprint,
+            remote: Some(remote),
+        });
+        let (loaded, hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(hit);
+        assert_eq!(loaded.hashes["//app:lib"].hash, "overall");
+        for _ in 0..2 {
+            requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        handle.join().unwrap();
+
+        // With the guard on, the same fingerprint-less entry is rejected, and since bazel is
+        // `/bin/false` here the recompute fails rather than silently serving stale hashes.
+        let mut guarded = state_for_repo(repo.path(), cache.path(), false);
+        Arc::get_mut(&mut guarded)
+            .unwrap()
+            .config
+            .dependency_fingerprint = true;
+        let data = HashFileData {
+            hashes: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                hash("Rule", "overall", "direct"),
+            )]),
+            ..Default::default()
+        };
+        let key = cache_key(&guarded, &sha, &BTreeSet::new());
+        write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
+        assert!(get_hashes_locked(&guarded, &sha, &BTreeSet::new()).is_err());
+    }
+
+    #[test]
     fn metrics_and_human_sizes_report_cache_state() {
         let repo = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -1709,6 +1827,7 @@ mod tests {
         let value = metrics(&state);
         assert_eq!(value["ready"], true);
         assert_eq!(value["trackDeps"], true);
+        assert_eq!(value["dependencyFingerprint"], true);
         assert_eq!(value["cache"]["entries"], 1);
         assert_eq!(value["cache"]["sizeHuman"], "1.5 KB");
         assert_eq!(human_bytes(0), "0 B");

@@ -79,14 +79,9 @@ build --output_groups=+rustfmt_checks
 # coverage mode anyway, so plain `bazel test` runs are never affected.
 coverage --coverage_output_generator=//tools/coverage:lcov_merger
 
-# Releases run the suite on a cold runner (release.yaml, through the reusable
-# workflow's bazel_test_command), where the long e2e suite -- //tests:e2e_test,
-# one `moderate` target per case plus the `eternal` :e2e_test_all -- has no
-# headroom left: v44.0.0 died on
-# "//tests:e2e_test TIMEOUT in 3600.0s" and published nothing. Per-size timeouts
-# are there to catch hangs on PRs, where the suite gets its own runner and an
-# overrun means something is wrong. A release has no such signal to give, so the
-# only bound left is GitHub's 6h job limit; a single value overrides all four
-# size categories. Not named `release`: `test` inherits `build` configs, so
-# --config=release would drag in -c opt and thin LTO and rebuild the world.
+# Local override when a nested-Bazel e2e case needs more than its size timeout
+# (`bazel test //tests:e2e_test --config=no-test-timeouts`). CI keeps the
+# per-size bounds so hangs fail in minutes. Not named `release`: `test`
+# inherits `build` configs, so --config=release would drag in -c opt and thin
+# LTO and rebuild the world.
 test:no-test-timeouts --test_timeout=21600

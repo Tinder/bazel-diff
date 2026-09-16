@@ -2,13 +2,11 @@
 # Uses bazel-contrib release ruleset: build, attest, and publish to GitHub Releases.
 # A separate matrix job attaches host-native Rust CLI binaries to the draft release.
 #
-# The whole test suite gates the release from inside the reusable workflow's
-# build job, through `bazel_test_command` below: one `bazel test //...` on one
-# runner, and nothing runs twice. It used to be split across a `rust-tests`
-# job of our own and the reusable workflow's build job (#469) because
-# //tests:e2e_test was a single target that could time out a whole run; the
-# suite is now one Bazel target per case (#476), so a single job has the
-# headroom the split was bought for.
+# Unit, lint, and tooling tests gate the release from inside the reusable
+# workflow's build job (`bazel_test_command` below). The nested-Bazel e2e suite
+# (`//tests:e2e_test`) does not: it runs on PRs and master in ci.yaml
+# (`rust-candidate-e2e`), where it has a JDK, per-case timeouts, and its own
+# runner. Putting it here blocked the rest of the release for hours (#499).
 name: Release
 on:
   workflow_dispatch:
@@ -29,30 +27,20 @@ jobs:
     uses: bazel-contrib/.github/.github/workflows/release_ruleset.yaml@v7.4.0
     with:
       release_files: archives/*.*
-      # The one place the suite runs. Replaces the reusable workflow's default
-      # (`bazel test //...`) only to add flags and the env the nested Bazel
-      # needs; it is substituted into a `run:` step verbatim, so the `$(...)`
-      # are evaluated by that step's shell, and the workflow appends its own
-      # --disk_cache/--repository_cache flags after the command.
+      # Replaces the reusable workflow's default (`bazel test //...`), which
+      # would pull in //tests:e2e_test. Substituted into a `run:` step
+      # verbatim; the workflow appends its own --disk_cache/--repository_cache
+      # flags after the command, so do not put a `--` target terminator here.
       #
-      # --build_tests_only: build what the tests need and nothing else -- the
-      #   release binary itself comes from the rust-binaries matrix below.
-      # --config=no-test-timeouts is in .bazelrc; it is what keeps the long
-      #   e2e suite from timing out on a cold release runner.
+      # //src/... and //tools/... are the unit/tooling tests. The clippy and
+      # rustfmt gates compile the e2e crate as a lint root; they do not run it.
+      # --build_tests_only: build what those tests need -- the release binary
+      #   itself comes from the rust-binaries matrix below.
       # --test_output=errors: the failing test's log goes to the job output,
       #   which is the only place it can go from inside the reusable workflow.
-      # BAZEL / USE_BAZEL_VERSION: //tests:e2e_test spawns a nested Bazel per
-      #   fixture workspace (env_inherit in //tests/BUILD). `bazel` on PATH is
-      #   the bazelisk that bazel-contrib/setup-bazel installs; without $BAZEL
-      #   the suite shells out to the outer Bazel's own binary, and without
-      #   USE_BAZEL_VERSION the nested bazelisk ignores the .bazelversion the
-      #   outer invocation read, since the fixture workspaces have none. The
-      #   fixtures with Java targets use the JDK the ubuntu-latest image ships
-      #   with (JAVA_HOME is inherited too); a reusable workflow has no step
-      #   of ours to install one.
       bazel_test_command: >-
-        BAZEL="$(command -v bazel)" USE_BAZEL_VERSION="$(cat .bazelversion)"
-        bazel test //... --build_tests_only --config=no-test-timeouts --test_output=errors
+        bazel test //src/... //tools/... //:rust_clippy_check //:rust_format_check
+        --build_tests_only --test_output=errors
       prerelease: false
       draft: true
       tag_name: ${{ inputs.tag_name || github.ref_name }}

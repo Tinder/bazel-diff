@@ -1,4 +1,4 @@
-use crate::hash::{generate_hashes, HashOptions};
+use crate::hash::{generate_hashes_timed, HashOptions};
 use crate::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
 };
@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use s3::creds::Credentials;
 use s3::request::ResponseData;
 use s3::{Bucket, Region};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
@@ -493,16 +493,18 @@ fn compute_query(state: &Arc<State>, inputs: QueryInputs, kind: QueryKind) -> Re
         // Same graph generate-hashes writes to --depEdgesFile: the end revision's
         // full (unscoped) dependency map. modifiedFilepaths must not shrink it —
         // PRI/CRI BFS-walk this file from the app target and need every edge.
-        let (to, _) = get_hashes_locked(state, &to_sha, &BTreeSet::new())?;
+        let to = get_hashes_locked(state, &to_sha, &BTreeSet::new())?.data;
         prune_cache(state)?;
         return Ok(serde_json::to_value(&to.dep_edges)?);
     }
     let from_started = Instant::now();
-    let (from, from_hit) = get_hashes_locked(state, &from_sha, &inputs.modified_filepaths)?;
-    let from_millis = from_started.elapsed().as_millis() as u64;
+    let from = get_hashes_locked(state, &from_sha, &inputs.modified_filepaths)?;
+    let from_profile = retrieval_profile(&from_sha, &from, from_started);
+    let from = from.data;
     let to_started = Instant::now();
-    let (to, to_hit) = get_hashes_locked(state, &to_sha, &inputs.modified_filepaths)?;
-    let to_millis = to_started.elapsed().as_millis() as u64;
+    let to = get_hashes_locked(state, &to_sha, &inputs.modified_filepaths)?;
+    let to_profile = retrieval_profile(&to_sha, &to, to_started);
+    let to = to.data;
     let diff_started = Instant::now();
     checkout(state, &to_sha)?;
     let exclude_external = state.config.hash_options.bazel.is_bzlmod_enabled();
@@ -544,10 +546,7 @@ fn compute_query(state: &Arc<State>, inputs: QueryInputs, kind: QueryKind) -> Re
             json!({
                 "totalDurationMillis": started.elapsed().as_millis() as u64,
                 "resolveRevisionsDurationMillis": resolve_millis,
-                "hashRetrievals": [
-                    {"sha": from_sha, "cacheHit": from_hit, "durationMillis": from_millis},
-                    {"sha": to_sha, "cacheHit": to_hit, "durationMillis": to_millis}
-                ],
+                "hashRetrievals": [from_profile, to_profile],
                 "diffDurationMillis": diff_millis,
                 "diffModuleGraphChanged": from.module_graph_json != to.module_graph_json
             }),
@@ -579,15 +578,79 @@ fn warm_revision(state: &Arc<State>, revision: &str) -> Result<()> {
     Ok(())
 }
 
+/// Wall-clock breakdown of one cache-miss hash generation, in pipeline order: the `git
+/// checkout`, then the phases of [`generate_hashes_timed`], then serialising the result and
+/// writing it to the cache tiers. `targetCount` sizes the graph the phases operated on. Field
+/// names match the profile the Kotlin service emitted, which tools/serve_harness.py asserts on.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerationBreakdown {
+    checkout_millis: u64,
+    bazel_query_millis: u64,
+    target_hash_millis: u64,
+    module_graph_millis: u64,
+    cache_write_millis: u64,
+    target_count: usize,
+}
+
+/// Outcome of one cache lookup: the data, whether it was served from a cache tier, and where the
+/// time went. A hit carries only `cache_read_millis` (reading and deserialising the entry is the
+/// whole cost of a hit); a miss carries only `generation`.
+struct Retrieval {
+    data: HashFileData,
+    cache_hit: bool,
+    cache_read_millis: Option<u64>,
+    generation: Option<GenerationBreakdown>,
+}
+
+impl Retrieval {
+    fn hit(data: HashFileData, read_started: Instant) -> Self {
+        Self {
+            data,
+            cache_hit: true,
+            cache_read_millis: Some(elapsed_millis(read_started)),
+            generation: None,
+        }
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis() as u64
+}
+
+/// One `profile.hashRetrievals[]` entry. Optional phases are omitted rather than nulled so a hit
+/// never shows a `generation` key and a miss never shows `cacheReadMillis`.
+fn retrieval_profile(sha: &str, retrieval: &Retrieval, started: Instant) -> Value {
+    let mut entry = serde_json::Map::from_iter([
+        ("sha".to_owned(), Value::String(sha.to_owned())),
+        ("cacheHit".to_owned(), Value::Bool(retrieval.cache_hit)),
+        (
+            "durationMillis".to_owned(),
+            Value::from(elapsed_millis(started)),
+        ),
+    ]);
+    if let Some(millis) = retrieval.cache_read_millis {
+        entry.insert("cacheReadMillis".to_owned(), Value::from(millis));
+    }
+    if let Some(generation) = &retrieval.generation {
+        entry.insert(
+            "generation".to_owned(),
+            serde_json::to_value(generation).unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(entry)
+}
+
 fn get_hashes_locked(
     state: &Arc<State>,
     sha: &str,
     modified: &BTreeSet<PathBuf>,
-) -> Result<(HashFileData, bool)> {
+) -> Result<Retrieval> {
     let key = cache_key(state, sha, modified);
     let path = state.config.cache_dir.join(format!("{key}.json"));
     let mut current_dependency_fingerprint = None;
     if path.is_file() {
+        let read_started = Instant::now();
         let data = HashFileData::read(&path)?;
         if cache_entry_is_servable(
             state,
@@ -598,10 +661,11 @@ fn get_hashes_locked(
             &mut current_dependency_fingerprint,
         )? {
             touch(&path);
-            return Ok((data, true));
+            return Ok(Retrieval::hit(data, read_started));
         }
     }
     if let Some(remote) = &state.remote {
+        let read_started = Instant::now();
         if let Some(bytes) = remote.get(&key) {
             let data = HashFileData::from_slice(&bytes)?;
             if cache_entry_is_servable(
@@ -613,18 +677,20 @@ fn get_hashes_locked(
                 &mut current_dependency_fingerprint,
             )? {
                 fs::write(&path, &bytes)?;
-                return Ok((data, true));
+                return Ok(Retrieval::hit(data, read_started));
             }
         }
     }
     if state.config.dependency_fingerprint {
         eprintln!("[BD-DBG][cache-recompute] sha={sha} key={key}");
     }
+    let checkout_started = Instant::now();
     checkout(state, sha)?;
+    let checkout_millis = elapsed_millis(checkout_started);
     let mut options = state.config.hash_options.clone();
     options.modified_filepaths = modified.clone();
     options.track_deps = state.config.track_deps;
-    let mut data = generate_hashes(&options)?;
+    let (mut data, timings) = generate_hashes_timed(&options)?;
     if state.config.dependency_fingerprint {
         data.dependency_fingerprint = current_dependency_fingerprint.take().or_else(|| {
             match dependency_fingerprint_for_workspace(state) {
@@ -643,6 +709,7 @@ fn get_hashes_locked(
             None => eprintln!("[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp=NONE"),
         }
     }
+    let write_started = Instant::now();
     let bytes = serde_json::to_vec(&data.serialized(true, state.config.track_deps))?;
     let temporary = state.config.cache_dir.join(format!("{key}.tmp"));
     fs::write(&temporary, bytes)?;
@@ -651,7 +718,31 @@ fn get_hashes_locked(
         let bytes = fs::read(state.config.cache_dir.join(format!("{key}.json")))?;
         remote.put(&key, &bytes);
     }
-    Ok((data, false))
+    let generation = GenerationBreakdown {
+        checkout_millis,
+        bazel_query_millis: timings.bazel_query_millis,
+        target_hash_millis: timings.target_hash_millis,
+        module_graph_millis: timings.module_graph_millis,
+        cache_write_millis: elapsed_millis(write_started),
+        target_count: data.hashes.len(),
+    };
+    // Always logged, not just for profile=true requests, so a slow generation is attributable to
+    // a phase straight from the server log.
+    eprintln!(
+        "[Info] generated hashes for {sha}: checkout={}ms bazelQuery={}ms targetHash={}ms moduleGraph={}ms cacheWrite={}ms targets={}",
+        generation.checkout_millis,
+        generation.bazel_query_millis,
+        generation.target_hash_millis,
+        generation.module_graph_millis,
+        generation.cache_write_millis,
+        generation.target_count
+    );
+    Ok(Retrieval {
+        data,
+        cache_hit: false,
+        cache_read_millis: None,
+        generation: Some(generation),
+    })
 }
 
 /// Decides whether a cached entry may be served for `sha`.
@@ -865,7 +956,7 @@ fn resolve_sha(state: &State, revision: &str) -> Result<String> {
         ],
     )?;
     if !output.status.success() {
-        bail!("revision '{revision}' was not found");
+        bail!("revision '{revision}' is missing from the local clone");
     }
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if sha.len() != 40 {
@@ -1467,7 +1558,11 @@ mod tests {
             "two"
         );
         assert!(!repo.path().join(".git/index.lock").exists());
-        assert!(resolve_sha(&state, "missing").is_err());
+        let missing = resolve_sha(&state, "missing").unwrap_err().to_string();
+        assert_eq!(
+            missing,
+            "revision 'missing' is missing from the local clone"
+        );
         assert!(checkout(&state, "missing").is_err());
         assert!(git(&state, &["not-a-command".into()]).is_err());
 
@@ -1577,8 +1672,11 @@ mod tests {
         let path = cache.path().join(format!("{key}.json"));
         write_hashes(&path, &data, true);
         let before = fs::metadata(&path).unwrap().modified().unwrap();
-        let (loaded, hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
-        assert!(hit);
+        let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(retrieval.cache_hit);
+        assert!(retrieval.cache_read_millis.is_some());
+        assert!(retrieval.generation.is_none());
+        let loaded = retrieval.data;
         assert_eq!(loaded.hashes["//app:lib"].hash, "overall");
         assert_eq!(loaded.dep_edges["//app:lib"], ["//dep:lib"]);
         assert!(fs::metadata(path).unwrap().modified().unwrap() >= before);
@@ -1614,14 +1712,15 @@ mod tests {
             remote: Some(remote),
         });
 
-        let (first, first_hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
-        assert!(first_hit);
-        assert_eq!(first.hashes["//app:lib"].hash, "overall");
+        let first = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(first.cache_hit);
+        assert!(first.cache_read_millis.is_some());
+        assert_eq!(first.data.hashes["//app:lib"].hash, "overall");
         let key = cache_key(&state, &sha, &BTreeSet::new());
         assert!(cache.path().join(format!("{key}.json")).is_file());
-        let (second, second_hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
-        assert!(second_hit);
-        assert_eq!(second.hashes["//app:lib"].hash, "overall");
+        let second = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(second.cache_hit);
+        assert_eq!(second.data.hashes["//app:lib"].hash, "overall");
 
         requests.recv_timeout(Duration::from_secs(5)).unwrap();
         handle.join().unwrap();
@@ -1676,7 +1775,14 @@ mod tests {
         let result = compute_query(&state, inputs, QueryKind::Distances).unwrap();
         assert_eq!(result["to"], second);
         assert_eq!(result["impactedTargets"].as_array().unwrap().len(), 2);
-        assert_eq!(result["profile"]["hashRetrievals"][0]["cacheHit"], true);
+        let retrievals = result["profile"]["hashRetrievals"].as_array().unwrap();
+        assert_eq!(retrievals.len(), 2);
+        for retrieval in retrievals {
+            assert_eq!(retrieval["cacheHit"], true);
+            assert!(retrieval["cacheReadMillis"].as_u64().is_some());
+            assert!(retrieval["durationMillis"].as_u64().is_some());
+            assert!(retrieval.get("generation").is_none());
+        }
         assert!(result.get("memoryProfile").is_some());
         assert_eq!(git_command(repo.path(), &["rev-parse", "HEAD"]), second);
     }
@@ -1758,9 +1864,9 @@ mod tests {
             };
             let key = cache_key(&state, &sha, &BTreeSet::new());
             write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
-            let (loaded, hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
-            assert!(hit);
-            assert_eq!(loaded.hashes["//app:lib"].hash, "overall");
+            let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+            assert!(retrieval.cache_hit);
+            assert_eq!(retrieval.data.hashes["//app:lib"].hash, "overall");
         }
 
         // The remote tier is trusted the same way: a fingerprint-less entry is a hit.
@@ -1787,9 +1893,9 @@ mod tests {
             fingerprint,
             remote: Some(remote),
         });
-        let (loaded, hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
-        assert!(hit);
-        assert_eq!(loaded.hashes["//app:lib"].hash, "overall");
+        let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(retrieval.cache_hit);
+        assert_eq!(retrieval.data.hashes["//app:lib"].hash, "overall");
         requests.recv_timeout(Duration::from_secs(5)).unwrap();
         handle.join().unwrap();
 
@@ -1810,6 +1916,39 @@ mod tests {
         let key = cache_key(&guarded, &sha, &BTreeSet::new());
         write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
         assert!(get_hashes_locked(&guarded, &sha, &BTreeSet::new()).is_err());
+    }
+
+    #[test]
+    fn miss_retrievals_serialize_the_generation_breakdown() {
+        let retrieval = Retrieval {
+            data: HashFileData::default(),
+            cache_hit: false,
+            cache_read_millis: None,
+            generation: Some(GenerationBreakdown {
+                checkout_millis: 1,
+                bazel_query_millis: 2,
+                target_hash_millis: 3,
+                module_graph_millis: 4,
+                cache_write_millis: 5,
+                target_count: 6,
+            }),
+        };
+        let value = retrieval_profile("abc", &retrieval, Instant::now());
+        assert_eq!(value["sha"], "abc");
+        assert_eq!(value["cacheHit"], false);
+        assert!(value["durationMillis"].as_u64().is_some());
+        assert!(value.get("cacheReadMillis").is_none());
+        assert_eq!(
+            value["generation"],
+            json!({
+                "checkoutMillis": 1,
+                "bazelQueryMillis": 2,
+                "targetHashMillis": 3,
+                "moduleGraphMillis": 4,
+                "cacheWriteMillis": 5,
+                "targetCount": 6
+            })
+        );
     }
 
     #[test]

@@ -6,11 +6,10 @@ on:
   pull_request:
     branches: [ master ]
 
-# Job ids and display names are load-bearing: branch protection on master
-# requires them by name (`Rust candidate (Bazel 8.x)`, `test-jre21 (...)`,
-# `test-jre11-run-example (...)`, `release-artifacts (...)`). Several predate
-# the Kotlin implementation's removal and no longer describe what they run;
-# rename them only together with the branch-protection rule.
+# Job display names are load-bearing: branch protection on master requires
+# checks by name (`Rust candidate (Bazel 8.x)`, `Rust candidate (Bazel 9.x)`,
+# `Rust candidate MSRV`, `Rust candidate E2E`, `release-artifacts (<os>)`).
+# Rename one of those only together with the branch-protection rule.
 jobs:
   # Every Rust check here runs through Bazel, with no cargo and no host Rust
   # toolchain: rules_rust downloads the compiler pinned in MODULE.bazel, so CI
@@ -148,10 +147,10 @@ jobs:
             --output_groups=-clippy_checks,-rustfmt_checks \
             --enable_bzlmod=true --enable_workspace=false
 
-  # The coverage gate. The job id is historical (it used to run the JVM suites
-  # on a JDK 21) and is kept because branch protection requires the
-  # `test-jre21 (<os>, <bazel>)` checks by that name.
-  test-jre21:
+  # The coverage gate: runs the Rust and tooling suites under `bazel coverage`
+  # on every OS/Bazel pair and fails below 90% main-source line coverage.
+  coverage:
+    name: Coverage (${{ matrix.os }}, Bazel ${{ matrix.bazel }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -200,7 +199,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: coverage-report-jre21-${{ matrix.os }}-bazel-${{ matrix.bazel }}
+          name: coverage-report-${{ matrix.os }}-bazel-${{ matrix.bazel }}
           path: bazel-out/_coverage/_coverage_report.dat
           if-no-files-found: warn
       - name: Enforce coverage threshold (>= 90% main-source line coverage)
@@ -224,14 +223,16 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-logs-jre21-${{ matrix.os }}-bazel-${{ matrix.bazel }}
+          name: test-logs-${{ matrix.os }}-bazel-${{ matrix.bazel }}
           path: bazel-testlogs/
           if-no-files-found: warn
   # Runs the example script end to end against this repository, on every Bazel
-  # version and workspace mode the tool supports. The job id is historical (the
-  # JVM CLI was exercised on a JDK 11 here) and is kept because branch protection
-  # requires the `test-jre11-run-example (...)` checks by that name.
-  test-jre11-run-example:
+  # version and workspace mode the tool supports.
+  run-example:
+    # Explicit so the check name stays readable and stable if the matrix grows;
+    # extra_flags is the only key that distinguishes rows with the same os and
+    # Bazel version.
+    name: Run example (${{ matrix.os }}, Bazel ${{ matrix.bazel }}, ${{ matrix.extra_flags || 'default flags' }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -361,7 +362,7 @@ jobs:
     # requiring `deploy (11)`, a check that stopped existing the moment this job
     # grew an os/rust_asset matrix. Adding a matrix key must not rename a check.
     name: release-artifacts (${{ matrix.os }})
-    needs: [test-jre21]
+    needs: [coverage]
     runs-on: ${{ matrix.os }}
     permissions:
       # Read-only: nothing here attests or publishes. The id-token/attestations

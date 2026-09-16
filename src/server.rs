@@ -778,6 +778,39 @@ fn cache_entry_is_servable(
     Ok(matched)
 }
 
+/// Decides whether a cached entry may be served for `sha`.
+///
+/// Without `--dependencyFingerprint` every entry is trusted, as it was before the guard existed:
+/// the cache key already covers the SHA and the hash-affecting configuration. With the flag on,
+/// the entry must carry a dependency fingerprint that matches the workspace's current
+/// external-dependency state, which costs a checkout plus `bazel mod` calls per lookup.
+fn cache_entry_is_servable(
+    state: &Arc<State>,
+    sha: &str,
+    scope: &str,
+    key: &str,
+    data: &HashFileData,
+    current_dependency_fingerprint: &mut Option<String>,
+) -> Result<bool> {
+    if !state.config.dependency_fingerprint {
+        return Ok(true);
+    }
+    let matched = cache_entry_matches_dependency_fingerprint(
+        state,
+        sha,
+        scope,
+        data,
+        current_dependency_fingerprint,
+    )?;
+    let outcome = if matched {
+        "cache-hit"
+    } else {
+        "cache-guard-miss"
+    };
+    eprintln!("[BD-DBG][{outcome}] scope={scope} sha={sha} key={key}");
+    Ok(matched)
+}
+
 fn cache_entry_matches_dependency_fingerprint(
     state: &Arc<State>,
     sha: &str,

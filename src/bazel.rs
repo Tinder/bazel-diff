@@ -66,6 +66,43 @@ impl BazelOptions {
             .unwrap_or(false)
     }
 
+    fn is_bzlmod_explicitly_disabled(&self) -> bool {
+        self.command_options
+            .iter()
+            .chain(&self.startup_options)
+            .any(|option| {
+                matches!(
+                    option.as_str(),
+                    "--noenable_bzlmod"
+                        | "--enable_bzlmod=false"
+                        | "--enable_bzlmod=0"
+                        | "--enable_bzlmod=no"
+                )
+            })
+    }
+
+    fn check_bzlmod_enabled(&self) -> Result<bool> {
+        let has_module_file =
+            self.workspace.join("MODULE.bazel").is_file() && !self.is_bzlmod_explicitly_disabled();
+        match self.run_capture(&["mod", "graph"]) {
+            Ok(output) if output.status.success() => Ok(true),
+            Ok(output) if has_module_file && !self.keep_going => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!(
+                    "MODULE.bazel is present in {}, but `bazel mod graph` failed (exit {}): {}",
+                    self.workspace.display(),
+                    output.status,
+                    stderr.trim()
+                )
+            }
+            Err(error) if has_module_file && !self.keep_going => Err(error.context(format!(
+                "MODULE.bazel is present in {}, but `bazel mod graph` failed to execute",
+                self.workspace.display()
+            ))),
+            _ => Ok(false),
+        }
+    }
+
     pub fn module_graph_json(&self) -> Option<String> {
         let output = self.run_capture(&["mod", "graph", "--output=json"]).ok()?;
         output
@@ -79,7 +116,7 @@ impl BazelOptions {
         const TEXT_FALLBACK_VERSION: &str = "bzlmod-show-repo-text-v1";
         let total_start = Instant::now();
         let mut hasher = Sha256::new();
-        if !self.is_bzlmod_enabled() {
+        if !self.check_bzlmod_enabled()? {
             hasher.update(b"mode:legacy");
             eprintln!(
                 "[BD-DBG][fingerprint-ms] mode=legacy version={TEXT_FALLBACK_VERSION} mapping=0 show_repo=0 total={}",
@@ -149,15 +186,29 @@ impl BazelOptions {
         &self,
         mut transform: impl FnMut(&mut Target),
     ) -> Result<Vec<Target>> {
-        let bzlmod_repos = if self.is_bzlmod_enabled()
-            && self.version().is_ok_and(|version| {
-                version >= BazelVersion(8, 6, 0) && version != BazelVersion(9, 0, 0)
-            }) {
-            self.query_bzlmod_repos(&mut transform)
-                .unwrap_or_else(|error| {
-                    eprintln!("[Warn] failed to hash Bzlmod repositories: {error:#}");
-                    Vec::new()
-                })
+        let bzlmod_repos = if self.check_bzlmod_enabled()? {
+            let supports_bzlmod = match self.version() {
+                Ok(version) => version >= BazelVersion(8, 6, 0) && version != BazelVersion(9, 0, 0),
+                Err(error) if self.keep_going => {
+                    eprintln!(
+                        "[Warn] failed to check Bazel version for Bzlmod repositories: {error:#}"
+                    );
+                    false
+                }
+                Err(error) => return Err(error),
+            };
+            if supports_bzlmod {
+                match self.query_bzlmod_repos(&mut transform) {
+                    Ok(repos) => repos,
+                    Err(error) if self.keep_going => {
+                        eprintln!("[Warn] failed to hash Bzlmod repositories: {error:#}");
+                        Vec::new()
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
@@ -260,11 +311,11 @@ impl BazelOptions {
             bail!("bazel mod show_repo failed with {}", output.status);
         }
         let repositories = decode_delimited::<Repository>(output_file.path())?;
-        let module_edges = self
-            .module_graph_json()
-            .as_deref()
-            .map(parse_module_dependency_edges)
-            .unwrap_or_default();
+        let module_edges = match self.module_graph_json() {
+            Some(json) => parse_module_dependency_edges(&json),
+            None if self.keep_going => BTreeMap::new(),
+            None => bail!("bazel mod graph --output=json failed"),
+        };
         Ok(lower_repositories(
             repositories,
             &canonical_to_apparent,
@@ -1613,5 +1664,110 @@ exit 1
             .chars()
             .all(|character| character.is_ascii_hexdigit()));
         assert!(selected_repos_marker.is_file());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn check_bzlmod_and_query_bzlmod_repos_honor_keep_going() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("MODULE.bazel"),
+            "module(name = \"test\")\n",
+        )
+        .unwrap();
+
+        let query_proto = workspace.path().join("query-result.pb");
+        write_delimited(&query_proto, &[rule_target("//app:lib")]);
+
+        // 1. Fake Bazel where `mod graph` fails.
+        let mod_graph_fail_script = workspace.path().join("fake-bazel-mod-graph-fail.sh");
+        fs::write(
+            &mod_graph_fail_script,
+            "#!/bin/sh\nif echo \"$*\" | grep -q \"mod graph\"; then\n  echo \"lockfile mismatch\" >&2\n  exit 2\nfi\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&mod_graph_fail_script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&mod_graph_fail_script, permissions).unwrap();
+
+        let mut options = BazelOptions {
+            workspace: workspace.path().to_path_buf(),
+            bazel: mod_graph_fail_script,
+            startup_options: Vec::new(),
+            command_options: Vec::new(),
+            cquery_options: Vec::new(),
+            use_cquery: false,
+            cquery_expression: None,
+            keep_going: false,
+            fine_grained_external_repos: BTreeSet::new(),
+            exclude_external_targets: true,
+            exclude_targets_query: None,
+            no_bazelrc: false,
+            verbose: false,
+        };
+
+        let err = options.query_all_targets().unwrap_err();
+        assert!(err.to_string().contains("MODULE.bazel is present"));
+        assert!(err.to_string().contains("lockfile mismatch"));
+        assert!(options.dependency_fingerprint().is_err());
+
+        // When explicitly disabled via --noenable_bzlmod, `check_bzlmod_enabled` returns Ok(false).
+        options.command_options.push("--noenable_bzlmod".into());
+        assert!(!options.check_bzlmod_enabled().unwrap());
+        options.command_options.clear();
+
+        // 2. Fake Bazel where `mod graph` succeeds, `version` returns 8.6.1,
+        //    `mod dump_repo_mapping` returns an external repo, `mod show_repo` fails,
+        //    and `query` writes `//app:lib` to `--output_file`.
+        let show_repo_fail_script = workspace.path().join("fake-bazel-show-repo-fail.sh");
+        let body = format!(
+            r#"#!/bin/sh
+args="$*"
+if echo "$args" | grep -q "mod graph"; then
+  echo "root"
+  exit 0
+fi
+if echo "$args" | grep -q "version"; then
+  echo "Build label: 8.6.1"
+  exit 0
+fi
+if echo "$args" | grep -q "mod dump_repo_mapping"; then
+  echo '{{"pip":"rules_python+0.31.0"}}'
+  exit 0
+fi
+if echo "$args" | grep -q "mod show_repo"; then
+  echo "transient fetch failure" >&2
+  exit 2
+fi
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output_file" ]; then
+    cp "{}" "$2"
+    exit 0
+  fi
+  shift
+done
+exit 1
+"#,
+            query_proto.display(),
+        );
+        fs::write(&show_repo_fail_script, body).unwrap();
+        let mut permissions = fs::metadata(&show_repo_fail_script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&show_repo_fail_script, permissions).unwrap();
+
+        options.bazel = show_repo_fail_script;
+        options.keep_going = false;
+        let show_repo_err = options.query_all_targets().unwrap_err();
+        assert!(show_repo_err
+            .to_string()
+            .contains("bazel mod show_repo failed"));
+
+        // With `keep_going = true`, `query_all_targets` logs a warning and falls back to main targets.
+        options.keep_going = true;
+        let targets = options.query_all_targets().unwrap();
+        assert_eq!(
+            targets.iter().filter_map(target_name).collect::<Vec<_>>(),
+            ["//app:lib"]
+        );
     }
 }

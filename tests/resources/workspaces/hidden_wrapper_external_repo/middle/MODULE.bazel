@@ -1,0 +1,6 @@
+module(
+    name = "middle",
+    version = "1.0",
+)
+
+bazel_dep(name = "leaf", version = "1.0")

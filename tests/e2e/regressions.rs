@@ -213,6 +213,50 @@ fn wrapped_external_repo_change_reaches_main_consumer() {
     );
 }
 
+/// Reproducer for https://github.com/Tinder/bazel-diff/issues/510: like the
+/// #197 case above, but the wrapper module (`middle`) is only declared by
+/// `facade`, under a private apparent name, so it is not visible from the root.
+#[test]
+fn hidden_wrapper_external_repo_change_reaches_main_consumer_reproducer_for_issue_510() {
+    let first = copy_workspace("hidden_wrapper_external_repo");
+    let second = copy_workspace("hidden_wrapper_external_repo");
+    fs::write(second.path().join("leaf/value.txt"), "after\n").unwrap();
+    let impacted = diff_workspaces(
+        first.path(),
+        second.path(),
+        &["--fineGrainedHashExternalRepos", "@leaf"],
+    );
+    assert!(
+        impacted
+            .iter()
+            .any(|label| label == "//:consumer" || label == "@@//:consumer"),
+        "{impacted:?}"
+    );
+    assert!(!impacted.contains("//:control"), "{impacted:?}");
+}
+
+/// Control for the issue 510 reproducer: naming every repository in the chain
+/// already propagates the change, so the fixture's edges are real and the gap
+/// is in discovering `@@middle+` from `@leaf` alone.
+#[test]
+fn hidden_wrapper_external_repo_change_propagates_with_explicit_chain() {
+    let first = copy_workspace("hidden_wrapper_external_repo");
+    let second = copy_workspace("hidden_wrapper_external_repo");
+    fs::write(second.path().join("leaf/value.txt"), "after\n").unwrap();
+    let impacted = diff_workspaces(
+        first.path(),
+        second.path(),
+        &["--fineGrainedHashExternalRepos", "@leaf,@facade,@@middle+"],
+    );
+    assert!(
+        impacted
+            .iter()
+            .any(|label| label == "//:consumer" || label == "@@//:consumer"),
+        "{impacted:?}"
+    );
+    assert!(!impacted.contains("//:control"), "{impacted:?}");
+}
+
 #[test]
 fn fine_grained_external_hashes_are_hermetic() {
     let first = copy_workspace("wrapped_external_repo");

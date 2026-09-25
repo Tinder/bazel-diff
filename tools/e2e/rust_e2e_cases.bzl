@@ -132,6 +132,14 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::hidden_wrapper_external_repo_change_propagates_with_explicit_chain",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::hidden_wrapper_external_repo_change_reaches_main_consumer_reproducer_for_issue_510",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::local_path_override_works_for_query_and_cquery",
                 "timeout": "moderate",
             },

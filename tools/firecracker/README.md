@@ -71,10 +71,9 @@ ARCH=arm64 SNAP=/tmp/bazel-diff-snap-linux-arm64 \
 # results land in .bench-results/ (report.json, target_count.txt, impacted.txt)
 ```
 
-The image bundles a JDK (for Bazel), bazelisk, git, the statically linked
-bazel-diff binary, and the Go orchestrator. It does **not** run Firecracker itself — that needs `/dev/kvm`,
-which Docker-for-Mac does not expose; real microVM record/consume runs on the
-self-hosted Linux+KVM host.
+The image includes a JDK, bazelisk, Git, the static musl `bazel-diff` binary,
+and `bazel-diff-snap`. The container runs the benchmark and local driver;
+Firecracker microVM tests require Linux with `/dev/kvm`.
 
 ## CLI hooks (`//src`)
 

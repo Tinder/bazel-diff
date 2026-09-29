@@ -1,4 +1,6 @@
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
 load("//tools/coverage:defs.bzl", "coverage_enforced_test")
 
 # The LCOV merger Bazel invokes inside every test action during

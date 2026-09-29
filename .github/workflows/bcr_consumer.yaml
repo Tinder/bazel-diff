@@ -1,14 +1,7 @@
 name: BCR consumer
 
-# The BCR presubmit's verify_targets tasks consume bazel-diff as a
-# *dependency* (non-root module) unpacked from the release source archive.
-# Regular CI only ever builds bazel-diff as the root module, which misses
-# failure modes specific to non-root consumption — e.g. crate_universe
-# refusing a from_cargo call without a shipped cargo-bazel lockfile (the
-# bazel-central-registry#10043 presubmit failure) — as well as files missing
-# from the release archive altogether. This check packs the archive with the
-# same script release_prep.sh uses, then builds the BCR verify_targets from a
-# scratch consumer module that pulls bazel-diff in via archive_override.
+# Build bazel-diff as a non-root module from the release source archive,
+# using the same targets as .bcr/presubmit.yml.
 
 on:
   push:
@@ -25,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         # Keep in sync with the bazel matrix in .bcr/presubmit.yml.
-        bazel: ['7.x', '8.x', '9.x']
+        bazel: ['8.5.0', '8.x', '9.x']
     steps:
       - name: Setup Go environment
         uses: actions/setup-go@v5
@@ -43,8 +36,7 @@ jobs:
           cat > MODULE.bazel <<EOF
           module(name = "bcr-consumer-check")
 
-          # The version is irrelevant: archive_override bypasses the registry
-          # and takes the module from the packed release archive.
+          # archive_override replaces this version with the release archive.
           bazel_dep(name = "bazel-diff", version = "0.0.0")
 
           archive_override(
@@ -53,11 +45,6 @@ jobs:
           )
           EOF
           touch BUILD.bazel
-          # Mirror the build flags the BCR presubmit passes on Linux.
-          cat > .bazelrc <<EOF
-          build --cxxopt=-std=c++17
-          build --host_cxxopt=-std=c++17
-          EOF
       - name: Build BCR verify_targets as a consumer
         working-directory: ${{ runner.temp }}/consumer
         env:

@@ -17,9 +17,7 @@ ARCH=${ARCH:-arm64}            # docker host arch (arm64 on Apple Silicon)
 REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 BENCH_DIR="$REPO_ROOT/tools/firecracker/bench"
 
-# The statically linked musl binary for the container's arch (see .bazelrc's
-# release-musl / release-musl-arm64 configs); the Bazel-derived asset name uses
-# amd64/arm64, matching the docker arch names.
+# Static musl release for the container's architecture (amd64 or arm64).
 BIN="${BAZEL_DIFF_BIN:-$REPO_ROOT/bazel-bin/release/bazel-diff-rust-linux-$ARCH}"
 SNAP="${SNAP:-/tmp/bazel-diff-snap-linux-$ARCH}"
 [ -f "$BIN" ] || { echo "missing $BIN — run: make release_rust_binary_linux (amd64) or make release_rust_binary_linux_arm64 (arm64)"; exit 1; }

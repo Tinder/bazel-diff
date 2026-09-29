@@ -82,12 +82,11 @@ jobs:
           sudo chmod 666 /dev/kvm
           ls -l /dev/kvm
 
-      # Two builds of the same crate: the host-native binary drives the local
-      # (cold) leg, and the static musl amd64 asset is baked into the guest
-      # rootfs, where it needs no libc.
-      - name: Build bazel-diff (host binary + static guest binary)
+      # The host binary runs the local benchmark; the Linux amd64 release
+      # binary is installed in the Ubuntu guest.
+      - name: Build bazel-diff (host binary + guest binary)
         run: |
-          ~/go/bin/bazelisk build //release:bazel-diff-rust --config=release-musl
+          ~/go/bin/bazelisk build //release:bazel-diff-rust --config=release-linux
           ~/go/bin/bazelisk run //:bazel-diff --script_path=/tmp/bazel_diff
           ls -l bazel-bin/release/bazel-diff-rust-linux-amd64 /tmp/bazel_diff
 

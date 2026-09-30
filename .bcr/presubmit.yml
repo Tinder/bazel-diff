@@ -1,6 +1,5 @@
 matrix:
   bazel:
-  - 8.5.0
   - 8.x
   - 9.x
 tasks:

@@ -18,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         # Keep in sync with the bazel matrix in .bcr/presubmit.yml.
-        bazel: ['8.5.0', '8.x', '9.x']
+        bazel: ['8.x', '9.x']
     steps:
       - name: Setup Go environment
         uses: actions/setup-go@v5

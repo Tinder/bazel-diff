@@ -33,11 +33,20 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/consumer"
           cd "$RUNNER_TEMP/consumer"
+          cp "$GITHUB_WORKSPACE/patches/rules_rs_package_name.patch" .
           cat > MODULE.bazel <<EOF
           module(name = "bcr-consumer-check")
 
           # archive_override replaces this version with the release archive.
           bazel_dep(name = "bazel-diff", version = "0.0.0")
+
+          # Match the temporary rules_rs override in README.md.
+          single_version_override(
+              module_name = "rules_rs",
+              version = "0.0.112",
+              patch_strip = 1,
+              patches = ["//:rules_rs_package_name.patch"],
+          )
 
           archive_override(
               module_name = "bazel-diff",

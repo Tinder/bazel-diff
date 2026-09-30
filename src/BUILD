@@ -1,3 +1,4 @@
+load("@bazel_diff_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rs//rs:cargo_build_script.bzl", "cargo_build_script")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
@@ -18,6 +19,7 @@ cargo_build_script(
         "//:rust/proto/build.proto",
     ],
     tools = ["@protobuf//:protoc"],
+    # Bazel supplies protoc, so omit Cargo's optional protoc-bin-vendored dependency.
     deps = ["@bazel_diff_crates//:buffa-build"],
 )
 
@@ -34,21 +36,10 @@ rust_library(
     },
     # //:rust_clippy_check and //:rust_format_check name this crate directly.
     visibility = ["//:__pkg__"],
-    deps = [
-        ":build_script",
-        "@bazel_diff_crates//:anyhow",
-        "@bazel_diff_crates//:buffa",
-        "@bazel_diff_crates//:hex",
-        "@bazel_diff_crates//:rayon",
-        "@bazel_diff_crates//:rust-s3",
-        "@bazel_diff_crates//:serde",
-        "@bazel_diff_crates//:serde_json",
-        "@bazel_diff_crates//:sha2",
-        "@bazel_diff_crates//:tempfile",
-        "@bazel_diff_crates//:tiny_http",
-        "@bazel_diff_crates//:url",
-        "@bazel_diff_crates//:walkdir",
-    ],
+    deps = all_crate_deps(
+        package_name = "",
+        normal = True,
+    ) + [":build_script"],
 )
 
 rust_binary(
@@ -59,15 +50,10 @@ rust_binary(
         "CARGO_PKG_VERSION": module_version() if module_version() else "unknown",
     },
     visibility = ["//visibility:public"],
-    deps = [
-        ":bazel_diff_lib",
-        "@bazel_diff_crates//:anyhow",
-        "@bazel_diff_crates//:clap",
-        "@bazel_diff_crates//:mimalloc",
-        "@bazel_diff_crates//:serde",
-        "@bazel_diff_crates//:serde_json",
-        "@bazel_diff_crates//:tempfile",
-    ],
+    deps = all_crate_deps(
+        package_name = "",
+        normal = True,
+    ) + [":bazel_diff_lib"],
 )
 
 coverage_enforced_test(

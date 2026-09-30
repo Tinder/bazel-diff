@@ -1,0 +1,26 @@
+--- a/rs/extensions.bzl
++++ b/rs/extensions.bzl
+@@ -615,3 +615,3 @@
+ def aliases(package_name = None):
+-    dep_data = DEP_DATA.get(package_name or native.package_name())
++    dep_data = DEP_DATA.get(native.package_name() if package_name == None else package_name)
+     if not dep_data:
+@@ -622,3 +622,3 @@
+ def crate_name(package_name = None):
+-    dep_data = DEP_DATA.get(package_name or native.package_name())
++    dep_data = DEP_DATA.get(native.package_name() if package_name == None else package_name)
+     if not dep_data:
+@@ -629,3 +629,3 @@
+ def edition(package_name = None):
+-    dep_data = DEP_DATA.get(package_name or native.package_name())
++    dep_data = DEP_DATA.get(native.package_name() if package_name == None else package_name)
+     if not dep_data:
+@@ -636,3 +636,3 @@
+ def lint_config(package_name = None):
+-    dep_data = DEP_DATA.get(package_name or native.package_name())
++    dep_data = DEP_DATA.get(native.package_name() if package_name == None else package_name)
+     if not dep_data:
+@@ -650,2 +650,2 @@
+-    dep_data = DEP_DATA.get(package_name or native.package_name())
++    dep_data = DEP_DATA.get(native.package_name() if package_name == None else package_name)
+     if not dep_data:

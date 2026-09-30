@@ -25,9 +25,8 @@ This approach was inspired by the [following BazelConf talk](https://www.youtube
 ## Prerequisites
 
 * Git
-* Bazel 7 or higher in the workspace analyzed by `bazel-diff`
+* Bazel 8 or higher (use the latest release for your major version)
 
-Building `bazel-diff`, including through bzlmod integration, requires Bazel 8.5 or higher.
 Bazel needs a JDK; the `bazel-diff` binary does not.
 
 ## Getting Started
@@ -435,11 +434,26 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 
 ### Integrate into your project
 
-With Bazel 8.5 or higher, add the following to your `MODULE.bazel`:
+With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
 bazel_dep(name = "bazel-diff", version = "{{BAZEL_DIFF_VERSION}}")
 ```
+
+Until `rules_rs` fixes `all_crate_deps(package_name = "")`, copy
+[`rules_rs_package_name.patch`](patches/rules_rs_package_name.patch) into your
+workspace root and add this override to the same `MODULE.bazel`:
+
+```bazel
+single_version_override(
+    module_name = "rules_rs",
+    version = "0.0.112",
+    patch_strip = 1,
+    patches = ["//:rules_rs_package_name.patch"],
+)
+```
+
+Bazel only applies overrides from the root module.
 
 You can now run the tool with:
 
@@ -455,7 +469,7 @@ Bzlmod is required; `@bazel-diff//:bazel-diff-rust` is an alias for the same bin
 
 ### Build from Source
 
-Use Bazel 8.5 or higher. Bazel downloads the Rust and C/C++ toolchains:
+Use Bazel 8 or higher. Bazel downloads the Rust and C/C++ toolchains:
 
 ```terminal
 bazel run :bazel-diff -- --help

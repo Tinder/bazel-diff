@@ -57,7 +57,7 @@ enum Commands {
     #[command(about = "Compute the snapshot/cache fingerprint for the current workspace")]
     Fingerprint(FingerprintArgs),
     #[command(about = "Run the HTTP impacted-target query service")]
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -381,7 +381,7 @@ struct ServeArgs {
     #[arg(long = "cachePruneInterval", default_value = "1h")]
     cache_prune_interval: String,
 
-    #[arg(long = "s3Bucket")]
+    #[arg(long = "s3Bucket", conflicts_with = "nexus_url")]
     s3_bucket: Option<String>,
 
     #[arg(long = "s3Prefix", default_value = "")]
@@ -395,7 +395,29 @@ struct ServeArgs {
 
     #[arg(long = "s3ForcePathStyle")]
     s3_force_path_style: bool,
+
+    /// Base URL of a Sonatype Nexus Repository instance used as the shared cache tier
+    #[arg(long = "nexusUrl", requires = "nexus_repository")]
+    nexus_url: Option<String>,
+
+    /// Raw hosted repository on --nexusUrl that holds cache entries
+    #[arg(long = "nexusRepository", requires = "nexus_url")]
+    nexus_repository: Option<String>,
+
+    #[arg(long = "nexusPrefix", default_value = "")]
+    nexus_prefix: String,
+
+    /// Basic-auth user; the password is read from the BAZEL_DIFF_NEXUS_PASSWORD environment variable
+    #[arg(long = "nexusUsername", env = "BAZEL_DIFF_NEXUS_USERNAME")]
+    nexus_username: Option<String>,
+
+    /// PEM bundle of extra CA certificates to trust for --nexusUrl
+    #[arg(long = "nexusCaCert", value_parser = parse_normalized_path)]
+    nexus_ca_cert: Option<PathBuf>,
 }
+
+/// The Nexus password is environment-only so it never shows up in a process listing.
+const NEXUS_PASSWORD_ENV: &str = "BAZEL_DIFF_NEXUS_PASSWORD";
 
 fn flatten_options(values: &[String]) -> Vec<String> {
     values
@@ -794,17 +816,42 @@ fn run_warmup_with(
 
 impl ServeArgs {
     fn to_config(&self, verbose: bool) -> Result<bazel_diff::server::ServerConfig> {
+        self.to_config_with_nexus_password(verbose, std::env::var(NEXUS_PASSWORD_ENV).ok())
+    }
+
+    fn to_config_with_nexus_password(
+        &self,
+        verbose: bool,
+        nexus_password: Option<String>,
+    ) -> Result<bazel_diff::server::ServerConfig> {
         if self.s3_bucket.is_some() && self.s3_endpoint.as_deref().is_some_and(str::is_empty) {
             bail!("--s3Endpoint must not be empty");
         }
-        let remote_cache = self.s3_bucket.as_ref().map(|bucket| {
-            let prefix = self.s3_prefix.trim_matches('/');
-            if prefix.is_empty() {
-                format!("s3://{bucket}/")
-            } else {
-                format!("s3://{bucket}/{prefix}/")
+        let nexus_credentials = match (&self.nexus_username, nexus_password) {
+            _ if self.nexus_url.is_none() => None,
+            (Some(username), Some(password)) => Some(bazel_diff::server::NexusCredentials {
+                username: username.clone(),
+                password,
+            }),
+            (None, None) => None,
+            (Some(_), None) => bail!("--nexusUsername requires {NEXUS_PASSWORD_ENV} to be set"),
+            (None, Some(_)) => bail!("{NEXUS_PASSWORD_ENV} requires --nexusUsername"),
+        };
+        let remote_cache = match (&self.s3_bucket, &self.nexus_url, &self.nexus_repository) {
+            (Some(bucket), _, _) => {
+                let prefix = self.s3_prefix.trim_matches('/');
+                Some(if prefix.is_empty() {
+                    format!("s3://{bucket}/")
+                } else {
+                    format!("s3://{bucket}/{prefix}/")
+                })
             }
-        });
+            (None, Some(url), Some(repository)) => Some(
+                bazel_diff::server::nexus_base_url(url, repository, &self.nexus_prefix)?
+                    .to_string(),
+            ),
+            _ => None,
+        };
         Ok(bazel_diff::server::ServerConfig {
             hash_options: hash_options(&self.hashing, None, None, self.track_deps, verbose)?,
             git_path: self.git_path.clone(),
@@ -833,6 +880,11 @@ impl ServeArgs {
             s3_region: self.s3_region.clone(),
             s3_endpoint: self.s3_endpoint.clone(),
             s3_force_path_style: self.s3_force_path_style,
+            nexus_url: self.nexus_url.clone(),
+            nexus_repository: self.nexus_repository.clone(),
+            nexus_prefix: self.nexus_prefix.clone(),
+            nexus_credentials,
+            nexus_ca_cert: self.nexus_ca_cert.clone(),
         })
     }
 }
@@ -1251,6 +1303,112 @@ mod tests {
         assert_eq!(config.warmup_revisions, ["main", "release"]);
         assert!(config.s3_force_path_style);
         assert!(config.hash_options.bazel.verbose);
+    }
+
+    #[test]
+    fn serve_config_parses_nexus_flags() {
+        let serve_args = |extra: &[&str]| {
+            let mut argv = vec![
+                "bazel-diff",
+                "serve",
+                "--workspacePath",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+            ];
+            argv.extend_from_slice(extra);
+            let Commands::Serve(args) = parse(&argv).command else {
+                panic!("expected serve");
+            };
+            args
+        };
+        let nexus = [
+            "--nexusUrl",
+            "https://nexus.example.com/nexus/",
+            "--nexusRepository",
+            "bazel-diff",
+            "--nexusPrefix",
+            "/team/repo/",
+            "--nexusCaCert",
+            "/etc/ssl/../ssl/corp-ca.pem",
+        ];
+
+        let config = serve_args(&nexus)
+            .to_config_with_nexus_password(false, None)
+            .unwrap();
+        assert_eq!(
+            config.remote_cache.as_deref(),
+            Some("https://nexus.example.com/nexus/repository/bazel-diff/team/repo/")
+        );
+        assert_eq!(config.nexus_repository.as_deref(), Some("bazel-diff"));
+        assert_eq!(config.nexus_prefix, "/team/repo/");
+        assert_eq!(
+            config.nexus_ca_cert.as_deref(),
+            Some(Path::new("/etc/ssl/corp-ca.pem"))
+        );
+        assert!(config.nexus_credentials.is_none());
+        assert!(config.s3_bucket.is_none());
+
+        let mut authenticated = nexus.to_vec();
+        authenticated.extend(["--nexusUsername", "svc"]);
+        let config = serve_args(&authenticated)
+            .to_config_with_nexus_password(false, Some("s3cret".to_owned()))
+            .unwrap();
+        let credentials = config.nexus_credentials.unwrap();
+        assert_eq!(credentials.username, "svc");
+        assert_eq!(credentials.password, "s3cret");
+
+        // A username without a password, or a password without a username, is a misconfiguration.
+        assert!(serve_args(&authenticated)
+            .to_config_with_nexus_password(false, None)
+            .is_err());
+        assert!(serve_args(&nexus)
+            .to_config_with_nexus_password(false, Some("s3cret".to_owned()))
+            .is_err());
+        // The password environment variable is ignored when Nexus is not configured at all.
+        assert!(serve_args(&[])
+            .to_config_with_nexus_password(false, Some("s3cret".to_owned()))
+            .unwrap()
+            .remote_cache
+            .is_none());
+        // URL and repository problems surface at startup, not on the first cache lookup.
+        assert!(
+            serve_args(&["--nexusUrl", "ftp://host", "--nexusRepository", "cache"])
+                .to_config_with_nexus_password(false, None)
+                .is_err()
+        );
+        assert!(
+            serve_args(&["--nexusUrl", "https://host", "--nexusRepository", "a/b"])
+                .to_config_with_nexus_password(false, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn serve_nexus_flags_require_each_other_and_conflict_with_s3() {
+        for extra in [
+            &["--nexusUrl", "https://host"][..],
+            &["--nexusRepository", "cache"][..],
+            &[
+                "--nexusUrl",
+                "https://host",
+                "--nexusRepository",
+                "cache",
+                "--s3Bucket",
+                "bucket",
+            ][..],
+        ] {
+            let mut argv = vec![
+                "bazel-diff",
+                "serve",
+                "--workspacePath",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+            ];
+            argv.extend_from_slice(extra);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{extra:?}");
+        }
     }
 
     #[test]

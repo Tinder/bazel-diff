@@ -96,6 +96,7 @@ version = "0.28.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07a9b245ba0739fc90935094c29adbaee3f977218b5fb95e822e261cda7f56a3"
 dependencies = [
+ "base64",
  "http",
  "log",
  "rustls",
@@ -142,6 +143,7 @@ name = "bazel-diff"
 version = "39.0.0"
 dependencies = [
  "anyhow",
+ "attohttpc",
  "buffa",
  "buffa-build",
  "clap",
@@ -150,6 +152,7 @@ dependencies = [
  "protoc-bin-vendored",
  "rayon",
  "rust-s3",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",

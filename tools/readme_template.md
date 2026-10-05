@@ -347,6 +347,47 @@ revision are also harmless — entries are deterministic per key, so last-write-
 content. The `--cacheMax*` pruning flags bound the *local* tier only; bound the bucket with an S3
 lifecycle policy instead.
 
+### Shared Sonatype Nexus cache
+
+If your organization already runs [Sonatype Nexus Repository](https://www.sonatype.com/products/sonatype-nexus-repository),
+a *raw (hosted)* repository can serve as the shared tier instead of S3. It behaves exactly like
+the S3 tier above — local disk first, Nexus on a local miss (backfilling disk on a hit), every
+generated entry published to both, and every Nexus failure degraded to a miss or a local-only
+write — and the two are mutually exclusive.
+
+```bash
+export BAZEL_DIFF_NEXUS_PASSWORD=...   # password, or a Nexus user token's pass code
+bazel-diff serve \
+  --workspacePath /path/to/workspace-clone \
+  --cacheDir /var/cache/bazel-diff \
+  --nexusUrl https://nexus.example.com \
+  --nexusRepository bazel-diff-cache \
+  --nexusPrefix my-repo \
+  --nexusUsername bazel-diff-svc
+```
+
+Entries live at `<nexusUrl>/repository/<nexusRepository>/<nexusPrefix>/<key>.json` and are read
+and written with plain `GET`/`PUT` against Nexus's raw content API. Include any context path Nexus
+is served under in `--nexusUrl` (e.g. `https://example.com/nexus`).
+
+* **Repository setup.** Create a *raw (hosted)* repository and set its *Deployment policy* to
+  **Allow redeploy**: replicas that race on the same revision each publish (identical) content,
+  and Nexus answers a redeploy under "Disable redeploy" with `400`, which is logged as a failed
+  write. A raw *group* or *proxy* repository cannot accept writes.
+* **Credentials.** `--nexusUsername` (or `BAZEL_DIFF_NEXUS_USERNAME`) and the
+  `BAZEL_DIFF_NEXUS_PASSWORD` environment variable are sent as HTTP basic auth; set both, or
+  neither for a repository that allows anonymous access. The password is deliberately
+  environment-only so it never appears in a process listing, and credentials embedded in
+  `--nexusUrl` are rejected. A Nexus [user token](https://help.sonatype.com/en/user-tokens.html)
+  works too: pass its name code as the username and pass code as the password. The account needs
+  `nx-repository-view-raw-<repository>-read`, `-add` and `-edit` privileges.
+* **TLS.** Public CAs are trusted out of the box. For a Nexus behind an internal CA, point
+  `--nexusCaCert` at a PEM bundle of the extra roots to trust.
+* **Redirects are not followed**, so basic-auth credentials are never replayed to another host;
+  point `--nexusUrl` at the final `https://` address rather than one that redirects to it.
+* **Retention.** As with S3, `--cacheMax*` bounds the local tier only. Bound the repository with a
+  Nexus *cleanup policy* (e.g. by component age or last-downloaded date) attached to it.
+
 Notes and operational guidance:
 
 * Distance metrics (`/impacted_targets_with_distances`) and the generate-hashes graph
@@ -359,7 +400,7 @@ Notes and operational guidance:
 * Dependency fingerprinting (`--dependencyFingerprint`) is opt-in. When enabled, every generated
   cache entry records a fingerprint of the workspace's external-dependency state (the bzlmod module
   graph and the resolved repository definitions, via `bazel mod`), and a cached entry -- local or
-  S3 -- is only served when that fingerprint still matches the checked-out revision; entries
+  shared tier -- is only served when that fingerprint still matches the checked-out revision; entries
   without a fingerprint, or with a stale one, are regenerated. This catches hashes that went stale
   because an external repository changed underneath an unchanged commit, at the cost of a checkout
   and a `bazel mod` round trip on every cache lookup. It is off by default, in which case a cache
@@ -383,7 +424,8 @@ Notes and operational guidance:
   evicting least-recently-used entries first — a cache hit refreshes an entry's recency, so revisions
   under active query are not expired out from under live traffic. With no `--cacheMax*` flag set the
   cache is never pruned (the previous behavior). The `--cacheMax*` flags always bound the local-disk
-  tier only; the shared S3 tier (see above) manages its own retention via a bucket lifecycle policy.
+  tier only; the shared S3 or Nexus tier (see above) manages its own retention via a bucket
+  lifecycle policy or a Nexus cleanup policy.
 * Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
   `generate-hashes`, and are folded into the cache key so a server started with different flags never
   serves another configuration's cached hashes.
@@ -395,7 +437,7 @@ Notes and operational guidance:
   such hash is cheaper because it skips reading unchanged files. The extra entries are bounded by the
   same LRU `--cacheMax*` pruning as everything else.
 * Containerization and multi-instance deployment manifests are not yet included; the shared S3
-  cache tier above is the building block for running replicas behind a load balancer.
+  or Nexus cache tier above is the building block for running replicas behind a load balancer.
 
 <!-- BEGIN_SECTION: cli-help -->
 <!-- END_SECTION: cli-help -->

@@ -136,7 +136,7 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
-                "name": "regressions::hidden_wrapper_external_repo_change_reaches_main_consumer_reproducer_for_issue_510",
+                "name": "regressions::hidden_wrapper_external_repo_change_reaches_main_consumer",
                 "timeout": "moderate",
             },
             {

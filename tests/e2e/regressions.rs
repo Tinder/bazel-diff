@@ -213,11 +213,11 @@ fn wrapped_external_repo_change_reaches_main_consumer() {
     );
 }
 
-/// Reproducer for https://github.com/Tinder/bazel-diff/issues/510: like the
+/// Regression for https://github.com/Tinder/bazel-diff/issues/510: like the
 /// #197 case above, but the wrapper module (`middle`) is only declared by
 /// `facade`, under a private apparent name, so it is not visible from the root.
 #[test]
-fn hidden_wrapper_external_repo_change_reaches_main_consumer_reproducer_for_issue_510() {
+fn hidden_wrapper_external_repo_change_reaches_main_consumer() {
     let first = copy_workspace("hidden_wrapper_external_repo");
     let second = copy_workspace("hidden_wrapper_external_repo");
     fs::write(second.path().join("leaf/value.txt"), "after\n").unwrap();
@@ -235,7 +235,7 @@ fn hidden_wrapper_external_repo_change_reaches_main_consumer_reproducer_for_issu
     assert!(!impacted.contains("//:control"), "{impacted:?}");
 }
 
-/// Control for the issue 510 reproducer: naming every repository in the chain
+/// Control for the issue 510 regression: naming every repository in the chain
 /// already propagates the change, so the fixture's edges are real and the gap
 /// is in discovering `@@middle+` from `@leaf` alone.
 #[test]

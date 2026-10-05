@@ -4,6 +4,8 @@ use crate::model::{
 };
 use crate::module_graph::impacted_with_module_changes;
 use anyhow::{anyhow, bail, Context, Result};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::CertificateDer;
 use s3::creds::Credentials;
 use s3::request::ResponseData;
 use s3::{Bucket, Region};
@@ -11,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -18,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
-use url::form_urlencoded;
+use url::{form_urlencoded, Url};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -42,6 +45,11 @@ pub struct ServerConfig {
     pub s3_region: Option<String>,
     pub s3_endpoint: Option<String>,
     pub s3_force_path_style: bool,
+    pub nexus_url: Option<String>,
+    pub nexus_repository: Option<String>,
+    pub nexus_prefix: String,
+    pub nexus_credentials: Option<NexusCredentials>,
+    pub nexus_ca_cert: Option<PathBuf>,
 }
 
 struct State {
@@ -53,16 +61,51 @@ struct State {
     remote: Option<RemoteCache>,
 }
 
-struct RemoteCache {
-    bucket: Box<Bucket>,
-    prefix: String,
+/// The shared cache tier behind local disk. Every backend degrades the same way: a failed read is
+/// a miss (the revision is regenerated) and a failed write leaves the entry local-only, so an
+/// outage of the shared store costs throughput, never availability.
+enum RemoteCache {
+    S3(S3Cache),
+    Nexus(Box<NexusCache>),
 }
 
 impl RemoteCache {
     fn new(config: &ServerConfig) -> Result<Option<Self>> {
-        let Some(bucket_name) = &config.s3_bucket else {
-            return Ok(None);
-        };
+        if let Some(bucket_name) = &config.s3_bucket {
+            return Ok(Some(Self::S3(S3Cache::new(config, bucket_name)?)));
+        }
+        if let (Some(url), Some(repository)) = (&config.nexus_url, &config.nexus_repository) {
+            return Ok(Some(Self::Nexus(Box::new(NexusCache::new(
+                nexus_base_url(url, repository, &config.nexus_prefix)?,
+                config.nexus_credentials.clone(),
+                config.nexus_ca_cert.as_deref(),
+            )?))));
+        }
+        Ok(None)
+    }
+
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        match self {
+            Self::S3(cache) => cache.get(key),
+            Self::Nexus(cache) => cache.get(key),
+        }
+    }
+
+    fn put(&self, key: &str, data: &[u8]) {
+        match self {
+            Self::S3(cache) => cache.put(key, data),
+            Self::Nexus(cache) => cache.put(key, data),
+        }
+    }
+}
+
+struct S3Cache {
+    bucket: Box<Bucket>,
+    prefix: String,
+}
+
+impl S3Cache {
+    fn new(config: &ServerConfig, bucket_name: &str) -> Result<Self> {
         let region_name = config
             .s3_region
             .clone()
@@ -82,10 +125,10 @@ impl RemoteCache {
         if config.s3_force_path_style {
             bucket = bucket.with_path_style();
         }
-        Ok(Some(Self {
+        Ok(Self {
             bucket,
             prefix: normalize_s3_prefix(&config.s3_prefix),
-        }))
+        })
     }
 
     fn object_key(&self, key: &str) -> String {
@@ -148,6 +191,174 @@ fn normalize_s3_prefix(prefix: &str) -> String {
     } else {
         format!("{trimmed}/")
     }
+}
+
+/// Username and password (or a Nexus user token's name and pass codes) for HTTP basic auth.
+#[derive(Clone)]
+pub struct NexusCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl fmt::Debug for NexusCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NexusCredentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Cache entries stored as components of a Sonatype Nexus Repository *raw* hosted repository,
+/// addressed through Nexus's plain HTTP content API: `GET`/`PUT` on
+/// `<nexusUrl>/repository/<repository>/<prefix>/<key>.json`.
+struct NexusCache {
+    session: attohttpc::Session,
+    base: Url,
+    credentials: Option<NexusCredentials>,
+}
+
+const NEXUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const NEXUS_READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bounds how much of an error body (Nexus answers many failures with a full HTML page) is
+/// echoed into a warning.
+const NEXUS_ERROR_BODY_LIMIT: usize = 200;
+
+impl NexusCache {
+    fn new(
+        base: Url,
+        credentials: Option<NexusCredentials>,
+        ca_cert: Option<&Path>,
+    ) -> Result<Self> {
+        let mut session = attohttpc::Session::new();
+        session.connect_timeout(NEXUS_CONNECT_TIMEOUT);
+        session.read_timeout(NEXUS_READ_TIMEOUT);
+        // A redirect is reported, never followed: following one would replay the basic-auth
+        // header against whatever host the `Location` names.
+        session.follow_redirects(false);
+        if let Some(path) = ca_cert {
+            for certificate in read_pem_certificates(path)? {
+                session.add_root_certificate(certificate);
+            }
+        }
+        Ok(Self {
+            session,
+            base,
+            credentials,
+        })
+    }
+
+    fn object_url(&self, key: &str) -> Url {
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .expect("validated by nexus_base_url")
+            .pop_if_empty()
+            .push(&format!("{key}.json"));
+        url
+    }
+
+    fn authorized<B>(&self, request: attohttpc::RequestBuilder<B>) -> attohttpc::RequestBuilder<B> {
+        match &self.credentials {
+            Some(credentials) => {
+                request.basic_auth(&credentials.username, Some(&credentials.password))
+            }
+            None => request,
+        }
+    }
+
+    /// Reads an entry, degrading to a miss on any failure. Nexus answers a missing component with
+    /// a plain `404`.
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        let url = self.object_url(key);
+        let failure = match self.authorized(self.session.get(url.as_str())).send() {
+            Ok(response) if response.status() == attohttpc::StatusCode::OK => {
+                match response.bytes() {
+                    Ok(bytes) => return Some(bytes),
+                    Err(error) => error.to_string(),
+                }
+            }
+            Ok(response) if response.status() == attohttpc::StatusCode::NOT_FOUND => return None,
+            Ok(response) => nexus_http_failure(response),
+            Err(error) => error.to_string(),
+        };
+        eprintln!("[Warn] Nexus cache read of {url} failed (treating as a miss): {failure}");
+        None
+    }
+
+    fn put(&self, key: &str, data: &[u8]) {
+        let url = self.object_url(key);
+        let failure = match self
+            .authorized(self.session.put(url.as_str()))
+            .header(attohttpc::header::CONTENT_TYPE, "application/json")
+            .bytes(data)
+            .send()
+        {
+            Ok(response) if response.is_success() => return,
+            Ok(response) if response.status() == attohttpc::StatusCode::BAD_REQUEST => format!(
+                "{} (a raw hosted repository answers 400 when its deployment policy forbids \
+                 redeploying an existing component; set it to \"Allow redeploy\")",
+                nexus_http_failure(response)
+            ),
+            Ok(response) => nexus_http_failure(response),
+            Err(error) => error.to_string(),
+        };
+        eprintln!("[Warn] Nexus cache write of {url} failed (entry not shared): {failure}");
+    }
+}
+
+fn nexus_http_failure(response: attohttpc::Response) -> String {
+    let status = response.status().as_u16();
+    let body = response.text().unwrap_or_default();
+    let body = body.trim();
+    let shown = match body.char_indices().nth(NEXUS_ERROR_BODY_LIMIT) {
+        Some((cut, _)) => format!("{}...", &body[..cut]),
+        None => body.to_owned(),
+    };
+    format!("Got HTTP {status} with content '{shown}'")
+}
+
+/// Resolves the directory URL every entry lives under:
+/// `<url>/repository/<repository>/<prefix>/`. `url` is the Nexus base URL, including any context
+/// path Nexus is served under (`https://host/nexus`). Shared with the CLI, which renders it as the
+/// `remote` cache location in `/metrics`.
+pub fn nexus_base_url(url: &str, repository: &str, prefix: &str) -> Result<Url> {
+    let mut base = Url::parse(url).with_context(|| format!("invalid Nexus URL {url:?}"))?;
+    if !matches!(base.scheme(), "http" | "https") {
+        bail!("Nexus URL must be http or https: {url}");
+    }
+    if !base.username().is_empty() || base.password().is_some() {
+        bail!(
+            "Nexus URL must not embed credentials; use --nexusUsername and \
+             BAZEL_DIFF_NEXUS_PASSWORD"
+        );
+    }
+    if repository.is_empty() || repository.contains('/') {
+        bail!("Nexus repository must be a single non-empty name: {repository:?}");
+    }
+    base.set_query(None);
+    base.set_fragment(None);
+    {
+        let mut segments = base
+            .path_segments_mut()
+            .map_err(|()| anyhow!("invalid Nexus URL {url:?}"))?;
+        segments.pop_if_empty().push("repository").push(repository);
+        segments.extend(prefix.split('/').filter(|segment| !segment.is_empty()));
+        segments.push("");
+    }
+    Ok(base)
+}
+
+fn read_pem_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let pem = fs::read(path)
+        .with_context(|| format!("failed to read Nexus CA certificate {}", path.display()))?;
+    let certificates = CertificateDer::pem_slice_iter(&pem)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| anyhow!("invalid PEM in {}: {error:?}", path.display()))?;
+    if certificates.is_empty() {
+        bail!("no PEM certificates found in {}", path.display());
+    }
+    Ok(certificates)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1209,6 +1420,11 @@ mod tests {
             s3_region: None,
             s3_endpoint: None,
             s3_force_path_style: false,
+            nexus_url: None,
+            nexus_repository: None,
+            nexus_prefix: String::new(),
+            nexus_credentials: None,
+            nexus_ca_cert: None,
         }
     }
 
@@ -1336,10 +1552,10 @@ mod tests {
         .unwrap()
         .with_path_style();
         (
-            RemoteCache {
+            RemoteCache::S3(S3Cache {
                 bucket,
                 prefix: normalize_s3_prefix(prefix),
-            },
+            }),
             receiver,
             handle,
         )
@@ -1404,7 +1620,10 @@ mod tests {
             "/team/repo/",
             vec![(200, b"hello".to_vec()), (200, Vec::new())],
         );
-        assert_eq!(remote.object_key("sha.fp"), "team/repo/sha.fp.json");
+        let RemoteCache::S3(s3) = &remote else {
+            panic!("expected the S3 backend");
+        };
+        assert_eq!(s3.object_key("sha.fp"), "team/repo/sha.fp.json");
         assert_eq!(remote.get("sha.fp"), Some(b"hello".to_vec()));
         remote.put("sha.fp", b"data");
         let captured = (0..2)
@@ -1446,6 +1665,280 @@ mod tests {
             http_failure(&response),
             "Got HTTP 403 with content 'denied'"
         );
+    }
+
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBkTCCATegAwIBAgIUaqMU9czNCvWG1R457FBnv8BzZfQwCgYIKoZIzj0EAwIw
+HTEbMBkGA1UEAwwSYmF6ZWwtZGlmZi10ZXN0LWNhMCAXDTI2MTAwNTE0NTUwOVoY
+DzIxMjYwOTExMTQ1NTA5WjAdMRswGQYDVQQDDBJiYXplbC1kaWZmLXRlc3QtY2Ew
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASRkDRNQ1MfFy+8eM1z9tY6FseE+Bqs
+p3hQcwR/2L3wzZKwFWhaDmfn5WFKAINVfcGxOAKWKcXrhK+xWOz9KmYoo1MwUTAd
+BgNVHQ4EFgQUzsQ/MEApeEP6b/jW5ecBMceQbJcwHwYDVR0jBBgwFoAUzsQ/MEAp
+eEP6b/jW5ecBMceQbJcwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBF
+AiEAixF88BBeQUzoM0fYxa/ivGx5U4kHdLW82V9LIFiOV14CIG/00V8ZKfomL0v0
+nQBeQ4AIl47nDOrFeVnvse8R9IHJ
+-----END CERTIFICATE-----
+";
+
+    /// A canned Nexus reply: status, extra headers, body.
+    type NexusReply = (u16, Vec<(&'static str, &'static str)>, Vec<u8>);
+
+    struct CapturedNexusRequest {
+        method: Method,
+        url: String,
+        authorization: Option<String>,
+        content_type: Option<String>,
+        body: Vec<u8>,
+    }
+
+    fn nexus_cache_with_responses(
+        prefix: &str,
+        credentials: Option<NexusCredentials>,
+        responses: Vec<NexusReply>,
+    ) -> (
+        RemoteCache,
+        std_mpsc::Receiver<CapturedNexusRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/nexus", server.server_addr().to_ip().unwrap());
+        let (sender, receiver) = std_mpsc::channel();
+        let handle = thread::spawn(move || {
+            for (status, headers, body) in responses {
+                let mut request = server.recv().unwrap();
+                let header = |name: &'static str| {
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv(name))
+                        .map(|header| header.value.as_str().to_owned())
+                };
+                let authorization = header("Authorization");
+                let content_type = header("Content-Type");
+                let mut received = Vec::new();
+                request.as_reader().read_to_end(&mut received).unwrap();
+                sender
+                    .send(CapturedNexusRequest {
+                        method: request.method().clone(),
+                        url: request.url().to_owned(),
+                        authorization,
+                        content_type,
+                        body: received,
+                    })
+                    .unwrap();
+                let mut response = Response::from_data(body).with_status_code(StatusCode(status));
+                for (name, value) in headers {
+                    response.add_header(Header::from_bytes(name, value).unwrap());
+                }
+                request.respond(response).unwrap();
+            }
+        });
+        let base = nexus_base_url(&endpoint, "bazel-diff", prefix).unwrap();
+        (
+            RemoteCache::Nexus(Box::new(NexusCache::new(base, credentials, None).unwrap())),
+            receiver,
+            handle,
+        )
+    }
+
+    #[test]
+    fn nexus_base_url_composes_repository_and_prefix() {
+        let url = |base: &str, repository: &str, prefix: &str| {
+            nexus_base_url(base, repository, prefix).map(|url| url.to_string())
+        };
+        assert_eq!(
+            url("https://nexus.example.com", "cache", "").unwrap(),
+            "https://nexus.example.com/repository/cache/"
+        );
+        assert_eq!(
+            url(
+                "https://nexus.example.com/nexus/?x=1#y",
+                "cache",
+                "/team//repo/"
+            )
+            .unwrap(),
+            "https://nexus.example.com/nexus/repository/cache/team/repo/"
+        );
+        assert_eq!(
+            url("http://host:8081", "cache", "a b").unwrap(),
+            "http://host:8081/repository/cache/a%20b/"
+        );
+        for (base, repository) in [
+            ("not a url", "cache"),
+            ("ftp://host", "cache"),
+            ("mailto:ops@example.com", "cache"),
+            ("https://user:pass@host", "cache"),
+            ("https://user@host", "cache"),
+            ("https://host", ""),
+            ("https://host", "a/b"),
+        ] {
+            assert!(url(base, repository, "").is_err(), "{base} {repository}");
+        }
+    }
+
+    #[test]
+    fn nexus_cache_is_selected_from_configuration() {
+        let mut config = test_config();
+        config.nexus_url = Some("https://nexus.example.com".to_owned());
+        config.nexus_repository = Some("cache".to_owned());
+        config.nexus_prefix = "team".to_owned();
+        let Some(RemoteCache::Nexus(cache)) = RemoteCache::new(&config).unwrap() else {
+            panic!("expected the Nexus backend");
+        };
+        assert_eq!(
+            cache.object_url("sha.fp").as_str(),
+            "https://nexus.example.com/repository/cache/team/sha.fp.json"
+        );
+        config.nexus_repository = Some("a/b".to_owned());
+        assert!(RemoteCache::new(&config).is_err());
+    }
+
+    #[test]
+    fn nexus_cache_reads_and_writes_with_basic_auth() {
+        let (remote, requests, handle) = nexus_cache_with_responses(
+            "/team/repo/",
+            Some(NexusCredentials {
+                username: "svc".to_owned(),
+                password: "s3cret".to_owned(),
+            }),
+            vec![
+                (200, Vec::new(), b"hello".to_vec()),
+                (404, Vec::new(), Vec::new()),
+                (201, Vec::new(), Vec::new()),
+            ],
+        );
+        assert_eq!(remote.get("sha.fp"), Some(b"hello".to_vec()));
+        assert_eq!(remote.get("missing"), None);
+        remote.put("sha.fp", b"data");
+        handle.join().unwrap();
+        let captured = requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(captured.len(), 3);
+        let methods = captured
+            .iter()
+            .map(|r| r.method.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(methods, [Method::Get, Method::Get, Method::Put]);
+        assert_eq!(
+            captured[0].url,
+            "/nexus/repository/bazel-diff/team/repo/sha.fp.json"
+        );
+        assert_eq!(
+            captured[1].url,
+            "/nexus/repository/bazel-diff/team/repo/missing.json"
+        );
+        assert_eq!(captured[2].url, captured[0].url);
+        for request in &captured {
+            // base64("svc:s3cret")
+            assert_eq!(
+                request.authorization.as_deref(),
+                Some("Basic c3ZjOnMzY3JldA==")
+            );
+        }
+        assert_eq!(
+            captured[2].content_type.as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(captured[2].body, b"data");
+    }
+
+    #[test]
+    fn nexus_cache_failures_degrade_without_following_redirects() {
+        let (remote, requests, handle) = nexus_cache_with_responses(
+            "",
+            None,
+            vec![
+                (500, Vec::new(), "x".repeat(1000).into_bytes()),
+                (401, Vec::new(), b"unauthorized".to_vec()),
+                (
+                    302,
+                    vec![("Location", "http://127.0.0.1:9/elsewhere")],
+                    Vec::new(),
+                ),
+                (
+                    400,
+                    Vec::new(),
+                    b"Repository does not allow updating assets".to_vec(),
+                ),
+            ],
+        );
+        assert_eq!(remote.get("failure"), None);
+        assert_eq!(remote.get("denied"), None);
+        assert_eq!(remote.get("moved"), None);
+        remote.put("immutable", b"data");
+        handle.join().unwrap();
+        let captured = requests.try_iter().collect::<Vec<_>>();
+        // Exactly one request per call: nothing is retried and the redirect is not followed.
+        assert_eq!(captured.len(), 4);
+        assert!(captured
+            .iter()
+            .all(|request| request.authorization.is_none()));
+    }
+
+    #[test]
+    fn nexus_cache_transport_errors_degrade_without_failing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let base = nexus_base_url(&endpoint, "cache", "").unwrap();
+        let remote = RemoteCache::Nexus(Box::new(NexusCache::new(base, None, None).unwrap()));
+        assert_eq!(remote.get("unreachable"), None);
+        remote.put("unreachable", b"data");
+    }
+
+    #[test]
+    fn nexus_http_failure_truncates_long_bodies() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let handle = thread::spawn(move || {
+            let request = server.recv().unwrap();
+            request
+                .respond(
+                    Response::from_data(format!("  {}  ", "é".repeat(300)))
+                        .with_status_code(StatusCode(503)),
+                )
+                .unwrap();
+        });
+        let response = attohttpc::get(format!("http://{address}/")).send().unwrap();
+        let failure = nexus_http_failure(response);
+        handle.join().unwrap();
+        assert_eq!(
+            failure,
+            format!("Got HTTP 503 with content '{}...'", "é".repeat(200))
+        );
+    }
+
+    #[test]
+    fn nexus_credentials_debug_redacts_password() {
+        let credentials = NexusCredentials {
+            username: "svc".to_owned(),
+            password: "s3cret".to_owned(),
+        };
+        let rendered = format!("{credentials:?}");
+        assert!(rendered.contains("svc"));
+        assert!(!rendered.contains("s3cret"));
+    }
+
+    #[test]
+    fn nexus_ca_certificates_load_from_pem_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let bundle = directory.path().join("ca.pem");
+        fs::write(&bundle, format!("{TEST_CA_PEM}{TEST_CA_PEM}")).unwrap();
+        assert_eq!(read_pem_certificates(&bundle).unwrap().len(), 2);
+        let base = nexus_base_url("https://nexus.example.com", "cache", "").unwrap();
+        assert!(NexusCache::new(base.clone(), None, Some(&bundle)).is_ok());
+
+        let empty = directory.path().join("empty.pem");
+        fs::write(&empty, "not a certificate").unwrap();
+        assert!(read_pem_certificates(&empty).is_err());
+        let corrupt = directory.path().join("corrupt.pem");
+        fs::write(
+            &corrupt,
+            "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(read_pem_certificates(&corrupt).is_err());
+        assert!(read_pem_certificates(&directory.path().join("missing.pem")).is_err());
+        assert!(NexusCache::new(base, None, Some(&empty)).is_err());
     }
 
     #[test]

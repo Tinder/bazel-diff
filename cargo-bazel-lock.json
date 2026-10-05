@@ -1,5 +1,5 @@
 {
-  "checksum": "3e82b6e041284d57ac71bde0287bb29854b98f09fbade93a88d92536503e2310",
+  "checksum": "bab1228af97ac7572505bff654a20dff9180685abb621d3d7df6d62c5a43cf88",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -583,6 +583,8 @@
         "crate_features": {
           "common": [
             "__rustls",
+            "base64",
+            "basic-auth",
             "json",
             "rustls-opt-dep",
             "serde",
@@ -595,6 +597,10 @@
         },
         "deps": {
           "common": [
+            {
+              "id": "base64 0.22.1",
+              "target": "base64"
+            },
             {
               "id": "http 1.5.0",
               "target": "http"
@@ -860,6 +866,10 @@
               "target": "anyhow"
             },
             {
+              "id": "attohttpc 0.28.5",
+              "target": "attohttpc"
+            },
+            {
               "id": "buffa 0.9.1",
               "target": "buffa"
             },
@@ -882,6 +892,10 @@
             {
               "id": "rust-s3 0.36.0",
               "target": "s3"
+            },
+            {
+              "id": "rustls-pki-types 1.15.1",
+              "target": "rustls_pki_types"
             },
             {
               "id": "serde 1.0.229",
@@ -11268,6 +11282,7 @@
   },
   "direct_deps": [
     "anyhow 1.0.104",
+    "attohttpc 0.28.5",
     "buffa 0.9.1",
     "buffa-build 0.9.1",
     "clap 4.6.5",
@@ -11276,6 +11291,7 @@
     "protoc-bin-vendored 3.2.0",
     "rayon 1.12.0",
     "rust-s3 0.36.0",
+    "rustls-pki-types 1.15.1",
     "serde 1.0.229",
     "serde_json 1.0.151",
     "sha2 0.10.9",

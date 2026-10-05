@@ -495,6 +495,20 @@ single_version_override(
 )
 ```
 
+On Windows hosts, also copy
+[`llvm_windows_exec_case_overlays.patch`](patches/llvm_windows_exec_case_overlays.patch)
+and add this override until `llvm` fixes
+[hermetic-llvm#809](https://github.com/hermeticbuild/hermetic-llvm/issues/809):
+
+```bazel
+single_version_override(
+    module_name = "llvm",
+    version = "0.8.24",
+    patch_strip = 1,
+    patches = ["//:llvm_windows_exec_case_overlays.patch"],
+)
+```
+
 Bazel only applies overrides from the root module.
 
 You can now run the tool with:

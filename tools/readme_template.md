@@ -479,8 +479,8 @@ Windows builds require acceptance of the MSVC runtime and Windows SDK licenses.
 After accepting, configure `BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA` and
 `BAZEL_WINDOWS_SDK_EULA` as described in
 [hermetic-llvm's Windows instructions](https://github.com/hermeticbuild/hermetic-llvm#windows).
-GitHub Actions reads repository variables with these names; other build environments
-must provide environment variables.
+This repository's GitHub Actions workflows set both to `1`; other build environments
+must set them as environment variables or with `--repo_env`.
 
 Release binaries are written to `bazel-bin/release/bazel-diff-rust-<os>-<arch>[.exe]`:
 

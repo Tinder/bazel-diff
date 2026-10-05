@@ -16,8 +16,11 @@ permissions:
   attestations: write
   contents: write
 env:
-  BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA: ${{ vars.BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA }}
-  BAZEL_WINDOWS_SDK_EULA: ${{ vars.BAZEL_WINDOWS_SDK_EULA }}
+  # hermetic-llvm's Windows toolchain fetches the MSVC runtime and Windows SDK
+  # only after these are set to 1. GitHub-hosted Windows runners already ship
+  # Visual Studio and the Windows SDK, and hermetic-llvm's own CI sets both.
+  BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA: '1'
+  BAZEL_WINDOWS_SDK_EULA: '1'
 jobs:
   release:
     uses: bazel-contrib/.github/.github/workflows/release_ruleset.yaml@v7.4.0

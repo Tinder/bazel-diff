@@ -1,217 +1,83 @@
 module(
     name = "bazel-diff",
-    version = "49.3.0",
-    compatibility_level = 0,
+    version = "50.0.0",
+    bazel_compatibility = [">=8.5.0"],
 )
 
 bazel_dep(name = "aspect_rules_lint", version = "2.1.0", dev_dependency = True)
 bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.2", dev_dependency = True)
-bazel_dep(name = "aspect_bazel_lib", version = "2.22.5", dev_dependency = True)
 
-# Direct dep because //release selects on @platforms//os and @platforms//cpu to
-# name the release binaries.
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_license", version = "1.0.0")
 
-# protoc for the build script that compiles rust/proto/*.proto into the crate.
+# build.rs uses protoc to compile rust/proto/*.proto.
 bazel_dep(name = "protobuf", version = "33.4")
 
-# rules_python is only needed when building bazel-diff itself (the release,
-# coverage and e2e tooling under //tools is Python). Marked dev_dependency so
-# consumers of bazel-diff as a module don't inherit it via MVS.
 bazel_dep(name = "rules_python", version = "1.8.4", dev_dependency = True)
-
-# Go support is internal to building/testing bazel-diff (tooling under tools/go,
-# whose line coverage is gated at >=90% in CI). Marked dev_dependency so consumers
-# of bazel-diff as a module don't inherit rules_go/gazelle via MVS.
-bazel_dep(name = "rules_go", version = "0.60.0", dev_dependency = True)
-bazel_dep(name = "gazelle", version = "0.47.0", dev_dependency = True)
+bazel_dep(name = "rules_go", version = "0.62.0", dev_dependency = True)
 
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk", dev_dependency = True)
 go_sdk.download(version = "1.23.1")
 
-# Rust is a first-class published implementation (`//:bazel-diff-rust`) and is
-# also used by the LCOV merger under //tools/coverage. Kept as a non-dev
-# dependency so BCR consumers and top-level verify_targets can build the Rust
-# binary without --ignore_dev_dependency stripping the crate repos/toolchains.
-bazel_dep(name = "rules_rust", version = "0.73.0")
+# llvm 0.8.20+ adds hermetic Windows MSVC toolchains, which fail on a Windows
+# MSVC exec host (rules_rs#271, hermetic-llvm#809). 0.8.19 has none, so Windows
+# builds use the locally installed Visual Studio toolchain.
+bazel_dep(name = "llvm", version = "0.8.19")
+bazel_dep(name = "rules_rs", version = "0.0.112")
+single_version_override(
+    module_name = "rules_rs",
+    patch_strip = 1,
+    patches = ["//patches:rules_rs_package_name.patch"],
+)
 
-rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+# LLVM 22.1.8 reads Rust 1.90's coverage profiles.
+llvm = use_extension("@llvm//extensions:llvm.bzl", "llvm")
+llvm.version(llvm_version = "22.1.8")
+use_repo(llvm, "llvm-project")
 
-# rustfmt_version is pinned to the same release as the toolchain instead of
-# rules_rust's default (a nightly), so the `rustfmt_aspect` gate in .bazelrc
-# checks formatting with the exact rustfmt a contributor gets from `cargo fmt`
-# on a stable toolchain. A nightly rustfmt can change defaults between releases,
-# which would fail CI on code that formats cleanly locally.
+# rules_rs provides the patched rules_rust lint rules and build settings.
+rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+use_repo(rules_rust, "rules_rust")
+
+# Keep these repo names short: they appear in Windows exec paths, which must
+# stay under MAX_PATH (rules_rs#270). The bd_ prefix avoids clashing with a
+# consumer's own rules_rs toolchain or crate repos.
+rust = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
 rust.toolchain(
+    name = "bd_rust",
     edition = "2021",
-    rustfmt_version = "1.90.0",
-    # Confine the stock toolchains to platforms that use the system libc. They
-    # are only constrained by os and cpu -- rules_rust has no musl constraint --
-    # so on //platforms:linux_x86_64_musl / linux_aarch64_musl they would match
-    # alongside the musl toolchain below and resolution would silently take
-    # whichever of the two was registered first.
-    target_settings = ["//platforms:is_system_libc"],
-    versions = ["1.90.0"],
+    version = "1.90.0",
 )
-use_repo(rust, "rust_toolchains")
+use_repo(rust, "bd_rust")
 
-register_toolchains("@rust_toolchains//:all")
+register_toolchains(
+    "@bd_rust//...",
+    "@llvm//toolchain:all",
+)
 
-# Rust std for the statically linked musl release binaries, cross-compiled from a
-# glibc Linux host (the release runner) or from an Apple Silicon Mac (so a
-# maintainer can reproduce the published binary locally). rustc itself is the
-# ordinary glibc build: only the target changes, which is what keeps proc-macro
-# and build-script actions -- compiled for the exec platform -- loadable.
-# These toolchains join the same @rust_toolchains hub registered above.
-rust.repository_set(
-    name = "rust_musl_linux_x86_64",
+# CI selects this toolchain explicitly to check Cargo.toml's rust-version.
+msrv = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains", dev_dependency = True)
+msrv.toolchain(
+    name = "bd_msrv",
     edition = "2021",
-    exec_triple = "x86_64-unknown-linux-gnu",
-    target_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:linux",
-        "//platforms:musl",
-    ],
-    target_settings = ["//platforms:is_musl"],
-    target_triple = "x86_64-unknown-linux-musl",
-    versions = ["1.90.0"],
+    version = "1.85.0",
 )
+use_repo(msrv, "bd_msrv")
 
-# Same exec host, second published Linux asset (arm64 musl). Sharing the set
-# name avoids a second auto-emitted glibc x86_64 exec toolchain. exec_triple,
-# edition, versions, and target_settings may only appear on the first tag for a
-# given name.
-rust.repository_set(
-    name = "rust_musl_linux_x86_64",
-    target_compatible_with = [
-        "@platforms//cpu:aarch64",
-        "@platforms//os:linux",
-        "//platforms:musl",
-    ],
-    target_triple = "aarch64-unknown-linux-musl",
-)
-
-# rules_rust also emits a toolchain for a set's own exec triple, so the set
-# above comes with a glibc x86_64 Linux toolchain whether or not it is wanted.
-# Declaring its constraints keeps it from matching musl builds; the set-level
-# //platforms:is_musl gate keeps it out of ordinary builds, where the stock
-# toolchain serves and this one would otherwise be a second, identical
-# candidate whose repository is a redundant ~200MB download.
-rust.repository_set(
-    name = "rust_musl_linux_x86_64",
-    target_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:linux",
-        "//platforms:system_libc",
-    ],
-    target_triple = "x86_64-unknown-linux-gnu",
-)
-
-# The macOS-hosted half of the same story. No companion tag is needed here: this
-# set's exec-triple toolchain targets macOS, and a macOS platform can never
-# satisfy the set's //platforms:is_musl gate.
-rust.repository_set(
-    name = "rust_musl_macos_aarch64",
-    edition = "2021",
-    exec_triple = "aarch64-apple-darwin",
-    target_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:linux",
-        "//platforms:musl",
-    ],
-    target_settings = ["//platforms:is_musl"],
-    target_triple = "x86_64-unknown-linux-musl",
-    versions = ["1.90.0"],
-)
-rust.repository_set(
-    name = "rust_musl_macos_aarch64",
-    target_compatible_with = [
-        "@platforms//cpu:aarch64",
-        "@platforms//os:linux",
-        "//platforms:musl",
-    ],
-    target_triple = "aarch64-unknown-linux-musl",
-)
-
-# Native ARM Linux host (Graviton, ubuntu-24.04-arm): same musl aarch64 target
-# as the x86_64-hosted set above, with a companion gnu tag so the auto-emitted
-# exec-triple toolchain does not collide with the stock glibc one.
-rust.repository_set(
-    name = "rust_musl_linux_aarch64",
-    edition = "2021",
-    exec_triple = "aarch64-unknown-linux-gnu",
-    target_compatible_with = [
-        "@platforms//cpu:aarch64",
-        "@platforms//os:linux",
-        "//platforms:musl",
-    ],
-    target_settings = ["//platforms:is_musl"],
-    target_triple = "aarch64-unknown-linux-musl",
-    versions = ["1.90.0"],
-)
-rust.repository_set(
-    name = "rust_musl_linux_aarch64",
-    target_compatible_with = [
-        "@platforms//cpu:aarch64",
-        "@platforms//os:linux",
-        "//platforms:system_libc",
-    ],
-    target_triple = "aarch64-unknown-linux-gnu",
-)
-
-# C toolchain for the musl target: a gcc cross-compiler bundled with musl libc,
-# used to link the Rust binary and to build the C in `ring` (rustls). Scoped to
-# //platforms:musl so it never displaces the host cc toolchain on ordinary
-# builds. dev_dependency because only bazel-diff's own release build needs it --
-# consumers of the module never resolve it.
-bazel_dep(name = "toolchains_musl", version = "0.1.27.bcr.1", dev_dependency = True)
-
-toolchains_musl = use_extension(
-    "@toolchains_musl//:toolchains_musl.bzl",
-    "toolchains_musl",
-    dev_dependency = True,
-)
-toolchains_musl.config(extra_target_compatible_with = ["//platforms:musl"])
-
-# Toolchain pinned to `rust-version` in Cargo.toml, so the MSRV job in ci.yaml
-# can prove the crate still builds on the minimum Rust it advertises. Keep the
-# version in sync with `rust-version` in Cargo.toml.
-#
-# It lands in the same @rust_toolchains hub as everything above, but rules_rust
-# appends `repository_set` toolchains *after* the default ones, so it never wins
-# ordinary toolchain resolution. The MSRV job selects it explicitly with
-# --extra_toolchains, which outranks every registered toolchain. It carries the
-# same system-libc gate as the stock toolchains for the same reason they do: one
-# Rust toolchain should match any given build, never two.
-#
-# Linux/x86_64 only: a `repository_set` tag declares one exec triple, and the
-# MSRV job runs on ubuntu-latest. Building it on another host just falls back to
-# the default toolchain (no MSRV coverage), it does not fail.
-rust.repository_set(
-    name = "rust_msrv",
-    edition = "2021",
-    exec_triple = "x86_64-unknown-linux-gnu",
-    target_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:linux",
-        "//platforms:system_libc",
-    ],
-    target_settings = ["//platforms:is_system_libc"],
-    target_triple = "x86_64-unknown-linux-gnu",
-    versions = ["1.85.0"],
-)
-
-crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
 crate.from_cargo(
-    name = "bazel_diff_crates",
-    cargo_lockfile = "//:Cargo.lock",
-    # crate_universe refuses to run from_cargo in a non-root module without a
-    # checked-in cargo-bazel lockfile (repinning can't cross module boundaries),
-    # so BCR consumers need this file shipped in the release archive.
-    # Regenerate with: CARGO_BAZEL_REPIN=1 bazel build //:bazel-diff-rust
-    # (`bazel sync` is WORKSPACE-only and this module is bzlmod-only).
-    lockfile = "//:cargo-bazel-lock.json",
-    manifests = ["//:Cargo.toml"],
+    name = "bd_crates",
+    cargo_lock = "//:Cargo.lock",
+    cargo_toml = "//:Cargo.toml",
+    platform_triples = [
+        "aarch64-apple-darwin",
+        "aarch64-pc-windows-msvc",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl",
+        "x86_64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
+    ],
 )
-use_repo(crate, "bazel_diff_crates")
+use_repo(crate, "bd_crates")

@@ -6,17 +6,11 @@ on:
   pull_request:
     branches: [ master ]
 
-# Job display names are load-bearing: branch protection on master requires
-# checks by name (`Rust candidate (Bazel 8.x)`, `Rust candidate (Bazel 9.x)`,
-# `Rust candidate MSRV`, `Rust candidate E2E`, `release-artifacts (<os>)`).
-# Rename one of those only together with the branch-protection rule.
+# Preserve the Rust candidate, MSRV, E2E, and release-artifacts job names:
+# master branch protection requires these checks.
 jobs:
-  # Every Rust check here runs through Bazel, with no cargo and no host Rust
-  # toolchain: rules_rust downloads the compiler pinned in MODULE.bazel, so CI
-  # and a local `bazel test` agree on the exact rustc. //:rust_clippy_check and
-  # //:rust_format_check below stand in for `cargo clippy -- -D warnings` and
-  # `cargo fmt --all -- --check`. //tools/... is the Python/Go release, e2e-split
-  # and coverage tooling.
+  # rules_rs pins rustc in MODULE.bazel. Bazel runs the tests, Clippy,
+  # rustfmt, and Python/Go tooling.
   rust-candidate:
     name: Rust candidate (Bazel ${{ matrix.bazel }})
     runs-on: ubuntu-latest
@@ -41,16 +35,13 @@ jobs:
       - name: Check Bazel build and tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-          CARGO_BAZEL_ISOLATED: 'false'
         run: ~/go/bin/bazelisk test //:rust_tests //:rust_clippy_check //:rust_format_check //tools/... --enable_bzlmod=true --enable_workspace=false
 
   rust-candidate-e2e:
     name: Rust candidate E2E
     runs-on: ubuntu-latest
     steps:
-      # bazel-diff itself needs no JDK, but the suite drives a nested Bazel over
-      # fixture workspaces with Java targets, and Bazel's default
-      # --java_runtime_version=local_jdk wants a host JDK for those.
+      # //tests:e2e_test queries fixture workspaces with Java targets.
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
@@ -61,11 +52,8 @@ jobs:
         with:
           go-version: ^1.17
       - name: Setup Bazelisk
-        # $BAZEL is the nested Bazel //tests:e2e_test spawns for each fixture
-        # workspace. Set explicitly because the fallback -- first `bazel` on
-        # PATH -- resolves to the *outer* Bazel's own binary inside a test,
-        # which ignores USE_BAZEL_VERSION. It reaches the test through the
-        # target's env_inherit.
+        # Pass Bazelisk to //tests:e2e_test so nested Bazel commands honor
+        # USE_BAZEL_VERSION instead of using the outer Bazel binary.
         run: |
           for i in 1 2 3; do
             go install github.com/bazelbuild/bazelisk@latest && break
@@ -81,12 +69,7 @@ jobs:
           USE_BAZEL_VERSION: '8.x'
         run: bazelisk test //tests:e2e_test --enable_bzlmod=true --enable_workspace=false
 
-  # The e2e suites are split into one Bazel test target per case by
-  # //tools/e2e:regen, whose output is checked in. This job is the gate that
-  # keeps the checked-in split honest: :regen_check re-derives the case list
-  # from the sources and fails when they differ, so an e2e test added, renamed
-  # or removed without `make regen-e2e` cannot merge.
-  # :split_e2e_tests_test covers the generator itself.
+  # Check the generated E2E targets and the generator in //tools/e2e.
   e2e-split-regen:
     name: E2E split regen
     runs-on: ubuntu-latest
@@ -126,29 +109,18 @@ jobs:
             sleep 10
           done
       - uses: actions/checkout@v4
-      # Builds the crate with the toolchain pinned to `rust-version` in
-      # Cargo.toml instead of the repo default. --extra_toolchains outranks the
-      # registered toolchains, which is what makes the swap take: the MSRV
-      # toolchain is declared in MODULE.bazel but deliberately not preferred.
-      # Bazel has no `cargo check` equivalent, so this is a full build -- which
-      # is strictly stronger, since it links as well as type-checks.
-      #
-      # The lint output groups are dropped because this job asks one question:
-      # does the crate still compile on the oldest Rust it claims to support.
-      # 1.85's clippy has a different lint set than the pinned toolchain's, so
-      # leaving them on would fail this job for warnings that say nothing about
-      # MSRV. //:rust_clippy_check and //:rust_format_check own that gate.
+      # Match Cargo.toml's rust-version. --extra_toolchains takes precedence
+      # over registered toolchains. Clippy and rustfmt use the default compiler.
       - name: Check declared minimum Rust version
         env:
           USE_BAZEL_VERSION: '8.x'
         run: |
           ~/go/bin/bazelisk build //src:bazel-diff \
-            --extra_toolchains=@rust_toolchains//:rust_msrv__x86_64-unknown-linux-gnu__stable \
+            --extra_toolchains=@bd_msrv//rustc:all \
             --output_groups=-clippy_checks,-rustfmt_checks \
             --enable_bzlmod=true --enable_workspace=false
 
-  # The coverage gate: runs the Rust and tooling suites under `bazel coverage`
-  # on every OS/Bazel pair and fails below 90% main-source line coverage.
+  # Enforce 90% line coverage for Rust and Go on Linux and macOS.
   coverage:
     name: Coverage (${{ matrix.os }}, Bazel ${{ matrix.bazel }})
     runs-on: ${{ matrix.os }}
@@ -204,20 +176,14 @@ jobs:
           if-no-files-found: warn
       - name: Enforce coverage threshold (>= 90% main-source line coverage)
         env:
-          # Must match the coverage step above, otherwise bazelisk downloads the
-          # default bazel from .bazelversion and starts a fresh server whose
-          # output base loses track of the coverage report symlink (seen flaking
-          # on macos-latest x bazel 9.x).
+          # Reuse the coverage step's Bazel version and output directory.
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           COVERAGE_THRESHOLD: '90'
         run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
       - name: Enforce Go coverage threshold (>= 90% line coverage under tools/go/)
         env:
-          # Must match the coverage step above; see the note on the previous step.
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        # Gate Go independently of the Rust overall so thin Go coverage can't hide
-        # behind well-covered Rust (and vice versa). --include scopes the report to
-        # Go production source only (tools/go/, which excludes tools/coverage_check.py).
+        # Enforce coverage for tools/go/ independently of Rust coverage.
         run: ~/go/bin/bazelisk run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
       - name: Upload test logs
         uses: actions/upload-artifact@v4
@@ -226,12 +192,10 @@ jobs:
           name: test-logs-${{ matrix.os }}-bazel-${{ matrix.bazel }}
           path: bazel-testlogs/
           if-no-files-found: warn
-  # Runs the example script end to end against this repository, on every Bazel
-  # version and workspace mode the tool supports.
+  # Runs the example script end to end against this repository with supported
+  # source-build Bazel versions.
   run-example:
-    # Explicit so the check name stays readable and stable if the matrix grows;
-    # extra_flags is the only key that distinguishes rows with the same os and
-    # Bazel version.
+    # extra_flags distinguishes rows with the same OS and Bazel version.
     name: Run example (${{ matrix.os }}, Bazel ${{ matrix.bazel }}, ${{ matrix.extra_flags || 'default flags' }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -239,19 +203,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            bazel: '7.x'
-            disable_workspace: 'false'
-            extra_flags: ''
-          - os: ubuntu-latest
-            bazel: '7.x'
-            disable_workspace: 'false'
-            extra_flags: '--incompatible_disable_native_repo_rules'
-          - os: ubuntu-latest
-            bazel: '8.x'
+            bazel: '8.5.0'
             disable_workspace: 'true'
             extra_flags: ''
           - os: ubuntu-latest
-            bazel: '8.6.0rc1'
+            bazel: '8.x'
             disable_workspace: 'true'
             extra_flags: ''
           - os: ubuntu-latest
@@ -266,8 +222,6 @@ jobs:
             bazel: '9.x'
             disable_workspace: 'true'
             extra_flags: '--incompatible_disable_native_repo_rules'
-          # Skip Windows + Bazel 7.x due to protobuf compilation issues on MSVC
-          # Windows is tested with Bazel 8.x and 9.x which are more current
           - os: windows-latest
             bazel: '8.x'
             disable_workspace: 'true'
@@ -334,14 +288,11 @@ jobs:
         # Retries guard against transient release-asset fetch errors (e.g. a 500 from
         # GitHub Releases downloading Bazel module deps).
         #
-        # The system bazelrc shortens the output root for every Bazel the example
-        # script runs (the outer build and the nested queries alike): MSVC's link.exe
-        # is MAX_PATH-bound (260), and under the default root the Rust stdlib rlib
-        # path overflows it with LNK1181. Same fix as bazel_startup_flags in the
-        # release-artifacts job below; a startup option cannot live in a --config.
+        # Keep Windows output paths short for the build and nested queries.
+        # A startup option cannot live in a --config.
         run: |
           New-Item -ItemType Directory -Force -Path "$env:ProgramData" | Out-Null
-          Add-Content -Path "$env:ProgramData\bazel.bazelrc" -Value "startup --output_user_root=C:/b"
+          Add-Content -Path "$env:ProgramData\bazel.bazelrc" -Value "startup --output_base=C:/b"
           $prevRev = git rev-parse HEAD~1
           $currRev = git rev-parse HEAD
           for ($i = 1; $i -le 3; $i++) {
@@ -351,50 +302,23 @@ jobs:
             Write-Host "example script failed (attempt $i); retrying in 15s..."
             Start-Sleep -Seconds 15
           }
-  # Verifies per-PR that everything a release ships still builds, on every
-  # platform it ships for. It publishes nothing: release.yaml owns that, via
-  # release_prep.sh (source archive) and its rust-binaries matrix. This
-  # job predates that flow -- it used to *be* the deploy -- so its uploads are
-  # a build check whose output happens to be downloadable, nothing more.
+  # Build the release assets on every PR. release.yaml publishes them.
   release-artifacts:
-    # Explicit name so the status check is stable. Left implicit, GitHub derives
-    # it from every matrix value -- which is how branch protection ended up
-    # requiring `deploy (11)`, a check that stopped existing the moment this job
-    # grew an os/rust_asset matrix. Adding a matrix key must not rename a check.
+    # Keep this check name stable for branch protection.
     name: release-artifacts (${{ matrix.os }})
     needs: [coverage]
     runs-on: ${{ matrix.os }}
     permissions:
-      # Read-only: nothing here attests or publishes. The id-token/attestations
-      # writes this job used to request were left over from the old deploy.
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        # rust_asset is the name //release:bazel-diff-rust gives the binary on
-        # that platform -- it is asserted, not applied (see the upload step).
-        #
-        # The two Windows-only Bazel flags can't move into --config=release:
-        # startup flags can't live in a --config at all, and .bazelrc expands
-        # platform-specific config for the bare `build` config name only.
-        # bazel_startup_flags shortens the output root because MSVC's link.exe
-        # is MAX_PATH-bound (260): under the default root, the Rust stdlib path
-        # ...rust_toolchain\lib\rustlib\x86_64-pc-windows-msvc\lib\
-        # librustc_std_workspace_alloc-<hash>.rlib comes to 263 characters and
-        # the link fails with LNK1181. C:/b buys back 35.
-        #
-        # release_config is `release-musl` on Linux: the published Linux amd64
-        # binary is statically linked against musl so it does not inherit the
-        # runner's glibc as a floor. It is a cross-compile, not a different
-        # runner, so it stays in this row. The linux-arm64 musl asset is built
-        # in extra steps on this same job (not a second matrix row) so the
-        # check name stays `release-artifacts (ubuntu-latest)`. macOS and
-        # Windows link their platform's own libc and use the plain `release`
-        # config.
+        # Match //release:bazel-diff-rust asset names. Linux configs use musl;
+        # Windows startup flags keep output paths short.
         include:
           - os: ubuntu-latest
             rust_asset: bazel-diff-rust-linux-amd64
-            release_config: release-musl
+            release_config: release-linux
             bazel_startup_flags: ''
             bazel_extra_flags: ''
             upload_archive: true
@@ -407,7 +331,7 @@ jobs:
           - os: windows-latest
             rust_asset: bazel-diff-rust-windows-amd64.exe
             release_config: release
-            bazel_startup_flags: '--output_user_root=C:/b'
+            bazel_startup_flags: '--output_base=C:/b'
             bazel_extra_flags: '--legacy_external_runfiles'
             upload_archive: false
     steps:
@@ -438,10 +362,7 @@ jobs:
           }
           echo "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/checkout@v4
-      # The same script release_prep.sh packs the shipped archive with, so this
-      # check can't pass on an archive the release would not produce. It used to
-      # call `make release_source_archive`, a second tar recipe that had already
-      # drifted (no __pycache__/*.pyc excludes).
+      # Use the same archive script as release_prep.sh.
       - name: Build release source archive
         if: matrix.upload_archive
         run: .github/workflows/pack_release_archive.sh archives/release.tar.gz
@@ -451,38 +372,29 @@ jobs:
           name: release.tar.gz
           path: archives/release.tar.gz
           if-no-files-found: error
-      # //release:bazel-diff-rust names the binary for the platform Bazel built
-      # it for, so this step neither renames nor relocates anything: whatever
-      # lands in bazel-bin/release/ is the published asset. matrix.release_config
-      # carries the flags (see .bazelrc) -- including, on Linux, the musl target
-      # platform. `if-no-files-found: error` below is the assertion that Bazel's
-      # name still matches matrix.rust_asset.
+      # .bazelrc defines release configs; //release:bazel-diff-rust names assets.
       - name: Build Rust binary
         shell: bash
         env:
-          # Windows runs this under Git bash, whose MSYS runtime rewrites any
-          # argument starting with `//package` into a `/package` Windows path --
-          # Bazel then rejects "invalid package name '/release'". (`//:target`
-          # survived only because it has no path-like segment to convert.)
+          # Prevent Git Bash from rewriting Bazel target labels as Windows paths.
           MSYS2_ARG_CONV_EXCL: '//'
         run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} ${{ matrix.bazel_extra_flags }}
-      - name: Assert Linux binary is statically linked
+      - name: Validate Linux release binary
         if: runner.os == 'Linux'
-        run: .github/workflows/assert_static_binary.sh "bazel-bin/release/${{ matrix.rust_asset }}"
+        run: |
+          .github/workflows/assert_static_binary.sh "bazel-bin/release/${{ matrix.rust_asset }}"
+          "bazel-bin/release/${{ matrix.rust_asset }}" --version
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.rust_asset }}
           path: bazel-bin/release/${{ matrix.rust_asset }}
           if-no-files-found: error
-      # Second published Linux asset, built in this same job so the status check
-      # stays `release-artifacts (ubuntu-latest)`. A matrix row with the same
-      # `os` would duplicate that name and break branch protection.
-      - name: Build Rust binary (linux-arm64 musl)
+      # Keep both Linux assets in the required release-artifacts (ubuntu-latest) job.
+      - name: Build Rust binary (linux-arm64)
         if: runner.os == 'Linux'
-        run: bazelisk build //release:bazel-diff-rust --config=release-musl-arm64
-      - name: Assert Linux arm64 binary is statically linked
-        if: runner.os == 'Linux'
-        run: .github/workflows/assert_static_binary.sh bazel-bin/release/bazel-diff-rust-linux-arm64
+        run: |
+          bazelisk build //release:bazel-diff-rust --config=release-linux-arm64
+          .github/workflows/assert_static_binary.sh bazel-bin/release/bazel-diff-rust-linux-arm64
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Linux'
         with:

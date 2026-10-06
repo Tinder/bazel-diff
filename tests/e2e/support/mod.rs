@@ -86,7 +86,9 @@ fn top_level_bazel_workspaces(root: &Path) -> Vec<PathBuf> {
 pub fn repo_root() -> PathBuf {
     match runfiles_root() {
         Some(root) => root,
-        None => PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        None => PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo must set CARGO_MANIFEST_DIR"),
+        ),
     }
 }
 

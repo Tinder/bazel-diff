@@ -70,7 +70,7 @@ jobs:
       # The same statically linked musl asset the release publishes for Linux amd64, so the
       # container needs no JDK or libc for bazel-diff itself.
       - name: Build bazel-diff (static musl binary, cross-built on the glibc host)
-        run: ~/go/bin/bazelisk build //release:bazel-diff-rust --config=release-musl
+        run: ~/go/bin/bazelisk build //release:bazel-diff-rust --config=release-linux
       - name: Stage container inputs
         # Everything the container needs goes into one mounted directory: the binary, the
         # harness sources, .bazelversion (the harness copies it into fabricated workspaces),

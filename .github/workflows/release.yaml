@@ -1,12 +1,5 @@
-# Cut a release whenever a new tag is pushed or via workflow_dispatch.
-# Uses bazel-contrib release ruleset: build, attest, and publish to GitHub Releases.
-# A separate matrix job attaches host-native Rust CLI binaries to the draft release.
-#
-# Unit, lint, and tooling tests gate the release from inside the reusable
-# workflow's build job (`bazel_test_command` below). The nested-Bazel e2e suite
-# (`//tests:e2e_test`) does not: it runs on PRs and master in ci.yaml
-# (`rust-candidate-e2e`), where it has a JDK, per-case timeouts, and its own
-# runner. Putting it here blocked the rest of the release for hours (#499).
+# Build and publish a source archive and Rust binaries for a tagged release.
+# Unit, lint, and tooling tests run here; //tests:e2e_test runs in ci.yaml.
 name: Release
 on:
   workflow_dispatch:
@@ -27,17 +20,8 @@ jobs:
     uses: bazel-contrib/.github/.github/workflows/release_ruleset.yaml@v7.4.0
     with:
       release_files: archives/*.*
-      # Replaces the reusable workflow's default (`bazel test //...`), which
-      # would pull in //tests:e2e_test. Substituted into a `run:` step
-      # verbatim; the workflow appends its own --disk_cache/--repository_cache
-      # flags after the command, so do not put a `--` target terminator here.
-      #
-      # //src/... and //tools/... are the unit/tooling tests. The clippy and
-      # rustfmt gates compile the e2e crate as a lint root; they do not run it.
-      # --build_tests_only: build what those tests need -- the release binary
-      #   itself comes from the rust-binaries matrix below.
-      # --test_output=errors: the failing test's log goes to the job output,
-      #   which is the only place it can go from inside the reusable workflow.
+      # Exclude the nested-Bazel E2E suite. The reusable workflow appends cache
+      # flags, so this command must not end with a `--` target terminator.
       bazel_test_command: >-
         bazel test //src/... //tools/... //:rust_clippy_check //:rust_format_check
         --build_tests_only --test_output=errors
@@ -64,25 +48,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # bazel_startup_flags shortens the output root on Windows because MSVC's
-        # link.exe is MAX_PATH-bound (260): under the default root the Rust
-        # stdlib rlib ...\librustc_std_workspace_alloc-<hash>.rlib comes to 263
-        # characters and the link fails with LNK1181. Keep in sync with the
-        # `release-artifacts` job in ci.yaml, which is where this gets exercised
-        # per-PR -- including release_config, which builds the Linux assets
-        # statically against musl so they run on any distribution rather than
-        # requiring the runner's glibc or newer. linux-arm64 is a second Ubuntu
-        # row here (jobs are named by asset) but extra steps in the same CI job
-        # so that check name does not change.
+        # Keep build flags in sync with `release-artifacts` in ci.yaml.
+        # Linux configs use musl; arm64 is cross-compiled on Ubuntu.
         include:
           - os: ubuntu-latest
             asset: bazel-diff-rust-linux-amd64
-            release_config: release-musl
+            release_config: release-linux
             bazel_startup_flags: ""
             bazel_extra_flags: ""
           - os: ubuntu-latest
             asset: bazel-diff-rust-linux-arm64
-            release_config: release-musl-arm64
+            release_config: release-linux-arm64
             bazel_startup_flags: ""
             bazel_extra_flags: ""
           - os: macos-latest
@@ -93,7 +69,7 @@ jobs:
           - os: windows-latest
             asset: bazel-diff-rust-windows-amd64.exe
             release_config: release
-            bazel_startup_flags: "--output_user_root=C:/b"
+            bazel_startup_flags: "--output_base=C:/b"
             bazel_extra_flags: "--legacy_external_runfiles"
     steps:
       - name: Checkout
@@ -115,24 +91,19 @@ jobs:
         run: |
           go install github.com/bazelbuild/bazelisk@latest
           echo "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      # //release:bazel-diff-rust names the binary for the platform Bazel built
-      # it for, so nothing here renames or relocates it: bazel-bin/release/ holds
-      # the published asset, and `gh release upload` keeps that file name. The
-      # build flags live in .bazelrc under matrix.release_config.
+      # .bazelrc defines release configs; //release:bazel-diff-rust names assets.
       - name: Build Rust binary
         shell: bash
         env:
-          # Windows runs this under Git bash, whose MSYS runtime rewrites any
-          # argument starting with `//package` into a `/package` Windows path --
-          # Bazel then rejects "invalid package name '/release'". (`//:target`
-          # survived only because it has no path-like segment to convert.)
+          # Prevent Git Bash from rewriting Bazel target labels as Windows paths.
           MSYS2_ARG_CONV_EXCL: '//'
         run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} ${{ matrix.bazel_extra_flags }}
-      # Last gate before the asset is published: a glibc-linked binary here
-      # would strand every user on an older distribution than the runner.
-      - name: Assert Linux binary is statically linked
+      - name: Check Linux static linking
         if: runner.os == 'Linux'
         run: .github/workflows/assert_static_binary.sh "bazel-bin/release/${{ matrix.asset }}"
+      - name: Run Linux release binary
+        if: matrix.asset == 'bazel-diff-rust-linux-amd64'
+        run: bazel-bin/release/${{ matrix.asset }} --version
       - name: Upload release asset
         shell: bash
         env:

@@ -13,7 +13,7 @@
 # path-independent -- the script locates it from $0):
 #
 #   <stage>/bazel-diff                the statically linked musl binary (//release:bazel-diff-rust
-#                                     --config=release-musl) built on the glibc host
+#                                     --config=release-linux) built on the glibc host
 #   <stage>/bazel-glibc               the official bazel release binary (see version note below)
 #   <stage>/.bazelversion             copied into fabricated workspaces (harness expects it)
 #   <stage>/tools/serve_stress.py     the harness + its shared plumbing + this script

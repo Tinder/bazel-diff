@@ -1,87 +1,40 @@
 run -c opt --show_loading_progress=false --show_progress=false --ui_event_filters=error
 run:verbose -c dbg --show_loading_progress=true --show_progress=true --ui_event_filters=info,error,debug
-# Enable platform-specific config
 common --enable_platform_specific_config
 
-# Set C++ standard to C++17 for abseil-cpp compatibility
-# Use GCC/Clang syntax for Linux and macOS
-build:linux --cxxopt=-std=c++17
-build:linux --host_cxxopt=-std=c++17
-build:macos --cxxopt=-std=c++17
-build:macos --host_cxxopt=-std=c++17
-# Use MSVC syntax for Windows
-build:windows --cxxopt=/std:c++17
-build:windows --host_cxxopt=/std:c++17
-# On Windows the `ring` crate's build script (pulled in by rust-s3's rustls
-# backend) only finds its generated headers through the legacy external
-# runfiles layout; without this it fails with "Cannot open include file:
-# 'ring_core_generated/prefix_symbols.h'". `run` and `test` inherit `build`,
-# `query` does not, so the nested Bazel the CLI shells out to is unaffected.
-# The release and BCR-presubmit Windows builds pass the same flag explicitly.
+common:windows --host_platform=//platforms:windows_msvc
+# Keep Windows exec paths under MAX_PATH (rules_rs#270): name output
+# directories "win-..." instead of "x64_windows-...".
+common:windows --experimental_platform_in_output_dir
+common:windows --experimental_override_name_platform_in_output_dir=//platforms:windows_msvc=win
+# ring's build script needs generated headers in the legacy runfiles layout.
 build:windows --legacy_external_runfiles
 
-# Release artifacts: `bazel build //release:bazel-diff-rust --config=release`.
-# CI uses nothing but this config, so the flags a published binary is built with
-# live here rather than in the workflow files. The C++ standard flags come from
-# the platform-specific configs above.
-#
-# rules_rust ignores Cargo profiles, so `-c opt` alone (opt-level=3,
-# debuginfo=0, strip=debuginfo) builds a *weaker* binary than
-# `cargo build --release` does under [profile.release] in Cargo.toml. The two
-# settings below restore the difference; keep them in sync with that profile.
+# Match Cargo.toml's release profile.
 build:release -c opt
-
-# lto = "thin" in Cargo.toml. Cross-crate inlining/DCE at link time. rules_rust
-# skips it for build scripts and proc-macros, matching Cargo.
 build:release --@rules_rust//rust/settings:lto=thin
-
-# strip = true in Cargo.toml (`-c opt` only strips debuginfo, not the symbol
-# table). Passed as an extra flag because the strip level is otherwise a
-# property of the toolchain, which would change every build, not just releases.
 build:release --@rules_rust//rust/settings:extra_rustc_flags=-Cstrip=symbols
 
-# Linux release artifacts: `bazel build //release:bazel-diff-rust --config=release-musl`
-# (amd64) or `--config=release-musl-arm64` (arm64). Everything --config=release
-# does, but built for a musl platform, which makes the published Linux binary
-# statically linked: it runs on any distribution instead of requiring the glibc
-# of whatever runner built it. //platforms explains the constraint; MODULE.bazel
-# wires up the Rust and C toolchains it selects. Cross-compiles, so these
-# configs work on a glibc Linux host and on an Apple Silicon Mac -- the asset
-# name is derived from the target platform.
-build:release-musl --config=release
-build:release-musl --platforms=//platforms:linux_x86_64_musl
+# Statically linked Linux releases, also cross-compiled from macOS.
+build:release-linux --config=release
+build:release-linux --platforms=@rules_rs//rs/platforms:x86_64-unknown-linux-musl
 
-build:release-musl-arm64 --config=release
-build:release-musl-arm64 --platforms=//platforms:linux_aarch64_musl
+build:release-linux-arm64 --config=release
+build:release-linux-arm64 --platforms=@rules_rs//rs/platforms:aarch64-unknown-linux-musl
 
-# Avoid cache thrashing, but allow integration tests to find "bazel" on the PATH.
+# Integration tests need bazel on PATH.
 common --incompatible_strict_action_env
 common --test_env=PATH
 
-# Lint and format-check first-party Rust crates on every build so issues surface
-# immediately. Both aspects only attach to rules_rust targets (required_providers
-# gates them) and skip external crates. Opt a target out with
-# tags = ["no-clippy"] / tags = ["no-rustfmt"].
-#
-# This is local feedback, not the gate: neither aspect propagates along deps, so
-# it only covers the targets a build names. //:rust_clippy_check and
-# //:rust_format_check are the targets CI runs, and they pin the roots.
+# Check selected first-party targets. CI checks all roots through
+# //:rust_clippy_check and //:rust_format_check.
 build --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
 build --output_groups=+clippy_checks
 build --aspects=@rules_rust//rust:defs.bzl%rustfmt_aspect
 build --output_groups=+rustfmt_checks
 
-# Coverage runs use the Rust LCOV merger from //tools/coverage instead of
-# Bazel's built-in one. Besides merging each test's raw tracefiles into its
-# coverage.dat, it enforces the per-target line-coverage minimums declared
-# via //tools/coverage:defs.bzl (targets opt in through their `env` attr).
-# Scoped to the `coverage` command, and Bazel only invokes an LCOV merger in
-# coverage mode anyway, so plain `bazel test` runs are never affected.
+# Merge LCOV reports and enforce the per-target coverage thresholds.
 coverage --coverage_output_generator=//tools/coverage:lcov_merger
 
-# Local override when a nested-Bazel e2e case needs more than its size timeout
-# (`bazel test //tests:e2e_test --config=no-test-timeouts`). CI keeps the
-# per-size bounds so hangs fail in minutes. Not named `release`: `test`
-# inherits `build` configs, so --config=release would drag in -c opt and thin
-# LTO and rebuild the world.
+# Optional longer timeout for local nested-Bazel integration tests.
 test:no-test-timeouts --test_timeout=21600

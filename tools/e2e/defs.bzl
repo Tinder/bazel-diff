@@ -18,7 +18,7 @@ in one process locally (`bazel test //tests:e2e_test_all`) and to give the Rust
 lint gates in //BUILD a single crate to check instead of one per case.
 """
 
-load("@rules_rust//rust:defs.bzl", "rust_test")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
 
 # How many CPUs one e2e case reserves from Bazel's local resource pool.
 #

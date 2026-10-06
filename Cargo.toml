@@ -13,6 +13,10 @@ publish = false
 name = "bazel-diff"
 path = "src/main.rs"
 
+[features]
+default = ["vendored-protoc"]
+vendored-protoc = ["dep:protoc-bin-vendored"]
+
 [dependencies]
 anyhow = "1.0"
 attohttpc = { version = "=0.28.5", default-features = false, features = ["basic-auth", "tls-rustls-webpki-roots"] }
@@ -33,7 +37,7 @@ walkdir = "2.5"
 
 [build-dependencies]
 buffa-build = "0.9.1"
-protoc-bin-vendored = "3.2"
+protoc-bin-vendored = { version = "3.2", optional = true }
 
 [dev-dependencies]
 zip = { version = "2.2", default-features = false, features = ["deflate"] }

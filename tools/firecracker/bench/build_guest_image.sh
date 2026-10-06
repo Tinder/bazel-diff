@@ -4,7 +4,7 @@
 #
 # The rootfs bakes in everything `bazel-diff warmup` / `generate-hashes` needs so
 # the guest is self-contained and offline: a JDK (for Bazel itself), a pinned
-# `bazel` binary, git, the statically linked bazel-diff binary (as
+# `bazel` binary, git, the static musl bazel-diff binary (as
 # `/usr/local/bin/bazel-diff`), the workspace, an sshd that trusts the operator
 # key, and the /snap dir warmup writes to.
 # fcDriver.baseRootfs() expects the rootfs at <kernel-dir>/rootfs.base.ext4, so
@@ -32,9 +32,9 @@ OUT="${OUT:-/tmp/fc-image}"
 SIZE_MB="${SIZE_MB:-6144}"
 JDK_PKG="${JDK_PKG:-openjdk-21-jdk-headless}"
 
-# The musl-static Linux release binary for $ARCH (make release_rust_binary_linux
-# / release_rust_binary_linux_arm64): it has no libc dependency on the guest.
-BAZEL_DIFF_BIN="${BAZEL_DIFF_BIN:?set BAZEL_DIFF_BIN to the statically linked bazel-diff Linux binary}"
+# Static musl release for $ARCH (make release_rust_binary_linux or
+# make release_rust_binary_linux_arm64).
+BAZEL_DIFF_BIN="${BAZEL_DIFF_BIN:?set BAZEL_DIFF_BIN to the bazel-diff Linux release binary}"
 BAZEL_BIN="${BAZEL_BIN:?set BAZEL_BIN to a bazel/bazelisk binary to bake in}"
 WORKSPACE_SRC="${WORKSPACE_SRC:?set WORKSPACE_SRC to the git workspace to bake in}"
 SSH_PUBKEY="${SSH_PUBKEY:?set SSH_PUBKEY to the public key the guest should trust}"

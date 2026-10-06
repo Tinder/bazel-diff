@@ -25,7 +25,9 @@ This approach was inspired by the [following BazelConf talk](https://www.youtube
 ## Prerequisites
 
 * Git
-* Bazel 7 or higher (Bazel itself needs a JDK; `bazel-diff` is a single static binary and does not)
+* Bazel 8 or higher (use the latest release for your major version)
+
+Bazel needs a JDK; the `bazel-diff` binary does not.
 
 ## Getting Started
 
@@ -452,10 +454,8 @@ content of the file are converted into a SHA256 value.
 
 ### Prebuilt binaries (recommended)
 
-Every [release](https://github.com/Tinder/bazel-diff/releases) ships a single self-contained
-binary per platform. The Linux binaries are statically linked against musl, so they run on any
-distribution (including Alpine and images older than the build runner) with no libc or JVM
-requirement:
+Every [release](https://github.com/Tinder/bazel-diff/releases) includes platform binaries.
+Linux binaries are statically linked with musl:
 
 ```terminal
 # Linux amd64
@@ -476,11 +476,26 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 
 ### Integrate into your project
 
-Add the following to your `MODULE.bazel`:
+With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
 bazel_dep(name = "bazel-diff", version = "{{BAZEL_DIFF_VERSION}}")
 ```
+
+Until `rules_rs` fixes `all_crate_deps(package_name = "")`, copy
+[`rules_rs_package_name.patch`](patches/rules_rs_package_name.patch) into your
+workspace root and add this override to the same `MODULE.bazel`:
+
+```bazel
+single_version_override(
+    module_name = "rules_rs",
+    version = "0.0.112",
+    patch_strip = 1,
+    patches = ["//:rules_rs_package_name.patch"],
+)
+```
+
+Bazel only applies overrides from the root module.
 
 You can now run the tool with:
 
@@ -488,34 +503,32 @@ You can now run the tool with:
 bazel run @bazel-diff//:bazel-diff -- --help
 ```
 
-(`@bazel-diff//:bazel-diff-rust` still resolves to the same binary for projects that adopted
-it under that name.) bazel-diff is bzlmod-only; there is no `WORKSPACE` integration.
+On Windows, add `--host_platform=@bazel-diff//platforms:windows_msvc` and
+`--legacy_external_runfiles` before `--`. Windows builds need Visual Studio with the
+C++ build tools installed.
+Bazel does not read a dependency's `.bazelrc`.
+
+Bzlmod is required; `@bazel-diff//:bazel-diff-rust` is an alias for the same binary.
 
 ### Build from Source
 
-After cloning down the repo, you are good to go, Bazel will handle the rest
-
-To run the project
+Use Bazel 8 or higher. Bazel downloads the Rust and C/C++ toolchains:
 
 ```terminal
 bazel run :bazel-diff -- --help
 ```
 
-To build the same binaries a release publishes (Bazel names the output for the platform it
-was built for, `bazel-bin/release/bazel-diff-rust-<os>-<arch>[.exe]`):
+Release binaries are written to `bazel-bin/release/bazel-diff-rust-<os>-<arch>[.exe]`:
 
 ```terminal
 make release_rust_binary              # bazel build //release:bazel-diff-rust --config=release
-make release_rust_binary_linux        # ... --config=release-musl
-make release_rust_binary_linux_arm64  # ... --config=release-musl-arm64
+make release_rust_binary_linux        # ... --config=release-linux
+make release_rust_binary_linux_arm64  # ... --config=release-linux-arm64
 ```
 
-`--config=release-musl` and `--config=release-musl-arm64` target
-`//platforms:linux_x86_64_musl` and `//platforms:linux_aarch64_musl`, which select a musl Rust
-std and a musl C toolchain, so the Linux assets are statically linked instead of inheriting the
-build runner's glibc as a version floor. They are cross-compiles: the same commands produce
-`bazel-diff-rust-linux-amd64` and `bazel-diff-rust-linux-arm64` on a glibc Linux host and on an
-Apple Silicon Mac.
+`--config=release-linux` and `--config=release-linux-arm64` build static musl
+binaries for amd64 and arm64, respectively. Both support cross-compilation from
+Linux and Apple Silicon macOS.
 
 #### Debugging (when running from source)
 

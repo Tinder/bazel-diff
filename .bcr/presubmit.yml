@@ -1,6 +1,5 @@
 matrix:
   bazel:
-  - 7.x
   - 8.x
   - 9.x
 tasks:
@@ -8,9 +7,6 @@ tasks:
     name: Verify build targets (Debian 10)
     platform: debian10
     bazel: ${{ bazel }}
-    build_flags:
-    - '--cxxopt=-std=c++17'
-    - '--host_cxxopt=-std=c++17'
     build_targets:
     - '@bazel-diff//:bazel-diff'
     - '@bazel-diff//:bazel-diff-rust'
@@ -18,9 +14,6 @@ tasks:
     name: Verify build targets (Ubuntu 20.04)
     platform: ubuntu2004
     bazel: ${{ bazel }}
-    build_flags:
-    - '--cxxopt=-std=c++17'
-    - '--host_cxxopt=-std=c++17'
     build_targets:
     - '@bazel-diff//:bazel-diff'
     - '@bazel-diff//:bazel-diff-rust'
@@ -28,9 +21,6 @@ tasks:
     name: Verify build targets (macOS ARM64)
     platform: macos_arm64
     bazel: ${{ bazel }}
-    build_flags:
-    - '--cxxopt=-std=c++17'
-    - '--host_cxxopt=-std=c++17'
     build_targets:
     - '@bazel-diff//:bazel-diff'
     - '@bazel-diff//:bazel-diff-rust'
@@ -40,8 +30,7 @@ tasks:
     bazel: "8.x"
     build_flags:
     - '--legacy_external_runfiles'
-    - '--cxxopt=-std=c++17'
-    - '--host_cxxopt=-std=c++17'
+    - '--host_platform=@bazel-diff//platforms:windows_msvc'
     build_targets:
     - '@bazel-diff//:bazel-diff'
     - '@bazel-diff//:bazel-diff-rust'
@@ -51,8 +40,7 @@ tasks:
     bazel: "9.x"
     build_flags:
     - '--legacy_external_runfiles'
-    - '--cxxopt=-std=c++17'
-    - '--host_cxxopt=-std=c++17'
+    - '--host_platform=@bazel-diff//platforms:windows_msvc'
     build_targets:
     - '@bazel-diff//:bazel-diff'
     - '@bazel-diff//:bazel-diff-rust'
@@ -70,9 +58,6 @@ bcr_test_module:
       name: Run test
       platform: ${{ platform }}
       bazel: ${{ bazel }}
-      build_flags:
-      - '--cxxopt=-std=c++17'
-      - '--host_cxxopt=-std=c++17'
       build_targets:
       - '//:bazel-diff-rust'
       test_targets:

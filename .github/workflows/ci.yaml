@@ -116,7 +116,7 @@ jobs:
           USE_BAZEL_VERSION: '8.x'
         run: |
           ~/go/bin/bazelisk build //src:bazel-diff \
-            --extra_toolchains=@bazel_diff_msrv_toolchains//rustc:all \
+            --extra_toolchains=@bd_msrv//rustc:all \
             --output_groups=-clippy_checks,-rustfmt_checks \
             --enable_bzlmod=true --enable_workspace=false
 

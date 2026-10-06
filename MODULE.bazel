@@ -39,31 +39,34 @@ use_repo(llvm, "llvm-project")
 rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
 use_repo(rules_rust, "rules_rust")
 
+# Keep these repo names short: they appear in Windows exec paths, which must
+# stay under MAX_PATH (rules_rs#270). The bd_ prefix avoids clashing with a
+# consumer's own rules_rs toolchain or crate repos.
 rust = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
 rust.toolchain(
-    name = "bazel_diff_rust_toolchains",
+    name = "bd_rust",
     edition = "2021",
     version = "1.90.0",
 )
-use_repo(rust, "bazel_diff_rust_toolchains")
+use_repo(rust, "bd_rust")
 
 register_toolchains(
-    "@bazel_diff_rust_toolchains//...",
+    "@bd_rust//...",
     "@llvm//toolchain:all",
 )
 
 # CI selects this toolchain explicitly to check Cargo.toml's rust-version.
 msrv = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains", dev_dependency = True)
 msrv.toolchain(
-    name = "bazel_diff_msrv_toolchains",
+    name = "bd_msrv",
     edition = "2021",
     version = "1.85.0",
 )
-use_repo(msrv, "bazel_diff_msrv_toolchains")
+use_repo(msrv, "bd_msrv")
 
 crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
 crate.from_cargo(
-    name = "bazel_diff_crates",
+    name = "bd_crates",
     cargo_lock = "//:Cargo.lock",
     cargo_toml = "//:Cargo.toml",
     platform_triples = [
@@ -77,4 +80,4 @@ crate.from_cargo(
         "x86_64-unknown-linux-musl",
     ],
 )
-use_repo(crate, "bazel_diff_crates")
+use_repo(crate, "bd_crates")

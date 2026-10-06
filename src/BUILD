@@ -1,4 +1,4 @@
-load("@bazel_diff_crates//:defs.bzl", "all_crate_deps")
+load("@bd_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rs//rs:cargo_build_script.bzl", "cargo_build_script")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
@@ -20,7 +20,7 @@ cargo_build_script(
     ],
     tools = ["@protobuf//:protoc"],
     # Bazel supplies protoc, so omit Cargo's optional protoc-bin-vendored dependency.
-    deps = ["@bazel_diff_crates//:buffa-build"],
+    deps = ["@bd_crates//:buffa-build"],
 )
 
 rust_library(

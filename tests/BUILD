@@ -1,4 +1,4 @@
-load("@bazel_diff_crates//:defs.bzl", "all_crate_deps")
+load("@bd_crates//:defs.bzl", "all_crate_deps")
 load("//tools/e2e:defs.bzl", "rust_e2e_tests")
 load("//tools/e2e:rust_e2e_cases.bzl", "RUST_E2E_SUITES")
 

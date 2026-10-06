@@ -1,0 +1,6 @@
+module(
+    name = "facade",
+    version = "1.0",
+)
+
+bazel_dep(name = "middle", version = "1.0", repo_name = "private_wrapper")

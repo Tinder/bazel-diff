@@ -69,7 +69,7 @@ jobs:
           - os: windows-latest
             asset: bazel-diff-rust-windows-amd64.exe
             release_config: release
-            bazel_startup_flags: "--output_user_root=C:/b"
+            bazel_startup_flags: "--output_base=C:/b"
             bazel_extra_flags: "--legacy_external_runfiles"
     steps:
       - name: Checkout

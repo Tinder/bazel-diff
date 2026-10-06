@@ -3,6 +3,10 @@ run:verbose -c dbg --show_loading_progress=true --show_progress=true --ui_event_
 common --enable_platform_specific_config
 
 common:windows --host_platform=//platforms:windows_msvc
+# Keep Windows exec paths under MAX_PATH (rules_rs#270): name output
+# directories "win-..." instead of "x64_windows-...".
+common:windows --experimental_platform_in_output_dir
+common:windows --experimental_override_name_platform_in_output_dir=//platforms:windows_msvc=win
 # ring's build script needs generated headers in the legacy runfiles layout.
 build:windows --legacy_external_runfiles
 

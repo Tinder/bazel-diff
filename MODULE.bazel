@@ -19,12 +19,10 @@ bazel_dep(name = "rules_go", version = "0.62.0", dev_dependency = True)
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk", dev_dependency = True)
 go_sdk.download(version = "1.23.1")
 
-bazel_dep(name = "llvm", version = "0.8.24")
-single_version_override(
-    module_name = "llvm",
-    patch_strip = 1,
-    patches = ["//patches:llvm_windows_exec_case_overlays.patch"],
-)
+# llvm 0.8.20+ adds hermetic Windows MSVC toolchains, which fail on a Windows
+# MSVC exec host (rules_rs#271, hermetic-llvm#809). 0.8.19 has none, so Windows
+# builds use the locally installed Visual Studio toolchain.
+bazel_dep(name = "llvm", version = "0.8.19")
 bazel_dep(name = "rules_rs", version = "0.0.112")
 single_version_override(
     module_name = "rules_rs",

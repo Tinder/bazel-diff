@@ -6,13 +6,6 @@ on:
   pull_request:
     branches: [ master ]
 
-env:
-  # hermetic-llvm's Windows toolchain fetches the MSVC runtime and Windows SDK
-  # only after these are set to 1. GitHub-hosted Windows runners already ship
-  # Visual Studio and the Windows SDK, and hermetic-llvm's own CI sets both.
-  BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA: '1'
-  BAZEL_WINDOWS_SDK_EULA: '1'
-
 # Preserve the Rust candidate, MSRV, E2E, and release-artifacts job names:
 # master branch protection requires these checks.
 jobs:

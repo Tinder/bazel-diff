@@ -495,20 +495,6 @@ single_version_override(
 )
 ```
 
-On Windows hosts, also copy
-[`llvm_windows_exec_case_overlays.patch`](patches/llvm_windows_exec_case_overlays.patch)
-and add this override until `llvm` fixes
-[hermetic-llvm#809](https://github.com/hermeticbuild/hermetic-llvm/issues/809):
-
-```bazel
-single_version_override(
-    module_name = "llvm",
-    version = "0.8.24",
-    patch_strip = 1,
-    patches = ["//:llvm_windows_exec_case_overlays.patch"],
-)
-```
-
 Bazel only applies overrides from the root module.
 
 You can now run the tool with:
@@ -518,7 +504,8 @@ bazel run @bazel-diff//:bazel-diff -- --help
 ```
 
 On Windows, add `--host_platform=@bazel-diff//platforms:windows_msvc` and
-`--legacy_external_runfiles` before `--`, and follow the Windows license setup below.
+`--legacy_external_runfiles` before `--`. Windows builds need Visual Studio with the
+C++ build tools installed.
 Bazel does not read a dependency's `.bazelrc`.
 
 Bzlmod is required; `@bazel-diff//:bazel-diff-rust` is an alias for the same binary.
@@ -530,13 +517,6 @@ Use Bazel 8 or higher. Bazel downloads the Rust and C/C++ toolchains:
 ```terminal
 bazel run :bazel-diff -- --help
 ```
-
-Windows builds require acceptance of the MSVC runtime and Windows SDK licenses.
-After accepting, configure `BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA` and
-`BAZEL_WINDOWS_SDK_EULA` as described in
-[hermetic-llvm's Windows instructions](https://github.com/hermeticbuild/hermetic-llvm#windows).
-This repository's GitHub Actions workflows set both to `1`; other build environments
-must set them as environment variables or with `--repo_env`.
 
 Release binaries are written to `bazel-bin/release/bazel-diff-rust-<os>-<arch>[.exe]`:
 

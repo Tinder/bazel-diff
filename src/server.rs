@@ -45,6 +45,8 @@ pub struct ServerConfig {
     pub s3_region: Option<String>,
     pub s3_endpoint: Option<String>,
     pub s3_force_path_style: bool,
+    pub gcs_bucket: Option<String>,
+    pub gcs_prefix: String,
     pub nexus_url: Option<String>,
     pub nexus_repository: Option<String>,
     pub nexus_prefix: String,
@@ -66,6 +68,7 @@ struct State {
 /// outage of the shared store costs throughput, never availability.
 enum RemoteCache {
     S3(S3Cache),
+    Gcs(Box<GcsCache>),
     Nexus(Box<NexusCache>),
 }
 
@@ -73,6 +76,12 @@ impl RemoteCache {
     fn new(config: &ServerConfig) -> Result<Option<Self>> {
         if let Some(bucket_name) = &config.s3_bucket {
             return Ok(Some(Self::S3(S3Cache::new(config, bucket_name)?)));
+        }
+        if let Some(bucket_name) = &config.gcs_bucket {
+            return Ok(Some(Self::Gcs(Box::new(GcsCache::new(
+                bucket_name,
+                &config.gcs_prefix,
+            )?))));
         }
         if let (Some(url), Some(repository)) = (&config.nexus_url, &config.nexus_repository) {
             return Ok(Some(Self::Nexus(Box::new(NexusCache::new(
@@ -87,6 +96,7 @@ impl RemoteCache {
     fn get(&self, key: &str) -> Option<Vec<u8>> {
         match self {
             Self::S3(cache) => cache.get(key),
+            Self::Gcs(cache) => cache.get(key),
             Self::Nexus(cache) => cache.get(key),
         }
     }
@@ -94,6 +104,7 @@ impl RemoteCache {
     fn put(&self, key: &str, data: &[u8]) {
         match self {
             Self::S3(cache) => cache.put(key, data),
+            Self::Gcs(cache) => cache.put(key, data),
             Self::Nexus(cache) => cache.put(key, data),
         }
     }
@@ -190,6 +201,140 @@ fn normalize_s3_prefix(prefix: &str) -> String {
         String::new()
     } else {
         format!("{trimmed}/")
+    }
+}
+
+type GcsTokenSource = Box<dyn Fn() -> Result<String> + Send + Sync>;
+
+struct GcsCache {
+    session: attohttpc::Session,
+    endpoint: Url,
+    bucket: String,
+    prefix: String,
+    token_source: GcsTokenSource,
+}
+
+impl GcsCache {
+    fn new(bucket: &str, prefix: &str) -> Result<Self> {
+        if bucket.is_empty() || bucket.contains('/') {
+            bail!("invalid GCS bucket name");
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create GCS credential runtime")?;
+        let provider = runtime
+            .block_on(gcp_auth::provider())
+            .context("failed to resolve GCS credentials")?;
+        Self::new_with_token_source(
+            bucket,
+            prefix,
+            "https://storage.googleapis.com",
+            Box::new(move || {
+                let token = runtime.block_on(
+                    provider.token(&["https://www.googleapis.com/auth/devstorage.read_write"]),
+                )?;
+                Ok(token.as_str().to_owned())
+            }),
+        )
+    }
+
+    fn new_with_token_source(
+        bucket: &str,
+        prefix: &str,
+        endpoint: &str,
+        token_source: GcsTokenSource,
+    ) -> Result<Self> {
+        let endpoint = Url::parse(endpoint).context("invalid GCS endpoint")?;
+        if !matches!(endpoint.scheme(), "http" | "https")
+            || bucket.is_empty()
+            || bucket.contains('/')
+        {
+            bail!("invalid GCS endpoint or bucket");
+        }
+        let mut session = attohttpc::Session::new();
+        session.connect_timeout(Duration::from_secs(10));
+        session.read_timeout(Duration::from_secs(60));
+        session.follow_redirects(false);
+        Ok(Self {
+            session,
+            endpoint,
+            bucket: bucket.to_owned(),
+            prefix: normalize_s3_prefix(prefix),
+            token_source,
+        })
+    }
+
+    fn object_name(&self, key: &str) -> String {
+        format!("{}{key}.json", self.prefix)
+    }
+
+    fn object_url(&self, key: &str) -> Url {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .expect("validated GCS endpoint")
+            .pop_if_empty()
+            .extend(["storage", "v1", "b", &self.bucket, "o"])
+            .push(&self.object_name(key));
+        url.query_pairs_mut().append_pair("alt", "media");
+        url
+    }
+
+    fn upload_url(&self, key: &str) -> Url {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .expect("validated GCS endpoint")
+            .pop_if_empty()
+            .extend(["upload", "storage", "v1", "b", &self.bucket, "o"]);
+        url.query_pairs_mut()
+            .append_pair("uploadType", "media")
+            .append_pair("name", &self.object_name(key));
+        url
+    }
+
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        let url = self.object_url(key);
+        let result = (|| -> Result<Option<Vec<u8>>> {
+            let token = (self.token_source)()?;
+            let response = self
+                .session
+                .get(url.as_str())
+                .header(attohttpc::header::AUTHORIZATION, format!("Bearer {token}"))
+                .send()?;
+            match response.status() {
+                attohttpc::StatusCode::OK => Ok(Some(response.bytes()?)),
+                attohttpc::StatusCode::NOT_FOUND => Ok(None),
+                status => bail!("HTTP {status}"),
+            }
+        })();
+        match result {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("[Warn] GCS cache read of {url} failed (treating as a miss): {error}");
+                None
+            }
+        }
+    }
+
+    fn put(&self, key: &str, data: &[u8]) {
+        let url = self.upload_url(key);
+        let result = (|| -> Result<()> {
+            let token = (self.token_source)()?;
+            let response = self
+                .session
+                .post(url.as_str())
+                .header(attohttpc::header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(attohttpc::header::CONTENT_TYPE, "application/json")
+                .bytes(data)
+                .send()?;
+            if !response.is_success() {
+                bail!("HTTP {}", response.status());
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("[Warn] GCS cache write of {url} failed (entry not shared): {error}");
+        }
     }
 }
 
@@ -1420,6 +1565,8 @@ mod tests {
             s3_region: None,
             s3_endpoint: None,
             s3_force_path_style: false,
+            gcs_bucket: None,
+            gcs_prefix: String::new(),
             nexus_url: None,
             nexus_repository: None,
             nexus_prefix: String::new(),
@@ -1665,6 +1812,125 @@ mod tests {
             http_failure(&response),
             "Got HTTP 403 with content 'denied'"
         );
+    }
+
+    struct CapturedGcsRequest {
+        method: Method,
+        url: String,
+        authorization: Option<String>,
+        content_type: Option<String>,
+        body: Vec<u8>,
+    }
+
+    fn gcs_cache_with_responses(
+        prefix: &str,
+        responses: Vec<(u16, Vec<u8>)>,
+    ) -> (
+        GcsCache,
+        std_mpsc::Receiver<CapturedGcsRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let (sender, receiver) = std_mpsc::channel();
+        let handle = thread::spawn(move || {
+            for (status, body) in responses {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .expect("expected a GCS request");
+                let header = |name: &'static str| {
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv(name))
+                        .map(|header| header.value.as_str().to_owned())
+                };
+                let authorization = header("Authorization");
+                let content_type = header("Content-Type");
+                let mut received = Vec::new();
+                request.as_reader().read_to_end(&mut received).unwrap();
+                sender
+                    .send(CapturedGcsRequest {
+                        method: request.method().clone(),
+                        url: request.url().to_owned(),
+                        authorization,
+                        content_type,
+                        body: received,
+                    })
+                    .unwrap();
+                request
+                    .respond(Response::from_data(body).with_status_code(StatusCode(status)))
+                    .unwrap();
+            }
+        });
+        let cache = GcsCache::new_with_token_source(
+            "cache-bucket",
+            prefix,
+            &endpoint,
+            Box::new(|| Ok("test-token".to_owned())),
+        )
+        .unwrap();
+        (cache, receiver, handle)
+    }
+
+    #[test]
+    fn gcs_cache_reads_and_writes_objects_with_bearer_auth() {
+        let (cache, requests, handle) = gcs_cache_with_responses(
+            "/team/repo/",
+            vec![(200, b"cached hashes".to_vec()), (200, Vec::new())],
+        );
+        assert_eq!(cache.get("sha.fp"), Some(b"cached hashes".to_vec()));
+        cache.put("sha.fp", b"generated hashes");
+        let read = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        let write = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(read.method, Method::Get);
+        assert_eq!(
+            read.url,
+            "/storage/v1/b/cache-bucket/o/team%2Frepo%2Fsha.fp.json?alt=media"
+        );
+        assert_eq!(read.authorization.as_deref(), Some("Bearer test-token"));
+        assert_eq!(write.method, Method::Post);
+        let url = Url::parse(&format!("http://localhost{}", write.url)).unwrap();
+        assert_eq!(url.path(), "/upload/storage/v1/b/cache-bucket/o");
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            query.get("uploadType").map(|value| value.as_ref()),
+            Some("media")
+        );
+        assert_eq!(
+            query.get("name").map(|value| value.as_ref()),
+            Some("team/repo/sha.fp.json")
+        );
+        assert_eq!(write.authorization.as_deref(), Some("Bearer test-token"));
+        assert_eq!(write.content_type.as_deref(), Some("application/json"));
+        assert_eq!(write.body, b"generated hashes");
+    }
+
+    #[test]
+    fn gcs_cache_misses_and_failures_degrade_without_failing() {
+        let (cache, requests, handle) = gcs_cache_with_responses(
+            "",
+            vec![
+                (404, b"not found".to_vec()),
+                (403, b"permission denied".to_vec()),
+                (500, b"unavailable".to_vec()),
+                (500, b"unavailable".to_vec()),
+            ],
+        );
+        assert_eq!(cache.get("missing"), None);
+        assert_eq!(cache.get("denied"), None);
+        assert_eq!(cache.get("failure"), None);
+        cache.put("failure", b"generated hashes");
+        for _ in 0..4 {
+            assert!(requests.recv_timeout(Duration::from_secs(5)).is_ok());
+        }
+        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
+        handle.join().unwrap();
     }
 
     const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----

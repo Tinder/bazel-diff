@@ -250,11 +250,23 @@ impl BazelOptions {
         }
         let canonical_to_apparent =
             parse_repo_mapping(&String::from_utf8_lossy(&mapping_output.stdout));
-        let canonical_names = canonical_to_apparent
+        let module_graph = self.module_graph_json();
+        let module_edges = match &module_graph {
+            Some(json) => parse_module_dependency_edges(json),
+            None if self.keep_going => BTreeMap::new(),
+            None => bail!("bazel mod graph --output=json failed"),
+        };
+        let mut canonical_names = canonical_to_apparent
             .keys()
             .filter(|name| name.contains('+') || name.contains('~'))
             .map(|name| format!("@@{name}"))
             .collect::<Vec<_>>();
+        // Modules the root does not declare (e.g. one only a dependency pulls in under its own
+        // apparent name) are absent from the root's repo mapping, yet sit on the path between
+        // root-visible repos. Ask for them by module key so that path stays connected (#510).
+        if let Some(json) = &module_graph {
+            canonical_names.extend(hidden_module_keys(json, &canonical_to_apparent));
+        }
         if canonical_names.is_empty() {
             return Ok(Vec::new());
         }
@@ -274,11 +286,6 @@ impl BazelOptions {
             bail!("bazel mod show_repo failed with {}", output.status);
         }
         let repositories = decode_delimited::<Repository>(output_file.path())?;
-        let module_edges = match self.module_graph_json() {
-            Some(json) => parse_module_dependency_edges(&json),
-            None if self.keep_going => BTreeMap::new(),
-            None => bail!("bazel mod graph --output=json failed"),
-        };
         Ok(lower_repositories(
             repositories,
             &canonical_to_apparent,
@@ -555,8 +562,14 @@ fn lower_repositories(
             .into_iter()
             .flat_map(|module| module_edges.get(module).into_iter().flatten())
             .filter_map(|dependency| module_to_canonical.get(dependency))
-            .flat_map(|canonical| canonical_to_apparent.get(canonical).into_iter().flatten())
-            .cloned()
+            .flat_map(|canonical| {
+                // A module the root cannot see has no apparent name there; its node is named
+                // by canonical name, matching the `apparent_names` fallback below.
+                canonical_to_apparent
+                    .get(canonical)
+                    .cloned()
+                    .unwrap_or_else(|| vec![canonical.clone()])
+            })
             .collect::<BTreeSet<_>>();
         let apparent_names = canonical_to_apparent
             .get(canonical)
@@ -970,6 +983,50 @@ fn parse_module_dependency_edges(json: &str) -> BTreeMap<String, BTreeSet<String
     let mut edges = BTreeMap::new();
     walk(&value, &mut edges);
     break_module_cycles(edges)
+}
+
+/// Module keys (`name@version`, as `bazel mod show_repo` accepts them) of every module in the
+/// resolved graph whose repository is not in the root's repo mapping.
+fn hidden_module_keys(
+    json: &str,
+    canonical_to_apparent: &BTreeMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    fn walk(value: &serde_json::Value, keys: &mut BTreeMap<String, String>) {
+        let Some(object) = value.as_object() else {
+            return;
+        };
+        if let (Some(key), Some(name)) = (
+            object.get("key").and_then(serde_json::Value::as_str),
+            object.get("name").and_then(serde_json::Value::as_str),
+        ) {
+            if key != "<root>" {
+                keys.insert(key.to_owned(), name.to_owned());
+            }
+        }
+        for dependency in object
+            .get("dependencies")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            walk(dependency, keys);
+        }
+    }
+    let start = json.find('{').unwrap_or(json.len());
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&json[start..]) else {
+        return BTreeSet::new();
+    };
+    let mut keys = BTreeMap::new();
+    walk(&value, &mut keys);
+    let visible_modules = canonical_to_apparent
+        .keys()
+        .filter(|canonical| canonical.matches('+').count() == 1)
+        .filter_map(|canonical| canonical.split('+').next())
+        .collect::<BTreeSet<_>>();
+    keys.into_iter()
+        .filter(|(_, name)| !visible_modules.contains(name.as_str()))
+        .map(|(key, _)| key)
+        .collect()
 }
 
 fn break_module_cycles(
@@ -1556,6 +1613,57 @@ mod tests {
             .unwrap();
         assert_eq!(dep.rule_class, "http_archive");
         assert_eq!(dep.rule_input, ["//external:child"]);
+    }
+
+    #[test]
+    fn modules_hidden_from_the_root_stay_on_the_repository_path() {
+        // Issue #510: root -> facade -> middle (apparent name only inside facade) -> leaf.
+        let mapping = parse_repo_mapping(
+            r#"{"":"","facade":"facade+","leaf":"leaf+","ext_repo":"+ext+repo","bazel_tools":"bazel_tools"}"#,
+        );
+        let graph = r#"{
+          "key":"<root>","name":"root","dependencies":[
+            {"key":"facade@_","name":"facade","dependencies":[
+              {"key":"middle@_","name":"middle","dependencies":[
+                {"key":"leaf@_","name":"leaf","dependencies":[]}]}]},
+            {"key":"leaf@_","name":"leaf","dependencies":[]}
+          ]
+        }"#;
+        assert_eq!(
+            hidden_module_keys(graph, &mapping),
+            BTreeSet::from(["middle@_".to_owned()])
+        );
+        assert!(hidden_module_keys("not json", &mapping).is_empty());
+
+        let repositories = ["facade+", "middle+", "leaf+"]
+            .into_iter()
+            .map(|canonical| Repository {
+                canonical_name: Some(canonical.into()),
+                repo_rule_name: Some("http_archive".into()),
+                ..Default::default()
+            })
+            .collect();
+        let targets = lower_repositories(
+            repositories,
+            &mapping,
+            &parse_module_dependency_edges(graph),
+            Path::new("."),
+            &mut |_| {},
+        );
+        let inputs = |name: &str| {
+            targets
+                .iter()
+                .find(|target| target_name(target) == Some(name))
+                .unwrap()
+                .rule
+                .as_option()
+                .unwrap()
+                .rule_input
+                .clone()
+        };
+        assert_eq!(inputs("//external:facade"), ["//external:middle+"]);
+        assert_eq!(inputs("//external:middle+"), ["//external:leaf"]);
+        assert!(inputs("//external:leaf").is_empty());
     }
 
     #[test]

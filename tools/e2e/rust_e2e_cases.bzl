@@ -108,6 +108,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::cquery_keeps_dependencies_of_every_configured_instance",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::cross_file_macro_change_is_scoped",
                 "timeout": "moderate",
             },

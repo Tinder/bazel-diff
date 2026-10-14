@@ -1,0 +1,4 @@
+module(
+    name = "cquery_transition_dedup_test",
+    version = "0.0.0",
+)

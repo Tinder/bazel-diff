@@ -27,12 +27,12 @@ meaningful under `--useCquery`.
 Editing `input.txt` changes `//:helper`, and through it the top-level `//:app`.
 The dependency edges for `//:app` include `//:helper`.
 
-## Observed behaviour
+## Behaviour before the fix
 
-bazel-diff keys the cquery results by label, so one of the two `//:app`
-instances is dropped and every edge into `//:app` resolves to the survivor.
-Which instance survives follows the cquery output order, and each outcome
-reproduces one of the symptoms in the issue:
+bazel-diff keyed the cquery results by label, so one of the two `//:app`
+instances was dropped and every edge into `//:app` resolved to the survivor.
+Which instance survived followed the cquery output order, and each outcome
+reproduced one of the symptoms in the issue:
 
 - The default-configuration instance survives (what Bazel 8.7 produces here):
   `//:helper`'s edge to `//:app` (bootstrap=true) now points at the instance
@@ -42,3 +42,11 @@ reproduces one of the symptoms in the issue:
   toolchain in one configuration reaches the same toolchain label in another.
 - The bootstrap instance survives: `//:app` has no deps, hashes as unchanged
   when `input.txt` changes, and its dep edges omit `//:helper`.
+
+## Behaviour after the fix
+
+Configured targets are keyed by `label|configuration checksum`, the same
+identity `configured_rule_input` gives each edge, so both `//:app` instances
+are hashed and each edge resolves to the instance it names. The hash file is
+still keyed by label: a label with several instances hashes all of them, and
+its dependency edges are the union of theirs.

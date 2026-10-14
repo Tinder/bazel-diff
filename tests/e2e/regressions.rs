@@ -321,7 +321,7 @@ fn external_go_dependencies_appear_in_hashes() {
 
 use std::collections::BTreeMap;
 
-/// Reproducer for <https://github.com/Tinder/bazel-diff/issues/512>.
+/// Regression test for <https://github.com/Tinder/bazel-diff/issues/512>.
 ///
 /// `deps(//:app)` under cquery contains `//:app` twice: in the default
 /// configuration, where it depends on `//:helper`, and in the bootstrap

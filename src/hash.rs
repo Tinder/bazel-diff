@@ -1,4 +1,4 @@
-use crate::bazel::{encode_configured_input, BazelOptions};
+use crate::bazel::{encode_configured_input, split_configured, target_label, BazelOptions};
 use crate::model::{HashFileData, TargetHash};
 use crate::proto::blaze_query::{target, Rule, Target};
 use anyhow::{anyhow, bail, Context, Result};
@@ -17,7 +17,6 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-const CONFIGURED_INPUT_SEPARATOR: char = '|';
 type DigestBytes = [u8; 32];
 const DEFAULT_HASH_THREADS: usize = 4;
 const FILE_HASH_BUFFER_SIZE: usize = 64 * 1024;
@@ -281,6 +280,7 @@ fn hash_targets_with_environment(
     for (name, node) in processed_rules {
         rules.insert(name, Rc::new(node));
     }
+    let mut label_instances = None;
     for target in &hash_targets {
         let HashTarget::Generated {
             name,
@@ -291,9 +291,22 @@ fn hash_targets_with_environment(
         };
         let rule = rules
             .get(generating_rule)
+            .or_else(|| {
+                label_instances
+                    .get_or_insert_with(|| configured_label_instances(rules.keys()))
+                    .get(target_label(generating_rule))
+                    .and_then(|keys| keys.first())
+                    .and_then(|key| rules.get(key))
+            })
             .cloned()
             .ok_or_else(|| anyhow!("Unexpected generating rule {generating_rule}"))?;
         rules.insert(name.clone(), rule);
+        if let (Some(index), (label, Some(_))) = (&mut label_instances, split_configured(name)) {
+            let instances = index.entry(label.to_owned()).or_default();
+            if let Err(position) = instances.binary_search(name) {
+                instances.insert(position, name.clone());
+            }
+        }
     }
 
     let mut context = HashContext {
@@ -301,18 +314,19 @@ fn hash_targets_with_environment(
         source_hasher: &source_hasher,
         source_digests,
         rules,
+        label_instances,
         cache: HashMap::new(),
         seed_hash,
         package_bzl_seeds,
         bzl_digests: HashMap::new(),
         always_affected_seed: unique_invocation_seed(),
     };
-    let mut hashes = BTreeMap::new();
+    let mut digests = Vec::with_capacity(hash_targets.len());
     for target in hash_targets {
-        let (label, kind, digest) = match target {
-            HashTarget::Rule(label) => {
-                let digest = context.rule_digest(&label, &mut Vec::new())?;
-                (label, "Rule", digest)
+        let (key, kind, digest) = match target {
+            HashTarget::Rule(key) => {
+                let digest = context.rule_digest(&key, &mut Vec::new())?;
+                (key, "Rule", digest)
             }
             HashTarget::Generated {
                 name,
@@ -347,16 +361,9 @@ fn hash_targets_with_environment(
                 )
             }
         };
-        hashes.insert(
-            label,
-            TargetHash {
-                kind: kind.to_owned(),
-                hash: digest_hex(digest.overall),
-                direct_hash: digest_hex(digest.direct),
-                deps: digest.deps,
-            },
-        );
+        digests.push((key, kind, digest));
     }
+    let hashes = aggregate_by_label(digests);
     let dep_edges = if options.track_deps {
         hashes
             .iter()
@@ -373,11 +380,104 @@ fn hash_targets_with_environment(
     })
 }
 
+/// Groups the keys that carry a configuration checksum by label, each group sorted.
+fn configured_label_instances<'a>(
+    keys: impl Iterator<Item = &'a String>,
+) -> HashMap<String, Vec<String>> {
+    let mut instances = HashMap::<String, Vec<String>>::new();
+    for key in keys {
+        if let (label, Some(_)) = split_configured(key) {
+            instances
+                .entry(label.to_owned())
+                .or_default()
+                .push(key.clone());
+        }
+    }
+    for keys in instances.values_mut() {
+        keys.sort_unstable();
+    }
+    instances
+}
+
+/// Folds per-key digests into the per-label hashes the hash file is keyed by.
+///
+/// A label hashed once (every target of a plain query, and most of a cquery) keeps its
+/// digest as is, so hash files do not change where nothing was collapsed. A label with
+/// several configured instances hashes all of them, in key order, so a change reaching any
+/// instance changes the label, and its dependency edges are the union of its instances'.
+fn aggregate_by_label(
+    digests: Vec<(String, &'static str, TargetDigest)>,
+) -> BTreeMap<String, TargetHash> {
+    let mut digests = digests
+        .into_iter()
+        .map(|(key, kind, digest)| (target_label(&key).len(), key, kind, digest))
+        .collect::<Vec<_>>();
+    digests.sort_by(|a, b| a.1[..a.0].cmp(&b.1[..b.0]).then_with(|| a.1.cmp(&b.1)));
+    let mut hashes = BTreeMap::new();
+    let mut instances = Vec::<(String, &'static str, TargetDigest)>::new();
+    for (label_length, key, kind, digest) in digests {
+        if instances
+            .last()
+            .is_some_and(|last| target_label(&last.0) != &key[..label_length])
+        {
+            let (label, hash) = label_hash(std::mem::take(&mut instances));
+            hashes.insert(label, hash);
+        }
+        instances.push((key, kind, digest));
+    }
+    if !instances.is_empty() {
+        let (label, hash) = label_hash(instances);
+        hashes.insert(label, hash);
+    }
+    hashes
+}
+
+fn label_hash(mut instances: Vec<(String, &'static str, TargetDigest)>) -> (String, TargetHash) {
+    let label = target_label(&instances[0].0).to_owned();
+    let kind = instances[0].1;
+    let (overall, direct) = if let [(_, _, digest)] = instances.as_slice() {
+        (digest.overall, digest.direct)
+    } else {
+        let mut overall = Sha256::new();
+        let mut direct = Sha256::new();
+        for (_, _, digest) in &instances {
+            overall.update(digest.overall);
+            direct.update(digest.direct);
+        }
+        (overall.finalize().into(), direct.finalize().into())
+    };
+    let mut seen = HashSet::new();
+    let deps = instances
+        .iter_mut()
+        .flat_map(|(_, _, digest)| digest.deps.drain(..))
+        .map(|mut dependency| {
+            let length = target_label(&dependency).len();
+            dependency.truncate(length);
+            dependency
+        })
+        .filter(|dependency| seen.insert(dependency.clone()))
+        .collect();
+    (
+        label,
+        TargetHash {
+            kind: kind.to_owned(),
+            hash: digest_hex(overall),
+            direct_hash: digest_hex(direct),
+            deps,
+        },
+    )
+}
+
 struct HashContext<'a> {
     options: &'a HashOptions,
     source_hasher: &'a SourceHasher<'a>,
     source_digests: HashMap<String, DigestBytes>,
     rules: HashMap<String, Rc<RuleNode>>,
+    /// Keys in `rules` grouped by label, sorted, for configured keys only: the fallback when
+    /// an input names a configured instance that is not in `rules`. Built on the first miss,
+    /// since most graphs never need it, and never for a plain query, where every key is a
+    /// bare label and resolves directly.
+    label_instances: Option<HashMap<String, Vec<String>>>,
     cache: HashMap<String, TargetDigest>,
     seed_hash: DigestBytes,
     package_bzl_seeds: BTreeMap<String, DigestBytes>,
@@ -386,36 +486,43 @@ struct HashContext<'a> {
 }
 
 impl HashContext<'_> {
-    fn rule_digest(&mut self, label: &str, path: &mut Vec<String>) -> Result<TargetDigest> {
-        if let Some(digest) = self.cache.get(label) {
+    /// Digests one rule, named by its key: its label, or under cquery its configured identity
+    /// `label|checksum` (see [`crate::bazel::CONFIGURED_SEPARATOR`]). Two configured instances
+    /// of one label are two nodes here, each with its own inputs, so an edge from one instance
+    /// to the other is a dependency and not a cycle.
+    fn rule_digest(&mut self, key: &str, path: &mut Vec<String>) -> Result<TargetDigest> {
+        if let Some(digest) = self.cache.get(key) {
             return Ok(digest.clone());
         }
         let rule = self
             .rules
-            .get(label)
+            .get(key)
             .cloned()
-            .ok_or_else(|| anyhow!("Unable to find rule {label}"))?;
-        let canonical_label = rule.rule.name.clone();
-        if let Some(digest) = self.cache.get(&canonical_label) {
+            .ok_or_else(|| anyhow!("Unable to find rule {key}"))?;
+        let canonical_key = rule.rule.name.clone();
+        if let Some(digest) = self.cache.get(&canonical_key) {
             return Ok(digest.clone());
         }
-        if let Some(index) = path.iter().position(|entry| entry == &canonical_label) {
+        if let Some(index) = path.iter().position(|entry| entry == &canonical_key) {
             let cycle = path[index..]
                 .iter()
-                .chain(std::iter::once(&canonical_label))
+                .chain(std::iter::once(&canonical_key))
                 .cloned()
                 .collect::<Vec<_>>()
                 .join(" -> ");
             bail!("Circular dependency detected: {cycle}");
         }
-        path.push(canonical_label.clone());
+        path.push(canonical_key.clone());
 
         let mut builder = TargetDigestBuilder::new(self.options.track_deps);
         builder.direct(rule.definition_digest);
         builder.direct(self.seed_hash);
         if let Some(seed) = self.rule_bzl_seed(&rule.rule)? {
             builder.direct(seed);
-        } else if let Some(seed) = self.package_bzl_seeds.get(label_package(&rule.rule.name)) {
+        } else if let Some(seed) = self
+            .package_bzl_seeds
+            .get(label_package(target_label(&rule.rule.name)))
+        {
             builder.direct(seed);
         }
         if !self.options.always_affected_tags.is_empty()
@@ -432,14 +539,15 @@ impl HashContext<'_> {
             &self.options.bazel.fine_grained_external_repos,
         ) {
             builder.direct(encoded_input.as_bytes());
-            let input_label = encoded_input
-                .split_once(CONFIGURED_INPUT_SEPARATOR)
-                .map_or(encoded_input.as_ref(), |(label, _)| label);
+            let input_label = target_label(&encoded_input);
             if let Some(source_digest) = self.source_digests.get(input_label) {
                 builder.direct(source_digest);
-            } else if self.rules.contains_key(input_label) && input_label != canonical_label {
-                let digest = self.rule_digest(input_label, path)?;
-                builder.transitive(input_label, digest.overall);
+            } else if let Some(dependency) = self
+                .resolve_dependency(&encoded_input, input_label, path)
+                .filter(|dependency| dependency != &canonical_key)
+            {
+                let digest = self.rule_digest(&dependency, path)?;
+                builder.transitive(&dependency, digest.overall);
             } else if let Some(digest) = self.source_hasher.soft_digest(input_label, &[])? {
                 self.source_digests.insert(input_label.to_owned(), digest);
                 builder.direct(digest);
@@ -453,7 +561,7 @@ impl HashContext<'_> {
 
         if !self.options.ignored_attributes.contains("visibility") {
             for package_group in visibility_package_groups(&rule.rule) {
-                if package_group == canonical_label {
+                if package_group == target_label(&canonical_key) {
                     continue;
                 }
                 let Some(group) = self.rules.get(package_group) else {
@@ -470,8 +578,41 @@ impl HashContext<'_> {
 
         path.pop();
         let digest = builder.finish();
-        self.cache.insert(canonical_label, digest.clone());
+        self.cache.insert(canonical_key, digest.clone());
         Ok(digest)
+    }
+
+    /// The key of the rule a rule input resolves to.
+    ///
+    /// A configured input names the exact instance it points at; that instance is used when
+    /// it was hashed, and a bare label (every input of a plain query) resolves directly.
+    /// Otherwise the edge falls back to a configured instance of the same label, which keeps
+    /// edges to instances outside the query result resolving as they always have. The
+    /// fallback never closes a cycle through the path being hashed: a configured graph Bazel
+    /// analyzed has none, so such an edge points at an instance that is simply not in the
+    /// result, and is dropped.
+    fn resolve_dependency<'a>(
+        &mut self,
+        encoded_input: &'a str,
+        input_label: &'a str,
+        path: &[String],
+    ) -> Option<Cow<'a, str>> {
+        if self.rules.contains_key(encoded_input) {
+            return Some(Cow::Borrowed(encoded_input));
+        }
+        if self.rules.contains_key(input_label) {
+            return Some(Cow::Borrowed(input_label));
+        }
+        let rules = &self.rules;
+        let fallback = self
+            .label_instances
+            .get_or_insert_with(|| configured_label_instances(rules.keys()))
+            .get(input_label)?
+            .first()?;
+        if path.iter().any(|entry| entry == fallback) {
+            return None;
+        }
+        Some(Cow::Owned(fallback.clone()))
     }
 
     fn rule_bzl_seed(&mut self, rule: &Rule) -> Result<Option<DigestBytes>> {
@@ -625,7 +766,7 @@ impl EncodeSink for Sha256Sink<'_> {
 fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes {
     let mut hasher = Sha256::new();
     hasher.update(rule.rule_class.as_bytes());
-    hasher.update(rule.name.as_bytes());
+    hasher.update(target_label(&rule.name).as_bytes());
     if let Some(environment_hash) = &rule.skylark_environment_hash_code {
         hasher.update(environment_hash.as_bytes());
     }
@@ -1960,5 +2101,123 @@ mod tests {
             .soft_digest("//path/to:dir", b"seed")
             .unwrap()
             .is_none());
+    }
+    fn configured_input(label: &str, checksum: Option<&str>) -> ConfiguredRuleInput {
+        ConfiguredRuleInput {
+            label: Some(label.to_owned()),
+            configuration_checksum: checksum.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    /// Tinder/bazel-diff#512: `//:app` is analyzed twice. In the default configuration it
+    /// depends on `//:helper`; `//:helper` transitions it into a bootstrap configuration where
+    /// it has no deps. Collapsing the two by label made the edge from `//:helper` point back at
+    /// the instance that depends on `//:helper`, which is a cycle only on paper.
+    #[test]
+    fn configured_instances_of_a_label_are_distinct_nodes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        fs::write(workspace.path().join("input.txt"), "before").unwrap();
+        let mut options = hash_options(workspace.path());
+        options.bazel.use_cquery = true;
+        let targets = || {
+            vec![
+                source_target("//:input.txt", &[]),
+                rule_target(Rule {
+                    name: "//:app|aa".into(),
+                    rule_class: "node".into(),
+                    configured_rule_input: vec![configured_input("//:helper", Some("aa"))],
+                    ..Default::default()
+                }),
+                rule_target(Rule {
+                    name: "//:app|bb".into(),
+                    rule_class: "node".into(),
+                    ..Default::default()
+                }),
+                rule_target(Rule {
+                    name: "//:helper|aa".into(),
+                    rule_class: "helper".into(),
+                    configured_rule_input: vec![
+                        configured_input("//:app", Some("bb")),
+                        configured_input("//:input.txt", None),
+                    ],
+                    ..Default::default()
+                }),
+            ]
+        };
+        let before = hash_targets_for_test(&options, targets(), &output_base).unwrap();
+        assert_eq!(
+            before.hashes.keys().collect::<Vec<_>>(),
+            ["//:app", "//:helper", "//:input.txt"]
+        );
+        assert_eq!(before.dep_edges["//:app"], ["//:helper"]);
+        assert_eq!(before.dep_edges["//:helper"], ["//:app"]);
+
+        fs::write(workspace.path().join("input.txt"), "after").unwrap();
+        let after = hash_targets_for_test(&options, targets(), &output_base).unwrap();
+        assert_ne!(
+            before.hashes["//:helper"].hash,
+            after.hashes["//:helper"].hash
+        );
+        assert_ne!(
+            before.hashes["//:app"].hash, after.hashes["//:app"].hash,
+            "the change reaches //:app through its default-configuration instance"
+        );
+    }
+
+    #[test]
+    fn single_configured_instance_hashes_like_a_bare_label() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        let mut options = hash_options(workspace.path());
+        options.bazel.use_cquery = true;
+        let rule = |name: &str| {
+            rule_target(Rule {
+                name: name.into(),
+                rule_class: "node".into(),
+                attribute: vec![string_list_attribute("tags", &["t"])],
+                ..Default::default()
+            })
+        };
+        let configured =
+            hash_targets_for_test(&options, vec![rule("//:a|aa")], &output_base).unwrap();
+        let bare = hash_targets_for_test(&options, vec![rule("//:a")], &output_base).unwrap();
+        assert_eq!(configured.hashes["//:a"], bare.hashes["//:a"]);
+    }
+
+    #[test]
+    fn configured_input_outside_the_result_falls_back_to_the_label() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        let mut options = hash_options(workspace.path());
+        options.bazel.use_cquery = true;
+        // //:lib's edge names an instance of //:tool that is not in the result; it resolves to
+        // the instance that is. //:tool's edge back to an absent instance of //:lib would only
+        // resolve to the //:lib being hashed, so it is dropped rather than reported as a cycle.
+        let data = hash_targets_for_test(
+            &options,
+            vec![
+                rule_target(Rule {
+                    name: "//:lib|aa".into(),
+                    rule_class: "node".into(),
+                    configured_rule_input: vec![configured_input("//:tool", Some("cc"))],
+                    ..Default::default()
+                }),
+                rule_target(Rule {
+                    name: "//:tool|bb".into(),
+                    rule_class: "node".into(),
+                    configured_rule_input: vec![configured_input("//:lib", Some("zz"))],
+                    ..Default::default()
+                }),
+            ],
+            &output_base,
+        )
+        .unwrap();
+        assert_eq!(data.dep_edges["//:lib"], ["//:tool"]);
+        assert!(data.dep_edges["//:tool"].is_empty());
     }
 }

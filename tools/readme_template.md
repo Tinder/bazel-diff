@@ -199,7 +199,7 @@ supported for production use.
 
 Instead of running `generate-hashes` from scratch on every CI invocation, you can run `bazel-diff` as
 a long-running HTTP service that answers affectedness queries between two git revisions and caches
-the generated hashes per commit SHA. This is the "bazel-diff as a service" model described in the
+the generated hashes per git tree. This is the "bazel-diff as a service" model described in the
 [BazelCon talk](https://youtu.be/9Dk7mtIm7_A?t=1875) that inspired this repo (see
 [issue #29](https://github.com/Tinder/bazel-diff/issues/29)).
 
@@ -214,8 +214,11 @@ bazel-diff serve \
 ```
 
 On startup the service performs an initial `git fetch` and only then reports healthy. For each
-request it resolves the `from`/`to` revisions, generates (and caches, keyed by commit SHA) the hashes
-for each, and reuses the exact same affectedness logic as `get-impacted-targets`.
+request it resolves the `from`/`to` revisions, generates (and caches, keyed by the commit's tree hash,
+so a rebase, an amended message, or a merge commit that changes no file reuses the entry) the hashes
+for each, and reuses the exact same affectedness logic as `get-impacted-targets`. Source files are
+hashed from the blob ids git already holds (one `git ls-tree` per revision) rather than by reading
+the working tree, so a cold hash costs the `bazel query`, not a read of every file.
 
 Endpoints:
 
@@ -417,7 +420,7 @@ Notes and operational guidance:
   supported -- including shallow (`--depth`) and partial (`--filter=blob:none`) clones, whose thin
   packs are delta-compressed against objects the clone does not have.
 * Hashes are cached on local disk via `--cacheDir` and survive restarts. Left unbounded the cache
-  grows by one entry per distinct commit SHA queried, so a long-running server can bound it with any
+  grows by one entry per distinct tree hashed, so a long-running server can bound it with any
   combination of `--cacheMaxAge` (expire entries not read or written within a window, e.g. `7d`),
   `--cacheMaxEntries`, and `--cacheMaxSize` (e.g. `10GB`, `500MB`, or a bare byte count). A background
   sweeper enforces the limits once at startup and then every `--cachePruneInterval` (default `1h`),
@@ -431,8 +434,9 @@ Notes and operational guidance:
   serves another configuration's cached hashes.
 * `modifiedFilepaths` (POST only) is scoped per request, not a server flag. A scoped hash of a
   revision is only comparable to another revision hashed with the *same* set, so cached scoped
-  entries are keyed by `<sha>.<fingerprint>.<digest-of-the-set>` — never mixed with, or served in
-  place of, the full-content `<sha>.<fingerprint>` entry. The trade-off: on the scoped path the
+  entries are keyed by `<tree>.<fingerprint>.<digest-of-the-set>` — never mixed with, or served in
+  place of, the full-content `<tree>.<fingerprint>` entry. Scoped entries read the listed files from
+  disk; only the full-content entry is seeded from git blob ids. The trade-off: on the scoped path the
   shared-base full-hash cache is not reused (each distinct changed-set re-hashes the base), but each
   such hash is cheaper because it skips reading unchanged files. The extra entries are bounded by the
   same LRU `--cacheMax*` pruning as everything else.
@@ -449,6 +453,20 @@ are the summation of the rule implementation hash, the SHA256 value
 for every attribute of the rule and then the summation of the SHA256 value for
 all `rule_inputs` using the same exact algorithm. For source_file inputs the
 content of the file are converted into a SHA256 value.
+
+A few inputs are normalized or extended on the way in:
+
+* A source label that names a **directory** hashes the whole tree (entry names, kinds, file
+  contents and executable bits, symlink targets), so an edit inside it impacts its consumers.
+* A **repository rule** (`//external:*`) that pins its download with `sha256` or `integrity` is
+  hashed without its `url`/`urls`, since a mirror or registry move cannot change what it fetches.
+  The main-repository files its attributes name -- patches, build files, lock files -- are hashed
+  by content, so a changed patch is a changed repository.
+* A **dependency cycle** in the query graph (which a build never sees, but which rules_go's
+  `go_context_data` and nogo analyzers form through non-dependency attributes) no longer fails
+  hashing. The back edge is hashed from the entered target's own definition, with a one-line
+  warning naming the cycle. Targets are visited in label order so the result does not depend on
+  the order `bazel query` emitted them.
 
 ## Installing
 

@@ -903,6 +903,13 @@ fn repository_target(
         attribute.string_value = Some(content_hash);
         rule.attribute.push(attribute);
     }
+    if let Some(inputs_hash) = repository_local_inputs_hash(repository, workspace) {
+        let mut attribute = Attribute::default();
+        attribute.name = "_bazel_diff_local_inputs_hash".to_owned();
+        attribute.r#type = crate::proto::blaze_query::attribute::Discriminator::String;
+        attribute.string_value = Some(inputs_hash);
+        rule.attribute.push(attribute);
+    }
     rule.rule_input = dependencies
         .iter()
         .filter(|dependency| dependency.as_str() != apparent)
@@ -912,6 +919,82 @@ fn repository_target(
     target.r#type = target::Discriminator::Rule;
     target.rule = buffa::MessageField::some(rule);
     target
+}
+
+/// Every main-repository label a repository rule's attributes point at: `patches`, `build_file`,
+/// a `requirements_lock`, and so on. Attributes only name these files; a repository fetched with
+/// a changed patch is a different repository, so their contents must reach its hash.
+fn repository_local_input_labels(repository: &Repository) -> BTreeSet<String> {
+    repository
+        .attribute
+        .iter()
+        .flat_map(|attribute| {
+            attribute
+                .string_value
+                .iter()
+                .cloned()
+                .chain(attribute.string_list_value.iter().cloned())
+                .chain(
+                    attribute
+                        .string_dict_value
+                        .iter()
+                        .map(|entry| entry.value.clone()),
+                )
+                .chain(
+                    attribute
+                        .label_dict_unary_value
+                        .iter()
+                        .flat_map(|entry| [entry.key.clone(), entry.value.clone()]),
+                )
+                .chain(
+                    attribute
+                        .label_keyed_string_dict_value
+                        .iter()
+                        .map(|entry| entry.key.clone()),
+                )
+                .chain(
+                    attribute
+                        .label_list_dict_value
+                        .iter()
+                        .flat_map(|entry| entry.value.iter().cloned()),
+                )
+                .chain(
+                    attribute
+                        .string_list_dict_value
+                        .iter()
+                        .flat_map(|entry| entry.value.iter().cloned()),
+                )
+                .collect::<Vec<_>>()
+        })
+        .filter(|value| crate::hash::main_repo_path(value).is_some())
+        .collect()
+}
+
+/// Hashes the contents of the main-repository files named by `repository`'s attributes, in label
+/// order. `None` when the attributes name no such file that exists in the workspace.
+fn repository_local_inputs_hash(repository: &Repository, workspace: &Path) -> Option<String> {
+    let mut hasher = Sha256::new();
+    let mut hashed_any = false;
+    for label in repository_local_input_labels(repository) {
+        let Some(path) = crate::hash::main_repo_path(&label) else {
+            continue;
+        };
+        let absolute = workspace.join(path);
+        let mut content = Sha256::new();
+        if absolute.is_file() {
+            content.update(fs::read(&absolute).ok()?);
+        } else if absolute.is_dir() {
+            crate::hash::hash_directory_into(&mut content, &absolute).ok()?;
+        } else {
+            continue;
+        }
+        hasher.update(label.as_bytes());
+        hasher.update([0]);
+        hasher.update(content.finalize());
+        hasher.update([0]);
+        hashed_any = true;
+    }
+    hashed_any.then(|| hex::encode(hasher.finalize()))
 }
 
 fn local_repository_content_hash(repository: &Repository, workspace: &Path) -> Option<String> {
@@ -1082,7 +1165,9 @@ pub fn encode_configured_input(input: &ConfiguredRuleInput) -> String {
 mod tests {
     use super::*;
     use crate::proto::analysis::{ConfiguredTarget, CqueryResult};
-    use crate::proto::blaze_query::{attribute, EnvironmentGroup, GeneratedFile, SourceFile};
+    use crate::proto::blaze_query::{
+        attribute, EnvironmentGroup, GeneratedFile, LabelDictUnaryEntry, SourceFile,
+    };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -1449,6 +1534,112 @@ mod tests {
             .any(|attribute| attribute.name == "_bazel_diff_content_hash"));
 
         assert!(local_repository_content_hash(&Repository::default(), workspace.path()).is_none());
+    }
+
+    #[test]
+    fn repository_hash_covers_main_repo_files_named_by_attributes() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("third_party/overlay")).unwrap();
+        fs::write(workspace.path().join("dep.patch"), "patch v1").unwrap();
+        fs::write(workspace.path().join("third_party/dep.BUILD"), "build").unwrap();
+        fs::write(
+            workspace.path().join("third_party/overlay/BUILD.bazel"),
+            "overlay",
+        )
+        .unwrap();
+        let repository = Repository {
+            repo_rule_name: Some("http_archive".into()),
+            attribute: vec![
+                Attribute {
+                    name: "urls".into(),
+                    r#type: attribute::Discriminator::StringList,
+                    string_list_value: vec!["https://example.com/dep.tar.gz".into()],
+                    ..Default::default()
+                },
+                Attribute {
+                    name: "patches".into(),
+                    r#type: attribute::Discriminator::LabelList,
+                    string_list_value: vec!["@@//:dep.patch".into(), "//:missing.patch".into()],
+                    ..Default::default()
+                },
+                Attribute {
+                    name: "build_file".into(),
+                    r#type: attribute::Discriminator::Label,
+                    string_value: Some("//third_party:dep.BUILD".into()),
+                    ..Default::default()
+                },
+                Attribute {
+                    name: "overlay".into(),
+                    r#type: attribute::Discriminator::LabelDictUnary,
+                    label_dict_unary_value: vec![LabelDictUnaryEntry {
+                        key: "//third_party:overlay".into(),
+                        value: "BUILD.bazel".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            repository_local_input_labels(&repository),
+            BTreeSet::from([
+                "@@//:dep.patch".to_owned(),
+                "//:missing.patch".to_owned(),
+                "//third_party:dep.BUILD".to_owned(),
+                "//third_party:overlay".to_owned(),
+            ])
+        );
+        let baseline = repository_local_inputs_hash(&repository, workspace.path()).unwrap();
+        assert_eq!(
+            repository_local_inputs_hash(&repository, workspace.path()).unwrap(),
+            baseline
+        );
+
+        // Patch content, the build file, and the overlay directory all reach the hash.
+        fs::write(workspace.path().join("dep.patch"), "patch v2").unwrap();
+        let patched = repository_local_inputs_hash(&repository, workspace.path()).unwrap();
+        assert_ne!(patched, baseline);
+        fs::write(workspace.path().join("third_party/dep.BUILD"), "build v2").unwrap();
+        let rebuilt = repository_local_inputs_hash(&repository, workspace.path()).unwrap();
+        assert_ne!(rebuilt, patched);
+        fs::write(
+            workspace.path().join("third_party/overlay/BUILD.bazel"),
+            "overlay v2",
+        )
+        .unwrap();
+        assert_ne!(
+            repository_local_inputs_hash(&repository, workspace.path()).unwrap(),
+            rebuilt
+        );
+
+        let target = repository_target(&repository, "dep", &BTreeSet::new(), workspace.path());
+        let rule = target.rule.as_option().unwrap();
+        assert!(rule
+            .attribute
+            .iter()
+            .any(|attribute| attribute.name == "_bazel_diff_local_inputs_hash"));
+
+        // A repository whose attributes name no workspace file carries no such attribute.
+        let remote_only = Repository {
+            repo_rule_name: Some("http_archive".into()),
+            attribute: vec![Attribute {
+                name: "patches".into(),
+                r#type: attribute::Discriminator::LabelList,
+                string_list_value: vec!["@other//:dep.patch".into(), "//:missing.patch".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(repository_local_inputs_hash(&remote_only, workspace.path()).is_none());
+        let target = repository_target(&remote_only, "dep", &BTreeSet::new(), workspace.path());
+        assert!(!target
+            .rule
+            .as_option()
+            .unwrap()
+            .attribute
+            .iter()
+            .any(|attribute| attribute.name == "_bazel_diff_local_inputs_hash"));
     }
 
     #[test]

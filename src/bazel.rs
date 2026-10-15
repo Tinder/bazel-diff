@@ -1,4 +1,4 @@
-use crate::proto::analysis::CqueryResult;
+use crate::proto::analysis::{ConfiguredTarget, CqueryResult};
 use crate::proto::blaze_query::{
     target, Attribute, ConfiguredRuleInput, PackageGroup, Repository, Rule, Target,
 };
@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use buffa::Message;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -371,8 +371,9 @@ impl BazelOptions {
             decode_target_stream(output_file.path(), transform)?
         };
         if let Some(compatible) = compatible {
-            targets
-                .retain(|target| target_name(target).is_some_and(|name| compatible.contains(name)));
+            targets.retain(|target| {
+                target_name(target).is_some_and(|name| compatible.contains(target_label(name)))
+            });
         }
         Ok(targets)
     }
@@ -744,40 +745,157 @@ fn decode_cquery_stream(
     streamed: bool,
     transform: &mut impl FnMut(&mut Target),
 ) -> Result<Vec<Target>> {
-    let results = if streamed {
+    let mut decoder = CqueryDecoder::default();
+    if streamed {
         let mut reader = BufReader::new(File::open(path)?);
-        let mut targets = Vec::new();
         loop {
             if reader.fill_buf()?.is_empty() {
                 break;
             }
             let result: CqueryResult =
                 buffa::DecodeOptions::new().decode_length_delimited_reader(&mut reader)?;
-            for mut target in result
-                .results
-                .into_iter()
-                .filter_map(|configured| configured.target.into_option())
-                .filter_map(lower_target)
-            {
-                transform(&mut target);
-                targets.push(target);
-            }
+            decoder.push(result, transform);
         }
-        return Ok(targets);
     } else {
         let bytes = fs::read(path)?;
-        vec![CqueryResult::decode_from_slice(&bytes)?]
-    };
-    let mut targets = results
-        .into_iter()
-        .flat_map(|result| result.results)
-        .filter_map(|configured| configured.target.into_option())
-        .filter_map(lower_target)
-        .collect::<Vec<_>>();
-    for target in &mut targets {
-        transform(target);
+        decoder.push(CqueryResult::decode_from_slice(&bytes)?, transform);
     }
-    Ok(targets)
+    Ok(decoder.finish(transform))
+}
+
+/// Separator between a label and the checksum of the configuration a target was analyzed in.
+///
+/// A cquery graph is a graph of *configured* targets: one label can be analyzed in several
+/// configurations (a transition, an exec dependency, a `select()` that resolves differently),
+/// and those instances have different dependencies. Bazel identifies each dependency edge by
+/// `(label, configuration checksum)` in `configured_rule_input`, and that is the identity
+/// the rule-input encoding folds into `label|checksum`. Configured targets are named the same
+/// way, so an edge resolves to the instance it points at rather than to whichever instance of
+/// the label happened to come first. Collapsing by label loses edges and, when an instance
+/// depends on the same label in another configuration, reports a cycle the configured graph
+/// does not have.
+pub const CONFIGURED_SEPARATOR: char = '|';
+
+/// Bazel reports the null configuration (source files, package groups) with this checksum.
+const NULL_CONFIGURATION_CHECKSUM: &str = "null";
+
+/// Decodes `CqueryResult` messages into targets named by their configured identity.
+///
+/// Each result carries its configuration inline (the deprecated `configuration` field, which
+/// Bazel still populates) and by id into `CqueryResult.configurations`. A streamed result's
+/// id table only arrives after the results that use it, so a result whose inline checksum is
+/// missing waits until the stream ends to be named.
+#[derive(Default)]
+struct CqueryDecoder {
+    targets: Vec<Target>,
+    configurations: HashMap<u32, String>,
+    pending: Vec<(Target, u32)>,
+}
+
+impl CqueryDecoder {
+    fn push(&mut self, result: CqueryResult, transform: &mut impl FnMut(&mut Target)) {
+        for configuration in result.configurations {
+            if let Some(checksum) = non_null_checksum(&configuration.checksum) {
+                self.configurations
+                    .insert(configuration.id, checksum.to_owned());
+            }
+        }
+        for configured in result.results {
+            let ConfiguredTarget {
+                target,
+                configuration,
+                configuration_id,
+                ..
+            } = configured;
+            let Some(target) = target.into_option() else {
+                continue;
+            };
+            let inline = configuration
+                .as_option()
+                .and_then(|configuration| non_null_checksum(&configuration.checksum))
+                .map(str::to_owned);
+            match inline.or_else(|| self.configurations.get(&configuration_id).cloned()) {
+                Some(checksum) => self.accept(target, Some(&checksum), transform),
+                None if configuration_id != 0 => self.pending.push((target, configuration_id)),
+                None => self.accept(target, None, transform),
+            }
+        }
+    }
+
+    fn accept(
+        &mut self,
+        target: Target,
+        checksum: Option<&str>,
+        transform: &mut impl FnMut(&mut Target),
+    ) {
+        let Some(mut target) = lower_target(target) else {
+            return;
+        };
+        if let Some(checksum) = checksum {
+            configure_target(&mut target, checksum);
+        }
+        transform(&mut target);
+        self.targets.push(target);
+    }
+
+    fn finish(mut self, transform: &mut impl FnMut(&mut Target)) -> Vec<Target> {
+        let pending = std::mem::take(&mut self.pending);
+        for (target, configuration_id) in pending {
+            let checksum = self.configurations.get(&configuration_id).cloned();
+            self.accept(target, checksum.as_deref(), transform);
+        }
+        self.targets
+    }
+}
+
+fn non_null_checksum(checksum: &str) -> Option<&str> {
+    (!checksum.is_empty() && checksum != NULL_CONFIGURATION_CHECKSUM).then_some(checksum)
+}
+
+/// Names a rule or generated file by its configured identity, `label|checksum`.
+///
+/// Source files are never configured (Bazel reports them in the null configuration), so their
+/// labels stay bare and keep matching the bare labels in `configured_rule_input`. A generated
+/// file shares its generating rule's configuration, so that reference is named the same way.
+fn configure_target(target: &mut Target, checksum: &str) {
+    match target.r#type {
+        target::Discriminator::Rule => {
+            if let Some(rule) = target.rule.as_option_mut() {
+                rule.name = configured_key(&rule.name, checksum);
+            }
+        }
+        target::Discriminator::GeneratedFile => {
+            if let Some(file) = target.generated_file.as_option_mut() {
+                file.name = configured_key(&file.name, checksum);
+                file.generating_rule = configured_key(&file.generating_rule, checksum);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn configured_key(label: &str, checksum: &str) -> String {
+    format!("{label}{CONFIGURED_SEPARATOR}{checksum}")
+}
+
+/// Splits a configured identity into its label and configuration checksum.
+///
+/// Bazel allows `|` in target names, so the suffix only counts as a checksum when it looks
+/// like one (non-empty, hexadecimal); a bare label is returned unchanged.
+pub fn split_configured(key: &str) -> (&str, Option<&str>) {
+    match key.rsplit_once(CONFIGURED_SEPARATOR) {
+        Some((label, checksum))
+            if !checksum.is_empty() && checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            (label, Some(checksum))
+        }
+        _ => (key, None),
+    }
+}
+
+/// The label of a configured identity, or the input unchanged when it is a bare label.
+pub fn target_label(key: &str) -> &str {
+    split_configured(key).0
 }
 
 pub fn target_name(target: &Target) -> Option<&str> {
@@ -1072,7 +1190,7 @@ fn break_module_cycles(
 pub fn encode_configured_input(input: &ConfiguredRuleInput) -> String {
     match input.configuration_checksum.as_deref() {
         Some(checksum) if !checksum.is_empty() => {
-            format!("{}|{checksum}", input.label.as_deref().unwrap_or_default())
+            configured_key(input.label.as_deref().unwrap_or_default(), checksum)
         }
         _ => input.label.clone().unwrap_or_default(),
     }
@@ -1081,7 +1199,7 @@ pub fn encode_configured_input(input: &ConfiguredRuleInput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::analysis::{ConfiguredTarget, CqueryResult};
+    use crate::proto::analysis::{Configuration, ConfiguredTarget, CqueryResult};
     use crate::proto::blaze_query::{attribute, EnvironmentGroup, GeneratedFile, SourceFile};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1811,5 +1929,124 @@ exit 1
             targets.iter().filter_map(target_name).collect::<Vec<_>>(),
             ["//app:lib"]
         );
+    }
+
+    fn configured(
+        target: Target,
+        checksum: Option<&str>,
+        configuration_id: u32,
+    ) -> ConfiguredTarget {
+        ConfiguredTarget {
+            target: buffa::MessageField::some(target),
+            configuration: match checksum {
+                Some(checksum) => buffa::MessageField::some(Configuration {
+                    checksum: checksum.to_owned(),
+                    ..Default::default()
+                }),
+                None => buffa::MessageField::none(),
+            },
+            configuration_id,
+            ..Default::default()
+        }
+    }
+
+    fn results(results: Vec<ConfiguredTarget>) -> CqueryResult {
+        CqueryResult {
+            results,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cquery_targets_are_named_by_their_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = Target {
+            r#type: target::Discriminator::SourceFile,
+            source_file: buffa::MessageField::some(SourceFile {
+                name: "//a:a.txt".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let generated = Target {
+            r#type: target::Discriminator::GeneratedFile,
+            generated_file: buffa::MessageField::some(GeneratedFile {
+                name: "//a:out".into(),
+                generating_rule: "//a:a".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Bazel streams the configuration table after the results that refer to it, so a
+        // result without an inline checksum is named once the stream has ended.
+        let messages = [
+            results(vec![configured(rule_target("//a:a"), Some("abc123"), 1)]),
+            results(vec![configured(rule_target("//a:a"), None, 2)]),
+            results(vec![
+                configured(source, Some("null"), 0),
+                configured(generated, Some("abc123"), 1),
+            ]),
+            CqueryResult {
+                configurations: vec![Configuration {
+                    id: 2,
+                    checksum: "def456".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+        let streamed = directory.path().join("cquery-stream.pb");
+        write_delimited(&streamed, &messages);
+        let mut seen = Vec::new();
+        let targets = decode_cquery_stream(&streamed, true, &mut |target| {
+            seen.push(target_name(target).unwrap().to_owned())
+        })
+        .unwrap();
+        let names = targets.iter().filter_map(target_name).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "//a:a|abc123",
+                "//a:a.txt",
+                "//a:out|abc123",
+                "//a:a|def456"
+            ]
+        );
+        assert_eq!(seen, names, "the transform sees configured names");
+        assert_eq!(
+            targets[2]
+                .generated_file
+                .as_option()
+                .unwrap()
+                .generating_rule,
+            "//a:a|abc123"
+        );
+        assert_eq!(deduplicate_targets(targets).unwrap().len(), 4);
+
+        let non_streamed = directory.path().join("cquery.pb");
+        let mut combined = results(vec![configured(rule_target("//a:a"), None, 2)]);
+        combined.configurations = vec![Configuration {
+            id: 2,
+            checksum: "def456".into(),
+            ..Default::default()
+        }];
+        fs::write(&non_streamed, combined.encode_to_vec()).unwrap();
+        let targets = decode_cquery_stream(&non_streamed, false, &mut |_| {}).unwrap();
+        assert_eq!(target_name(&targets[0]), Some("//a:a|def456"));
+    }
+
+    #[test]
+    fn configured_keys_split_into_label_and_checksum() {
+        assert_eq!(configured_key("//a:a", "0f"), "//a:a|0f");
+        assert_eq!(split_configured("//a:a|abc123"), ("//a:a", Some("abc123")));
+        assert_eq!(split_configured("//a:a"), ("//a:a", None));
+        // `|` is legal in a target name; only a hexadecimal suffix is a checksum.
+        assert_eq!(split_configured("//a:odd|name"), ("//a:odd|name", None));
+        assert_eq!(
+            split_configured("//a:odd|name|0f"),
+            ("//a:odd|name", Some("0f"))
+        );
+        assert_eq!(target_label("//a:a|"), "//a:a|");
+        assert_eq!(target_label("//a:a|abc123"), "//a:a");
     }
 }

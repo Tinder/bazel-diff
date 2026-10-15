@@ -459,7 +459,7 @@ Commands:
   help                  Print this message or the help of the given subcommand(s)
 
 Options:
-  -v, --verbose  
+  -v, --verbose
   -h, --help     Print help
   -V, --version  Print version
 ```
@@ -472,11 +472,11 @@ Write canonical hashes for Bazel targets in a workspace
 Usage: bazel-diff generate-hashes [OPTIONS] --workspacePath <WORKSPACE_PATH> [OUTPUT_PATH]
 
 Arguments:
-  [OUTPUT_PATH]  
+  [OUTPUT_PATH]
 
 Options:
   -v, --verbose
-          
+
   -w, --workspacePath <WORKSPACE_PATH>
           Path to the Bazel workspace
   -b, --bazelPath <BAZEL_PATH>
@@ -490,33 +490,33 @@ Options:
       --cqueryCommandOptions <CQUERY_COMMAND_OPTIONS>
           Additional space-separated `bazel cquery` options
       --fineGrainedHashExternalRepos <FINE_GRAINED_HASH_EXTERNAL_REPOS>
-          
+
       --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
-          
+
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
       --cqueryExpression <CQUERY_EXPRESSION>
-          
+
   -k, --keep_going[=<KEEP_GOING>]
           [default: false] [possible values: true, false]
       --ignoredRuleHashingAttributes <IGNORED_RULE_HASHING_ATTRIBUTES>
-          
+
       --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
           [default: false] [possible values: true, false]
       --excludeTargetsQuery <EXCLUDE_TARGETS_QUERY>
-          
+
       --alwaysAffectedTags <ALWAYS_AFFECTED_TAGS>
-          
+
       --contentHashPath <CONTENT_HASH_PATH>
-          
+
       --includeTargetType[=<INCLUDE_TARGET_TYPE>]
           [default: false] [possible values: true, false]
       --targetType <TARGET_TYPE>
-          
+
   -d, --depEdgesFile <DEP_EDGES_FILE>
-          
+
   -m, --modified-filepaths <MODIFIED_FILEPATHS>
-          
+
   -h, --help
           Print help
   -V, --version
@@ -532,23 +532,23 @@ Usage: bazel-diff get-impacted-targets [OPTIONS] --startingHashes <STARTING_HASH
 
 Options:
       --startingHashes <STARTING_HASHES>
-          
+
   -v, --verbose
-          
+
       --finalHashes <FINAL_HASHES>
-          
+
   -d, --depEdgesFile <DEP_EDGES_FILE>
-          
+
       --targetType <TARGET_TYPE>
-          
+
   -o, --output <OUTPUT>
-          
+
   -w, --workspacePath <WORKSPACE_PATH>
-          
+
   -b, --bazelPath <BAZEL_PATH>
           [default: bazel]
       --bazelStartupOptions <BAZEL_STARTUP_OPTIONS>
-          
+
       --noBazelrc[=<NO_BAZELRC>]
           [default: false] [possible values: true, false]
       --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
@@ -571,7 +571,7 @@ Options:
           The JSON file of target hashes for the initial revision, from `generate-hashes`
 
   -v, --verbose
-          
+
 
       --finalHashes <FINAL_HASHES>
           The JSON file of target hashes for the final revision, from `generate-hashes`
@@ -590,7 +590,7 @@ Options:
           - json
           - dot:     A Graphviz node-link graph of the blame subgraph, edges from root cause to queried target
           - mermaid: A Mermaid `flowchart TD` of the same graph
-          
+
           [default: text]
 
   -o, --output <OUTPUT>
@@ -598,12 +598,12 @@ Options:
 
       --maxRootCauses <MAX_ROOT_CAUSES>
           Report at most this many root causes, nearest first. The full count is always reported alongside. 0 means no limit
-          
+
           [default: 25]
 
       --maxDepth <MAX_DEPTH>
           Stop searching this many dependency hops above the queried target. Root causes further upstream are then not reported (a warning is printed). -1 means no bound
-          
+
           [default: -1]
 
   -h, --help
@@ -622,7 +622,7 @@ Usage: bazel-diff serve [OPTIONS] --workspacePath <WORKSPACE_PATH> --cacheDir <C
 
 Options:
   -v, --verbose
-          
+
   -w, --workspacePath <WORKSPACE_PATH>
           Path to the Bazel workspace
   -b, --bazelPath <BAZEL_PATH>
@@ -636,23 +636,23 @@ Options:
       --cqueryCommandOptions <CQUERY_COMMAND_OPTIONS>
           Additional space-separated `bazel cquery` options
       --fineGrainedHashExternalRepos <FINE_GRAINED_HASH_EXTERNAL_REPOS>
-          
+
       --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
-          
+
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
       --cqueryExpression <CQUERY_EXPRESSION>
-          
+
   -k, --keep_going[=<KEEP_GOING>]
           [default: false] [possible values: true, false]
       --ignoredRuleHashingAttributes <IGNORED_RULE_HASHING_ATTRIBUTES>
-          
+
       --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
           [default: false] [possible values: true, false]
       --excludeTargetsQuery <EXCLUDE_TARGETS_QUERY>
-          
+
       --alwaysAffectedTags <ALWAYS_AFFECTED_TAGS>
-          
+
       --gitPath <GIT_PATH>
           [default: git]
       --port <PORT>
@@ -660,33 +660,33 @@ Options:
       --requestTimeout <REQUEST_TIMEOUT>
           [default: 0]
       --cacheDir <CACHE_DIR>
-          
+
       --trackDeps[=<TRACK_DEPS>]
           [default: false] [possible values: true, false]
       --dependencyFingerprint[=<DEPENDENCY_FINGERPRINT>]
           Opt-in: only serve cached entries whose external-dependency fingerprint still matches [default: false] [possible values: true, false]
       --no-initial-fetch
-          
+
       --warmupRevision <WARMUP_REVISIONS>
-          
+
       --cacheMaxAge <CACHE_MAX_AGE>
-          
+
       --cacheMaxEntries <CACHE_MAX_ENTRIES>
-          
+
       --cacheMaxSize <CACHE_MAX_SIZE>
-          
+
       --cachePruneInterval <CACHE_PRUNE_INTERVAL>
           [default: 1h]
       --s3Bucket <S3_BUCKET>
-          
+
       --s3Prefix <S3_PREFIX>
           [default: ""]
       --s3Region <S3_REGION>
-          
+
       --s3Endpoint <S3_ENDPOINT>
-          
+
       --s3ForcePathStyle
-          
+
       --nexusUrl <NEXUS_URL>
           Base URL of a Sonatype Nexus Repository instance used as the shared cache tier
       --nexusRepository <NEXUS_REPOSITORY>
@@ -741,7 +741,7 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "50.2.0")
+bazel_dep(name = "bazel-diff", version = "50.3.0")
 ```
 
 Until `rules_rs` fixes `all_crate_deps(package_name = "")`, copy

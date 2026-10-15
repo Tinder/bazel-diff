@@ -463,7 +463,7 @@ Commands:
   help                  Print this message or the help of the given subcommand(s)
 
 Options:
-  -v, --verbose  
+  -v, --verbose
   -h, --help     Print help
   -V, --version  Print version
 ```
@@ -476,11 +476,11 @@ Write canonical hashes for Bazel targets in a workspace
 Usage: bazel-diff generate-hashes [OPTIONS] --workspacePath <WORKSPACE_PATH> [OUTPUT_PATH]
 
 Arguments:
-  [OUTPUT_PATH]  
+  [OUTPUT_PATH]
 
 Options:
   -v, --verbose
-          
+
   -w, --workspacePath <WORKSPACE_PATH>
           Path to the Bazel workspace
   -b, --bazelPath <BAZEL_PATH>
@@ -494,33 +494,33 @@ Options:
       --cqueryCommandOptions <CQUERY_COMMAND_OPTIONS>
           Additional space-separated `bazel cquery` options
       --fineGrainedHashExternalRepos <FINE_GRAINED_HASH_EXTERNAL_REPOS>
-          
+
       --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
-          
+
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
       --cqueryExpression <CQUERY_EXPRESSION>
-          
+
   -k, --keep_going[=<KEEP_GOING>]
           [default: false] [possible values: true, false]
       --ignoredRuleHashingAttributes <IGNORED_RULE_HASHING_ATTRIBUTES>
-          
+
       --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
           [default: false] [possible values: true, false]
       --excludeTargetsQuery <EXCLUDE_TARGETS_QUERY>
-          
+
       --alwaysAffectedTags <ALWAYS_AFFECTED_TAGS>
-          
+
       --contentHashPath <CONTENT_HASH_PATH>
-          
+
       --includeTargetType[=<INCLUDE_TARGET_TYPE>]
           [default: false] [possible values: true, false]
       --targetType <TARGET_TYPE>
-          
+
   -d, --depEdgesFile <DEP_EDGES_FILE>
-          
+
   -m, --modified-filepaths <MODIFIED_FILEPATHS>
-          
+
   -h, --help
           Print help
   -V, --version
@@ -536,23 +536,23 @@ Usage: bazel-diff get-impacted-targets [OPTIONS] --startingHashes <STARTING_HASH
 
 Options:
       --startingHashes <STARTING_HASHES>
-          
+
   -v, --verbose
-          
+
       --finalHashes <FINAL_HASHES>
-          
+
   -d, --depEdgesFile <DEP_EDGES_FILE>
-          
+
       --targetType <TARGET_TYPE>
-          
+
   -o, --output <OUTPUT>
-          
+
   -w, --workspacePath <WORKSPACE_PATH>
-          
+
   -b, --bazelPath <BAZEL_PATH>
           [default: bazel]
       --bazelStartupOptions <BAZEL_STARTUP_OPTIONS>
-          
+
       --noBazelrc[=<NO_BAZELRC>]
           [default: false] [possible values: true, false]
       --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
@@ -575,7 +575,7 @@ Options:
           The JSON file of target hashes for the initial revision, from `generate-hashes`
 
   -v, --verbose
-          
+
 
       --finalHashes <FINAL_HASHES>
           The JSON file of target hashes for the final revision, from `generate-hashes`
@@ -594,7 +594,7 @@ Options:
           - json
           - dot:     A Graphviz node-link graph of the blame subgraph, edges from root cause to queried target
           - mermaid: A Mermaid `flowchart TD` of the same graph
-          
+
           [default: text]
 
   -o, --output <OUTPUT>
@@ -602,12 +602,12 @@ Options:
 
       --maxRootCauses <MAX_ROOT_CAUSES>
           Report at most this many root causes, nearest first. The full count is always reported alongside. 0 means no limit
-          
+
           [default: 25]
 
       --maxDepth <MAX_DEPTH>
           Stop searching this many dependency hops above the queried target. Root causes further upstream are then not reported (a warning is printed). -1 means no bound
-          
+
           [default: -1]
 
   -h, --help
@@ -626,7 +626,7 @@ Usage: bazel-diff serve [OPTIONS] --workspacePath <WORKSPACE_PATH> --cacheDir <C
 
 Options:
   -v, --verbose
-          
+
   -w, --workspacePath <WORKSPACE_PATH>
           Path to the Bazel workspace
   -b, --bazelPath <BAZEL_PATH>
@@ -640,23 +640,23 @@ Options:
       --cqueryCommandOptions <CQUERY_COMMAND_OPTIONS>
           Additional space-separated `bazel cquery` options
       --fineGrainedHashExternalRepos <FINE_GRAINED_HASH_EXTERNAL_REPOS>
-          
+
       --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
-          
+
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
       --cqueryExpression <CQUERY_EXPRESSION>
-          
+
   -k, --keep_going[=<KEEP_GOING>]
           [default: false] [possible values: true, false]
       --ignoredRuleHashingAttributes <IGNORED_RULE_HASHING_ATTRIBUTES>
-          
+
       --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
           [default: false] [possible values: true, false]
       --excludeTargetsQuery <EXCLUDE_TARGETS_QUERY>
-          
+
       --alwaysAffectedTags <ALWAYS_AFFECTED_TAGS>
-          
+
       --gitPath <GIT_PATH>
           [default: git]
       --port <PORT>
@@ -664,33 +664,33 @@ Options:
       --requestTimeout <REQUEST_TIMEOUT>
           [default: 0]
       --cacheDir <CACHE_DIR>
-          
+
       --trackDeps[=<TRACK_DEPS>]
           [default: false] [possible values: true, false]
       --dependencyFingerprint[=<DEPENDENCY_FINGERPRINT>]
           Opt-in: only serve cached entries whose external-dependency fingerprint still matches [default: false] [possible values: true, false]
       --no-initial-fetch
-          
+
       --warmupRevision <WARMUP_REVISIONS>
-          
+
       --cacheMaxAge <CACHE_MAX_AGE>
-          
+
       --cacheMaxEntries <CACHE_MAX_ENTRIES>
-          
+
       --cacheMaxSize <CACHE_MAX_SIZE>
-          
+
       --cachePruneInterval <CACHE_PRUNE_INTERVAL>
           [default: 1h]
       --s3Bucket <S3_BUCKET>
-          
+
       --s3Prefix <S3_PREFIX>
           [default: ""]
       --s3Region <S3_REGION>
-          
+
       --s3Endpoint <S3_ENDPOINT>
-          
+
       --s3ForcePathStyle
-          
+
       --nexusUrl <NEXUS_URL>
           Base URL of a Sonatype Nexus Repository instance used as the shared cache tier
       --nexusRepository <NEXUS_REPOSITORY>
@@ -759,7 +759,7 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "50.1.0")
+bazel_dep(name = "bazel-diff", version = "50.3.0")
 ```
 
 Until `rules_rs` fixes `all_crate_deps(package_name = "")`, copy
@@ -824,31 +824,31 @@ bazel run :bazel-diff --config=verbose -- --help
 <table>
   <tr>
     <td align="center"><a href="https://github.com/tinder-maxwellelliott"><img src="https://avatars.githubusercontent.com/u/56700854?s=64" width="64" alt="Maxwell Elliott"/><br/><sub><b>Maxwell Elliott</b></sub></a></td>
-    <td align="center"><a href="https://github.com/honnix"><img src="https://avatars.githubusercontent.com/honnix?s=64" width="64" alt="Honnix"/><br/><sub><b>Honnix</b></sub></a></td>
-    <td align="center"><sub><b>eric wang</b></sub></td>
-    <td align="center"><sub><b>Eric Wang</b></sub></td>
-    <td align="center"><sub><b>Tianyu Geng</b></sub></td>
-    <td align="center"><sub><b>Patrick Balestra</b></sub></td>
+    <td align="center"><a href="https://github.com/honnix"><img src="https://avatars.githubusercontent.com/u/158892?s=64" width="64" alt="Honnix"/><br/><sub><b>Honnix</b></sub></a></td>
+    <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="eric wang"/><br/><sub><b>eric wang</b></sub></a></td>
+    <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="Eric Wang"/><br/><sub><b>Eric Wang</b></sub></a></td>
+    <td align="center"><a href="https://github.com/tgeng"><img src="https://avatars.githubusercontent.com/u/29584386?s=64" width="64" alt="Tianyu Geng"/><br/><sub><b>Tianyu Geng</b></sub></a></td>
+    <td align="center"><a href="https://github.com/BalestraPatrick"><img src="https://avatars.githubusercontent.com/u/3658887?s=64" width="64" alt="Patrick Balestra"/><br/><sub><b>Patrick Balestra</b></sub></a></td>
   </tr>
   <tr>
-    <td align="center"><sub><b>Daniel P. Purkhus</b></sub></td>
-    <td align="center"><sub><b>Alex Eagle</b></sub></td>
-    <td align="center"><sub><b>Anton Malinskiy</b></sub></td>
-    <td align="center"><a href="https://github.com/rdark"><img src="https://avatars.githubusercontent.com/rdark?s=64" width="64" alt="rdark"/><br/><sub><b>rdark</b></sub></a></td>
+    <td align="center"><a href="https://github.com/purkhusid"><img src="https://avatars.githubusercontent.com/u/5622403?s=64" width="64" alt="Daniel P. Purkhus"/><br/><sub><b>Daniel P. Purkhus</b></sub></a></td>
+    <td align="center"><a href="https://github.com/alexeagle"><img src="https://avatars.githubusercontent.com/u/47395?s=64" width="64" alt="Alex Eagle"/><br/><sub><b>Alex Eagle</b></sub></a></td>
+    <td align="center"><a href="https://github.com/Malinskiy"><img src="https://avatars.githubusercontent.com/u/2089114?s=64" width="64" alt="Anton Malinskiy"/><br/><sub><b>Anton Malinskiy</b></sub></a></td>
+    <td align="center"><a href="https://github.com/rdark"><img src="https://avatars.githubusercontent.com/u/260691?s=64" width="64" alt="rdark"/><br/><sub><b>rdark</b></sub></a></td>
     <td align="center"><a href="https://github.com/ViggedalZenseact"><img src="https://avatars.githubusercontent.com/u/174004696?s=64" width="64" alt="ViggedalZenseact"/><br/><sub><b>ViggedalZenseact</b></sub></a></td>
     <td align="center"><a href="https://github.com/corypaik"><img src="https://avatars.githubusercontent.com/u/36490981?s=64" width="64" alt="Cory Paik"/><br/><sub><b>Cory Paik</b></sub></a></td>
   </tr>
   <tr>
     <td align="center"><sub><b>Ted Kaplan</b></sub></td>
-    <td align="center"><sub><b>Sharmila</b></sub></td>
-    <td align="center"><a href="https://github.com/dkostyrev"><img src="https://avatars.githubusercontent.com/dkostyrev?s=64" width="64" alt="Dmitrii Kostyrev"/><br/><sub><b>Dmitrii Kostyrev</b></sub></a></td>
-    <td align="center"><sub><b>Jérémy Mathevet</b></sub></td>
-    <td align="center"><sub><b>Nikhil Birmiwal</b></sub></td>
-    <td align="center"><sub><b>Sergei Morozov</b></sub></td>
+    <td align="center"><a href="https://github.com/sharmila-oai"><img src="https://avatars.githubusercontent.com/u/257629015?s=64" width="64" alt="Sharmila"/><br/><sub><b>Sharmila</b></sub></a></td>
+    <td align="center"><a href="https://github.com/dkostyrev"><img src="https://avatars.githubusercontent.com/u/183590?s=64" width="64" alt="Dmitrii Kostyrev"/><br/><sub><b>Dmitrii Kostyrev</b></sub></a></td>
+    <td align="center"><a href="https://github.com/jmthvt"><img src="https://avatars.githubusercontent.com/u/1737199?s=64" width="64" alt="Jérémy Mathevet"/><br/><sub><b>Jérémy Mathevet</b></sub></a></td>
+    <td align="center"><a href="https://github.com/nikhilbirmiwal"><img src="https://avatars.githubusercontent.com/u/65141192?s=64" width="64" alt="Nikhil Birmiwal"/><br/><sub><b>Nikhil Birmiwal</b></sub></a></td>
+    <td align="center"><a href="https://github.com/morozov"><img src="https://avatars.githubusercontent.com/u/59683?s=64" width="64" alt="Sergei Morozov"/><br/><sub><b>Sergei Morozov</b></sub></a></td>
   </tr>
   <tr>
-    <td align="center"><a href="https://github.com/fahhem"><img src="https://avatars.githubusercontent.com/fahhem?s=64" width="64" alt="Fahrzin Hemmati"/><br/><sub><b>Fahrzin Hemmati</b></sub></a></td>
-    <td align="center"><sub><b>Jaime Lennox</b></sub></td>
+    <td align="center"><a href="https://github.com/fahhem"><img src="https://avatars.githubusercontent.com/u/306100?s=64" width="64" alt="Fahrzin Hemmati"/><br/><sub><b>Fahrzin Hemmati</b></sub></a></td>
+    <td align="center"><a href="https://github.com/JaimeLennox"><img src="https://avatars.githubusercontent.com/u/1424638?s=64" width="64" alt="Jaime Lennox"/><br/><sub><b>Jaime Lennox</b></sub></a></td>
     <td align="center"><a href="https://github.com/dzbarsky"><img src="https://avatars.githubusercontent.com/u/1565842?s=64" width="64" alt="David Zbarsky"/><br/><sub><b>David Zbarsky</b></sub></a></td>
     <td align="center"><a href="https://github.com/q4rk"><img src="https://avatars.githubusercontent.com/u/214901060?s=64" width="64" alt="Eje Daniel"/><br/><sub><b>Eje Daniel</b></sub></a></td>
     <td align="center"><a href="https://github.com/lukasmi93"><img src="https://avatars.githubusercontent.com/u/194943870?s=64" width="64" alt="lukasmi93"/><br/><sub><b>lukasmi93</b></sub></a></td>
@@ -860,35 +860,35 @@ bazel run :bazel-diff --config=verbose -- --help
     <td align="center"><a href="https://github.com/csmoe"><img src="https://avatars.githubusercontent.com/u/35686186?s=64" width="64" alt="csmoe"/><br/><sub><b>csmoe</b></sub></a></td>
     <td align="center"><a href="https://github.com/SimonFoobar648"><img src="https://avatars.githubusercontent.com/u/245426116?s=64" width="64" alt="SimonFoobar648"/><br/><sub><b>SimonFoobar648</b></sub></a></td>
     <td align="center"><a href="https://github.com/dgollahon-plaid"><img src="https://avatars.githubusercontent.com/u/179647366?s=64" width="64" alt="dgollahon-plaid"/><br/><sub><b>dgollahon-plaid</b></sub></a></td>
-    <td align="center"><sub><b>jmwachtel</b></sub></td>
+    <td align="center"><a href="https://github.com/jmwachtel"><img src="https://avatars.githubusercontent.com/u/1046228?s=64" width="64" alt="jmwachtel"/><br/><sub><b>jmwachtel</b></sub></a></td>
   </tr>
   <tr>
-    <td align="center"><a href="https://github.com/Ahajha"><img src="https://avatars.githubusercontent.com/Ahajha?s=64" width="64" alt="Alex Trotta"/><br/><sub><b>Alex Trotta</b></sub></a></td>
-    <td align="center"><sub><b>Johan Mjönes</b></sub></td>
-    <td align="center"><a href="https://github.com/lucasteixeira-cb"><img src="https://avatars.githubusercontent.com/lucasteixeira-cb?s=64" width="64" alt="Lucas Teixeira"/><br/><sub><b>Lucas Teixeira</b></sub></a></td>
-    <td align="center"><a href="https://github.com/GuillaumeVW"><img src="https://avatars.githubusercontent.com/GuillaumeVW?s=64" width="64" alt="Guillaume Van Wassenhove"/><br/><sub><b>Guillaume Van Wassenhove</b></sub></a></td>
-    <td align="center"><sub><b>Fabian Meumertzheim</b></sub></td>
-    <td align="center"><a href="https://github.com/blockjon-dd"><img src="https://avatars.githubusercontent.com/blockjon-dd?s=64" width="64" alt="Jonathan Block"/><br/><sub><b>Jonathan Block</b></sub></a></td>
+    <td align="center"><a href="https://github.com/Ahajha"><img src="https://avatars.githubusercontent.com/u/44127594?s=64" width="64" alt="Alex Trotta"/><br/><sub><b>Alex Trotta</b></sub></a></td>
+    <td align="center"><a href="https://github.com/nollbit"><img src="https://avatars.githubusercontent.com/u/99957?s=64" width="64" alt="Johan Mjönes"/><br/><sub><b>Johan Mjönes</b></sub></a></td>
+    <td align="center"><a href="https://github.com/lucasteixeira-cb"><img src="https://avatars.githubusercontent.com/u/116316841?s=64" width="64" alt="Lucas Teixeira"/><br/><sub><b>Lucas Teixeira</b></sub></a></td>
+    <td align="center"><a href="https://github.com/GuillaumeVW"><img src="https://avatars.githubusercontent.com/u/53425033?s=64" width="64" alt="Guillaume Van Wassenhove"/><br/><sub><b>Guillaume Van Wassenhove</b></sub></a></td>
+    <td align="center"><a href="https://github.com/fmeum"><img src="https://avatars.githubusercontent.com/u/4312191?s=64" width="64" alt="Fabian Meumertzheim"/><br/><sub><b>Fabian Meumertzheim</b></sub></a></td>
+    <td align="center"><a href="https://github.com/blockjon-dd"><img src="https://avatars.githubusercontent.com/u/117850895?s=64" width="64" alt="Jonathan Block"/><br/><sub><b>Jonathan Block</b></sub></a></td>
   </tr>
   <tr>
-    <td align="center"><sub><b>Alex Torok</b></sub></td>
-    <td align="center"><sub><b>Naveen Narayanan</b></sub></td>
-    <td align="center"><sub><b>Mathieu Sabourin</b></sub></td>
-    <td align="center"><sub><b>André</b></sub></td>
-    <td align="center"><a href="https://github.com/bz-canva"><img src="https://avatars.githubusercontent.com/bz-canva?s=64" width="64" alt="Boris"/><br/><sub><b>Boris</b></sub></a></td>
-    <td align="center"><sub><b>Rui Chen</b></sub></td>
+    <td align="center"><a href="https://github.com/alex-torok"><img src="https://avatars.githubusercontent.com/u/8749956?s=64" width="64" alt="Alex Torok"/><br/><sub><b>Alex Torok</b></sub></a></td>
+    <td align="center"><a href="https://github.com/naveenOnarayanan"><img src="https://avatars.githubusercontent.com/u/3528131?s=64" width="64" alt="Naveen Narayanan"/><br/><sub><b>Naveen Narayanan</b></sub></a></td>
+    <td align="center"><a href="https://github.com/OniOni"><img src="https://avatars.githubusercontent.com/u/385657?s=64" width="64" alt="Mathieu Sabourin"/><br/><sub><b>Mathieu Sabourin</b></sub></a></td>
+    <td align="center"><a href="https://github.com/andre-alves"><img src="https://avatars.githubusercontent.com/u/7773955?s=64" width="64" alt="André"/><br/><sub><b>André</b></sub></a></td>
+    <td align="center"><a href="https://github.com/bz-canva"><img src="https://avatars.githubusercontent.com/u/125319243?s=64" width="64" alt="Boris"/><br/><sub><b>Boris</b></sub></a></td>
+    <td align="center"><a href="https://github.com/chenrui333"><img src="https://avatars.githubusercontent.com/u/1580956?s=64" width="64" alt="Rui Chen"/><br/><sub><b>Rui Chen</b></sub></a></td>
   </tr>
   <tr>
-    <td align="center"><a href="https://github.com/sanju-naik"><img src="https://avatars.githubusercontent.com/sanju-naik?s=64" width="64" alt="Sanju Naik"/><br/><sub><b>Sanju Naik</b></sub></a></td>
-    <td align="center"><a href="https://github.com/lalten"><img src="https://avatars.githubusercontent.com/lalten?s=64" width="64" alt="Laurenz"/><br/><sub><b>Laurenz</b></sub></a></td>
-    <td align="center"><sub><b>mla</b></sub></td>
-    <td align="center"><sub><b>tinder-yukisawa</b></sub></td>
-    <td align="center"><sub><b>Kevin Jiao</b></sub></td>
-    <td align="center"><sub><b>Vincent Case</b></sub></td>
+    <td align="center"><a href="https://github.com/sanju-naik"><img src="https://avatars.githubusercontent.com/u/66404008?s=64" width="64" alt="Sanju Naik"/><br/><sub><b>Sanju Naik</b></sub></a></td>
+    <td align="center"><a href="https://github.com/lalten"><img src="https://avatars.githubusercontent.com/u/11611719?s=64" width="64" alt="Laurenz"/><br/><sub><b>Laurenz</b></sub></a></td>
+    <td align="center"><a href="https://github.com/molar"><img src="https://avatars.githubusercontent.com/u/1433210?s=64" width="64" alt="mla"/><br/><sub><b>mla</b></sub></a></td>
+    <td align="center"><a href="https://github.com/tinder-yukisawa"><img src="https://avatars.githubusercontent.com/u/54122444?s=64" width="64" alt="tinder-yukisawa"/><br/><sub><b>tinder-yukisawa</b></sub></a></td>
+    <td align="center"><a href="https://github.com/KevinJiao"><img src="https://avatars.githubusercontent.com/u/9851473?s=64" width="64" alt="Kevin Jiao"/><br/><sub><b>Kevin Jiao</b></sub></a></td>
+    <td align="center"><a href="https://github.com/vcase"><img src="https://avatars.githubusercontent.com/u/10698795?s=64" width="64" alt="Vincent Case"/><br/><sub><b>Vincent Case</b></sub></a></td>
   </tr>
   <tr>
-    <td align="center"><sub><b>Walt Panfil</b></sub></td>
-    <td align="center"><sub><b>Mehran Poursadeghi</b></sub></td>
+    <td align="center"><a href="https://github.com/fh-wpanfil"><img src="https://avatars.githubusercontent.com/u/262680997?s=64" width="64" alt="Walt Panfil"/><br/><sub><b>Walt Panfil</b></sub></a></td>
+    <td align="center"><a href="https://github.com/mehran-prs"><img src="https://avatars.githubusercontent.com/u/22454054?s=64" width="64" alt="Mehran Poursadeghi"/><br/><sub><b>Mehran Poursadeghi</b></sub></a></td>
   </tr>
 </table>
 <!-- END_SECTION: contributors -->

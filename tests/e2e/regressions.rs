@@ -320,3 +320,64 @@ fn external_go_dependencies_appear_in_hashes() {
 }
 
 use std::collections::BTreeMap;
+
+/// Regression test for <https://github.com/Tinder/bazel-diff/issues/512>.
+///
+/// `deps(//:app)` under cquery contains `//:app` twice: in the default
+/// configuration, where it depends on `//:helper`, and in the bootstrap
+/// configuration that `//:helper` transitions it into, where it has no deps.
+/// Hashing by label keeps only one instance, and every edge into `//:app`
+/// resolves to it. When the default instance wins, `//:helper`'s edge to the
+/// bootstrap `//:app` closes a false cycle and generate-hashes fails. When the
+/// bootstrap instance wins, a change to `input.txt` reaches `//:helper` but
+/// never `//:app`, and the dep-edge output for `//:app` omits `//:helper`.
+#[test]
+fn cquery_keeps_dependencies_of_every_configured_instance() {
+    let first = copy_workspace("cquery_transition_dedup");
+    let second = copy_workspace("cquery_transition_dedup");
+    fs::write(second.path().join("input.txt"), "after\n").unwrap();
+
+    let output = tempfile::tempdir().unwrap();
+    let from = output.path().join("from.json");
+    let to = output.path().join("to.json");
+    let edges = output.path().join("edges.json");
+    let result = output.path().join("impacted.txt");
+    let cquery = ["--useCquery", "--cqueryExpression", "deps(//:app)"];
+
+    let mut with_edges = cquery.to_vec();
+    with_edges.extend(["--depEdgesFile", edges.to_str().unwrap()]);
+    for (workspace, output, args) in [
+        (first.path(), &from, &with_edges),
+        (second.path(), &to, &cquery.to_vec()),
+    ] {
+        let generated = generate(workspace, output, args);
+        assert!(
+            generated.status.success(),
+            "generate-hashes --useCquery failed (a false cycle means the two //:app \
+             instances were collapsed by label): {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+    }
+    assert!(impacted(second.path(), &from, &to, &result, &[])
+        .status
+        .success());
+
+    let dep_edges: BTreeMap<String, Vec<String>> =
+        serde_json::from_slice(&fs::read(&edges).unwrap()).unwrap();
+    let app_edges = dep_edges
+        .iter()
+        .find(|(label, _)| label.ends_with("//:app"))
+        .map(|(_, deps)| deps.clone())
+        .expect("//:app has dep edges");
+    assert!(
+        app_edges.iter().any(|dep| dep.ends_with("//:helper")),
+        "//:app lost its default-configuration edge to //:helper: {app_edges:?}"
+    );
+
+    let impacted = read_lines(&result);
+    assert!(impacted.iter().any(|label| label.ends_with("//:helper")));
+    assert!(
+        impacted.iter().any(|label| label.ends_with("//:app")),
+        "//:app should be impacted through //:helper, got {impacted:?}"
+    );
+}

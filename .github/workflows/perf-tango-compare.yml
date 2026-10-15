@@ -1,0 +1,126 @@
+name: "Perf: bazel-diff vs Tango"
+
+# Nightly performance comparison of bazel-diff against Uber's Tango (https://github.com/uber/tango)
+# on identical workloads. Runs tools/perf/tango_compare.py, which builds the Tango example
+# server/client (go build, pinned commit), generates synthetic genrule workspaces of several sizes,
+# and for each one times both tools end to end (checkout -> bazel query -> hash -> diff) cold (fresh
+# Bazel servers), warm (servers alive) and diff-only, cross-checking that the two tools report the
+# same impacted targets. See tools/perf/README.md for the methodology.
+#
+# Every run writes a markdown step summary and a 90-day metrics artifact, so trends can be read
+# across nights, and a Tango commit can be compared on demand via the tango_ref input. Scheduled
+# runs pin Tango to the commit in the harness so a Tango change never silently moves the baseline.
+# Note: scheduled + dispatched workflows run from the default branch, so this must land on master
+# before the cron fires.
+on:
+  workflow_dispatch:
+    inputs:
+      workloads:
+        description: "Comma-separated synthetic presets (tiny, small, medium, large, xlarge)"
+        type: string
+        default: "small,medium,large,xlarge"
+      iterations:
+        description: "Timed iterations per workload"
+        type: string
+        default: "3"
+      tango_ref:
+        description: "uber/tango commit/branch/tag to build (empty = the harness's pinned commit)"
+        type: string
+        default: ""
+      tango_pool_size:
+        description: "Tango worker pool size (1 = sequential like bazel-diff; 2 = parallel revisions)"
+        type: string
+        default: "1"
+      quick:
+        description: "Smoke profile: tiny workload, one iteration (overrides workloads/iterations)"
+        type: boolean
+        default: false
+  schedule:
+    # Nightly at 03:45 UTC, offset from the serve crons (30 6, 30 8, 0 */12) and the format/badge
+    # crons (12:00-13:00) so the jobs never contend for runners.
+    - cron: "45 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  TangoCompare:
+    runs-on: ubuntu-latest
+    # The default legs x 3 iterations x (cold + warm) x 2 tools, plus the bazel-diff Rust build and
+    # the Tango Go build, fit well inside an hour on a 4-core runner (the cold numbers are dominated
+    # by Bazel server start-up, not graph size). The timeout is generous so a slow build or a runner
+    # hiccup yields data, not a kill.
+    timeout-minutes: 120
+    steps:
+      - name: Setup Go environment
+        # Tango's go.mod declares go 1.25; the harness also sets GOTOOLCHAIN=auto as a fallback.
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.25.0'
+          cache: false
+        id: go
+      - name: Setup Bazelisk
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
+      - uses: actions/checkout@v4
+      - name: Build bazel-diff
+        # Built here rather than by the harness so the Rust build has its own step and log. The
+        # .bazelrc lint aspects are skipped: this is a measurement binary, CI lints it elsewhere.
+        run: >
+          ~/go/bin/bazelisk build //src:bazel-diff -c opt
+          --output_groups=-clippy_checks,-rustfmt_checks
+          --enable_bzlmod=true --enable_workspace=false
+      - name: Run comparison harness
+        # Dispatch inputs reach the harness through the environment and a bash array, never by
+        # interpolating them into the command line. Scheduled runs see empty inputs and take the
+        # defaults. --bazel points both tools (and the harness's own `bazel shutdown`s) at bazelisk;
+        # each workspace's .bazelversion selects the Bazel release, so both tools run the same one.
+        env:
+          IN_WORKLOADS: ${{ inputs.workloads || 'small,medium,large,xlarge' }}
+          IN_ITERATIONS: ${{ inputs.iterations || '3' }}
+          IN_TANGO_REF: ${{ inputs.tango_ref }}
+          IN_POOL: ${{ inputs.tango_pool_size || '1' }}
+          IN_QUICK: ${{ inputs.quick && 'true' || 'false' }}
+        run: |
+          args=()
+          if [ "$IN_QUICK" = "true" ]; then
+            args+=(--quick)
+          else
+            IFS=',' read -ra WLS <<< "$IN_WORKLOADS"
+            for w in "${WLS[@]}"; do
+              w="${w//[[:space:]]/}"
+              [ -n "$w" ] && args+=(--workload "$w")
+            done
+            args+=(--iterations "$IN_ITERATIONS")
+          fi
+          [ -n "$IN_TANGO_REF" ] && args+=(--tango-ref "$IN_TANGO_REF")
+          args+=(--tango-pool-size "$IN_POOL")
+          echo "harness args: ${args[*]}"
+          python3 tools/perf/tango_compare.py \
+            --bazel "$HOME/go/bin/bazelisk" \
+            --bazel-diff bazel-bin/src/bazel-diff \
+            --skip-build \
+            --metrics-out tango-compare-metrics.json \
+            --summary-out tango-compare-summary.md \
+            "${args[@]}"
+      - name: Publish step summary
+        if: always()
+        run: |
+          if [ -f tango-compare-summary.md ]; then
+            cat tango-compare-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tango-compare-${{ github.run_id }}
+          path: |
+            tango-compare-metrics.json
+            tango-compare-summary.md
+          if-no-files-found: warn
+          retention-days: 90

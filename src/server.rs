@@ -12,7 +12,7 @@ use s3::{Bucket, Region};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -857,7 +857,10 @@ fn get_hashes_locked(
     sha: &str,
     modified: &BTreeSet<PathBuf>,
 ) -> Result<Retrieval> {
-    let key = cache_key(state, sha, modified);
+    // Keyed by the commit's tree, not the commit itself: a rebase, an amended message, or a merge
+    // commit that changes no file all point at a tree that was already hashed.
+    let tree = resolve_tree(state, sha)?;
+    let key = cache_key(state, &tree, modified);
     let path = state.config.cache_dir.join(format!("{key}.json"));
     let mut current_dependency_fingerprint = None;
     if path.is_file() {
@@ -901,6 +904,20 @@ fn get_hashes_locked(
     let mut options = state.config.hash_options.clone();
     options.modified_filepaths = modified.clone();
     options.track_deps = state.config.track_deps;
+    if modified.is_empty() && options.content_hashes.is_none() {
+        // Git already holds a content hash for every tracked file, so seed the source hasher from
+        // one `ls-tree` instead of reading the whole working tree. The scoped `modifiedFilepaths`
+        // path keeps its own disk-read semantics, and files absent from the tree (untracked, or in
+        // a fine-grained external repository) still fall back to a disk read.
+        let listed_started = Instant::now();
+        let content_hashes = git_content_hashes(state, sha)?;
+        eprintln!(
+            "[Info] listed {} tracked blobs for {sha} in {}ms",
+            content_hashes.len(),
+            elapsed_millis(listed_started)
+        );
+        options.content_hashes = Some(content_hashes);
+    }
     let (mut data, timings) = generate_hashes_timed(&options)?;
     if state.config.dependency_fingerprint {
         data.dependency_fingerprint = current_dependency_fingerprint.take().or_else(|| {
@@ -1093,6 +1110,9 @@ fn configuration_fingerprint(config: &ServerConfig) -> String {
             .collect::<Vec<_>>()
             .join(","),
         config.track_deps.to_string(),
+        // Full-content entries hash git blob ids rather than file bytes; keep them apart from
+        // entries a build without this seeding wrote under the same package version.
+        String::from("sourceContent=git-blob"),
     ] {
         hasher.update(value.as_bytes());
         hasher.update([0]);
@@ -1174,6 +1194,67 @@ fn resolve_sha(state: &State, revision: &str) -> Result<String> {
         bail!("revision '{revision}' resolved to invalid SHA '{sha}'");
     }
     Ok(sha)
+}
+
+/// Resolves the tree object a commit points at; distinct commits with identical content share it.
+fn resolve_tree(state: &State, sha: &str) -> Result<String> {
+    let output = git_output(
+        state,
+        &[
+            String::from("rev-parse"),
+            String::from("--verify"),
+            format!("{sha}^{{tree}}"),
+        ],
+    )?;
+    if !output.status.success() {
+        bail!("tree for revision '{sha}' is missing from the local clone");
+    }
+    let tree = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if tree.len() != 40 {
+        bail!("revision '{sha}' resolved to invalid tree '{tree}'");
+    }
+    Ok(tree)
+}
+
+/// Maps every tracked path at `sha` to its git blob id, the same shape `--contentHashPath`
+/// accepts. Submodule entries are skipped: their id names a commit, not file content.
+fn git_content_hashes(state: &State, sha: &str) -> Result<BTreeMap<String, String>> {
+    let args = [
+        String::from("ls-tree"),
+        String::from("-r"),
+        String::from("-z"),
+        sha.to_owned(),
+    ];
+    let output = git_output(state, &args)?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(parse_ls_tree(&output.stdout))
+}
+
+/// Parses `git ls-tree -r -z` records: `<mode> <type> <object>\t<path>\0`.
+fn parse_ls_tree(output: &[u8]) -> BTreeMap<String, String> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| {
+            let tab = record.iter().position(|byte| *byte == b'\t')?;
+            let metadata = String::from_utf8_lossy(&record[..tab]);
+            let mut fields = metadata.split(' ');
+            let _mode = fields.next()?;
+            let kind = fields.next()?;
+            let object = fields.next()?;
+            if kind != "blob" {
+                return None;
+            }
+            let path = String::from_utf8_lossy(&record[tab + 1..]).into_owned();
+            Some((path, object.to_owned()))
+        })
+        .collect()
 }
 
 fn checkout(state: &State, sha: &str) -> Result<()> {
@@ -1493,6 +1574,78 @@ mod tests {
             fingerprint,
             remote: None,
         })
+    }
+
+    /// The full-content cache key `get_hashes_locked` uses for a commit: its tree, not its SHA.
+    fn cache_key_for_commit(state: &State, sha: &str) -> String {
+        cache_key(state, &resolve_tree(state, sha).unwrap(), &BTreeSet::new())
+    }
+
+    #[test]
+    fn cache_key_is_shared_by_commits_with_identical_trees() {
+        let (repo, first, second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        git_command(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "no file changes"],
+        );
+        let third = git_command(repo.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(second, third);
+        assert_eq!(
+            cache_key_for_commit(&state, &second),
+            cache_key_for_commit(&state, &third)
+        );
+        assert_ne!(
+            cache_key_for_commit(&state, &first),
+            cache_key_for_commit(&state, &second)
+        );
+        assert!(cache_key_for_commit(&state, &second)
+            .starts_with(&git_command(repo.path(), &["rev-parse", "HEAD^{tree}"])));
+        assert!(resolve_tree(&state, "0000000000000000000000000000000000000000").is_err());
+    }
+
+    #[test]
+    fn git_content_hashes_list_tracked_blobs_and_skip_submodules() {
+        let (repo, first, second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        fs::create_dir_all(repo.path().join("nested dir")).unwrap();
+        fs::write(repo.path().join("nested dir/with space.txt"), "three").unwrap();
+        git_command(repo.path(), &["add", "."]);
+        git_command(repo.path(), &["commit", "-q", "-m", "three"]);
+        let third = git_command(repo.path(), &["rev-parse", "HEAD"]);
+
+        let hashes = git_content_hashes(&state, &third).unwrap();
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(
+            hashes["file.txt"],
+            git_command(repo.path(), &["rev-parse", &format!("{third}:file.txt")])
+        );
+        assert_eq!(
+            hashes["nested dir/with space.txt"],
+            git_command(
+                repo.path(),
+                &["rev-parse", &format!("{third}:nested dir/with space.txt")]
+            )
+        );
+        // Same path, different content: the blob id moves with it.
+        assert_ne!(
+            git_content_hashes(&state, &first).unwrap()["file.txt"],
+            git_content_hashes(&state, &second).unwrap()["file.txt"]
+        );
+        assert!(git_content_hashes(&state, "not-a-revision").is_err());
+
+        let parsed = parse_ls_tree(
+            b"100644 blob aaaa\tREADME\x00160000 commit bbbb\tvendor/lib\x00120000 blob cccc\tlink\x00garbage\x00",
+        );
+        assert_eq!(
+            parsed,
+            BTreeMap::from([
+                ("README".to_owned(), "aaaa".to_owned()),
+                ("link".to_owned(), "cccc".to_owned()),
+            ])
+        );
     }
 
     fn request(state: &Arc<State>, request: &str) -> String {
@@ -2161,7 +2314,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
-        let key = cache_key(&state, &sha, &BTreeSet::new());
+        let key = cache_key_for_commit(&state, &sha);
         let path = cache.path().join(format!("{key}.json"));
         write_hashes(&path, &data, true);
         let before = fs::metadata(&path).unwrap().modified().unwrap();
@@ -2209,7 +2362,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         assert!(first.cache_hit);
         assert!(first.cache_read_millis.is_some());
         assert_eq!(first.data.hashes["//app:lib"].hash, "overall");
-        let key = cache_key(&state, &sha, &BTreeSet::new());
+        let key = cache_key_for_commit(&state, &sha);
         assert!(cache.path().join(format!("{key}.json")).is_file());
         let second = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
         assert!(second.cache_hit);
@@ -2251,7 +2404,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             ..Default::default()
         };
         for (sha, data) in [(&first, &from), (&second, &to)] {
-            let key = cache_key(&state, sha, &BTreeSet::new());
+            let key = cache_key_for_commit(&state, sha);
             write_hashes(
                 &cache.path().join(format!("{key}.json")),
                 data,
@@ -2355,7 +2508,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 dependency_fingerprint: cached_fingerprint,
                 ..Default::default()
             };
-            let key = cache_key(&state, &sha, &BTreeSet::new());
+            let key = cache_key_for_commit(&state, &sha);
             write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
             let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
             assert!(retrieval.cache_hit);
@@ -2406,7 +2559,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             )]),
             ..Default::default()
         };
-        let key = cache_key(&guarded, &sha, &BTreeSet::new());
+        let key = cache_key_for_commit(&guarded, &sha);
         write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
         assert!(get_hashes_locked(&guarded, &sha, &BTreeSet::new()).is_err());
     }
@@ -2557,7 +2710,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             ..Default::default()
         };
         for (sha, data) in [(&first, &from), (&second, &to)] {
-            let key = cache_key(&state, sha, &BTreeSet::new());
+            let key = cache_key_for_commit(&state, sha);
             write_hashes(
                 &cache.path().join(format!("{key}.json")),
                 data,

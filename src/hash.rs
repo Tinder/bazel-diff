@@ -108,6 +108,15 @@ enum HashTarget {
     Source(String),
 }
 
+impl HashTarget {
+    fn label(&self) -> &str {
+        match self {
+            HashTarget::Rule(label) | HashTarget::Source(label) => label,
+            HashTarget::Generated { name, .. } => name,
+        }
+    }
+}
+
 struct SourceTarget {
     name: String,
     subincludes: Vec<String>,
@@ -320,7 +329,11 @@ fn hash_targets_with_environment(
         package_bzl_seeds,
         bzl_digests: HashMap::new(),
         always_affected_seed: unique_invocation_seed(),
+        cycle_warnings: HashSet::new(),
     };
+    // `--order_output=no` makes the query order arbitrary. Acyclic hashes do not care, but the
+    // digest of a cycle depends on which member is entered first, so fix the traversal order.
+    hash_targets.sort_by(|left, right| left.label().cmp(right.label()));
     let mut digests = Vec::with_capacity(hash_targets.len());
     for target in hash_targets {
         let (key, kind, digest) = match target {
@@ -483,6 +496,8 @@ struct HashContext<'a> {
     package_bzl_seeds: BTreeMap<String, DigestBytes>,
     bzl_digests: HashMap<String, Option<DigestBytes>>,
     always_affected_seed: DigestBytes,
+    /// Targets already reported as the entry of a cycle, so each is warned about once.
+    cycle_warnings: HashSet<String>,
 }
 
 impl HashContext<'_> {
@@ -504,13 +519,31 @@ impl HashContext<'_> {
             return Ok(digest.clone());
         }
         if let Some(index) = path.iter().position(|entry| entry == &canonical_key) {
-            let cycle = path[index..]
-                .iter()
-                .chain(std::iter::once(&canonical_key))
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" -> ");
-            bail!("Circular dependency detected: {cycle}");
+            // A back edge: the query graph can hold cycles a build never sees (rules_go's
+            // `go_context_data` and the nogo analyzers reference each other through non-dependency
+            // attributes). The target is still being hashed, so stand in with a digest of its own
+            // definition. Which member of the cycle is entered first is fixed by the sorted
+            // traversal in `hash_targets_with_environment`, so the result is deterministic.
+            if self.cycle_warnings.insert(canonical_key.clone()) {
+                let cycle = path[index..]
+                    .iter()
+                    .chain(std::iter::once(&canonical_key))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                eprintln!(
+                    "[Warn] Circular dependency detected: {cycle}; the back edge to {canonical_key} is hashed from its own definition only"
+                );
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(b"cycle");
+            hasher.update(rule.definition_digest);
+            let placeholder: DigestBytes = hasher.finalize().into();
+            return Ok(TargetDigest {
+                overall: placeholder,
+                direct: placeholder,
+                deps: Vec::new(),
+            });
         }
         path.push(canonical_key.clone());
 
@@ -689,6 +722,46 @@ fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<()> {
     }
 }
 
+/// Hashes a directory tree deterministically: every entry's workspace-independent relative path
+/// and kind, plus regular-file contents and executable bits and symlink targets. Entries are
+/// visited in sorted order so the digest does not depend on readdir order.
+pub(crate) fn hash_directory_into(hasher: &mut Sha256, root: &Path) -> Result<()> {
+    for entry in walkdir::WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        let entry = entry?;
+        let relative = entry
+            .path()
+            .strip_prefix(root)?
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        let file_type = entry.file_type();
+        if file_type.is_symlink() {
+            let target = fs::read_link(entry.path())?;
+            hasher.update(b"symlink");
+            hasher.update(target.to_string_lossy().as_bytes());
+        } else if file_type.is_dir() {
+            hasher.update(b"dir");
+        } else if file_type.is_file() {
+            let mut content = Sha256::new();
+            hash_file_into(&mut content, entry.path())?;
+            hasher.update(b"file");
+            hasher.update(content.finalize());
+            hasher.update([u8::from(owner_executable(entry.path()))]);
+        } else {
+            hasher.update(b"other");
+        }
+        hasher.update([0]);
+    }
+    Ok(())
+}
+
 fn unique_invocation_seed() -> DigestBytes {
     let mut hasher = Sha256::new();
     hasher.update(std::process::id().to_le_bytes());
@@ -763,6 +836,20 @@ impl EncodeSink for Sha256Sink<'_> {
     }
 }
 
+/// Repository rules (`//external:*`) that pin their download with `sha256` or `integrity` fetch
+/// byte-identical content from any URL, so a mirror or registry move must not impact every
+/// target that depends on the repository. Only such rules get their URL attributes skipped.
+fn pins_download_content(rule: &Rule) -> bool {
+    rule.name.starts_with("//external:")
+        && rule.attribute.iter().any(|attribute| {
+            matches!(attribute.name.as_str(), "sha256" | "integrity")
+                && attribute
+                    .string_value
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+        })
+}
+
 fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes {
     let mut hasher = Sha256::new();
     hasher.update(rule.rule_class.as_bytes());
@@ -770,6 +857,7 @@ fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes
     if let Some(environment_hash) = &rule.skylark_environment_hash_code {
         hasher.update(environment_hash.as_bytes());
     }
+    let skip_urls = pins_download_content(rule);
     let mut size_cache = SizeCache::new();
     let attributes_are_sorted = rule
         .attribute
@@ -777,13 +865,13 @@ fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes
         .all(|pair| pair[0].name <= pair[1].name);
     if attributes_are_sorted {
         for attribute in &rule.attribute {
-            hash_attribute(attribute, ignored, &mut size_cache, &mut hasher);
+            hash_attribute(attribute, ignored, skip_urls, &mut size_cache, &mut hasher);
         }
     } else {
         let mut attributes = rule.attribute.iter().collect::<Vec<_>>();
         attributes.sort_by_key(|attribute| &attribute.name);
         for attribute in attributes {
-            hash_attribute(attribute, ignored, &mut size_cache, &mut hasher);
+            hash_attribute(attribute, ignored, skip_urls, &mut size_cache, &mut hasher);
         }
     }
     hasher.finalize().into()
@@ -799,10 +887,14 @@ fn prehash_rule(rule: &mut Rule, ignored: &HashSet<String>) -> DigestBytes {
 fn hash_attribute(
     attribute: &crate::proto::blaze_query::Attribute,
     ignored: &HashSet<String>,
+    skip_urls: bool,
     size_cache: &mut SizeCache,
     hasher: &mut Sha256,
 ) {
     if attribute.name == "generator_location" || ignored.contains(&attribute.name) {
+        return;
+    }
+    if skip_urls && matches!(attribute.name.as_str(), "url" | "urls") {
         return;
     }
     attribute.encode_with_cache(size_cache, &mut Sha256Sink(hasher));
@@ -941,6 +1033,21 @@ impl SourceHasher<'_> {
             }
             hasher.update([1]);
             hasher.update([u8::from(owner_executable(&absolute))]);
+        } else if absolute.is_dir() {
+            // A label can point at a directory (`srcs = ["testdata"]`). Bazel only tracks the
+            // directory itself, but its contents are what the consuming action reads, so hash the
+            // tree: otherwise an edit inside it never impacts anything.
+            let should_hash = self.modified_filepaths.is_empty()
+                || self
+                    .modified_filepaths
+                    .iter()
+                    .any(|modified| self.workspace.join(modified).starts_with(&absolute));
+            if should_hash {
+                hash_directory_into(&mut hasher, &absolute).with_context(|| {
+                    format!("failed to read source directory {}", absolute.display())
+                })?;
+            }
+            hasher.update([2]);
         } else {
             if self.modified_filepaths.is_empty() {
                 eprintln!("[Warn] File {} not found", absolute.display());
@@ -994,7 +1101,7 @@ fn is_main_repo(label: &str) -> bool {
     label.starts_with("//") || label.starts_with("@//") || label.starts_with("@@//")
 }
 
-fn main_repo_path(label: &str) -> Option<PathBuf> {
+pub(crate) fn main_repo_path(label: &str) -> Option<PathBuf> {
     let body = label
         .strip_prefix("@@//")
         .or_else(|| label.strip_prefix("@//"))
@@ -1573,6 +1680,7 @@ mod tests {
         hash_attribute(
             &attribute,
             &HashSet::new(),
+            false,
             &mut SizeCache::new(),
             &mut included,
         );
@@ -1580,6 +1688,7 @@ mod tests {
         hash_attribute(
             &attribute,
             &HashSet::from(["cmd".to_owned()]),
+            false,
             &mut SizeCache::new(),
             &mut ignored,
         );
@@ -1750,28 +1859,6 @@ mod tests {
         let output_base = workspace.path().join("output");
         fs::create_dir_all(output_base.join("external")).unwrap();
         let options = hash_options(workspace.path());
-        let cycle = hash_targets_for_test(
-            &options,
-            vec![
-                rule_target(Rule {
-                    name: "//:a".into(),
-                    rule_class: "alias".into(),
-                    rule_input: vec!["//:b".into()],
-                    ..Default::default()
-                }),
-                rule_target(Rule {
-                    name: "//:b".into(),
-                    rule_class: "alias".into(),
-                    rule_input: vec!["//:a".into()],
-                    ..Default::default()
-                }),
-            ],
-            &output_base,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(cycle.contains("Circular dependency detected"));
-
         let missing = hash_targets_for_test(
             &options,
             vec![generated_target("//:out", "//:missing")],
@@ -1780,6 +1867,69 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(missing.contains("Unexpected generating rule"));
+    }
+
+    #[test]
+    fn cycles_hash_deterministically_and_changes_propagate_through_them() {
+        fn cyclic_targets(a_cmd: &str, b_cmd: &str) -> Vec<Target> {
+            let attribute = |value: &str| Attribute {
+                name: "cmd".into(),
+                r#type: attribute::Discriminator::String,
+                string_value: Some(value.into()),
+                ..Default::default()
+            };
+            vec![
+                rule_target(Rule {
+                    name: "//:consumer".into(),
+                    rule_class: "alias".into(),
+                    rule_input: vec!["//:a".into()],
+                    ..Default::default()
+                }),
+                rule_target(Rule {
+                    name: "//:a".into(),
+                    rule_class: "genrule".into(),
+                    rule_input: vec!["//:b".into()],
+                    attribute: vec![attribute(a_cmd)],
+                    ..Default::default()
+                }),
+                rule_target(Rule {
+                    name: "//:b".into(),
+                    rule_class: "genrule".into(),
+                    rule_input: vec!["//:a".into()],
+                    attribute: vec![attribute(b_cmd)],
+                    ..Default::default()
+                }),
+            ]
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        let options = hash_options(workspace.path());
+
+        let baseline = hash_targets_for_test(&options, cyclic_targets("a", "b"), &output_base)
+            .unwrap()
+            .hashes;
+        // The query order is arbitrary; the hashes must not depend on it.
+        let mut reversed = cyclic_targets("a", "b");
+        reversed.reverse();
+        let shuffled = hash_targets_for_test(&options, reversed, &output_base)
+            .unwrap()
+            .hashes;
+        assert_eq!(baseline, shuffled);
+        // The dependency edges inside the cycle survive for distance metrics and `explain`.
+        assert_eq!(baseline["//:a"].deps, ["//:b"]);
+        assert_eq!(baseline["//:b"].deps, ["//:a"]);
+        assert_eq!(baseline["//:consumer"].deps, ["//:a"]);
+
+        // A change to either member reaches both members and everything downstream.
+        for changed in [cyclic_targets("a2", "b"), cyclic_targets("a", "b2")] {
+            let hashes = hash_targets_for_test(&options, changed, &output_base)
+                .unwrap()
+                .hashes;
+            for label in ["//:a", "//:b", "//:consumer"] {
+                assert_ne!(hashes[label].hash, baseline[label].hash, "{label}");
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -2076,6 +2226,169 @@ mod tests {
                 .digest("@ext//path/to:file.txt", b"seed")
                 .unwrap(),
             <DigestBytes>::from(Sha256::digest([]))
+        );
+    }
+
+    #[test]
+    fn source_hash_covers_directory_contents() {
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = workspace.path().join("pkg/testdata");
+        fs::create_dir_all(directory.join("nested")).unwrap();
+        fs::write(directory.join("a.txt"), "a").unwrap();
+        fs::write(directory.join("nested/b.txt"), "b").unwrap();
+        let resolver = ExternalRepoResolver {
+            workspace: workspace.path().to_path_buf(),
+            bazel: PathBuf::from("bazel"),
+            output_base: workspace.path().join("output"),
+            ..Default::default()
+        };
+        let modified = BTreeSet::new();
+        let hasher = SourceHasher {
+            workspace: workspace.path(),
+            content_hashes: None,
+            modified_filepaths: &modified,
+            fine_grained_external_repos: BTreeSet::new(),
+            external_resolver: resolver.clone(),
+        };
+        let baseline = hasher.digest("//pkg:testdata", b"seed").unwrap();
+        assert_eq!(baseline, hasher.digest("//pkg:testdata", b"seed").unwrap());
+
+        // An edit deep inside the tree moves the digest; so does the shape of the tree.
+        fs::write(directory.join("nested/b.txt"), "changed").unwrap();
+        let edited = hasher.digest("//pkg:testdata", b"seed").unwrap();
+        assert_ne!(edited, baseline);
+        fs::rename(directory.join("a.txt"), directory.join("c.txt")).unwrap();
+        let renamed = hasher.digest("//pkg:testdata", b"seed").unwrap();
+        assert_ne!(renamed, edited);
+        fs::create_dir(directory.join("empty")).unwrap();
+        let with_empty_dir = hasher.digest("//pkg:testdata", b"seed").unwrap();
+        assert_ne!(with_empty_dir, renamed);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("c.txt", directory.join("link")).unwrap();
+            let with_link = hasher.digest("//pkg:testdata", b"seed").unwrap();
+            assert_ne!(with_link, with_empty_dir);
+            fs::remove_file(directory.join("link")).unwrap();
+            std::os::unix::fs::symlink("nested/b.txt", directory.join("link")).unwrap();
+            assert_ne!(hasher.digest("//pkg:testdata", b"seed").unwrap(), with_link);
+            fs::remove_file(directory.join("link")).unwrap();
+        }
+
+        // A directory is never confused with a missing path or an empty file.
+        fs::remove_dir_all(&directory).unwrap();
+        let missing = hasher.digest("//pkg:testdata", b"seed").unwrap();
+        fs::write(&directory, "").unwrap();
+        let empty_file = hasher.digest("//pkg:testdata", b"seed").unwrap();
+        fs::remove_file(&directory).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        let empty_dir = hasher.digest("//pkg:testdata", b"seed").unwrap();
+        assert_ne!(missing, empty_dir);
+        assert_ne!(empty_file, empty_dir);
+
+        // With a modified-paths scope, the tree is read only when a listed path is inside it.
+        fs::write(directory.join("a.txt"), "a").unwrap();
+        let unrelated = BTreeSet::from([PathBuf::from("other/file.txt")]);
+        let scoped_out = SourceHasher {
+            workspace: workspace.path(),
+            content_hashes: None,
+            modified_filepaths: &unrelated,
+            fine_grained_external_repos: BTreeSet::new(),
+            external_resolver: resolver.clone(),
+        };
+        let skipped = scoped_out.digest("//pkg:testdata", b"seed").unwrap();
+        fs::write(directory.join("a.txt"), "edited").unwrap();
+        assert_eq!(
+            scoped_out.digest("//pkg:testdata", b"seed").unwrap(),
+            skipped
+        );
+        let inside = BTreeSet::from([PathBuf::from("pkg/testdata/a.txt")]);
+        let scoped_in = SourceHasher {
+            workspace: workspace.path(),
+            content_hashes: None,
+            modified_filepaths: &inside,
+            fine_grained_external_repos: BTreeSet::new(),
+            external_resolver: resolver,
+        };
+        assert_ne!(
+            scoped_in.digest("//pkg:testdata", b"seed").unwrap(),
+            skipped
+        );
+        assert_eq!(
+            scoped_in.digest("//pkg:testdata", b"seed").unwrap(),
+            hasher.digest("//pkg:testdata", b"seed").unwrap()
+        );
+    }
+
+    #[test]
+    fn external_rule_digest_ignores_urls_when_content_is_pinned() {
+        fn string(name: &str, value: &str) -> Attribute {
+            Attribute {
+                name: name.into(),
+                r#type: attribute::Discriminator::String,
+                string_value: Some(value.into()),
+                ..Default::default()
+            }
+        }
+        fn urls(values: &[&str]) -> Attribute {
+            Attribute {
+                name: "urls".into(),
+                r#type: attribute::Discriminator::StringList,
+                string_list_value: values.iter().map(|value| (*value).into()).collect(),
+                ..Default::default()
+            }
+        }
+        let pinned = Rule {
+            name: "//external:dep".into(),
+            rule_class: "http_archive".into(),
+            attribute: vec![
+                urls(&["https://mirror-a/dep.tar.gz"]),
+                string("url", "https://mirror-a/dep.tar.gz"),
+                string("sha256", "abc"),
+            ],
+            ..Default::default()
+        };
+        let mut moved = pinned.clone();
+        moved.attribute[0] = urls(&["https://mirror-b/dep.tar.gz"]);
+        moved.attribute[1] = string("url", "https://mirror-b/dep.tar.gz");
+        let none = HashSet::new();
+        assert_eq!(
+            rule_definition_digest(&pinned, &none),
+            rule_definition_digest(&moved, &none)
+        );
+
+        let mut new_content = moved.clone();
+        new_content.attribute[2] = string("sha256", "def");
+        assert_ne!(
+            rule_definition_digest(&moved, &none),
+            rule_definition_digest(&new_content, &none)
+        );
+
+        // `integrity` pins content the same way; an empty pin does not.
+        let mut integrity = pinned.clone();
+        integrity.attribute[2] = string("integrity", "sha256-abc");
+        let mut integrity_moved = moved.clone();
+        integrity_moved.attribute[2] = string("integrity", "sha256-abc");
+        assert_eq!(
+            rule_definition_digest(&integrity, &none),
+            rule_definition_digest(&integrity_moved, &none)
+        );
+        let mut unpinned = pinned.clone();
+        unpinned.attribute[2] = string("sha256", "");
+        let mut unpinned_moved = moved.clone();
+        unpinned_moved.attribute[2] = string("sha256", "");
+        assert_ne!(
+            rule_definition_digest(&unpinned, &none),
+            rule_definition_digest(&unpinned_moved, &none)
+        );
+
+        // Only repository rules are normalized; a main-repo rule keeps its URL attributes.
+        let mut main_repo = pinned.clone();
+        main_repo.name = "//tools:fetch".into();
+        let mut main_repo_moved = moved.clone();
+        main_repo_moved.name = "//tools:fetch".into();
+        assert_ne!(
+            rule_definition_digest(&main_repo, &none),
+            rule_definition_digest(&main_repo_moved, &none)
         );
     }
 

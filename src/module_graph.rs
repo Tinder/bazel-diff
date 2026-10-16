@@ -185,8 +185,8 @@ mod tests {
     fn hash(kind: &str, value: &str) -> TargetHash {
         TargetHash {
             kind: kind.to_owned(),
-            hash: value.to_owned(),
-            direct_hash: value.to_owned(),
+            hash: value.into(),
+            direct_hash: value.into(),
             deps: Vec::new(),
         }
     }

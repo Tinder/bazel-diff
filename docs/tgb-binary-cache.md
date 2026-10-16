@@ -78,21 +78,27 @@ Below those thresholds, the cheaper steps in the next section give most of the b
 
 ## Cheaper steps first (no format change)
 
-In order of payoff per line of code:
+All four landed together with this note. Measured on the same 1M-entry pair, one
+`get-impacted-targets` (two parses plus the compare) went from 4.8 s and 1.46 GB peak to 2.5 s and
+0.96 GB; the compare alone from 0.75 s to 0.30 s. In `serve`, a request whose revisions are already
+parsed skips both parses outright. In order of payoff per line of code:
 
 1. **Keep parsed entries in memory in `serve`.** Nearly every request shares a `from` revision
-   (the main branch). A small LRU of `Arc<HashFileData>` keyed by cache key removes one of the two
-   parses from almost every request and both from repeated queries. Bound it by entry count or
-   bytes, alongside the existing disk pruning.
-2. **Parse directly.** Deserialize into the final map with a `serde` visitor instead of building a
-   `Value` and re-inserting, and store hashes as `[u8; 32]` rather than hex `String`s. This also
-   halves per-node memory.
-3. **Compare without allocating.** `impacted_targets` and `impacted_types` can compare the three
-   fields by reference instead of formatting `identity()` strings. Measured 2.5x on the compare.
-4. **Compress the shared tier.** zstd or gzip the bytes written to S3 or Nexus (2.5x on hashes,
-   18x on `depEdges`). The on-disk local tier can stay plain so `cache_entries` sizing and
-   `/metrics` keep working. Mark compressed objects by extension (`.json.zst`) so mixed fleets
-   keep reading.
+   (the main branch). An LRU of `Arc<HashFileData>` keyed by cache key, bounded by
+   `--cacheMemoryMax` (default 512 MB of serialized size, `0` disables), removes one of the two
+   parses from almost every request and both from repeated queries. A memory hit still refreshes
+   the on-disk entry's modification time, so the disk pruner does not expire a hot entry.
+2. **Parse directly.** `HashFileData` deserializes with a `serde` visitor straight into the final
+   map, no intermediate `Value`, and hashes are a `Digest` that holds a SHA-256 as 32 raw bytes
+   (anything that is not 64 lowercase hex digits stays text and round-trips unchanged). The hex
+   decode is a single table-driven pass; it was 42% of parse instructions as two passes.
+3. **Compare without allocating.** `TargetHash::same_as` compares kind and both digests by value
+   in place of the two formatted `identity()` strings per node, and `filter_and_sort_labels`
+   ranks each label once instead of cloning it inside the sort.
+4. **Compress the shared tier.** Entries are published to S3 or Nexus as fast-level gzip under
+   `<key>.json.gz`; a read tries that name first and falls back to the plain `<key>.json` an older
+   release wrote, so a mixed fleet keeps sharing during an upgrade. The local-disk tier stays plain
+   so `cache_entries` sizing and `/metrics` are unchanged.
 
 Steps 1 through 3 are independent of the binary format and remain useful after it lands, because
 the binary reader still needs a label-level view for `explain`, distances and module changes.

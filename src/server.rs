@@ -4,6 +4,9 @@ use crate::model::{
 };
 use crate::module_graph::impacted_with_module_changes;
 use anyhow::{anyhow, bail, Context, Result};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
 use s3::creds::Credentials;
@@ -12,9 +15,10 @@ use s3::{Bucket, Region};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +43,9 @@ pub struct ServerConfig {
     pub cache_max_entries: Option<usize>,
     pub cache_max_size: Option<u64>,
     pub cache_prune_interval: Duration,
+    /// Byte budget for parsed entries kept in memory, measured by each entry's serialized size.
+    /// `0` disables the in-memory tier.
+    pub cache_memory_max: u64,
     pub remote_cache: Option<String>,
     pub s3_bucket: Option<String>,
     pub s3_prefix: String,
@@ -59,6 +66,84 @@ struct State {
     started: Instant,
     fingerprint: String,
     remote: Option<RemoteCache>,
+    /// Parsed entries, in front of the local-disk tier. Guarded by its own lock rather than
+    /// `workspace_lock` so `/metrics` can read its size while a query holds the workspace.
+    memory: Mutex<MemoryCache>,
+}
+
+/// The in-memory tier: entries already parsed, most recently used last.
+///
+/// Nearly every request shares its `from` revision (the main branch) with the previous one, and
+/// reading and parsing a large entry costs seconds, so a hit here is the difference between a
+/// query bounded by the compare and one bounded by JSON parsing. Entries are sized by their
+/// serialized length, the one cheap proxy for their heap footprint, and the least recently used
+/// entry goes first when the budget is exceeded.
+struct MemoryCache {
+    budget: u64,
+    used: u64,
+    entries: VecDeque<MemoryEntry>,
+}
+
+struct MemoryEntry {
+    key: String,
+    bytes: u64,
+    data: Arc<HashFileData>,
+}
+
+impl MemoryCache {
+    fn new(budget: u64) -> Self {
+        Self {
+            budget,
+            used: 0,
+            entries: VecDeque::new(),
+        }
+    }
+
+    /// Returns the entry for `key`, marking it most recently used.
+    fn get(&mut self, key: &str) -> Option<Arc<HashFileData>> {
+        let index = self.entries.iter().position(|entry| entry.key == key)?;
+        let entry = self.entries.remove(index)?;
+        let data = Arc::clone(&entry.data);
+        self.entries.push_back(entry);
+        Some(data)
+    }
+
+    /// Remembers `data` for `key`, evicting least recently used entries to stay within budget. An
+    /// entry larger than the whole budget is not kept.
+    fn insert(&mut self, key: &str, bytes: u64, data: &Arc<HashFileData>) {
+        if bytes > self.budget {
+            return;
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let previous = self.entries.remove(index).expect("index from position");
+            self.used -= previous.bytes;
+        }
+        while self.used + bytes > self.budget {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.used -= evicted.bytes;
+        }
+        self.used += bytes;
+        self.entries.push_back(MemoryEntry {
+            key: key.to_owned(),
+            bytes,
+            data: Arc::clone(data),
+        });
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Locks the in-memory tier. A panic while holding it cannot leave the cache inconsistent in a
+/// way that matters (it is only a cache), so a poisoned lock is recovered rather than propagated.
+fn memory_cache(state: &State) -> std::sync::MutexGuard<'_, MemoryCache> {
+    state
+        .memory
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The shared cache tier behind local disk. Every backend degrades the same way: a failed read is
@@ -84,19 +169,85 @@ impl RemoteCache {
         Ok(None)
     }
 
+    /// Reads the entry for `key`: the compressed object first, then the plain one an older
+    /// replica (or this one, before compression) may have written. A read failure is a miss and
+    /// does not fall through, so an outage costs one request per lookup, not two.
     fn get(&self, key: &str) -> Option<Vec<u8>> {
-        match self {
-            Self::S3(cache) => cache.get(key),
-            Self::Nexus(cache) => cache.get(key),
+        let compressed = format!("{key}{COMPRESSED_SUFFIX}");
+        match self.fetch(&compressed) {
+            Fetched::Found(bytes) => match gunzip(&bytes) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    eprintln!(
+                        "[Warn] shared cache entry {compressed} is not valid gzip (treating as a miss): {error}"
+                    );
+                    None
+                }
+            },
+            Fetched::Missing => match self.fetch(&format!("{key}{PLAIN_SUFFIX}")) {
+                Fetched::Found(bytes) => Some(bytes),
+                Fetched::Missing | Fetched::Failed => None,
+            },
+            Fetched::Failed => None,
         }
     }
 
+    /// Publishes `data` for `key` as a gzip-compressed object. Hash entries are repetitive label
+    /// text and hex, so this is a 2-3x smaller upload and backfill for every replica.
     fn put(&self, key: &str, data: &[u8]) {
-        match self {
-            Self::S3(cache) => cache.put(key, data),
-            Self::Nexus(cache) => cache.put(key, data),
+        match gzip(data) {
+            Ok(compressed) => self.store(
+                &format!("{key}{COMPRESSED_SUFFIX}"),
+                &compressed,
+                "application/gzip",
+            ),
+            Err(error) => eprintln!(
+                "[Warn] failed to compress shared cache entry {key} (entry not shared): {error}"
+            ),
         }
     }
+
+    fn fetch(&self, name: &str) -> Fetched {
+        match self {
+            Self::S3(cache) => cache.get(name),
+            Self::Nexus(cache) => cache.get(name),
+        }
+    }
+
+    fn store(&self, name: &str, data: &[u8], content_type: &str) {
+        match self {
+            Self::S3(cache) => cache.put(name, data),
+            Self::Nexus(cache) => cache.put(name, data, content_type),
+        }
+    }
+}
+
+/// Object name suffixes on the shared tier. New entries are written compressed; the plain suffix
+/// is read for entries written before compression existed.
+const COMPRESSED_SUFFIX: &str = ".json.gz";
+const PLAIN_SUFFIX: &str = ".json";
+
+/// Outcome of one object read on the shared tier. A clean miss and a failure are told apart so a
+/// miss on the compressed name can fall back to the plain one while a failure stays a failure.
+enum Fetched {
+    Found(Vec<u8>),
+    Missing,
+    Failed,
+}
+
+/// Fast-level gzip: the compressed size is within a few percent of the default level on hash
+/// entries and the encode is several times quicker, which matters on a cache write that already
+/// sits on the critical path of a cold query.
+fn gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 2), Compression::fast());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(data.len() * 3);
+    GzDecoder::new(data).read_to_end(&mut decoded)?;
+    Ok(decoded)
 }
 
 struct S3Cache {
@@ -131,8 +282,8 @@ impl S3Cache {
         })
     }
 
-    fn object_key(&self, key: &str) -> String {
-        format!("{}{key}.json", self.prefix)
+    fn object_key(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
     }
 
     /// Reads an entry, degrading to a miss on any failure.
@@ -142,29 +293,31 @@ impl S3Cache {
     /// miss with `404`, `Transfer-Encoding: chunked` and no body, and every HTTP client on this
     /// stack fails reading that absent body -- `attohttpc: Io Error: unexpected end of file`. A GET
     /// miss carries a real `NoSuchKey` body, so it reads back cleanly.
-    fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let failure = match self.bucket.get_object(self.object_key(key)) {
-            Ok(response) if response.status_code() == 200 => return Some(response.to_vec()),
-            Ok(response) if response.status_code() == 404 => return None,
+    fn get(&self, name: &str) -> Fetched {
+        let failure = match self.bucket.get_object(self.object_key(name)) {
+            Ok(response) if response.status_code() == 200 => {
+                return Fetched::Found(response.to_vec())
+            }
+            Ok(response) if response.status_code() == 404 => return Fetched::Missing,
             Ok(response) => http_failure(&response),
             Err(error) => error.to_string(),
         };
         eprintln!(
             "[Warn] S3 cache read of {} failed (treating as a miss): {failure}",
-            self.object_key(key)
+            self.object_key(name)
         );
-        None
+        Fetched::Failed
     }
 
-    fn put(&self, key: &str, data: &[u8]) {
-        let failure = match self.bucket.put_object(self.object_key(key), data) {
+    fn put(&self, name: &str, data: &[u8]) {
+        let failure = match self.bucket.put_object(self.object_key(name), data) {
             Ok(response) if (200..300).contains(&response.status_code()) => return,
             Ok(response) => http_failure(&response),
             Err(error) => error.to_string(),
         };
         eprintln!(
             "[Warn] S3 cache write of {} failed (entry not shared): {failure}",
-            self.object_key(key)
+            self.object_key(name)
         );
     }
 }
@@ -212,7 +365,7 @@ impl fmt::Debug for NexusCredentials {
 
 /// Cache entries stored as components of a Sonatype Nexus Repository *raw* hosted repository,
 /// addressed through Nexus's plain HTTP content API: `GET`/`PUT` on
-/// `<nexusUrl>/repository/<repository>/<prefix>/<key>.json`.
+/// `<nexusUrl>/repository/<repository>/<prefix>/<key>.json.gz`.
 struct NexusCache {
     session: attohttpc::Session,
     base: Url,
@@ -249,12 +402,12 @@ impl NexusCache {
         })
     }
 
-    fn object_url(&self, key: &str) -> Url {
+    fn object_url(&self, name: &str) -> Url {
         let mut url = self.base.clone();
         url.path_segments_mut()
             .expect("validated by nexus_base_url")
             .pop_if_empty()
-            .push(&format!("{key}.json"));
+            .push(name);
         url
     }
 
@@ -269,28 +422,30 @@ impl NexusCache {
 
     /// Reads an entry, degrading to a miss on any failure. Nexus answers a missing component with
     /// a plain `404`.
-    fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let url = self.object_url(key);
+    fn get(&self, name: &str) -> Fetched {
+        let url = self.object_url(name);
         let failure = match self.authorized(self.session.get(url.as_str())).send() {
             Ok(response) if response.status() == attohttpc::StatusCode::OK => {
                 match response.bytes() {
-                    Ok(bytes) => return Some(bytes),
+                    Ok(bytes) => return Fetched::Found(bytes),
                     Err(error) => error.to_string(),
                 }
             }
-            Ok(response) if response.status() == attohttpc::StatusCode::NOT_FOUND => return None,
+            Ok(response) if response.status() == attohttpc::StatusCode::NOT_FOUND => {
+                return Fetched::Missing
+            }
             Ok(response) => nexus_http_failure(response),
             Err(error) => error.to_string(),
         };
         eprintln!("[Warn] Nexus cache read of {url} failed (treating as a miss): {failure}");
-        None
+        Fetched::Failed
     }
 
-    fn put(&self, key: &str, data: &[u8]) {
-        let url = self.object_url(key);
+    fn put(&self, name: &str, data: &[u8], content_type: &str) {
+        let url = self.object_url(name);
         let failure = match self
             .authorized(self.session.put(url.as_str()))
-            .header(attohttpc::header::CONTENT_TYPE, "application/json")
+            .header(attohttpc::header::CONTENT_TYPE, content_type)
             .bytes(data)
             .send()
         {
@@ -454,6 +609,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
     let fingerprint = configuration_fingerprint(&config);
     let remote = RemoteCache::new(&config)?;
     let state = Arc::new(State {
+        memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
         config,
         ready: AtomicBool::new(false),
         workspace_lock: Mutex::new(()),
@@ -808,14 +964,14 @@ struct GenerationBreakdown {
 /// time went. A hit carries only `cache_read_millis` (reading and deserialising the entry is the
 /// whole cost of a hit); a miss carries only `generation`.
 struct Retrieval {
-    data: HashFileData,
+    data: Arc<HashFileData>,
     cache_hit: bool,
     cache_read_millis: Option<u64>,
     generation: Option<GenerationBreakdown>,
 }
 
 impl Retrieval {
-    fn hit(data: HashFileData, read_started: Instant) -> Self {
+    fn hit(data: Arc<HashFileData>, read_started: Instant) -> Self {
         Self {
             data,
             cache_hit: true,
@@ -863,9 +1019,29 @@ fn get_hashes_locked(
     let key = cache_key(state, &tree, modified);
     let path = state.config.cache_dir.join(format!("{key}.json"));
     let mut current_dependency_fingerprint = None;
+    // Bound first so the tier's lock is released before the (possibly slow) servability check.
+    let remembered = memory_cache(state).get(&key);
+    if let Some(data) = remembered {
+        let read_started = Instant::now();
+        if cache_entry_is_servable(
+            state,
+            sha,
+            "memory",
+            &key,
+            &data,
+            &mut current_dependency_fingerprint,
+        )? {
+            // Still counts as a use of the on-disk entry, so the pruner does not expire it out
+            // from under an entry that is hot in memory.
+            touch(&path);
+            return Ok(Retrieval::hit(data, read_started));
+        }
+    }
     if path.is_file() {
         let read_started = Instant::now();
-        let data = HashFileData::read(&path)?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read hash file {}", path.display()))?;
+        let data = Arc::new(HashFileData::from_slice(&bytes)?);
         if cache_entry_is_servable(
             state,
             sha,
@@ -875,13 +1051,14 @@ fn get_hashes_locked(
             &mut current_dependency_fingerprint,
         )? {
             touch(&path);
+            memory_cache(state).insert(&key, bytes.len() as u64, &data);
             return Ok(Retrieval::hit(data, read_started));
         }
     }
     if let Some(remote) = &state.remote {
         let read_started = Instant::now();
         if let Some(bytes) = remote.get(&key) {
-            let data = HashFileData::from_slice(&bytes)?;
+            let data = Arc::new(HashFileData::from_slice(&bytes)?);
             if cache_entry_is_servable(
                 state,
                 sha,
@@ -891,6 +1068,7 @@ fn get_hashes_locked(
                 &mut current_dependency_fingerprint,
             )? {
                 fs::write(&path, &bytes)?;
+                memory_cache(state).insert(&key, bytes.len() as u64, &data);
                 return Ok(Retrieval::hit(data, read_started));
             }
         }
@@ -940,12 +1118,13 @@ fn get_hashes_locked(
     let write_started = Instant::now();
     let bytes = serde_json::to_vec(&data.serialized(true, state.config.track_deps))?;
     let temporary = state.config.cache_dir.join(format!("{key}.tmp"));
-    fs::write(&temporary, bytes)?;
+    fs::write(&temporary, &bytes)?;
     fs::rename(temporary, path)?;
     if let Some(remote) = &state.remote {
-        let bytes = fs::read(state.config.cache_dir.join(format!("{key}.json")))?;
         remote.put(&key, &bytes);
     }
+    let data = Arc::new(data);
+    memory_cache(state).insert(&key, bytes.len() as u64, &data);
     let generation = GenerationBreakdown {
         checkout_millis,
         bazel_query_millis: timings.bazel_query_millis,
@@ -1315,6 +1494,10 @@ fn metrics(state: &State) -> Value {
     let entries = cache_entries(&state.config.cache_dir);
     let total = entries.iter().map(|entry| entry.size).sum::<u64>();
     let (used, max) = memory_usage();
+    let (memory_entries, memory_used, memory_max) = {
+        let memory = memory_cache(state);
+        (memory.len(), memory.used, memory.budget)
+    };
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptimeSeconds": state.started.elapsed().as_secs(),
@@ -1328,6 +1511,11 @@ fn metrics(state: &State) -> Value {
             "entries": entries.len(),
             "sizeBytes": total,
             "sizeHuman": human_bytes(total),
+            "memory": {
+                "entries": memory_entries,
+                "sizeBytes": memory_used,
+                "maxBytes": memory_max,
+            },
         },
         "jvm": {"usedBytes": used, "maxBytes": max}
     })
@@ -1391,10 +1579,10 @@ fn prune_cache(state: &State) -> Result<()> {
 }
 
 fn touch(path: &Path) {
-    // Rewriting the same bytes is portable and gives pruning a genuine
-    // last-use timestamp without another platform-specific dependency.
-    if let Ok(bytes) = fs::read(path) {
-        let _ = fs::write(path, bytes);
+    // Refreshes the modification time pruning reads as last use. Opening for write without
+    // truncating leaves the bytes alone; rewriting them cost a full copy of the entry per hit.
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
     }
 }
 
@@ -1495,6 +1683,7 @@ mod tests {
             cache_max_entries: None,
             cache_max_size: None,
             cache_prune_interval: Duration::from_secs(60),
+            cache_memory_max: 64 * 1024 * 1024,
             remote_cache: None,
             s3_bucket: None,
             s3_prefix: String::new(),
@@ -1512,8 +1701,8 @@ mod tests {
     fn hash(kind: &str, value: &str, direct: &str) -> TargetHash {
         TargetHash {
             kind: kind.to_owned(),
-            hash: value.to_owned(),
-            direct_hash: direct.to_owned(),
+            hash: value.into(),
+            direct_hash: direct.into(),
             deps: Vec::new(),
         }
     }
@@ -1567,6 +1756,7 @@ mod tests {
         config.dependency_fingerprint = true;
         let fingerprint = configuration_fingerprint(&config);
         Arc::new(State {
+            memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
             config,
             ready: AtomicBool::new(true),
             workspace_lock: Mutex::new(()),
@@ -1771,12 +1961,12 @@ mod tests {
     fn remote_cache_operations_use_normalized_key_and_succeed() {
         let (remote, requests, handle) = remote_cache_with_responses(
             "/team/repo/",
-            vec![(200, b"hello".to_vec()), (200, Vec::new())],
+            vec![(200, gzip(b"hello").unwrap()), (200, Vec::new())],
         );
         let RemoteCache::S3(s3) = &remote else {
             panic!("expected the S3 backend");
         };
-        assert_eq!(s3.object_key("sha.fp"), "team/repo/sha.fp.json");
+        assert_eq!(s3.object_key("sha.fp.json.gz"), "team/repo/sha.fp.json.gz");
         assert_eq!(remote.get("sha.fp"), Some(b"hello".to_vec()));
         remote.put("sha.fp", b"data");
         let captured = (0..2)
@@ -1785,7 +1975,52 @@ mod tests {
         handle.join().unwrap();
         assert!(captured
             .iter()
-            .all(|request| request.url.contains("/bucket/team/repo/sha.fp.json")));
+            .all(|request| request.url.contains("/bucket/team/repo/sha.fp.json.gz")));
+    }
+
+    #[test]
+    fn remote_cache_falls_back_to_plain_entries_and_rejects_corrupt_compressed_ones() {
+        // A replica that predates compression wrote `<key>.json`: the compressed name misses
+        // cleanly and the plain one is read. A compressed object that does not decode is a miss,
+        // with no fallback (the plain name would be a stale duplicate at best).
+        let (remote, requests, handle) = remote_cache_with_responses(
+            "",
+            vec![
+                (404, b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
+                (200, b"plain".to_vec()),
+                (200, b"not gzip".to_vec()),
+            ],
+        );
+        assert_eq!(remote.get("legacy"), Some(b"plain".to_vec()));
+        assert_eq!(remote.get("corrupt"), None);
+        let captured = (0..3)
+            .map(|_| requests.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect::<Vec<_>>();
+        handle.join().unwrap();
+        assert!(captured[0].url.ends_with("/legacy.json.gz"));
+        assert!(captured[1].url.ends_with("/legacy.json"));
+        assert!(captured[2].url.ends_with("/corrupt.json.gz"));
+        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn gzip_round_trips_and_shrinks_hash_entries() {
+        let entry = (0..2000)
+            .map(|index| {
+                format!(
+                    "\"//pkg/{}:target_{index}\":\"Rule#{:064x}~{:064x}\"",
+                    index / 8,
+                    index,
+                    index * 7
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let entry = format!("{{{entry}}}").into_bytes();
+        let compressed = gzip(&entry).unwrap();
+        assert!(compressed.len() * 2 < entry.len());
+        assert_eq!(gunzip(&compressed).unwrap(), entry);
+        assert!(gunzip(b"not gzip").is_err());
     }
 
     #[test]
@@ -1794,6 +2029,7 @@ mod tests {
             "",
             vec![
                 (404, b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
+                (404, b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
                 (500, b"failure".to_vec()),
                 (500, Vec::new()),
             ],
@@ -1801,10 +2037,11 @@ mod tests {
         assert_eq!(remote.get("missing"), None);
         assert_eq!(remote.get("failure"), None);
         remote.put("failure", b"data");
-        // Exactly one request per call. `rust-s3`'s `fail-on-err` feature is off precisely so a
-        // non-2xx stays a response: as an error it would enter the crate's `retry!`, and every
-        // miss would cost a second request and a one-second backoff sleep.
-        for _ in 0..3 {
+        // A clean miss probes the compressed and then the plain name; a failure is one request
+        // and no fallback. `rust-s3`'s `fail-on-err` feature is off precisely so a non-2xx stays
+        // a response: as an error it would enter the crate's `retry!`, and every miss would cost
+        // a second request and a one-second backoff sleep.
+        for _ in 0..4 {
             requests.recv_timeout(Duration::from_secs(5)).unwrap();
         }
         assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
@@ -1939,8 +2176,8 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             panic!("expected the Nexus backend");
         };
         assert_eq!(
-            cache.object_url("sha.fp").as_str(),
-            "https://nexus.example.com/repository/cache/team/sha.fp.json"
+            cache.object_url("sha.fp.json.gz").as_str(),
+            "https://nexus.example.com/repository/cache/team/sha.fp.json.gz"
         );
         config.nexus_repository = Some("a/b".to_owned());
         assert!(RemoteCache::new(&config).is_err());
@@ -1955,7 +2192,8 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 password: "s3cret".to_owned(),
             }),
             vec![
-                (200, Vec::new(), b"hello".to_vec()),
+                (200, Vec::new(), gzip(b"hello").unwrap()),
+                (404, Vec::new(), Vec::new()),
                 (404, Vec::new(), Vec::new()),
                 (201, Vec::new(), Vec::new()),
             ],
@@ -1965,21 +2203,28 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         remote.put("sha.fp", b"data");
         handle.join().unwrap();
         let captured = requests.try_iter().collect::<Vec<_>>();
-        assert_eq!(captured.len(), 3);
+        assert_eq!(captured.len(), 4);
         let methods = captured
             .iter()
             .map(|r| r.method.clone())
             .collect::<Vec<_>>();
-        assert_eq!(methods, [Method::Get, Method::Get, Method::Put]);
+        assert_eq!(
+            methods,
+            [Method::Get, Method::Get, Method::Get, Method::Put]
+        );
         assert_eq!(
             captured[0].url,
-            "/nexus/repository/bazel-diff/team/repo/sha.fp.json"
+            "/nexus/repository/bazel-diff/team/repo/sha.fp.json.gz"
         );
         assert_eq!(
             captured[1].url,
+            "/nexus/repository/bazel-diff/team/repo/missing.json.gz"
+        );
+        assert_eq!(
+            captured[2].url,
             "/nexus/repository/bazel-diff/team/repo/missing.json"
         );
-        assert_eq!(captured[2].url, captured[0].url);
+        assert_eq!(captured[3].url, captured[0].url);
         for request in &captured {
             // base64("svc:s3cret")
             assert_eq!(
@@ -1988,10 +2233,10 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             );
         }
         assert_eq!(
-            captured[2].content_type.as_deref(),
-            Some("application/json")
+            captured[3].content_type.as_deref(),
+            Some("application/gzip")
         );
-        assert_eq!(captured[2].body, b"data");
+        assert_eq!(gunzip(&captured[3].body).unwrap(), b"data");
     }
 
     #[test]
@@ -2151,6 +2396,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             config.cache_dir = cache.path().to_path_buf();
             let fingerprint = configuration_fingerprint(&config);
             Arc::new(State {
+                memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
                 config,
                 ready: AtomicBool::new(false),
                 workspace_lock: Mutex::new(()),
@@ -2219,6 +2465,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         let mut bad_config = state.config.clone();
         bad_config.git_path = PathBuf::from("/definitely/missing/git");
         let bad = State {
+            memory: Mutex::new(MemoryCache::new(bad_config.cache_memory_max)),
             config: bad_config,
             ready: AtomicBool::new(true),
             workspace_lock: Mutex::new(()),
@@ -2281,6 +2528,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         let mut bad_config = state.config.clone();
         bad_config.git_path = PathBuf::from("/missing/git");
         let bad_state = State {
+            memory: Mutex::new(MemoryCache::new(bad_config.cache_memory_max)),
             config: bad_config,
             ready: AtomicBool::new(true),
             workspace_lock: Mutex::new(()),
@@ -2329,6 +2577,87 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
     }
 
     #[test]
+    fn memory_cache_evicts_least_recently_used_within_budget() {
+        let entry = |label: &str| {
+            Arc::new(HashFileData {
+                hashes: std::collections::BTreeMap::from([(
+                    label.to_owned(),
+                    hash("Rule", "a", "b"),
+                )]),
+                ..Default::default()
+            })
+        };
+        let mut cache = MemoryCache::new(100);
+        cache.insert("a", 40, &entry("//a"));
+        cache.insert("b", 40, &entry("//b"));
+        assert_eq!(cache.len(), 2);
+        // Reading `a` makes `b` the least recently used, so `c` evicts `b`.
+        assert!(cache.get("a").unwrap().hashes.contains_key("//a"));
+        cache.insert("c", 40, &entry("//c"));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get("b").is_none());
+        assert!(cache.get("a").is_some());
+        assert!(cache.get("c").is_some());
+        assert_eq!(cache.used, 80);
+        // Re-inserting a key replaces it instead of double counting.
+        cache.insert("c", 50, &entry("//c2"));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.used, 90);
+        assert!(cache.get("c").unwrap().hashes.contains_key("//c2"));
+        // An entry over the whole budget is never kept; one that needs the whole budget evicts
+        // everything else.
+        cache.insert("huge", 101, &entry("//huge"));
+        assert!(cache.get("huge").is_none());
+        cache.insert("whole", 100, &entry("//whole"));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.used, 100);
+        // A zero budget disables the tier.
+        let mut disabled = MemoryCache::new(0);
+        disabled.insert("a", 1, &entry("//a"));
+        assert_eq!(disabled.len(), 0);
+        assert!(disabled.get("a").is_none());
+    }
+
+    #[test]
+    fn parsed_entries_are_served_from_memory_after_the_first_read() {
+        let (repo, _, sha) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        let data = HashFileData {
+            hashes: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                hash("Rule", "overall", "direct"),
+            )]),
+            dependency_fingerprint: state
+                .config
+                .hash_options
+                .bazel
+                .dependency_fingerprint()
+                .ok(),
+            ..Default::default()
+        };
+        let key = cache_key_for_commit(&state, &sha);
+        let path = cache.path().join(format!("{key}.json"));
+        write_hashes(&path, &data, false);
+        assert_eq!(metrics(&state)["cache"]["memory"]["entries"], 0);
+
+        let first = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(first.cache_hit);
+        let memory = metrics(&state)["cache"]["memory"].clone();
+        assert_eq!(memory["entries"], 1);
+        assert_eq!(memory["sizeBytes"], fs::metadata(&path).unwrap().len());
+        assert_eq!(memory["maxBytes"], state.config.cache_memory_max);
+
+        // The on-disk entry is gone (pruned, say); the parsed one still serves, and both
+        // retrievals share the same allocation.
+        fs::remove_file(&path).unwrap();
+        let second = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(second.cache_hit);
+        assert!(Arc::ptr_eq(&first.data, &second.data));
+        assert_eq!(second.data.hashes["//app:lib"].hash, "overall");
+    }
+
+    #[test]
     fn remote_cache_hit_is_backfilled_and_next_read_is_local() {
         let (repo, _, sha) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
@@ -2347,9 +2676,11 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
-        let (remote, requests, handle) = remote_cache_with_responses("", vec![(200, bytes)]);
+        let (remote, requests, handle) =
+            remote_cache_with_responses("", vec![(200, gzip(&bytes).unwrap())]);
         let fingerprint = configuration_fingerprint(&config);
         let state = Arc::new(State {
+            memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
             config,
             ready: AtomicBool::new(true),
             workspace_lock: Mutex::new(()),
@@ -2529,9 +2860,17 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
-        let (remote, requests, handle) = remote_cache_with_responses("", vec![(200, bytes)]);
+        // Written by a replica from before compression: only the plain object exists.
+        let (remote, requests, handle) = remote_cache_with_responses(
+            "",
+            vec![
+                (404, b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
+                (200, bytes),
+            ],
+        );
         let fingerprint = configuration_fingerprint(&config);
         let state = Arc::new(State {
+            memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
             config,
             ready: AtomicBool::new(true),
             workspace_lock: Mutex::new(()),
@@ -2542,6 +2881,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
         assert!(retrieval.cache_hit);
         assert_eq!(retrieval.data.hashes["//app:lib"].hash, "overall");
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
         requests.recv_timeout(Duration::from_secs(5)).unwrap();
         handle.join().unwrap();
 
@@ -2567,7 +2907,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
     #[test]
     fn miss_retrievals_serialize_the_generation_breakdown() {
         let retrieval = Retrieval {
-            data: HashFileData::default(),
+            data: Arc::new(HashFileData::default()),
             cache_hit: false,
             cache_read_millis: None,
             generation: Some(GenerationBreakdown {

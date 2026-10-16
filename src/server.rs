@@ -1,3 +1,5 @@
+use crate::bazel::BazelOptions;
+use crate::cancel::{self, Cancellation, CANCELLED};
 use crate::hash::{generate_hashes_timed, HashOptions};
 use crate::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
@@ -21,8 +23,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use url::{form_urlencoded, Url};
@@ -59,15 +61,26 @@ pub struct ServerConfig {
     pub nexus_ca_cert: Option<PathBuf>,
 }
 
+/// How long a timed-out request waits for its cancelled query to stop before answering anyway.
+/// Killing the subprocesses is immediate; this bounds the CPU-only phases (target hashing) a
+/// cancel can only interrupt at their boundaries.
+const CANCEL_GRACE: Duration = Duration::from_secs(60);
+
+/// How often a query waiting for the workspace re-checks whether it has been cancelled.
+const WORKSPACE_WAIT_POLL: Duration = Duration::from_millis(50);
+
 struct State {
     config: ServerConfig,
     ready: AtomicBool,
-    workspace_lock: Mutex<()>,
+    workspace: Workspace,
+    /// Queries accepted and not yet finished: waiting for the workspace, running, or abandoned by
+    /// a timed-out client but still running. `/metrics` reports it as `activeQueries`.
+    active_queries: AtomicUsize,
     started: Instant,
     fingerprint: String,
     remote: Option<RemoteCache>,
-    /// Parsed entries, in front of the local-disk tier. Guarded by its own lock rather than
-    /// `workspace_lock` so `/metrics` can read its size while a query holds the workspace.
+    /// Parsed entries, in front of the local-disk tier. Guarded by its own lock rather than the
+    /// workspace's so `/metrics` can read its size while a query holds the workspace.
     memory: Mutex<MemoryCache>,
 }
 
@@ -144,6 +157,111 @@ fn memory_cache(state: &State) -> std::sync::MutexGuard<'_, MemoryCache> {
         .memory
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl State {
+    fn new(config: ServerConfig, remote: Option<RemoteCache>) -> Self {
+        let fingerprint = configuration_fingerprint(&config);
+        Self {
+            memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
+            config,
+            ready: AtomicBool::new(false),
+            workspace: Workspace::default(),
+            active_queries: AtomicUsize::new(0),
+            started: Instant::now(),
+            fingerprint,
+            remote,
+        }
+    }
+
+    /// The server's Bazel options bound to the query currently holding the workspace, so the
+    /// Bazel subprocesses it spawns die with that query.
+    fn bazel_options(&self) -> BazelOptions {
+        let mut options = self.config.hash_options.bazel.clone();
+        options.cancellation = self.workspace.holder();
+        options
+    }
+}
+
+/// Serialises everything that mutates `--workspacePath` (git checkout, `bazel query`) and
+/// remembers which operation holds it. That lets `/metrics` report `workspaceBusy`, lets the
+/// subprocesses the holder spawns be killed when its query is cancelled, and lets a query that is
+/// cancelled while queued give up instead of taking the workspace for nothing.
+#[derive(Default)]
+struct Workspace {
+    holder: Mutex<Option<Arc<Cancellation>>>,
+    released: Condvar,
+}
+
+impl Workspace {
+    fn acquire(&self, token: &Arc<Cancellation>) -> Result<WorkspaceGuard<'_>> {
+        let mut holder = self.holder.lock().map_err(|_| poisoned())?;
+        while holder.is_some() {
+            if token.is_cancelled() {
+                bail!(CANCELLED);
+            }
+            holder = self
+                .released
+                .wait_timeout(holder, WORKSPACE_WAIT_POLL)
+                .map_err(|_| poisoned())?
+                .0;
+        }
+        *holder = Some(Arc::clone(token));
+        Ok(WorkspaceGuard { workspace: self })
+    }
+
+    fn holder(&self) -> Option<Arc<Cancellation>> {
+        self.holder.lock().ok().and_then(|holder| holder.clone())
+    }
+
+    fn is_busy(&self) -> bool {
+        self.holder
+            .lock()
+            .map(|holder| holder.is_some())
+            .unwrap_or(true)
+    }
+
+    /// Fails once the operation holding the workspace has been cancelled: the caller is about to
+    /// do something (write a cache entry) that only a finished query should do.
+    fn check_cancelled(&self) -> Result<()> {
+        if let Some(token) = self.holder() {
+            token.check()?;
+        }
+        Ok(())
+    }
+}
+
+fn poisoned() -> anyhow::Error {
+    anyhow!("workspace lock poisoned")
+}
+
+struct WorkspaceGuard<'a> {
+    workspace: &'a Workspace,
+}
+
+impl Drop for WorkspaceGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut holder) = self.workspace.holder.lock() {
+            *holder = None;
+        }
+        self.workspace.released.notify_all();
+    }
+}
+
+/// Keeps `activeQueries` accurate even when the worker panics.
+struct ActiveQuery(Arc<State>);
+
+impl ActiveQuery {
+    fn start(state: &Arc<State>) -> Self {
+        state.active_queries.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(state))
+    }
+}
+
+impl Drop for ActiveQuery {
+    fn drop(&mut self) {
+        self.0.active_queries.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The shared cache tier behind local disk. Every backend degrades the same way: a failed read is
@@ -606,17 +724,8 @@ pub fn parse_byte_size(value: &str) -> Result<u64> {
 
 pub fn serve(config: ServerConfig) -> Result<()> {
     fs::create_dir_all(&config.cache_dir)?;
-    let fingerprint = configuration_fingerprint(&config);
     let remote = RemoteCache::new(&config)?;
-    let state = Arc::new(State {
-        memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
-        config,
-        ready: AtomicBool::new(false),
-        workspace_lock: Mutex::new(()),
-        started: Instant::now(),
-        fingerprint,
-        remote,
-    });
+    let state = Arc::new(State::new(config, remote));
     prune_cache(&state)?;
     start_cache_pruner(&state)?;
     perform_initial_fetch(&state);
@@ -747,10 +856,17 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
                 );
             }
             let timeout = state.config.request_timeout;
+            let token = Arc::new(Cancellation::new());
+            let active = ActiveQuery::start(state);
             let state_for_compute = Arc::clone(state);
+            let worker_token = Arc::clone(&token);
             let (sender, receiver) = mpsc::sync_channel(1);
             std::thread::spawn(move || {
-                let _ = sender.send(compute_query(&state_for_compute, inputs, kind));
+                let result = compute_query(&state_for_compute, inputs, kind, &worker_token);
+                // Decrement before answering so a client that polls /metrics right after its
+                // response never sees its own finished query still counted.
+                drop(active);
+                let _ = sender.send(result);
             });
             let computed = if timeout.is_zero() {
                 receiver
@@ -760,11 +876,16 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
                 match receiver.recv_timeout(timeout) {
                     Ok(result) => result,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let stopped = cancel_query(&token, &receiver, timeout);
                         return respond_json(
                             request,
                             504,
-                            &json!({"error": format!("request timed out after {}s", timeout.as_secs())}),
-                        )
+                            &json!({
+                                "error": format!("request timed out after {}s", timeout.as_secs()),
+                                "cancelled": stopped,
+                                "workspaceBusy": state.workspace.is_busy(),
+                            }),
+                        );
                     }
                     Err(_) => Err(anyhow!("query worker stopped")),
                 }
@@ -775,6 +896,39 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
             }
         }
         _ => respond_json(request, 404, &json!({"error": "not found"})),
+    }
+}
+
+/// Cancels the query a timed-out request abandoned and waits for its worker to stop, so the 504
+/// is sent only once the query has released the workspace and will write no cache entry. Returns
+/// whether the worker stopped within [`CANCEL_GRACE`]; when it did not, `/metrics` reports the
+/// moment it does through `activeQueries` and `workspaceBusy`.
+fn cancel_query(
+    token: &Cancellation,
+    receiver: &mpsc::Receiver<Result<Value>>,
+    timeout: Duration,
+) -> bool {
+    let killed = token.cancel();
+    eprintln!(
+        "[Warn] request timed out after {}s; cancelled its query and killed {killed} subprocess(es)",
+        timeout.as_secs()
+    );
+    let cancelled = Instant::now();
+    match receiver.recv_timeout(CANCEL_GRACE) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "[Warn] cancelled query is still running {}s later; /metrics reports when it stops",
+                CANCEL_GRACE.as_secs()
+            );
+            false
+        }
+        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!(
+                "[Info] cancelled query stopped and released the workspace after {}ms",
+                elapsed_millis(cancelled)
+            );
+            true
+        }
     }
 }
 
@@ -847,12 +1001,14 @@ fn normalized_types(types: Option<Vec<String>>) -> Option<HashSet<String>> {
         .filter(|types| !types.is_empty())
 }
 
-fn compute_query(state: &Arc<State>, inputs: QueryInputs, kind: QueryKind) -> Result<Value> {
+fn compute_query(
+    state: &Arc<State>,
+    inputs: QueryInputs,
+    kind: QueryKind,
+    token: &Arc<Cancellation>,
+) -> Result<Value> {
     let started = Instant::now();
-    let _guard = state
-        .workspace_lock
-        .lock()
-        .map_err(|_| anyhow!("workspace lock poisoned"))?;
+    let _guard = state.workspace.acquire(token)?;
     let resolve_started = Instant::now();
     let (from_sha, to_sha) = resolve_both(state, &inputs.from, &inputs.to)?;
     let resolve_millis = resolve_started.elapsed().as_millis() as u64;
@@ -874,9 +1030,9 @@ fn compute_query(state: &Arc<State>, inputs: QueryInputs, kind: QueryKind) -> Re
     let to = to.data;
     let diff_started = Instant::now();
     checkout(state, &to_sha)?;
-    let exclude_external = state.config.hash_options.bazel.is_bzlmod_enabled();
-    let impacted =
-        impacted_with_module_changes(&from, &to, Some(&state.config.hash_options.bazel))?;
+    let bazel = state.bazel_options();
+    let exclude_external = bazel.is_bzlmod_enabled();
+    let impacted = impacted_with_module_changes(&from, &to, Some(&bazel))?;
     let impacted_value = if matches!(kind, QueryKind::Distances) {
         let hash_impacted = impacted_targets(&from.hashes, &to.hashes, None, false)?
             .into_iter()
@@ -936,10 +1092,7 @@ fn compute_query(state: &Arc<State>, inputs: QueryInputs, kind: QueryKind) -> Re
 }
 
 fn warm_revision(state: &Arc<State>, revision: &str) -> Result<()> {
-    let _guard = state
-        .workspace_lock
-        .lock()
-        .map_err(|_| anyhow!("workspace lock poisoned"))?;
+    let _guard = state.workspace.acquire(&Arc::new(Cancellation::new()))?;
     let sha = resolve_sha(state, revision)?;
     get_hashes_locked(state, &sha, &BTreeSet::new())?;
     Ok(())
@@ -1080,6 +1233,7 @@ fn get_hashes_locked(
     checkout(state, sha)?;
     let checkout_millis = elapsed_millis(checkout_started);
     let mut options = state.config.hash_options.clone();
+    options.bazel.cancellation = state.workspace.holder();
     options.modified_filepaths = modified.clone();
     options.track_deps = state.config.track_deps;
     if modified.is_empty() && options.content_hashes.is_none() {
@@ -1097,6 +1251,9 @@ fn get_hashes_locked(
         options.content_hashes = Some(content_hashes);
     }
     let (mut data, timings) = generate_hashes_timed(&options)?;
+    // A generation the client stopped waiting for is not cached: the subprocess kill above may
+    // have left the working tree mid-checkout, and the caller may already be reusing it.
+    state.workspace.check_cancelled()?;
     if state.config.dependency_fingerprint {
         data.dependency_fingerprint = current_dependency_fingerprint.take().or_else(|| {
             match dependency_fingerprint_for_workspace(state) {
@@ -1232,9 +1389,7 @@ fn short_fingerprint(value: &str) -> &str {
 
 fn dependency_fingerprint_for_workspace(state: &State) -> Result<String> {
     state
-        .config
-        .hash_options
-        .bazel
+        .bazel_options()
         .dependency_fingerprint()
         .map_err(|error| {
             anyhow!("failed to compute dependency fingerprint for cache guard: {error:#}")
@@ -1481,12 +1636,15 @@ fn git(state: &State, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Runs git in the workspace. While a query holds the workspace the subprocess belongs to it and
+/// is killed if that query is cancelled; outside the lock (startup fetch) it runs plainly.
 fn git_output(state: &State, args: &[String]) -> Result<std::process::Output> {
-    Command::new(&state.config.git_path)
+    let mut command = Command::new(&state.config.git_path);
+    command
         .current_dir(&state.config.hash_options.bazel.workspace)
         .args(args)
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::null());
+    cancel::output(state.workspace.holder().as_deref(), &mut command)
         .with_context(|| format!("failed to execute {}", state.config.git_path.display()))
 }
 
@@ -1502,6 +1660,8 @@ fn metrics(state: &State) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "uptimeSeconds": state.started.elapsed().as_secs(),
         "ready": state.ready.load(Ordering::Acquire),
+        "activeQueries": state.active_queries.load(Ordering::SeqCst),
+        "workspaceBusy": state.workspace.is_busy(),
         "gitEngine": "subprocess",
         "trackDeps": state.config.track_deps,
         "dependencyFingerprint": state.config.dependency_fingerprint,
@@ -1663,6 +1823,7 @@ mod tests {
                     exclude_targets_query: None,
                     no_bazelrc: false,
                     verbose: false,
+                    cancellation: None,
                 },
                 content_hashes: None,
                 ignored_attributes: HashSet::new(),
@@ -1754,16 +1915,13 @@ mod tests {
         config.track_deps = track_deps;
         config.hash_options.track_deps = track_deps;
         config.dependency_fingerprint = true;
-        let fingerprint = configuration_fingerprint(&config);
-        Arc::new(State {
-            memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
-            config,
-            ready: AtomicBool::new(true),
-            workspace_lock: Mutex::new(()),
-            started: Instant::now(),
-            fingerprint,
-            remote: None,
-        })
+        ready_state(config, None)
+    }
+
+    fn ready_state(config: ServerConfig, remote: Option<RemoteCache>) -> Arc<State> {
+        let state = State::new(config, remote);
+        state.ready.store(true, Ordering::Release);
+        Arc::new(state)
     }
 
     /// The full-content cache key `get_hashes_locked` uses for a commit: its tree, not its SHA.
@@ -2394,16 +2552,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             config.hash_options.bazel.workspace = repo.path().to_path_buf();
             config.git_path = PathBuf::from("git");
             config.cache_dir = cache.path().to_path_buf();
-            let fingerprint = configuration_fingerprint(&config);
-            Arc::new(State {
-                memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
-                config,
-                ready: AtomicBool::new(false),
-                workspace_lock: Mutex::new(()),
-                started: Instant::now(),
-                fingerprint,
-                remote: None,
-            })
+            Arc::new(State::new(config, None))
         };
 
         let lame_duck = unready_state(false);
@@ -2464,15 +2613,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
 
         let mut bad_config = state.config.clone();
         bad_config.git_path = PathBuf::from("/definitely/missing/git");
-        let bad = State {
-            memory: Mutex::new(MemoryCache::new(bad_config.cache_memory_max)),
-            config: bad_config,
-            ready: AtomicBool::new(true),
-            workspace_lock: Mutex::new(()),
-            started: Instant::now(),
-            fingerprint: state.fingerprint.clone(),
-            remote: None,
-        };
+        let bad = State::new(bad_config, None);
         assert!(git_output(&bad, &[]).is_err());
     }
 
@@ -2527,15 +2668,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
 
         let mut bad_config = state.config.clone();
         bad_config.git_path = PathBuf::from("/missing/git");
-        let bad_state = State {
-            memory: Mutex::new(MemoryCache::new(bad_config.cache_memory_max)),
-            config: bad_config,
-            ready: AtomicBool::new(true),
-            workspace_lock: Mutex::new(()),
-            started: Instant::now(),
-            fingerprint: state.fingerprint.clone(),
-            remote: None,
-        };
+        let bad_state = State::new(bad_config, None);
         assert!(!fetch_revision(&bad_state, "HEAD"));
     }
 
@@ -2678,16 +2811,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
         let (remote, requests, handle) =
             remote_cache_with_responses("", vec![(200, gzip(&bytes).unwrap())]);
-        let fingerprint = configuration_fingerprint(&config);
-        let state = Arc::new(State {
-            memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
-            config,
-            ready: AtomicBool::new(true),
-            workspace_lock: Mutex::new(()),
-            started: Instant::now(),
-            fingerprint,
-            remote: Some(remote),
-        });
+        let state = ready_state(config, Some(remote));
 
         let first = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
         assert!(first.cache_hit);
@@ -2749,7 +2873,13 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             modified_filepaths: BTreeSet::new(),
             profile: true,
         };
-        let result = compute_query(&state, inputs, QueryKind::Distances).unwrap();
+        let result = compute_query(
+            &state,
+            inputs,
+            QueryKind::Distances,
+            &Arc::new(Cancellation::new()),
+        )
+        .unwrap();
         assert_eq!(result["to"], second);
         assert_eq!(result["impactedTargets"].as_array().unwrap().len(), 2);
         let retrievals = result["profile"]["hashRetrievals"].as_array().unwrap();
@@ -2868,16 +2998,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 (200, bytes),
             ],
         );
-        let fingerprint = configuration_fingerprint(&config);
-        let state = Arc::new(State {
-            memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
-            config,
-            ready: AtomicBool::new(true),
-            workspace_lock: Mutex::new(()),
-            started: Instant::now(),
-            fingerprint,
-            remote: Some(remote),
-        });
+        let state = ready_state(config, Some(remote));
         let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
         assert!(retrieval.cache_hit);
         assert_eq!(retrieval.data.hashes["//app:lib"].hash, "overall");
@@ -3103,13 +3224,147 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         let cache = tempfile::tempdir().unwrap();
         let mut state = state_for_repo(repo.path(), cache.path(), false);
         Arc::get_mut(&mut state).unwrap().config.request_timeout = Duration::from_millis(20);
-        let _guard = state.workspace_lock.lock().unwrap();
+        // Another operation holds the workspace for the whole test, so the query never gets it.
+        let _guard = state
+            .workspace
+            .acquire(&Arc::new(Cancellation::new()))
+            .unwrap();
         let response = request(
             &state,
             "GET /impacted_targets?from=a&to=b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
         assert!(response.starts_with("HTTP/1.1 504"), "{response}");
         assert!(response.contains("request timed out"));
+        // The abandoned query stopped waiting (so it is no longer counted) and the workspace is
+        // reported busy because of the other holder, not because of it.
+        assert!(response.contains("\"cancelled\":true"), "{response}");
+        assert!(response.contains("\"workspaceBusy\":true"), "{response}");
+        assert_eq!(state.active_queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn metrics_report_active_queries_and_workspace_busy() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        let idle = metrics(&state);
+        assert_eq!(idle["activeQueries"], 0);
+        assert_eq!(idle["workspaceBusy"], false);
+        assert!(state.workspace.holder().is_none());
+        assert!(state.bazel_options().cancellation.is_none());
+        state.workspace.check_cancelled().unwrap();
+
+        let token = Arc::new(Cancellation::new());
+        let guard = state.workspace.acquire(&token).unwrap();
+        assert_eq!(metrics(&state)["workspaceBusy"], true);
+        assert!(Arc::ptr_eq(&state.workspace.holder().unwrap(), &token));
+        // Bazel options handed out while the query holds the workspace carry its token, so the
+        // subprocesses they spawn are killed with it.
+        let bazel = state.bazel_options();
+        assert!(Arc::ptr_eq(bazel.cancellation.as_ref().unwrap(), &token));
+        state.workspace.check_cancelled().unwrap();
+        token.cancel();
+        assert_eq!(
+            state.workspace.check_cancelled().unwrap_err().to_string(),
+            CANCELLED
+        );
+        assert_eq!(bazel.check_cancelled().unwrap_err().to_string(), CANCELLED);
+        drop(guard);
+        assert_eq!(metrics(&state)["workspaceBusy"], false);
+        assert!(state.workspace.holder().is_none());
+
+        let counted = ActiveQuery::start(&state);
+        assert_eq!(metrics(&state)["activeQueries"], 1);
+        drop(counted);
+        assert_eq!(metrics(&state)["activeQueries"], 0);
+    }
+
+    #[test]
+    fn queued_query_gives_up_once_cancelled() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        let _held = state
+            .workspace
+            .acquire(&Arc::new(Cancellation::new()))
+            .unwrap();
+
+        // Cancelled before it ever waits: fails on the first check.
+        let cancelled = Arc::new(Cancellation::new());
+        cancelled.cancel();
+        assert_eq!(
+            state
+                .workspace
+                .acquire(&cancelled)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            CANCELLED
+        );
+
+        // Cancelled while waiting: notices within one poll interval instead of blocking until
+        // the holder is done.
+        let waiting = Arc::new(Cancellation::new());
+        let waiter_state = Arc::clone(&state);
+        let waiter_token = Arc::clone(&waiting);
+        let waiter = thread::spawn(move || {
+            waiter_state
+                .workspace
+                .acquire(&waiter_token)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string()
+        });
+        thread::sleep(WORKSPACE_WAIT_POLL);
+        waiting.cancel();
+        assert_eq!(waiter.join().unwrap(), CANCELLED);
+        assert!(state.workspace.is_busy());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_query_kills_its_subprocess_and_releases_the_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, first, second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        // A git that never returns on its own: the query's first subprocess hangs in it, so only
+        // the kill can end the request in time.
+        let slow_git = tools.path().join("slow-git");
+        fs::write(&slow_git, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&slow_git, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut state = state_for_repo(repo.path(), cache.path(), false);
+        {
+            let config = &mut Arc::get_mut(&mut state).unwrap().config;
+            config.request_timeout = Duration::from_millis(100);
+            config.git_path = slow_git;
+        }
+
+        let started = Instant::now();
+        let response = request(
+            &state,
+            &format!(
+                "GET /impacted_targets?from={first}&to={second} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+        assert!(
+            response.contains("request timed out after 0s"),
+            "{response}"
+        );
+        assert!(response.contains("\"cancelled\":true"), "{response}");
+        assert!(response.contains("\"workspaceBusy\":false"), "{response}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the hanging git was not killed; request took {:?}",
+            started.elapsed()
+        );
+        // The 504 was only sent once the query had released the workspace and stopped counting.
+        assert!(!state.workspace.is_busy());
+        assert_eq!(state.active_queries.load(Ordering::SeqCst), 0);
+        // Nothing was cached for the generation the client walked away from.
+        assert!(cache_entries(cache.path()).is_empty());
     }
 
     #[test]

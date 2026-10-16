@@ -302,7 +302,11 @@ curl 'http://localhost:8080/dependency_edges?from=main&to=my-feature-branch'
   identity, liveness, and cache size usage without scraping logs. Unlike the query endpoints it is
   never gated on readiness, so it still responds on an un-ready or lame-ducked instance (the `ready`
   field reports the current state). The `cache` size fields are populated for the local-disk backend
-  and are `null` for a backend whose size is not cheaply knowable in-process.
+  and are `null` for a backend whose size is not cheaply knowable in-process. `activeQueries` counts
+  the queries accepted and not yet finished (queued, running, or abandoned by a client that stopped
+  waiting), and `workspaceBusy` is `true` while any operation holds `--workspacePath` (a query's
+  checkout and `bazel query`, or a startup warmup). A tool that shares the checkout with the server
+  should wait for `workspaceBusy` to be `false` before touching it.
 
 ```bash
 curl 'http://localhost:8080/metrics'
@@ -313,6 +317,8 @@ curl 'http://localhost:8080/metrics'
   "version": "31.4.0",
   "uptimeSeconds": 3600,
   "ready": true,
+  "activeQueries": 1,
+  "workspaceBusy": true,
   "gitEngine": "subprocess",
   "trackDeps": false,
   "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB", "memory": {"entries": 2, "sizeBytes": 75374, "maxBytes": 536870912}},
@@ -418,6 +424,16 @@ Notes and operational guidance:
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
   so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.
+* `--requestTimeout <seconds>` (default `0`, no limit) bounds how long a query may run. A query that
+  exceeds it is cancelled, not merely abandoned: its `git` and `bazel` subprocesses are killed, the
+  hashes it had not finished generating are not written to the local or shared cache, and the `504`
+  is sent only after the query has released the workspace. The `504` body reports `cancelled`
+  (`true` once the query has stopped; `false` only if it was still winding down a minute later, in
+  which case `/metrics` `activeQueries` reports when it is done) and `workspaceBusy` (whether
+  another operation holds the workspace at that moment). A client that enforces its own deadline
+  instead cannot cancel the server-side work: it keeps running to completion, so poll `/metrics` for
+  `workspaceBusy` before reusing the checkout, or prefer `--requestTimeout`. A killed `git checkout`
+  can leave the clone mid-switch; the next query repairs it with `git checkout --force`.
 * Git operations (fetch and checkout) shell out to the `git` binary at `--gitPath` (default `git`
   on the `PATH`), so a `git` binary must be available on the host. The working tree is checked out
   on disk for `bazel query` to read. Because native git performs every fetch, all clone shapes are

@@ -518,6 +518,7 @@ fn bazel_options(args: &HashingArgs, verbose: bool) -> Result<BazelOptions> {
         exclude_targets_query: args.exclude_targets_query.clone(),
         no_bazelrc: false,
         verbose,
+        cancellation: None,
     })
 }
 
@@ -682,6 +683,7 @@ fn get_bazel_options(args: &GetImpactedTargetsArgs, verbose: bool) -> BazelOptio
         exclude_targets_query: None,
         no_bazelrc: args.no_bazelrc,
         verbose,
+        cancellation: None,
     }
 }
 

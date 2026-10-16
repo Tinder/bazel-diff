@@ -5,6 +5,7 @@
 //! tests; its module-level API is not a stability commitment.
 
 pub mod bazel;
+pub mod cancel;
 pub mod explain;
 pub mod fingerprint;
 pub mod hash;

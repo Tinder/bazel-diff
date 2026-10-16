@@ -1,4 +1,5 @@
 use crate::bazel::{encode_configured_input, split_configured, target_label, BazelOptions};
+use crate::cancel::{self, Cancellation};
 use crate::model::{HashFileData, TargetHash};
 use crate::proto::blaze_query::{target, Rule, Target};
 use anyhow::{anyhow, bail, Context, Result};
@@ -153,6 +154,9 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
         );
     })?;
     let bazel_query_millis = elapsed_millis(query_started);
+    // The query is the phase worth cancelling; a request abandoned during it stops here instead
+    // of hashing targets nobody will read.
+    options.bazel.check_cancelled()?;
     let (data, mut timings) = hash_targets_with_digests(options, targets, definition_digests)?;
     timings.bazel_query_millis = bazel_query_millis;
     Ok((data, timings))
@@ -171,6 +175,7 @@ fn hash_targets_with_digests(
     let external_resolver = ExternalRepoResolver::new(&options.bazel)?;
     let module_graph_started = Instant::now();
     let module_graph_json = options.bazel.module_graph_json();
+    options.bazel.check_cancelled()?;
     let module_graph_millis = elapsed_millis(module_graph_started);
     let data = hash_targets_with_environment(
         options,
@@ -1131,6 +1136,8 @@ struct ExternalRepoResolver {
     output_base: PathBuf,
     startup_options: Vec<String>,
     no_bazelrc: bool,
+    /// The owning query's cancellation token; see [`BazelOptions::cancellation`].
+    cancellation: Option<Arc<Cancellation>>,
     /// Memoizes resolution per apparent repository name. `resolve` is called once
     /// per external source file and can shell out to Bazel, so without this a
     /// repository with N source files costs N Bazel invocations, all of which
@@ -1143,11 +1150,8 @@ struct ExternalRepoResolver {
 impl ExternalRepoResolver {
     fn new(options: &BazelOptions) -> Result<Self> {
         let mut command = options.command_for_hashing();
-        let output = command
-            .arg("info")
-            .arg("output_base")
-            .stdin(Stdio::null())
-            .output()
+        command.arg("info").arg("output_base").stdin(Stdio::null());
+        let output = cancel::output(options.cancellation.as_deref(), &mut command)
             .context("failed to determine Bazel output_base")?;
         if !output.status.success() {
             bail!(
@@ -1161,6 +1165,7 @@ impl ExternalRepoResolver {
             output_base: PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()),
             startup_options: options.startup_options.clone(),
             no_bazelrc: options.no_bazelrc,
+            cancellation: options.cancellation.clone(),
             ..Default::default()
         })
     }
@@ -1214,15 +1219,15 @@ impl ExternalRepoResolver {
                 return Ok(candidate);
             }
         }
-        let output = self
-            .command()
+        let mut command = self.command();
+        command
             .arg("query")
             .arg(format!("@{repo}//..."))
             .arg("--keep_going")
             .arg("--output")
             .arg("location")
-            .stdin(Stdio::null())
-            .output()?;
+            .stdin(Stdio::null());
+        let output = cancel::output(self.cancellation.as_deref(), &mut command)?;
         let line = String::from_utf8_lossy(&output.stdout)
             .lines()
             .next()
@@ -1245,14 +1250,13 @@ impl ExternalRepoResolver {
     /// (for example a WORKSPACE-only build), leaving the `bazel query` fallback.
     fn repo_mapping(&self) -> &HashMap<String, String> {
         self.repo_mapping.get_or_init(|| {
-            let output = self
-                .command()
+            let mut command = self.command();
+            command
                 .arg("mod")
                 .arg("dump_repo_mapping")
                 .arg("")
-                .stdin(Stdio::null())
-                .output();
-            match output {
+                .stdin(Stdio::null());
+            match cancel::output(self.cancellation.as_deref(), &mut command) {
                 Ok(output) if output.status.success() => {
                     parse_apparent_repo_mapping(&String::from_utf8_lossy(&output.stdout))
                 }
@@ -1329,6 +1333,7 @@ mod tests {
             exclude_targets_query: None,
             no_bazelrc: true,
             verbose: false,
+            cancellation: None,
         }
     }
 

@@ -1,3 +1,4 @@
+use crate::cancel::{self, Cancellation};
 use crate::proto::analysis::{ConfiguredTarget, CqueryResult};
 use crate::proto::blaze_query::{
     target, Attribute, ConfiguredRuleInput, PackageGroup, Repository, Rule, Target,
@@ -8,9 +9,10 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
 
@@ -32,6 +34,9 @@ pub struct BazelOptions {
     pub exclude_targets_query: Option<String>,
     pub no_bazelrc: bool,
     pub verbose: bool,
+    /// Set by `bazel-diff serve` for the query being answered: every Bazel subprocess is run
+    /// through it so an abandoned query can kill them. `None` for the CLI commands.
+    pub cancellation: Option<Arc<Cancellation>>,
 }
 
 impl BazelOptions {
@@ -49,15 +54,34 @@ impl BazelOptions {
         command
     }
 
-    fn run_capture(&self, args: &[&str]) -> Result<std::process::Output> {
+    fn run_capture(&self, args: &[&str]) -> Result<Output> {
         let mut command = self.command();
         command.args(args).stdin(Stdio::null());
         if self.verbose {
             eprintln!("[Info] Command: {command:?}");
         }
-        command
-            .output()
+        self.run(&mut command)
             .with_context(|| format!("failed to execute {}", self.bazel.display()))
+    }
+
+    /// Runs a Bazel command like `Command::output`, through the request's cancellation token when
+    /// there is one.
+    fn run(&self, command: &mut Command) -> io::Result<Output> {
+        cancel::output(self.cancellation.as_deref(), command)
+    }
+
+    /// [`run`](Self::run) for a command whose stdout is redirected to a file.
+    fn run_configured(&self, command: &mut Command) -> io::Result<Output> {
+        cancel::output_configured(self.cancellation.as_deref(), command)
+    }
+
+    /// Fails once the query these options belong to has been cancelled, so a phase without a
+    /// subprocess to kill still stops promptly.
+    pub fn check_cancelled(&self) -> Result<()> {
+        if let Some(token) = &self.cancellation {
+            token.check()?;
+        }
+        Ok(())
     }
 
     pub fn is_bzlmod_enabled(&self) -> bool {
@@ -278,7 +302,9 @@ impl BazelOptions {
             .stdout(File::create(output_file.path())?)
             .stdin(Stdio::null())
             .stderr(Stdio::piped());
-        let output = command.output().context("execute bazel mod show_repo")?;
+        let output = self
+            .run_configured(&mut command)
+            .context("execute bazel mod show_repo")?;
         if !output.stderr.is_empty() {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
         }
@@ -355,7 +381,9 @@ impl BazelOptions {
             eprintln!("[Info] Executing Query: {expression}");
             eprintln!("[Info] Command: {command:?}");
         }
-        let output = command.output().context("failed to execute Bazel query")?;
+        let output = self
+            .run_configured(&mut command)
+            .context("failed to execute Bazel query")?;
         let code = output.status.code().unwrap_or(-1);
         if code != 0 && !(self.keep_going && code == 3) {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -407,8 +435,8 @@ impl BazelOptions {
             .arg("--query_file")
             .arg(query_file.path())
             .stdin(Stdio::null());
-        let output = command
-            .output()
+        let output = self
+            .run(&mut command)
             .context("execute compatible-target cquery")?;
         if !output.status.success() {
             bail!(
@@ -453,8 +481,8 @@ impl BazelOptions {
         if self.verbose {
             eprintln!("[Info] Command: {command:?}");
         }
-        let output = command
-            .output()
+        let output = self
+            .run(&mut command)
             .context("execute bazel mod show_repo streamed_proto")?;
         if !output.status.success() {
             bail!(
@@ -475,10 +503,10 @@ impl BazelOptions {
         eprintln!(
             "[BD-DBG][fingerprint-command] path=text_all_visible cmd={all_visible_command:?}"
         );
-        let output = all_visible_command
+        all_visible_command
             .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .output();
+            .stderr(Stdio::piped());
+        let output = self.run(&mut all_visible_command);
         if let Ok(output) = output {
             if output.status.success() {
                 return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
@@ -494,7 +522,9 @@ impl BazelOptions {
         }
         eprintln!("[BD-DBG][fingerprint-command] path=text_selected_repos cmd={command:?}");
         command.stdin(Stdio::null()).stderr(Stdio::piped());
-        let output = command.output().context("execute bazel mod show_repo")?;
+        let output = self
+            .run(&mut command)
+            .context("execute bazel mod show_repo")?;
         if !output.stderr.is_empty() && self.verbose {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
         }
@@ -1786,6 +1816,7 @@ mod tests {
             exclude_targets_query: None,
             no_bazelrc: false,
             verbose: false,
+            cancellation: None,
         };
         options.exclude_targets_query = Some("attr(tags, manual, //...)".into());
         assert_eq!(
@@ -1812,6 +1843,7 @@ mod tests {
             exclude_targets_query: Some("attr(tags, manual, //...)".into()),
             no_bazelrc: false,
             verbose: false,
+            cancellation: None,
         };
         let mut queries = Vec::new();
         let targets = options
@@ -1854,6 +1886,7 @@ mod tests {
             exclude_targets_query: None,
             no_bazelrc: false,
             verbose: false,
+            cancellation: None,
         };
         let mut queries = Vec::new();
         let targets = options
@@ -2036,6 +2069,7 @@ exit 1
             exclude_targets_query: None,
             no_bazelrc: false,
             verbose: false,
+            cancellation: None,
         };
 
         let fingerprint = options.dependency_fingerprint().unwrap();
@@ -2106,6 +2140,7 @@ exit 1
             exclude_targets_query: None,
             no_bazelrc: false,
             verbose: false,
+            cancellation: None,
         };
 
         let show_repo_err = options.query_all_targets().unwrap_err();

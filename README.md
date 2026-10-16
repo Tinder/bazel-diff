@@ -321,7 +321,7 @@ curl 'http://localhost:8080/metrics'
   "workspaceBusy": true,
   "gitEngine": "subprocess",
   "trackDeps": false,
-  "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB"},
+  "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB", "memory": {"entries": 2, "sizeBytes": 75374, "maxBytes": 536870912}},
   "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
 }
 ```
@@ -343,7 +343,10 @@ bazel-diff serve \
 
 With `--s3Bucket` set the cache becomes two-tiered: reads check local disk first and fall back to
 the bucket (backfilling local disk on a hit), and every generated entry is published to both, so
-any replica can serve a revision another replica already hashed. Credentials and region resolve
+any replica can serve a revision another replica already hashed. Entries are published
+gzip-compressed as `<key>.json.gz`, 2-3x smaller than the JSON a replica keeps on local disk; a
+read tries the compressed object first and falls back to the plain `<key>.json` an older release
+wrote, so a mixed fleet keeps sharing entries during an upgrade. Credentials and region resolve
 through the standard AWS default provider chains (environment variables, profile, IRSA web
 identity on EKS, IMDS), or pin the region with `--s3Region`. `--s3Endpoint` plus
 `--s3ForcePathStyle` point the client at an S3-compatible store (MinIO, LocalStack) for local
@@ -375,8 +378,9 @@ bazel-diff serve \
   --nexusUsername bazel-diff-svc
 ```
 
-Entries live at `<nexusUrl>/repository/<nexusRepository>/<nexusPrefix>/<key>.json` and are read
-and written with plain `GET`/`PUT` against Nexus's raw content API. Include any context path Nexus
+Entries live at `<nexusUrl>/repository/<nexusRepository>/<nexusPrefix>/<key>.json.gz`
+(gzip-compressed, with a fallback read of the plain `<key>.json` an older release wrote) and are
+read and written with plain `GET`/`PUT` against Nexus's raw content API. Include any context path Nexus
 is served under in `--nexusUrl` (e.g. `https://example.com/nexus`).
 
 * **Repository setup.** Create a *raw (hosted)* repository and set its *Deployment policy* to
@@ -445,6 +449,11 @@ Notes and operational guidance:
   cache is never pruned (the previous behavior). The `--cacheMax*` flags always bound the local-disk
   tier only; the shared S3 or Nexus tier (see above) manages its own retention via a bucket
   lifecycle policy or a Nexus cleanup policy.
+* Parsed entries are also kept in memory, least recently used out first, within `--cacheMemoryMax`
+  (default `512MB`; `0` disables the tier). Nearly every request shares its `from` revision with
+  the previous one, and reading and parsing a large entry costs seconds, so a repeated revision
+  skips the disk read and the JSON parse entirely. The budget counts each entry's serialized size,
+  a proxy for its heap footprint, and `/metrics` reports the tier under `cache.memory`.
 * Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
   `generate-hashes`, and are folded into the cache key so a server started with different flags never
   serves another configuration's cached hashes.
@@ -697,6 +706,8 @@ Options:
 
       --cachePruneInterval <CACHE_PRUNE_INTERVAL>
           [default: 1h]
+      --cacheMemoryMax <CACHE_MEMORY_MAX>
+          [default: 512MB]
       --s3Bucket <S3_BUCKET>
 
       --s3Prefix <S3_PREFIX>

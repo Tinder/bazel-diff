@@ -22,6 +22,7 @@ anyhow = "1.0"
 attohttpc = { version = "=0.28.5", default-features = false, features = ["basic-auth", "tls-rustls-webpki-roots"] }
 buffa = "0.9.1"
 clap = { version = "4.5", features = ["derive", "env"] }
+flate2 = "1.1"
 hex = "0.4"
 mimalloc = "0.1"
 rayon = "1.10"

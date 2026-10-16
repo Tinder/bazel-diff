@@ -479,8 +479,8 @@ fn label_hash(mut instances: Vec<(String, &'static str, TargetDigest)>) -> (Stri
         label,
         TargetHash {
             kind: kind.to_owned(),
-            hash: digest_hex(overall),
-            direct_hash: digest_hex(direct),
+            hash: overall.into(),
+            direct_hash: direct.into(),
             deps,
         },
     )
@@ -813,12 +813,6 @@ fn package_bzl_seeds(
         }
     }
     Ok(result)
-}
-
-fn digest_hex(digest: DigestBytes) -> String {
-    let mut encoded = [0; 64];
-    hex::encode_to_slice(digest, &mut encoded).expect("fixed-size hex output");
-    String::from_utf8(encoded.to_vec()).expect("hex output is ASCII")
 }
 
 struct Sha256Sink<'a>(&'a mut Sha256);
@@ -1598,7 +1592,7 @@ mod tests {
         untracked.direct(b"direct");
         untracked.transitive("//dep:a", b"dependency");
         assert!(untracked.finish().deps.is_empty());
-        assert_eq!(digest_hex([0; 32]).len(), 64);
+        assert_eq!(crate::model::Digest::from([0; 32]).to_string().len(), 64);
     }
 
     #[test]

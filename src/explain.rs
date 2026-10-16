@@ -727,8 +727,8 @@ mod tests {
     fn hash(kind: &str, hash: &str, direct: &str) -> TargetHash {
         TargetHash {
             kind: kind.to_owned(),
-            hash: hash.to_owned(),
-            direct_hash: direct.to_owned(),
+            hash: hash.into(),
+            direct_hash: direct.into(),
             deps: Vec::new(),
         }
     }

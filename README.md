@@ -356,6 +356,24 @@ revision are also harmless — entries are deterministic per key, so last-write-
 content. The `--cacheMax*` pruning flags bound the *local* tier only; bound the bucket with an S3
 lifecycle policy instead.
 
+### Shared GCS cache
+
+Use a GCS bucket as the shared cache tier when the service runs on Google Cloud:
+
+```bash
+bazel-diff serve \
+  --workspacePath /path/to/workspace-clone \
+  --cacheDir /var/cache/bazel-diff \
+  --gcsBucket my-hash-cache-bucket \
+  --gcsPrefix bazel-diff/my-repo
+```
+
+GCS and the S3 and Nexus backends are mutually exclusive. GCS uses the same local-first cache flow and the same failure policy as S3. The service stores entries under `<gcsPrefix>/<key>.json` and reports the shared tier as `gs://` in `/metrics`.
+
+The service uses Google Application Default Credentials. Set `GOOGLE_APPLICATION_CREDENTIALS` to a service account JSON file, use local `gcloud` application-default credentials, or use a configured Google Cloud metadata service such as GKE Workload Identity. The account needs permission to read and create objects in the bucket. It also needs permission to delete objects when another instance overwrites an existing entry. No HMAC keys or AWS settings are needed. Configure bucket retention with a GCS lifecycle policy; `--cacheMax*` flags only prune local disk.
+
+The local tests use a mock HTTP server. A real bucket and its credentials have not been validated by this repository's CI.
+
 ### Shared Sonatype Nexus cache
 
 If your organization already runs [Sonatype Nexus Repository](https://www.sonatype.com/products/sonatype-nexus-repository),

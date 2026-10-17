@@ -381,7 +381,7 @@ struct ServeArgs {
     #[arg(long = "cachePruneInterval", default_value = "1h")]
     cache_prune_interval: String,
 
-    #[arg(long = "s3Bucket", conflicts_with = "nexus_url")]
+    #[arg(long = "s3Bucket", conflicts_with_all = ["nexus_url", "gcs_bucket"])]
     s3_bucket: Option<String>,
 
     #[arg(long = "s3Prefix", default_value = "")]
@@ -396,8 +396,18 @@ struct ServeArgs {
     #[arg(long = "s3ForcePathStyle")]
     s3_force_path_style: bool,
 
+    #[arg(long = "gcsBucket", conflicts_with_all = ["s3_bucket", "nexus_url"])]
+    gcs_bucket: Option<String>,
+
+    #[arg(long = "gcsPrefix", requires = "gcs_bucket", default_value = "")]
+    gcs_prefix: String,
+
     /// Base URL of a Sonatype Nexus Repository instance used as the shared cache tier
-    #[arg(long = "nexusUrl", requires = "nexus_repository")]
+    #[arg(
+        long = "nexusUrl",
+        requires = "nexus_repository",
+        conflicts_with = "gcs_bucket"
+    )]
     nexus_url: Option<String>,
 
     /// Raw hosted repository on --nexusUrl that holds cache entries
@@ -829,6 +839,13 @@ impl ServeArgs {
         if self.s3_bucket.is_some() && self.s3_endpoint.as_deref().is_some_and(str::is_empty) {
             bail!("--s3Endpoint must not be empty");
         }
+        if self
+            .gcs_bucket
+            .as_deref()
+            .is_some_and(|bucket| bucket.is_empty() || bucket.contains('/'))
+        {
+            bail!("--gcsBucket must be a non-empty bucket name");
+        }
         let nexus_credentials = match (&self.nexus_username, nexus_password) {
             _ if self.nexus_url.is_none() => None,
             (Some(username), Some(password)) => Some(bazel_diff::server::NexusCredentials {
@@ -839,20 +856,27 @@ impl ServeArgs {
             (Some(_), None) => bail!("--nexusUsername requires {NEXUS_PASSWORD_ENV} to be set"),
             (None, Some(_)) => bail!("{NEXUS_PASSWORD_ENV} requires --nexusUsername"),
         };
-        let remote_cache = match (&self.s3_bucket, &self.nexus_url, &self.nexus_repository) {
-            (Some(bucket), _, _) => {
-                let prefix = self.s3_prefix.trim_matches('/');
-                Some(if prefix.is_empty() {
-                    format!("s3://{bucket}/")
-                } else {
-                    format!("s3://{bucket}/{prefix}/")
-                })
-            }
-            (None, Some(url), Some(repository)) => Some(
+        let remote_cache = if let Some(bucket) = &self.s3_bucket {
+            let prefix = self.s3_prefix.trim_matches('/');
+            Some(if prefix.is_empty() {
+                format!("s3://{bucket}/")
+            } else {
+                format!("s3://{bucket}/{prefix}/")
+            })
+        } else if let Some(bucket) = &self.gcs_bucket {
+            let prefix = self.gcs_prefix.trim_matches('/');
+            Some(if prefix.is_empty() {
+                format!("gs://{bucket}/")
+            } else {
+                format!("gs://{bucket}/{prefix}/")
+            })
+        } else if let (Some(url), Some(repository)) = (&self.nexus_url, &self.nexus_repository) {
+            Some(
                 bazel_diff::server::nexus_base_url(url, repository, &self.nexus_prefix)?
                     .to_string(),
-            ),
-            _ => None,
+            )
+        } else {
+            None
         };
         Ok(bazel_diff::server::ServerConfig {
             hash_options: hash_options(&self.hashing, None, None, self.track_deps, verbose)?,
@@ -882,6 +906,8 @@ impl ServeArgs {
             s3_region: self.s3_region.clone(),
             s3_endpoint: self.s3_endpoint.clone(),
             s3_force_path_style: self.s3_force_path_style,
+            gcs_bucket: self.gcs_bucket.clone(),
+            gcs_prefix: self.gcs_prefix.clone(),
             nexus_url: self.nexus_url.clone(),
             nexus_repository: self.nexus_repository.clone(),
             nexus_prefix: self.nexus_prefix.clone(),
@@ -1305,6 +1331,100 @@ mod tests {
         assert_eq!(config.warmup_revisions, ["main", "release"]);
         assert!(config.s3_force_path_style);
         assert!(config.hash_options.bazel.verbose);
+    }
+
+    #[test]
+    fn serve_config_parses_gcs_bucket_and_prefix() {
+        for (extra, expected) in [
+            (vec!["--gcsBucket", "cache-bucket"], "gs://cache-bucket/"),
+            (
+                vec!["--gcsBucket", "cache-bucket", "--gcsPrefix", "/team/repo/"],
+                "gs://cache-bucket/team/repo/",
+            ),
+        ] {
+            let mut argv = vec![
+                "bazel-diff",
+                "serve",
+                "--workspacePath",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+            ];
+            argv.extend(extra);
+            let cli = Cli::try_parse_from(&argv).expect("GCS bucket flags should parse");
+            let Commands::Serve(args) = cli.command else {
+                panic!("expected serve");
+            };
+            let config = args.to_config(false).unwrap();
+            assert_eq!(config.remote_cache.as_deref(), Some(expected));
+            assert!(config.s3_bucket.is_none());
+            assert!(config.nexus_url.is_none());
+        }
+    }
+
+    #[test]
+    fn serve_gcs_bucket_must_not_be_empty() {
+        let cli = parse(&[
+            "bazel-diff",
+            "serve",
+            "--workspacePath",
+            "/tmp/ws",
+            "--cacheDir",
+            "/tmp/cache",
+            "--gcsBucket",
+            "",
+        ]);
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve");
+        };
+        assert!(args.to_config(false).is_err());
+    }
+
+    #[test]
+    fn serve_gcs_prefix_requires_bucket() {
+        let argv = [
+            "bazel-diff",
+            "serve",
+            "--workspacePath",
+            "/tmp/ws",
+            "--cacheDir",
+            "/tmp/cache",
+            "--gcsPrefix",
+            "team/repo",
+        ];
+        assert_eq!(
+            Cli::try_parse_from(argv).unwrap_err().kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn serve_gcs_bucket_conflicts_with_other_remote_caches() {
+        for other in [
+            vec!["--s3Bucket", "s3-bucket"],
+            vec![
+                "--nexusUrl",
+                "https://nexus.example.com",
+                "--nexusRepository",
+                "cache",
+            ],
+        ] {
+            let mut argv = vec![
+                "bazel-diff",
+                "serve",
+                "--workspacePath",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+                "--gcsBucket",
+                "gcs-bucket",
+            ];
+            argv.extend(other);
+            assert_eq!(
+                Cli::try_parse_from(&argv).unwrap_err().kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
     }
 
     #[test]

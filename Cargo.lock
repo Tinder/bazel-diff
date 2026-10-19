@@ -147,6 +147,7 @@ dependencies = [
  "buffa",
  "buffa-build",
  "clap",
+ "flate2",
  "hex",
  "mimalloc",
  "protoc-bin-vendored",

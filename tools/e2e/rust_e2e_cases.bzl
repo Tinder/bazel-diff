@@ -60,6 +60,14 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::bzlmod_override_patch_impacts_consumer",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::bzlmod_override_patch_impacts_consumer_cquery",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::bzlmod_show_repo_and_external_filtering",
                 "timeout": "moderate",
             },

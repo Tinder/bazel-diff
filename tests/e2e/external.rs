@@ -1,6 +1,8 @@
 use crate::support::*;
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
+use std::process::Command;
 
 fn zipped_golden_case(first_zip: &str, second_zip: &str, generate_args: &[&str], golden: &str) {
     let first = extract_fixture(first_zip);
@@ -197,6 +199,117 @@ fn transitive_external_repo_change_reaches_consumer() {
     fs::write(second.path().join("inner/data.txt"), "world\n").unwrap();
     let impacted = diff_local(first.path(), second.path(), &[]);
     assert!(impacted.contains("//:consume") || impacted.contains("@@//:consume"));
+}
+
+#[test]
+fn bzlmod_override_patch_impacts_consumer() {
+    override_patch_case(&[]);
+}
+
+#[test]
+fn bzlmod_override_patch_impacts_consumer_cquery() {
+    override_patch_case(&[
+        "--useCquery",
+        "--cqueryExpression",
+        "deps((//...) except attr(tags,manual,//...))",
+    ]);
+}
+
+fn override_patch_case(args: &[&str]) {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("bzlmod_override_patch");
+    let module = "module(name = \"patched_dep\", version = \"1.0.0\")\n";
+    let archive_path = workspace.path().join("dep.zip");
+    let mut archive = zip::ZipWriter::new(fs::File::create(&archive_path).unwrap());
+    for (name, contents) in [
+        ("MODULE.bazel", module),
+        ("BUILD", "exports_files([\"data.txt\"])\n"),
+        ("data.txt", "original\n"),
+    ] {
+        archive
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(contents.as_bytes()).unwrap();
+    }
+    archive.finish().unwrap();
+    // A local registry exercises single_version_override without a remote test dependency.
+    let registry = workspace.path().join("registry");
+    let version = registry.join("modules/patched_dep/1.0.0");
+    fs::create_dir_all(&version).unwrap();
+    fs::write(registry.join("bazel_registry.json"), "{}\n").unwrap();
+    fs::write(version.join("MODULE.bazel"), module).unwrap();
+    fs::write(
+        version.join("source.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "url": url::Url::from_file_path(&archive_path).unwrap().as_str(),
+            "integrity": "",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join(".bazelrc"),
+        format!(
+            "common --registry={}\ncommon --registry=https://bcr.bazel.build\n",
+            url::Url::from_directory_path(&registry).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let build = |expected| {
+        let output = Command::new(bazel())
+            .current_dir(workspace.path())
+            .args(["build", "//:consumer"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(bazel())
+            .current_dir(workspace.path())
+            .args(["info", "bazel-bin"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let bin = std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        assert_eq!(
+            fs::read_to_string(bin.join("copied.txt")).unwrap(),
+            expected
+        );
+    };
+    let output = tempfile::tempdir().unwrap();
+    let from = output.path().join("from.json");
+    let unchanged = output.path().join("unchanged.json");
+    let to = output.path().join("to.json");
+    let result = output.path().join("impacted.txt");
+    build("first\n");
+    assert!(generate(workspace.path(), &from, args).status.success());
+    assert!(generate(workspace.path(), &unchanged, args)
+        .status
+        .success());
+    assert_eq!(hashes(&from), hashes(&unchanged));
+
+    edit(&workspace.path().join("dep.patch"), |text| {
+        text.replace("+first", "+second")
+    });
+    build("second\n");
+    assert!(generate(workspace.path(), &to, args).status.success());
+    assert!(impacted(workspace.path(), &from, &to, &result, &[])
+        .status
+        .success());
+    let labels = read_lines(&result);
+    assert!(
+        labels.iter().any(|label| label.ends_with("//:consumer")),
+        "{labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|label| label.ends_with("//:unrelated")),
+        "{labels:?}"
+    );
 }
 
 #[test]

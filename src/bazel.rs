@@ -594,20 +594,25 @@ fn lower_repositories(
             .flat_map(|module| module_edges.get(module).into_iter().flatten())
             .filter_map(|dependency| module_to_canonical.get(dependency))
             .flat_map(|canonical| {
-                // A module the root cannot see has no apparent name there; its node is named
-                // by canonical name, matching the `apparent_names` fallback below.
+                // Hidden modules have no root-visible apparent name; canonical names keep
+                // their transitive repository dependencies connected.
                 canonical_to_apparent
                     .get(canonical)
                     .cloned()
                     .unwrap_or_else(|| vec![canonical.clone()])
             })
             .collect::<BTreeSet<_>>();
-        let apparent_names = canonical_to_apparent
+        // cquery --consistent_labels uses canonical names even for root-visible repos. Both
+        // spellings must reach the repository hash or patch changes cannot reach consumers (#522).
+        let names = canonical_to_apparent
             .get(canonical)
-            .cloned()
-            .unwrap_or_else(|| vec![canonical.to_owned()]);
-        for apparent in apparent_names {
-            let mut target = repository_target(&repository, &apparent, &dep_apparent, workspace);
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .chain(std::iter::once(canonical))
+            .collect::<BTreeSet<_>>();
+        for name in names {
+            let mut target = repository_target(&repository, name, &dep_apparent, workspace);
             transform(&mut target);
             targets.push(target);
         }
@@ -1941,20 +1946,28 @@ mod tests {
             Path::new("."),
             &mut |target| transformed.push(target_name(target).unwrap().to_owned()),
         );
-        assert_eq!(targets.len(), 3);
+        assert_eq!(targets.len(), 5);
         assert_eq!(
             transformed,
-            ["//external:alias", "//external:dep", "//external:child"]
+            [
+                "//external:alias",
+                "//external:dep",
+                "//external:dep+1.0",
+                "//external:child",
+                "//external:child+2.0",
+            ]
         );
-        let dep = targets
-            .iter()
-            .find(|target| target_name(target) == Some("//external:dep"))
-            .unwrap()
-            .rule
-            .as_option()
-            .unwrap();
-        assert_eq!(dep.rule_class, "http_archive");
-        assert_eq!(dep.rule_input, ["//external:child"]);
+        for name in ["//external:alias", "//external:dep", "//external:dep+1.0"] {
+            let dep = targets
+                .iter()
+                .find(|target| target_name(target) == Some(name))
+                .unwrap()
+                .rule
+                .as_option()
+                .unwrap();
+            assert_eq!(dep.rule_class, "http_archive");
+            assert_eq!(dep.rule_input, ["//external:child"]);
+        }
     }
 
     #[test]

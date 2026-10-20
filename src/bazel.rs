@@ -2300,6 +2300,66 @@ mod tests {
         assert_eq!(dep.rule_input, ["//external:child"]);
     }
 
+    /// Issue #522: a module pinned with `single_version_override(patches = ["//:dep.patch"])`
+    /// is shown by `bazel mod show_repo` as an `http_archive` whose `patches` name a main-repo
+    /// file. Its node is `//external:dep`, named by the root's apparent name and not by the
+    /// canonical `dep+` cquery prints, and the patch content is part of the node's hash even
+    /// though the patch touches no `.bzl` file.
+    #[test]
+    fn single_version_override_patch_is_hashed_into_the_apparent_repository_node() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("dep.patch"),
+            "--- a/data.txt\n+++ b/data.txt\n@@ -1 +1 @@\n-original\n+patched v1\n",
+        )
+        .unwrap();
+        let mapping = parse_repo_mapping(r#"{"":"","dep":"dep+","bazel_tools":"bazel_tools"}"#);
+        let repository = || Repository {
+            canonical_name: Some("dep+".into()),
+            repo_rule_name: Some("http_archive".into()),
+            attribute: vec![
+                Attribute {
+                    name: "urls".into(),
+                    r#type: attribute::Discriminator::StringList,
+                    string_list_value: vec!["file:/registry/dep.zip".into()],
+                    ..Default::default()
+                },
+                Attribute {
+                    name: "patches".into(),
+                    r#type: attribute::Discriminator::LabelList,
+                    string_list_value: vec!["//:dep.patch".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let lower = || {
+            let targets = lower_repositories(
+                vec![repository()],
+                &mapping,
+                &BTreeMap::new(),
+                None,
+                workspace.path(),
+                &mut |_| {},
+            );
+            assert_eq!(targets.len(), 1);
+            let rule = targets[0].rule.as_option().unwrap().clone();
+            assert_eq!(rule.name, "//external:dep");
+            rule.attribute
+                .iter()
+                .find(|attribute| attribute.name == "_bazel_diff_local_inputs_hash")
+                .and_then(|attribute| attribute.string_value.clone())
+                .expect("patch hashed into the node")
+        };
+        let before = lower();
+        fs::write(
+            workspace.path().join("dep.patch"),
+            "--- a/data.txt\n+++ b/data.txt\n@@ -1 +1 @@\n-original\n+patched v2\n",
+        )
+        .unwrap();
+        assert_ne!(lower(), before);
+    }
+
     #[test]
     fn modules_hidden_from_the_root_stay_on_the_repository_path() {
         // Issue #510: root -> facade -> middle (apparent name only inside facade) -> leaf.

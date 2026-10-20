@@ -352,6 +352,27 @@ pub fn hashes(path: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The `--depEdgesFile` output: each hashed label to the labels it depends on.
+pub fn dep_edges(path: &Path) -> BTreeMap<String, BTreeSet<String>> {
+    let value: Value =
+        serde_json::from_slice(&fs::read(path).expect("read dep edges")).expect("json");
+    value
+        .as_object()
+        .expect("edge object")
+        .iter()
+        .map(|(label, deps)| {
+            (
+                label.clone(),
+                deps.as_array()
+                    .expect("edge list")
+                    .iter()
+                    .map(|dep| dep.as_str().expect("edge label").to_owned())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 pub fn edit(path: &Path, transform: impl FnOnce(String) -> String) {
     let original = fs::read_to_string(path).expect("read edit target");
     let changed = transform(original.clone());

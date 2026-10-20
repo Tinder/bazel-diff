@@ -1,0 +1,16 @@
+module(
+    name = "extension_repo_patch_test",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "sdk_rules", version = "1.0")
+local_path_override(
+    module_name = "sdk_rules",
+    path = "sdk_rules",
+)
+
+# The SDK repository is created by sdk_rules' extension and reached through
+# toolchain resolution only: the root never `use_repo`s it, so it is in no
+# module's repo mapping, like rules_go's `go_default_sdk`.
+sdk = use_extension("@sdk_rules//:extensions.bzl", "sdk")
+sdk.download(patches = ["//patches:sdk.patch"])

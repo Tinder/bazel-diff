@@ -200,6 +200,14 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::unused_transitive_extension_failure_hides_direct_dependency_change",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::unused_transitive_extension_failure_keeps_bzlmod_repos_hashed",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::wrapped_external_repo_change_reaches_main_consumer",
                 "timeout": "moderate",
             },

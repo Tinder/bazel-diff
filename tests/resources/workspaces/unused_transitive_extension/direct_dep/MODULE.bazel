@@ -1,0 +1,8 @@
+module(
+    name = "direct_dep",
+    version = "1.0",
+)
+
+# Pulls in the module whose extension usage is broken, the way grpc pulls in
+# envoy_api. direct_dep itself never loads anything from transitive_dep.
+bazel_dep(name = "transitive_dep", version = "1.0")

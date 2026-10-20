@@ -604,3 +604,68 @@ fn extension_repo_nodes_are_stable_without_a_change() {
     let impacted = diff_workspaces(first.path(), second.path(), &[]);
     assert!(impacted.is_empty(), "{impacted:?}");
 }
+
+/// Reproducer for https://github.com/Tinder/bazel-diff/issues/531: a transitive module's
+/// `use_extension` is broken (it imports a repository the extension no longer generates),
+/// but nothing in `//...` reaches that extension, so Bazel's lazy evaluation keeps
+/// `bazel build //...` green. `bazel mod graph` and `bazel mod show_repo` evaluate every
+/// extension in the graph eagerly and exit 2 instead. bazel-diff reads the failing
+/// `bazel mod graph` as "Bzlmod is disabled" and falls back to legacy hashing, so every
+/// `//external:` node vanishes without an error -- the one for `@direct_dep`, which `//:app`
+/// does use, included. The reporter saw the same eager evaluation surface as a hard exit 2.
+#[test]
+fn unused_transitive_extension_failure_keeps_bzlmod_repos_hashed() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("unused_transitive_extension");
+    let build = std::process::Command::new(bazel())
+        .args(["build", "//..."])
+        .current_dir(workspace.path())
+        .output()
+        .expect("run bazel build");
+    assert!(
+        build.status.success(),
+        "the broken extension must not break the build itself: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let output = workspace.path().join("hashes.json");
+    let result = generate(
+        workspace.path(),
+        &output,
+        &[
+            "--no-keep_going",
+            "--excludeExternalTargets",
+            "--includeTargetType",
+        ],
+    );
+    assert!(result.status.success(), "generate-hashes must not fail");
+    let hashes = hashes(&output);
+    assert!(
+        hashes.contains_key("//external:direct_dep"),
+        "the module repository //:app depends on must still be hashed, got {:?}",
+        hashes.keys().collect::<Vec<_>>()
+    );
+}
+
+/// The user-visible consequence of the case above: with the `//external:direct_dep` node
+/// gone, a change to the direct dependency's module definition no longer reaches `//:app`,
+/// so the dependency upgrade that a pull request makes goes untested.
+#[test]
+fn unused_transitive_extension_failure_hides_direct_dependency_change() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("unused_transitive_extension");
+    let second = copy_workspace("unused_transitive_extension");
+    edit(&second.path().join("direct_dep/MODULE.bazel"), |text| {
+        text.replace("version = \"1.0\",", "version = \"1.1\",")
+    });
+    let impacted = diff_workspaces(first.path(), second.path(), &["--no-keep_going"]);
+    assert!(
+        impacted
+            .iter()
+            .any(|label| label == "//:app" || label == "@@//:app"),
+        "{impacted:?}"
+    );
+}

@@ -1,0 +1,30 @@
+module(
+    name = "unused_transitive_extension_test",
+    version = "0.0.0",
+)
+
+# Reproducer workspace for https://github.com/Tinder/bazel-diff/issues/531.
+#
+# Shape:
+#   root //:app --> @direct_dep//:lib.txt
+#   direct_dep --(bazel_dep)--> transitive_dep
+#   transitive_dep --(use_extension + use_repo)--> @missing_repo, which the extension
+#                                                  does not generate
+#
+# Bazel evaluates module extensions lazily: `bazel build //...` only touches
+# @direct_dep, never transitive_dep's extension, so the broken usage goes
+# unnoticed and the build is green. `bazel mod graph`, `bazel mod show_repo` and
+# `bazel mod dump_repo_mapping` evaluate every extension in the dependency graph
+# eagerly, so they fail -- and with them `bazel-diff generate-hashes`.
+bazel_dep(name = "direct_dep", version = "1.0")
+local_path_override(
+    module_name = "direct_dep",
+    path = "direct_dep",
+)
+
+# Only the root module may override, so transitive_dep's checkout is pointed
+# at from here even though nothing in this workspace uses it.
+local_path_override(
+    module_name = "transitive_dep",
+    path = "transitive_dep",
+)

@@ -751,14 +751,6 @@ A few inputs are normalized or extended on the way in:
   hashed without its `url`/`urls`, since a mirror or registry move cannot change what it fetches.
   The main-repository files its attributes name -- patches, build files, lock files -- are hashed
   by content, so a changed patch is a changed repository.
-* Under Bzlmod every repository a **module extension** generates gets such a node, including the
-  ones no module imports with `use_repo`: a Go SDK reached only through toolchain resolution, the
-  crate or wheel behind a hub's alias. Repositories the root imports are named `//external:<apparent
-  name>`; the rest `//external:<canonical name>` (`//external:rules_go++go_sdk+go_default_sdk`). In
-  query mode, where a toolchain is resolved rather than declared and a hub's aliases are never
-  loaded, the module that owns an extension depends on everything it generates and each imported
-  repository on the siblings nobody imports, so a patch or version edit reaches the targets that
-  use them; cquery sees those edges as real inputs and gets the nodes alone.
 * A **dependency cycle** in the query graph (which a build never sees, but which rules_go's
   `go_context_data` and nogo analyzers form through non-dependency attributes) no longer fails
   hashing. The back edge is hashed from the entered target's own definition, with a one-line
@@ -794,7 +786,7 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "61.0.0")
+bazel_dep(name = "bazel-diff", version = "62.0.0")
 ```
 
 Until `rules_rs` fixes `all_crate_deps(package_name = "")`, copy

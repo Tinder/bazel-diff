@@ -120,6 +120,18 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::extension_repo_nodes_are_stable_without_a_change",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::extension_repo_patch_edit_impacts_toolchain_user",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::extension_repo_patch_edit_impacts_toolchain_user_cquery",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::external_go_dependencies_appear_in_hashes",
                 "timeout": "moderate",
             },

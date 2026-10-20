@@ -381,3 +381,63 @@ fn cquery_keeps_dependencies_of_every_configured_instance() {
         "//:app should be impacted through //:helper, got {impacted:?}"
     );
 }
+
+/// Regression for https://github.com/Tinder/bazel-diff/issues/522 and hashbench's
+/// `toolchain_patch_edit` scenario: a repository created by a module extension that no
+/// module imports (`go_sdk.download(patches = ...)`) is reached by toolchain resolution
+/// only. Editing its patch changes what every user of the toolchain builds, so the users
+/// must be impacted even though `bazel query` shows no edge from them to the SDK repo.
+#[test]
+fn extension_repo_patch_edit_impacts_toolchain_user() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("extension_repo_patch");
+    let second = copy_workspace("extension_repo_patch");
+    edit(&second.path().join("patches/sdk.patch"), |text| {
+        text.replace("+1.0.0-patched", "+1.0.0-repatched")
+    });
+    let impacted = diff_workspaces(first.path(), second.path(), &[]);
+    assert!(
+        impacted
+            .iter()
+            .any(|label| label == "//:app" || label == "@@//:app"),
+        "{impacted:?}"
+    );
+    assert!(!impacted.contains("//:control"), "{impacted:?}");
+}
+
+/// The cquery side of the case above: the resolved toolchain is a real configured input
+/// there, so the extension repo's node alone carries the patch edit to `//:app`.
+#[test]
+fn extension_repo_patch_edit_impacts_toolchain_user_cquery() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("extension_repo_patch");
+    let second = copy_workspace("extension_repo_patch");
+    edit(&second.path().join("patches/sdk.patch"), |text| {
+        text.replace("+1.0.0-patched", "+1.0.0-repatched")
+    });
+    let impacted = diff_workspaces(first.path(), second.path(), &["--useCquery"]);
+    assert!(
+        impacted
+            .iter()
+            .any(|label| label == "//:app" || label == "@@//:app"),
+        "{impacted:?}"
+    );
+    assert!(!impacted.contains("//:control"), "{impacted:?}");
+}
+
+/// Without a change nothing is impacted: the extension repo nodes and their stand-in edges
+/// hash deterministically across two checkouts of the same workspace.
+#[test]
+fn extension_repo_nodes_are_stable_without_a_change() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("extension_repo_patch");
+    let second = copy_workspace("extension_repo_patch");
+    let impacted = diff_workspaces(first.path(), second.path(), &[]);
+    assert!(impacted.is_empty(), "{impacted:?}");
+}

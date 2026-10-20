@@ -235,6 +235,62 @@ fn hidden_wrapper_external_repo_change_reaches_main_consumer() {
     assert!(!impacted.contains("//:control"), "{impacted:?}");
 }
 
+/// The #510 chain under `--useCquery`, where every label is canonical: `@@facade+//:export`
+/// names `@@middle+//:wrapped`, which names `@@leaf+//:value`. `leaf` is root-visible, so its
+/// node is `//external:leaf` and the canonical `leaf+` has to be translated to reach it; `middle`
+/// is hidden, so its node keeps the canonical name `//external:middle+`. The impacted set alone
+/// cannot tell the two apart (the `middle` node also depends on the `leaf` node), so the edges
+/// are asserted directly.
+#[test]
+fn hidden_wrapper_external_repo_change_reaches_main_consumer_cquery() {
+    let first = copy_workspace("hidden_wrapper_external_repo");
+    let second = copy_workspace("hidden_wrapper_external_repo");
+    fs::write(second.path().join("leaf/value.txt"), "after\n").unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let from = output.path().join("from.json");
+    let to = output.path().join("to.json");
+    let edges_file = output.path().join("edges.json");
+    let result = output.path().join("impacted.txt");
+    let args = ["--useCquery"];
+    assert!(generate(first.path(), &from, &args).status.success());
+    assert!(generate(
+        second.path(),
+        &to,
+        &[
+            "--useCquery",
+            "--depEdgesFile",
+            edges_file.to_str().unwrap()
+        ],
+    )
+    .status
+    .success());
+    assert!(impacted(second.path(), &from, &to, &result, &[])
+        .status
+        .success());
+    let edges = dep_edges(&edges_file);
+    assert!(
+        edges["@@middle+//:wrapped"].contains("//external:leaf"),
+        "{:?}",
+        edges["@@middle+//:wrapped"]
+    );
+    assert!(
+        edges["@@facade+//:export"].contains("//external:middle+"),
+        "{:?}",
+        edges["@@facade+//:export"]
+    );
+    let impacted = read_lines(&result);
+    assert!(
+        impacted
+            .iter()
+            .any(|label| label == "//:consumer" || label == "@@//:consumer"),
+        "{impacted:?}"
+    );
+    assert!(
+        !impacted.iter().any(|label| label.ends_with(":control")),
+        "{impacted:?}"
+    );
+}
+
 /// Control for the issue 510 regression: naming every repository in the chain
 /// already propagates the change, so the fixture's edges are real and the gap
 /// is in discovering `@@middle+` from `@leaf` alone.
@@ -255,6 +311,113 @@ fn hidden_wrapper_external_repo_change_propagates_with_explicit_chain() {
         "{impacted:?}"
     );
     assert!(!impacted.contains("//:control"), "{impacted:?}");
+}
+
+/// Regression for https://github.com/Tinder/bazel-diff/issues/522: a module patched through
+/// `single_version_override(patches = [...])`, where the patch rewrites a plain data file and no
+/// `.bzl`. The patch is hashed into the module's `//external:dep` node
+/// (`_bazel_diff_local_inputs_hash`), and `//:consumer` reaches that node through its input
+/// label: `@dep//:data` under query, `@@dep+//:data` under cquery. The canonical form used to
+/// miss the node, which is named by the apparent name `dep`, so the reporter's cquery run saw no
+/// impacted targets for a patch edit while plain query did. The query-mode run is the control
+/// that proves the fixture carries the signal at all.
+fn single_version_override_patch_change(generate_args: &[&str]) {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("single_version_override_patch");
+    let second = copy_workspace("single_version_override_patch");
+    write_local_registry(first.path());
+    write_local_registry(second.path());
+    edit(&second.path().join("dep.patch"), |text| {
+        text.replace("patched v1", "patched v2")
+    });
+    let impacted = diff_workspaces(first.path(), second.path(), generate_args);
+    assert!(
+        impacted
+            .iter()
+            .any(|label| label == "//:consumer" || label == "@@//:consumer"),
+        "{generate_args:?}: {impacted:?}"
+    );
+    assert!(
+        !impacted.iter().any(|label| label.ends_with(":control")),
+        "{generate_args:?}: {impacted:?}"
+    );
+}
+
+#[test]
+fn single_version_override_patch_change_reaches_consumer_query() {
+    single_version_override_patch_change(&[]);
+}
+
+/// The reporter's exact invocation: `--useCquery` with a `--cqueryExpression` that excludes
+/// manual targets, on a Bzlmod-only workspace where the `//external:all-targets` query is
+/// dropped with the "//external is not available" warning.
+#[test]
+fn single_version_override_patch_change_reaches_consumer_cquery() {
+    single_version_override_patch_change(&[
+        "--useCquery",
+        "--cqueryExpression",
+        "deps((//...) except attr(tags,manual,//...))",
+    ]);
+}
+
+/// Turns the `single_version_override_patch` fixture into a working Bzlmod registry: zips
+/// `dep_src/` into the archive the registry's `source.json` points at (a `file://` URL and its
+/// integrity depend on the temp path, so neither is checked in) and adds the registry to the
+/// workspace's `.bazelrc` ahead of the BCR, which still serves Bazel's implicit dependencies.
+fn write_local_registry(workspace: &std::path::Path) {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    let archive = workspace.join("dep.zip");
+    let mut zip = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for name in ["MODULE.bazel", "BUILD.bazel", "data.txt"] {
+        zip.start_file(format!("dep/{name}"), options).unwrap();
+        zip.write_all(&fs::read(workspace.join("dep_src").join(name)).unwrap())
+            .unwrap();
+    }
+    zip.finish().unwrap();
+    let digest = Sha256::digest(fs::read(&archive).unwrap());
+    fs::write(
+        workspace.join("registry/modules/dep/1.0/source.json"),
+        format!(
+            "{{\"url\": \"file://{}\", \"integrity\": \"sha256-{}\", \"strip_prefix\": \"dep\"}}\n",
+            archive.display(),
+            base64(&digest)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join(".bazelrc"),
+        format!(
+            "common --registry=file://{}\ncommon --registry=https://bcr.bazel.build\n",
+            workspace.join("registry").display()
+        ),
+    )
+    .unwrap();
+}
+
+/// Standard base64 with padding, as Subresource Integrity strings use.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let mut word = 0u32;
+        for (index, byte) in chunk.iter().enumerate() {
+            word |= u32::from(*byte) << (16 - 8 * index);
+        }
+        for index in 0..4 {
+            if index <= chunk.len() {
+                out.push(ALPHABET[((word >> (18 - 6 * index)) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 #[test]

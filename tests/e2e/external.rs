@@ -47,9 +47,14 @@ fn fine_grained_bzlmod_repo_cquery() {
     zipped_golden_case(
         "fine-grained-hash-bzlmod-test-1.zip",
         "fine-grained-hash-bzlmod-test-2.zip",
+        // The apparent name, as the query-mode case passes: it names the same repository on
+        // every Bazel version, where the canonical spelling changed from `~~maven~maven`
+        // (Bazel 7) to `++maven+maven` (Bazel 8). With cquery's canonical labels now reaching
+        // the `//external:bazel_diff_maven` node, a flag that names nothing makes the lock-file
+        // change fan out to every maven consumer instead of the fine-grained set.
         &[
             "--fineGrainedHashExternalRepos",
-            "@@rules_jvm_external~~maven~maven",
+            "@bazel_diff_maven",
             "--useCquery",
         ],
         "fine-grained-hash-bzlmod-cquery-test-impacted-targets.txt",
@@ -71,9 +76,10 @@ fn bzlmod_transitive_deps_cquery() {
     zipped_golden_case(
         "bzlmod-transitive-test-1.zip",
         "bzlmod-transitive-test-2.zip",
+        // Apparent name for the same reason as fine_grained_bzlmod_repo_cquery.
         &[
             "--fineGrainedHashExternalRepos",
-            "@@rules_jvm_external~~maven~maven",
+            "@bazel_diff_maven",
             "--useCquery",
         ],
         "bzlmod-transitive-test-cquery-impacted-targets.txt",
@@ -197,6 +203,26 @@ fn transitive_external_repo_change_reaches_consumer() {
     fs::write(second.path().join("inner/data.txt"), "world\n").unwrap();
     let impacted = diff_local(first.path(), second.path(), &[]);
     assert!(impacted.contains("//:consume") || impacted.contains("@@//:consume"));
+}
+
+/// cquery prints canonical labels (`@@inner+//:data`) where query prints apparent ones
+/// (`@inner//:data`). The synthetic `//external:inner` node is named by the apparent name, so
+/// until the canonical name was translated the edge from `@@outer+//:lib` to the node was dropped
+/// and a change inside `inner` never reached `//:consume` under `--useCquery`. hashbench
+/// (2026-10-18) hit the same gap on a rules_multitool lockfile bump.
+#[test]
+fn transitive_external_repo_change_reaches_consumer_cquery() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("bzlmod_transitive_external");
+    let second = copy_workspace("bzlmod_transitive_external");
+    fs::write(second.path().join("inner/data.txt"), "world\n").unwrap();
+    let impacted = diff_local(first.path(), second.path(), &["--useCquery"]);
+    assert!(
+        impacted.contains("//:consume") || impacted.contains("@@//:consume"),
+        "{impacted:?}"
+    );
 }
 
 #[test]

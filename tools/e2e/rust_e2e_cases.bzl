@@ -104,6 +104,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::transitive_external_repo_change_reaches_consumer_cquery",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::always_affected_tag_marks_non_hermetic_target",
                 "timeout": "moderate",
             },
@@ -156,6 +160,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::hidden_wrapper_external_repo_change_reaches_main_consumer_cquery",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::local_path_override_works_for_query_and_cquery",
                 "timeout": "moderate",
             },
@@ -173,6 +181,14 @@ RUST_E2E_SUITES = [
             },
             {
                 "name": "regressions::rule_bzl_change_is_scoped_to_consumer",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::single_version_override_patch_change_reaches_consumer_cquery",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::single_version_override_patch_change_reaches_consumer_query",
                 "timeout": "moderate",
             },
             {

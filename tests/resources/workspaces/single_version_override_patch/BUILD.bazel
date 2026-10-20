@@ -1,0 +1,20 @@
+# Reproducer workspace for https://github.com/Tinder/bazel-diff/issues/522.
+#
+# Shape:
+#   //:consumer --> @dep//:data  (cquery prints it as @@dep+//:data)
+#   @dep        --> single_version_override(patches = ["//:dep.patch"])
+#
+# Editing dep.patch rewrites @dep's data.txt, so //:consumer must be impacted in
+# both query and cquery mode. The patch touches no .bzl file, so nothing leaks
+# through the rule-class definition hash: the only path from the patch to the
+# consumer is the //external:dep node, which cquery used to miss because its
+# input label is canonical (`@@dep+//...`) while the node is named `dep`.
+filegroup(
+    name = "consumer",
+    srcs = ["@dep//:data"],
+)
+
+filegroup(
+    name = "control",
+    srcs = ["control.txt"],
+)

@@ -571,10 +571,26 @@ impl HashContext<'_> {
             builder.direct(self.always_affected_seed);
         }
 
+        // cquery prints canonical labels (`@@rules_rs++crate+bd_crates//:anyhow`), while the
+        // synthetic `//external:<repo>` nodes are named by the root's apparent names. Only fetch
+        // the translation when a rule actually names a canonical repository, so a plain `query`
+        // or WORKSPACE run never pays for the extra `bazel mod` call.
+        let empty_repo_nodes = HashMap::new();
+        let canonical_repo_nodes = if rule
+            .rule
+            .rule_input
+            .iter()
+            .any(|input| is_canonical_external_label(input))
+        {
+            self.source_hasher.external_resolver.canonical_repo_nodes()
+        } else {
+            &empty_repo_nodes
+        };
         for encoded_input in rule_inputs(
             &rule.rule,
             self.options.bazel.use_cquery,
             &self.options.bazel.fine_grained_external_repos,
+            canonical_repo_nodes,
         ) {
             builder.direct(encoded_input.as_bytes());
             let input_label = target_label(&encoded_input);
@@ -903,11 +919,12 @@ fn rule_inputs<'a>(
     rule: &'a Rule,
     use_cquery: bool,
     fine_grained_repos: &BTreeSet<String>,
+    canonical_repo_nodes: &HashMap<String, String>,
 ) -> Vec<Cow<'a, str>> {
     let external_synthetic = rule
         .rule_input
         .iter()
-        .map(|input| transform_external_input(input, fine_grained_repos))
+        .map(|input| transform_external_input(input, fine_grained_repos, canonical_repo_nodes))
         .filter(|input| input.starts_with("//external:"));
     let mut inputs = if use_cquery {
         rule.configured_rule_input
@@ -927,28 +944,55 @@ fn rule_inputs<'a>(
     inputs
 }
 
+/// Whether `label` names a target in an external repository by canonical name (`@@repo//...`),
+/// as `bazel cquery` prints every label. `@@//pkg:t` is the main repository.
+fn is_canonical_external_label(label: &str) -> bool {
+    label.starts_with("@@") && !label.starts_with("@@//")
+}
+
+/// Rewrites an input label in an external repository to the synthetic `//external:<repo>` node
+/// `bazel::lower_repositories` produces for that repository, unless the repository is hashed
+/// fine-grained, in which case the label is kept and resolved target by target.
+///
+/// Nodes are named by the apparent repository name the root module sees (`//external:bd_crates`),
+/// falling back to the canonical name for modules the root cannot see (`//external:rules_cc+`,
+/// #510). `bazel query` prints apparent labels, so the repository name is the node name; `bazel
+/// cquery` prints canonical labels (`@@rules_rs++crate+bd_crates//:anyhow`), which
+/// `canonical_repo_nodes` (canonical -> node name) translates. Without that translation every
+/// cquery-mode edge to a repository node was silently dropped, so a lock file or patch hashed into
+/// the node never reached any main-repository target.
 fn transform_external_input<'a>(
     input: &'a str,
     fine_grained_repos: &BTreeSet<String>,
+    canonical_repo_nodes: &HashMap<String, String>,
 ) -> Cow<'a, str> {
-    let is_main = input.starts_with("//") || input.starts_with("@//") || input.starts_with("@@//");
-    if !is_main
-        && input.starts_with('@')
-        // Match on the full repo name (up to the `//` boundary), not a bare string prefix: with
-        // hub-and-spoke repos (e.g. rules_python's `@pip` hub and `@pip_<pkg>` spokes), a bare
-        // prefix check makes every spoke label look like it belongs to the fine-grained hub, so it
-        // is never rewritten to its `//external:<spoke>` seed and changes stop propagating.
-        && !fine_grained_repos.iter().any(|repo| {
-            input
-                .strip_prefix(repo.as_str())
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with("//"))
-        })
-    {
-        if let Some((repo, _)) = input.split_once("//") {
-            return Cow::Owned(format!("//external:{}", repo.trim_start_matches('@')));
-        }
+    if is_main_repo(input) || !input.starts_with('@') {
+        return Cow::Borrowed(input);
     }
-    Cow::Borrowed(input)
+    let Some((repo, _)) = input.split_once("//") else {
+        return Cow::Borrowed(input);
+    };
+    let name = repo.trim_start_matches('@');
+    let node = if repo.starts_with("@@") {
+        canonical_repo_nodes.get(name).map_or(name, String::as_str)
+    } else {
+        name
+    };
+    // Match on the full repo name, not a bare string prefix: with hub-and-spoke repos (e.g.
+    // rules_python's `@pip` hub and `@pip_<pkg>` spokes), a bare prefix check makes every spoke
+    // label look like it belongs to the fine-grained hub, so it is never rewritten to its
+    // `//external:<spoke>` seed and changes stop propagating. Users may name the repository by
+    // either its apparent name (`@pip`) or, in cquery mode, its canonical name
+    // (`@@rules_python++pip+pip`).
+    let is_fine_grained = |candidate: &str| {
+        fine_grained_repos
+            .iter()
+            .any(|repo| repo.trim_start_matches('@') == candidate)
+    };
+    if is_fine_grained(name) || is_fine_grained(node) {
+        return Cow::Borrowed(input);
+    }
+    Cow::Owned(format!("//external:{node}"))
 }
 
 fn rule_tags(rule: &Rule) -> HashSet<&str> {
@@ -1077,11 +1121,24 @@ impl SourceHasher<'_> {
             return Ok(Some((path.clone(), path.to_string_lossy().into_owned())));
         }
         if let Some(rest) = label.strip_prefix('@') {
+            let canonical = rest.starts_with('@');
             let rest = rest.trim_start_matches('@');
             let Some((repo, target)) = rest.split_once("//") else {
                 return Ok(None);
             };
-            if !self.fine_grained_external_repos.contains(repo) {
+            // A canonical label (`@@rules_jvm_external++maven+maven//...`, as cquery prints)
+            // is fine-grained when the user named the repository either way: by that canonical
+            // name or by the apparent name its `//external:` node carries (`@maven`), the same
+            // rule `transform_external_input` applies to the rule's inputs.
+            let fine_grained = self.fine_grained_external_repos.contains(repo)
+                || (canonical
+                    && !self.fine_grained_external_repos.is_empty()
+                    && self
+                        .external_resolver
+                        .canonical_repo_nodes()
+                        .get(repo)
+                        .is_some_and(|node| self.fine_grained_external_repos.contains(node)));
+            if !fine_grained {
                 return Ok(None);
             }
             let relative = PathBuf::from(target.trim_start_matches(':').replace(':', "/"));
@@ -1139,6 +1196,9 @@ struct ExternalRepoResolver {
     resolved: Arc<Mutex<HashMap<String, PathBuf>>>,
     /// Lazily populated apparent -> canonical repository name mapping.
     repo_mapping: Arc<OnceLock<HashMap<String, String>>>,
+    /// Lazily populated canonical repository name -> synthetic `//external:` node name, the
+    /// inverse of `repo_mapping`; see [`ExternalRepoResolver::canonical_repo_nodes`].
+    canonical_repo_nodes: Arc<OnceLock<HashMap<String, String>>>,
 }
 
 impl ExternalRepoResolver {
@@ -1256,6 +1316,27 @@ impl ExternalRepoResolver {
                 }
                 _ => HashMap::new(),
             }
+        })
+    }
+
+    /// Returns canonical repository name -> the name of the synthetic `//external:<name>` node
+    /// `bazel::lower_repositories` emits for it: the root's apparent name for that repository.
+    /// A repository mapped under several apparent names has one node per name; the smallest is
+    /// chosen so the edge is deterministic. Repositories the root does not map (modules hidden
+    /// behind another module, #510) are absent, and their node is named canonically, so callers
+    /// fall back to the canonical name itself.
+    fn canonical_repo_nodes(&self) -> &HashMap<String, String> {
+        self.canonical_repo_nodes.get_or_init(|| {
+            let mut nodes = HashMap::<String, String>::new();
+            for (apparent, canonical) in self.repo_mapping() {
+                match nodes.get(canonical) {
+                    Some(existing) if existing <= apparent => {}
+                    _ => {
+                        nodes.insert(canonical.clone(), apparent.clone());
+                    }
+                }
+            }
+            nodes
         })
     }
 }
@@ -1421,7 +1502,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            rule_inputs(&rule, true, &BTreeSet::new()),
+            rule_inputs(&rule, true, &BTreeSet::new(), &HashMap::new()),
             [String::from("//a:a|1"), String::from("//b:b|2")]
         );
     }
@@ -1504,8 +1585,301 @@ mod tests {
     #[test]
     fn opaque_external_input_maps_to_synthetic_target() {
         assert_eq!(
-            transform_external_input("@maven//:guava", &BTreeSet::new()),
+            transform_external_input("@maven//:guava", &BTreeSet::new(), &HashMap::new()),
             "//external:maven"
+        );
+    }
+
+    // `bazel cquery` prints canonical labels. The synthetic repository nodes are named by the
+    // root's apparent names (or by canonical name for modules the root cannot see, #510), so a
+    // canonical input has to be translated or its edge silently vanishes: hashbench (2026-10-18)
+    // caught a rules_multitool lockfile bump that query mode reported and cquery mode missed.
+    #[test]
+    fn canonical_external_inputs_map_to_the_apparent_repository_node() {
+        let nodes = HashMap::from([
+            ("rules_rs+".to_owned(), "rules_rs".to_owned()),
+            (
+                "rules_rs++crate+bd_crates".to_owned(),
+                "bd_crates".to_owned(),
+            ),
+            (
+                "rules_multitool++multitool+multitool".to_owned(),
+                "multitool".to_owned(),
+            ),
+        ]);
+        let none = BTreeSet::new();
+        // A module the root declares with bazel_dep.
+        assert_eq!(
+            transform_external_input("@@rules_rs+//:defs.bzl", &none, &nodes),
+            "//external:rules_rs"
+        );
+        // A repository generated by a module extension, visible under its use_repo name.
+        assert_eq!(
+            transform_external_input(
+                "@@rules_rs++crate+bd_crates//:anyhow-1.0.104",
+                &none,
+                &nodes
+            ),
+            "//external:bd_crates"
+        );
+        assert_eq!(
+            transform_external_input(
+                "@@rules_multitool++multitool+multitool//tools/foo:foo",
+                &none,
+                &nodes
+            ),
+            "//external:multitool"
+        );
+        // A module the root cannot see keeps its canonical name, matching the node lowered for it.
+        assert_eq!(
+            transform_external_input("@@rules_cc+//cc:defs.bzl", &none, &nodes),
+            "//external:rules_cc+"
+        );
+        // Main-repository labels are never external, canonical or not.
+        assert_eq!(
+            transform_external_input("@@//src:bazel-diff", &none, &nodes),
+            "@@//src:bazel-diff"
+        );
+        assert!(is_canonical_external_label("@@rules_rs+//:defs.bzl"));
+        assert!(!is_canonical_external_label("@@//src:bazel-diff"));
+        assert!(!is_canonical_external_label("@rules_rs//:defs.bzl"));
+        assert!(!is_canonical_external_label("//src:bazel-diff"));
+
+        // WORKSPACE-style apparent labels never consult the translation.
+        assert_eq!(
+            transform_external_input("@rules_rs//:defs.bzl", &none, &nodes),
+            "//external:rules_rs"
+        );
+
+        // A fine-grained repository is left alone whether the user named it by apparent or by
+        // canonical name, in either label form.
+        let apparent = BTreeSet::from(["@bd_crates".to_owned()]);
+        let canonical = BTreeSet::from(["@@rules_rs++crate+bd_crates".to_owned()]);
+        for fine_grained in [&apparent, &canonical] {
+            assert_eq!(
+                transform_external_input(
+                    "@@rules_rs++crate+bd_crates//:anyhow-1.0.104",
+                    fine_grained,
+                    &nodes
+                ),
+                "@@rules_rs++crate+bd_crates//:anyhow-1.0.104"
+            );
+            assert_eq!(
+                transform_external_input("@bd_crates//:anyhow-1.0.104", &apparent, &nodes),
+                "@bd_crates//:anyhow-1.0.104"
+            );
+        }
+        // ... but a repository that merely shares a prefix with it is still rewritten.
+        assert_eq!(
+            transform_external_input("@@rules_rs++crate+bd_crates_other//:x", &apparent, &nodes),
+            "//external:rules_rs++crate+bd_crates_other"
+        );
+    }
+
+    /// Issue #522 end to end through the hasher: `//:consumer` names `@@dep+//:data` (as cquery
+    /// prints `@dep//:data`), and `dep` is patched through `single_version_override`, so the
+    /// patch is hashed into `//external:dep`. Editing the patch must flip the consumer.
+    #[test]
+    fn single_version_override_patch_reaches_consumer_under_cquery() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        let mut options = hash_options(workspace.path());
+        options.bazel.use_cquery = true;
+        let hash = |patch_hash: &str| {
+            hash_targets_with_environment(
+                &options,
+                vec![
+                    rule_target(Rule {
+                        name: "@@//:consumer".into(),
+                        rule_class: "filegroup".into(),
+                        rule_input: vec!["@@dep+//:data".into()],
+                        configured_rule_input: vec![configured_input("@@dep+//:data", Some("aa"))],
+                        ..Default::default()
+                    }),
+                    rule_target(Rule {
+                        name: "@@dep+//:data|aa".into(),
+                        rule_class: "filegroup".into(),
+                        rule_input: vec!["@@dep+//:data.txt".into()],
+                        ..Default::default()
+                    }),
+                    rule_target(Rule {
+                        name: "//external:dep".into(),
+                        rule_class: "http_archive".into(),
+                        attribute: vec![Attribute {
+                            name: "_bazel_diff_local_inputs_hash".into(),
+                            r#type: attribute::Discriminator::String,
+                            string_value: Some(patch_hash.to_owned()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                ],
+                HashMap::new(),
+                ExternalRepoResolver {
+                    workspace: options.bazel.workspace.clone(),
+                    bazel: options.bazel.bazel.clone(),
+                    output_base: output_base.clone(),
+                    repo_mapping: Arc::new(OnceLock::from(HashMap::from([(
+                        "dep".to_owned(),
+                        "dep+".to_owned(),
+                    )]))),
+                    ..Default::default()
+                },
+                Some(r#"{"name":"root"}"#.to_owned()),
+            )
+            .unwrap()
+        };
+        let before = hash("patch-v1");
+        assert_eq!(
+            before.dep_edges["@@//:consumer"],
+            ["//external:dep", "@@dep+//:data"]
+        );
+        assert_eq!(before.dep_edges["@@dep+//:data"], ["//external:dep"]);
+        let after = hash("patch-v2");
+        assert_ne!(
+            before.hashes["@@//:consumer"].hash,
+            after.hashes["@@//:consumer"].hash
+        );
+    }
+
+    /// The fine-grained half of the apparent-name rule: a source file named by canonical label
+    /// resolves inside the repository when the user listed the repository's apparent name.
+    #[test]
+    fn fine_grained_source_resolves_canonical_labels_by_apparent_name() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        let repo_root = output_base
+            .join("external")
+            .join("rules_jvm_external++maven+maven");
+        fs::create_dir_all(&repo_root).unwrap();
+        fs::write(repo_root.join("guava.jar"), "jar").unwrap();
+        let resolver = ExternalRepoResolver {
+            workspace: workspace.path().to_path_buf(),
+            bazel: PathBuf::from("bazel"),
+            output_base,
+            repo_mapping: Arc::new(OnceLock::from(HashMap::from([(
+                "maven".to_owned(),
+                "rules_jvm_external++maven+maven".to_owned(),
+            )]))),
+            ..Default::default()
+        };
+        let modified = BTreeSet::new();
+        let hasher = |fine_grained: &[&str]| SourceHasher {
+            workspace: workspace.path(),
+            content_hashes: None,
+            modified_filepaths: &modified,
+            fine_grained_external_repos: fine_grained.iter().map(|r| (*r).to_owned()).collect(),
+            external_resolver: resolver.clone(),
+        };
+        let label = "@@rules_jvm_external++maven+maven//:guava.jar";
+        for fine_grained in [&["maven"][..], &["rules_jvm_external++maven+maven"][..]] {
+            let (path, key) = hasher(fine_grained).resolve(label).unwrap().unwrap();
+            assert_eq!(path, repo_root.join("guava.jar"), "{fine_grained:?}");
+            assert_eq!(
+                key, "external/rules_jvm_external++maven+maven/guava.jar",
+                "{fine_grained:?}"
+            );
+        }
+        // Neither name listed: the label is opaque, as before.
+        assert!(hasher(&["other"]).resolve(label).unwrap().is_none());
+        assert!(hasher(&[]).resolve(label).unwrap().is_none());
+        // An apparent label never consults the translation.
+        assert!(hasher(&["rules_jvm_external++maven+maven"])
+            .resolve("@maven//:guava.jar")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn canonical_repo_nodes_invert_the_repo_mapping_deterministically() {
+        let resolver = ExternalRepoResolver {
+            repo_mapping: Arc::new(OnceLock::from(HashMap::from([
+                ("rules_rs".to_owned(), "rules_rs+".to_owned()),
+                (
+                    "bd_crates".to_owned(),
+                    "rules_rs++crate+bd_crates".to_owned(),
+                ),
+                // Two apparent names for one repository: the node picked is the smallest.
+                ("zz_alias".to_owned(), "rules_cc+".to_owned()),
+                ("cc_rules".to_owned(), "rules_cc+".to_owned()),
+            ]))),
+            ..Default::default()
+        };
+        let nodes = resolver.canonical_repo_nodes();
+        assert_eq!(nodes["rules_rs+"], "rules_rs");
+        assert_eq!(nodes["rules_rs++crate+bd_crates"], "bd_crates");
+        assert_eq!(nodes["rules_cc+"], "cc_rules");
+        assert_eq!(nodes.len(), 3);
+        assert!(std::ptr::eq(nodes, resolver.canonical_repo_nodes()));
+    }
+
+    /// End to end through the hasher: under cquery, a main-repository rule whose input lives in
+    /// an extension repository reaches that repository's `//external:` node, so a change hashed
+    /// into the node (a lock file, a patch) flips the rule.
+    #[test]
+    fn cquery_rule_reaches_the_repository_node_through_a_canonical_input() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        let mut options = hash_options(workspace.path());
+        options.bazel.use_cquery = true;
+        let targets = |lock_hash: &str| {
+            vec![
+                rule_target(Rule {
+                    name: "@@//src:bazel-diff".into(),
+                    rule_class: "rust_binary".into(),
+                    rule_input: vec![
+                        "@@//src:main.rs".into(),
+                        "@@rules_rs++crate+bd_crates//:anyhow-1.0.104".into(),
+                    ],
+                    configured_rule_input: vec![configured_input(
+                        "@@rules_rs++crate+bd_crates//:anyhow-1.0.104",
+                        Some("aa"),
+                    )],
+                    ..Default::default()
+                }),
+                rule_target(Rule {
+                    name: "//external:bd_crates".into(),
+                    rule_class: "crate_repository".into(),
+                    attribute: vec![Attribute {
+                        name: "_bazel_diff_local_inputs_hash".into(),
+                        r#type: attribute::Discriminator::String,
+                        string_value: Some(lock_hash.to_owned()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            ]
+        };
+        let hash = |lock_hash: &str| {
+            hash_targets_with_environment(
+                &options,
+                targets(lock_hash),
+                HashMap::new(),
+                ExternalRepoResolver {
+                    workspace: options.bazel.workspace.clone(),
+                    bazel: options.bazel.bazel.clone(),
+                    output_base: output_base.clone(),
+                    repo_mapping: Arc::new(OnceLock::from(HashMap::from([(
+                        "bd_crates".to_owned(),
+                        "rules_rs++crate+bd_crates".to_owned(),
+                    )]))),
+                    ..Default::default()
+                },
+                Some(r#"{"name":"root"}"#.to_owned()),
+            )
+            .unwrap()
+        };
+        let before = hash("lock-v1");
+        assert_eq!(
+            before.dep_edges["@@//src:bazel-diff"],
+            ["//external:bd_crates"]
+        );
+        let after = hash("lock-v2");
+        assert_ne!(
+            before.hashes["@@//src:bazel-diff"].hash, after.hashes["@@//src:bazel-diff"].hash,
+            "the lock file change must reach the consumer in cquery mode"
         );
     }
 
@@ -1518,11 +1892,11 @@ mod tests {
     fn fine_grained_repo_name_does_not_prefix_match_spoke_repos() {
         let fine_grained = BTreeSet::from(["@pip".to_owned()]);
         assert_eq!(
-            transform_external_input("@pip_numpy//:lib", &fine_grained),
+            transform_external_input("@pip_numpy//:lib", &fine_grained, &HashMap::new()),
             "//external:pip_numpy"
         );
         assert_eq!(
-            transform_external_input("@pip//numpy:pkg", &fine_grained),
+            transform_external_input("@pip//numpy:pkg", &fine_grained, &HashMap::new()),
             "@pip//numpy:pkg"
         );
 
@@ -1535,7 +1909,7 @@ mod tests {
         // The spoke input keeps its raw label and gains the seed; the hub-internal input stays raw
         // because the hub itself is fine-grained.
         assert_eq!(
-            rule_inputs(&rule, false, &fine_grained),
+            rule_inputs(&rule, false, &fine_grained, &HashMap::new()),
             [
                 "//external:pip_numpy",
                 "@pip//numpy:other",
@@ -1640,19 +2014,19 @@ mod tests {
 
         let fine_grained = BTreeSet::from(["@repo".to_owned()]);
         assert_eq!(
-            transform_external_input("@repo//pkg:file", &fine_grained),
+            transform_external_input("@repo//pkg:file", &fine_grained, &HashMap::new()),
             "@repo//pkg:file"
         );
         assert_eq!(
-            transform_external_input("@other//pkg:file", &fine_grained),
+            transform_external_input("@other//pkg:file", &fine_grained, &HashMap::new()),
             "//external:other"
         );
         assert_eq!(
-            transform_external_input("@@other+1.0//pkg:file", &fine_grained),
+            transform_external_input("@@other+1.0//pkg:file", &fine_grained, &HashMap::new()),
             "//external:other+1.0"
         );
         assert_eq!(
-            transform_external_input("@//pkg:file", &fine_grained),
+            transform_external_input("@//pkg:file", &fine_grained, &HashMap::new()),
             "@//pkg:file"
         );
     }

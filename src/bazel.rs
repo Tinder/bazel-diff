@@ -1081,8 +1081,8 @@ fn lower_repositories(
     workspace: &Path,
     transform: &mut impl FnMut(&mut Target),
 ) -> Vec<Target> {
-    // Hidden modules have no root-visible apparent name; canonical names keep their
-    // transitive repository dependencies connected.
+    // A module the root cannot see has no apparent name there; its node is named by canonical
+    // name, matching the `apparent_names` fallback below.
     let node_names = |canonical: &str| {
         canonical_to_apparent
             .get(canonical)

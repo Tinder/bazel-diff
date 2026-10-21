@@ -17,6 +17,6 @@ bazel test //tests:e2e_test_external_bzlmod_override_patch_impacts_consumer \
 ```
 
 Repository input content hashing (#520) covers the patch itself. Cquery uses
-canonical labels, so its synthetic repository dependencies must also resolve
-under canonical names; otherwise the changed repository hash never reaches the
-consumer. This fixture reproduces that missing dependency edge.
+canonical labels, so those inputs must resolve to the synthetic repository nodes
+named by the root's apparent names; otherwise the changed repository hash never
+reaches the consumer. This fixture reproduces that missing dependency edge.

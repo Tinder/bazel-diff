@@ -1,0 +1,9 @@
+module(
+    name = "sdk_rules",
+    version = "1.0",
+)
+
+sdk = use_extension("//:extensions.bzl", "sdk")
+use_repo(sdk, "default_sdk")
+
+register_toolchains("//:sdk_toolchain")

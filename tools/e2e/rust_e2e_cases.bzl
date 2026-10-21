@@ -180,6 +180,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::referenced_failing_extension_fails_without_keep_going",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::rule_bzl_change_is_scoped_to_consumer",
                 "timeout": "moderate",
             },
@@ -197,6 +201,14 @@ RUST_E2E_SUITES = [
             },
             {
                 "name": "regressions::unrelated_macro_does_not_overinvalidate",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::unused_transitive_extension_failure_hides_direct_dependency_change",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::unused_transitive_extension_failure_keeps_bzlmod_repos_hashed",
                 "timeout": "moderate",
             },
             {

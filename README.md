@@ -786,7 +786,7 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "62.0.0")
+bazel_dep(name = "bazel-diff", version = "63.0.0")
 ```
 
 Until `rules_rs` fixes `all_crate_deps(package_name = "")`, copy

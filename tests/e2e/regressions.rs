@@ -619,15 +619,17 @@ fn unused_transitive_extension_failure_keeps_bzlmod_repos_hashed() {
         return;
     }
     let workspace = copy_workspace("unused_transitive_extension");
-    let build = std::process::Command::new(bazel())
-        .args(["build", "//..."])
+    // The build's own loading never reaches the extension. A `deps` query loads the same
+    // packages the build would without needing the toolchain repositories a build fetches.
+    let query = std::process::Command::new(bazel())
+        .args(["query", "deps(//...:all-targets)"])
         .current_dir(workspace.path())
         .output()
-        .expect("run bazel build");
+        .expect("run bazel query");
     assert!(
-        build.status.success(),
-        "the broken extension must not break the build itself: {}",
-        String::from_utf8_lossy(&build.stderr)
+        query.status.success(),
+        "the broken extension must not break loading the workspace itself: {}",
+        String::from_utf8_lossy(&query.stderr)
     );
     let output = workspace.path().join("hashes.json");
     let result = generate(
@@ -667,5 +669,47 @@ fn unused_transitive_extension_failure_hides_direct_dependency_change() {
             .iter()
             .any(|label| label == "//:app" || label == "@@//:app"),
         "{impacted:?}"
+    );
+}
+
+/// The counterpart of the two cases above: once a target does depend on a repository of
+/// the failed extension, the hashes cannot cover that input. `bazel query //...:all-targets`
+/// lists the target without loading its dependencies, so it is bazel-diff that has to say
+/// so: an error under `--no-keep_going`, a warning and a hash set without the input
+/// otherwise.
+#[test]
+fn referenced_failing_extension_fails_without_keep_going() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("unused_transitive_extension");
+    edit(&workspace.path().join("MODULE.bazel"), |text| {
+        text + "\nbazel_dep(name = \"transitive_dep\", version = \"1.0\")\n\
+            broken = use_extension(\"@transitive_dep//:extensions.bzl\", \"broken\")\n\
+            use_repo(broken, \"missing_repo\")\n"
+    });
+    edit(&workspace.path().join("BUILD"), |text| {
+        text
+            + "\nfilegroup(\n    name = \"uses_missing\",\n    srcs = [\"@missing_repo//:x\"],\n)\n"
+    });
+    let output = workspace.path().join("hashes.json");
+    let strict = generate(workspace.path(), &output, &["--no-keep_going"]);
+    assert!(
+        !strict.status.success(),
+        "the missing input must be an error"
+    );
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(
+        stderr.contains("//:uses_missing depends on @missing_repo//:x")
+            && stderr.contains("extensions.bzl%broken"),
+        "{stderr}"
+    );
+    let lenient = generate(workspace.path(), &output, &["--keep_going"]);
+    assert!(lenient.status.success());
+    let hashes = hashes(&output);
+    assert!(
+        hashes.contains_key("//:uses_missing") && hashes.contains_key("//external:direct_dep"),
+        "{:?}",
+        hashes.keys().collect::<Vec<_>>()
     );
 }

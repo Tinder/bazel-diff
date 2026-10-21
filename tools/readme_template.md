@@ -525,21 +525,6 @@ With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 bazel_dep(name = "bazel-diff", version = "{{BAZEL_DIFF_VERSION}}")
 ```
 
-Until `rules_rs` fixes `all_crate_deps(package_name = "")`, copy
-[`rules_rs_package_name.patch`](patches/rules_rs_package_name.patch) into your
-workspace root and add this override to the same `MODULE.bazel`:
-
-```bazel
-single_version_override(
-    module_name = "rules_rs",
-    version = "0.0.112",
-    patch_strip = 1,
-    patches = ["//:rules_rs_package_name.patch"],
-)
-```
-
-Bazel only applies overrides from the root module.
-
 You can now run the tool with:
 
 ```terminal

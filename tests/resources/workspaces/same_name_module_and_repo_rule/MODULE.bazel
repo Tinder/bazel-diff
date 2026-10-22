@@ -1,0 +1,29 @@
+module(
+    name = "same_name_module_and_repo_rule_test",
+    version = "0.0.0",
+)
+
+# Reproducer workspace for https://github.com/Tinder/bazel-diff/issues/535.
+#
+# Two distinct repositories share the bare name `dep`:
+#
+#   root-visible name | canonical name    | source directory
+#   ------------------+-------------------+-----------------
+#   @dep              | +_repo_rules+dep  | primary/
+#   @module_dep       | dep+              | shadow/
+#
+# //:consumer reads @dep only. Once anything touches @module_dep, Bazel
+# materializes `external/dep+`, and fine-grained hashing that guesses the
+# directory from the apparent name picks that unrelated checkout for @dep.
+bazel_dep(name = "dep", version = "1.0", repo_name = "module_dep")
+local_path_override(
+    module_name = "dep",
+    path = "shadow",
+)
+
+local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+
+local_repository(
+    name = "dep",
+    path = "primary",
+)

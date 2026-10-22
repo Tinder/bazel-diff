@@ -1,6 +1,7 @@
 use crate::support::*;
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::Path;
 
 fn diff_workspaces(
     first: &std::path::Path,
@@ -711,5 +712,72 @@ fn referenced_failing_extension_fails_without_keep_going() {
         hashes.contains_key("//:uses_missing") && hashes.contains_key("//external:direct_dep"),
         "{:?}",
         hashes.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Reproducer for https://github.com/Tinder/bazel-diff/issues/535: the root maps the apparent
+/// name `dep` to a repository rule (`+_repo_rules+dep`) and, under the apparent name
+/// `module_dep`, also depends on a *module* named `dep`, whose directory is `external/dep+`.
+/// `//:consumer` reads `@dep` only. Fine-grained hashing guessed the repository's directory
+/// from its apparent name before consulting `bazel mod dump_repo_mapping`, so as soon as
+/// anything materialized the unrelated `external/dep+` -- here a query of `@module_dep` --
+/// `@dep//:data` was hashed from the wrong checkout and `//:consumer` flipped on edits that
+/// cannot reach it.
+#[test]
+fn fine_grained_repo_rule_is_not_shadowed_by_a_same_named_module() {
+    let workspace = copy_workspace("same_name_module_and_repo_rule");
+    let args = ["--fineGrainedHashExternalRepos", "@dep"];
+    let hash = |name: &str| {
+        let output = workspace.path().join(name);
+        assert!(generate(workspace.path(), &output, &args).status.success());
+        output
+    };
+    let impacted_between = |from: &Path, to: &Path| {
+        let result = workspace.path().join("impacted.txt");
+        assert!(impacted(workspace.path(), from, to, &result, &[])
+            .status
+            .success());
+        read_lines(&result)
+    };
+
+    // Nothing in //... reaches @module_dep, so the first hash is taken before Bazel has
+    // materialized `external/dep+`, exactly as the reporter's first measurement was.
+    let before = hash("before.json");
+    let query = std::process::Command::new(bazel())
+        .args(["query", "@module_dep//:data"])
+        .current_dir(workspace.path())
+        .output()
+        .expect("run bazel query");
+    assert!(
+        query.status.success(),
+        "{}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let materialized = hash("materialized.json");
+    assert_eq!(
+        impacted_between(&before, &materialized),
+        BTreeSet::new(),
+        "materializing the unrelated module must not change any hash"
+    );
+
+    // With both directories present: an edit inside the module is invisible to //:consumer...
+    edit(&workspace.path().join("shadow/value.txt"), |text| {
+        text + "edited\n"
+    });
+    let shadow_edited = hash("shadow-edited.json");
+    assert_eq!(
+        impacted_between(&materialized, &shadow_edited),
+        BTreeSet::new()
+    );
+
+    // ...and an edit inside the repository rule's checkout reaches it.
+    edit(&workspace.path().join("primary/value.txt"), |text| {
+        text + "edited\n"
+    });
+    let primary_edited = hash("primary-edited.json");
+    let impacted = impacted_between(&shadow_edited, &primary_edited);
+    assert!(
+        impacted.contains("//:consumer") && impacted.contains("@dep//:data"),
+        "{impacted:?}"
     );
 }

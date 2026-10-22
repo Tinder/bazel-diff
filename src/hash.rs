@@ -1257,20 +1257,27 @@ impl ExternalRepoResolver {
 
     fn resolve_uncached(&self, repo: &str) -> Result<PathBuf> {
         let external = self.output_base.join("external");
-        for candidate in [external.join(repo), external.join(format!("{repo}+"))] {
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-        }
         // Under Bzlmod the directory is named after the canonical repository name
-        // (`rules_req_compile++requirements+pip_deps`), which neither candidate
-        // above guesses. `bazel mod dump_repo_mapping` reports that name directly
-        // and is one invocation for every repository, so prefer it over the
-        // `bazel query` fallback below.
-        if let Some(canonical) = self.repo_mapping().get(repo) {
+        // (`rules_req_compile++requirements+pip_deps`). `bazel mod dump_repo_mapping`
+        // reports that name directly and is one invocation for every repository, so
+        // it is consulted before any guess from the apparent name and before the
+        // `bazel query` fallback below. The mapping has to come first: an apparent
+        // `dep` the root maps to a repository rule (`+_repo_rules+dep`) can coexist
+        // with a *module* named `dep`, whose directory `external/dep+` the guess
+        // below would pick as soon as anything materialized it (#535).
+        let canonical = self.repo_mapping().get(repo);
+        if let Some(canonical) = canonical {
             let candidate = external.join(canonical);
             if candidate.exists() {
                 return Ok(candidate);
+            }
+        } else {
+            // No mapping entry: a WORKSPACE repository, whose directory carries its
+            // own name, or a canonical name given directly (`@@dep+`).
+            for candidate in [external.join(repo), external.join(format!("{repo}+"))] {
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
             }
         }
         let mut command = self.command();
@@ -1296,7 +1303,7 @@ impl ExternalRepoResolver {
                 }
             }
         }
-        Ok(external.join(repo))
+        Ok(external.join(canonical.map(String::as_str).unwrap_or(repo)))
     }
 
     /// Returns the main repository's apparent -> canonical repository mapping,
@@ -2338,15 +2345,113 @@ mod tests {
         let output_base = workspace.path().join("output");
         let external = output_base.join("external");
         fs::create_dir_all(external.join("existing+")).unwrap();
+        fs::create_dir_all(external.join("workspace_repo")).unwrap();
+        let log = workspace.path().join("bazel.log");
+        // No mapping at all, as in a WORKSPACE build: the directory is guessed from the
+        // apparent name, with no `query` fallback for a guess that exists.
+        let bazel = stub_bazel(workspace.path(), &log, "");
         let resolver = ExternalRepoResolver {
             workspace: workspace.path().to_path_buf(),
-            bazel: PathBuf::from("bazel"),
+            bazel,
             output_base,
             ..Default::default()
         };
         assert_eq!(
             resolver.resolve("existing").unwrap(),
             external.join("existing+")
+        );
+        assert_eq!(
+            resolver.resolve("workspace_repo").unwrap(),
+            external.join("workspace_repo")
+        );
+        let invocations = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            invocations.lines().collect::<Vec<_>>(),
+            ["mod dump_repo_mapping "]
+        );
+    }
+
+    /// Tinder/bazel-diff#535: the root maps the apparent `dep` to a repository rule, and a
+    /// module also named `dep` (reachable under another apparent name) has been fetched, so
+    /// `external/dep+` exists next to `external/+_repo_rules+dep`. The mapping decides, not
+    /// the directory a guess from the apparent name happens to find.
+    #[cfg(unix)]
+    #[test]
+    fn external_repo_resolver_prefers_the_repo_mapping_over_a_same_named_module() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        let external = output_base.join("external");
+        fs::create_dir_all(external.join("dep+")).unwrap();
+        fs::create_dir_all(external.join("+_repo_rules+dep")).unwrap();
+        let log = workspace.path().join("bazel.log");
+        let bazel = stub_bazel(
+            workspace.path(),
+            &log,
+            r#"{"dep": "+_repo_rules+dep", "module_dep": "dep+"}"#,
+        );
+        let resolver = ExternalRepoResolver {
+            workspace: workspace.path().to_path_buf(),
+            bazel,
+            output_base,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolver.resolve("dep").unwrap(),
+            external.join("+_repo_rules+dep")
+        );
+        assert_eq!(
+            resolver.resolve("module_dep").unwrap(),
+            external.join("dep+")
+        );
+        // A canonical name given directly is not in the mapping and is found as-is.
+        assert_eq!(resolver.resolve("dep+").unwrap(), external.join("dep+"));
+        let invocations = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            invocations.lines().collect::<Vec<_>>(),
+            ["mod dump_repo_mapping "]
+        );
+    }
+
+    /// The other half of #535: a mapped repository that is not materialized yet is never
+    /// substituted by a same-named module's directory. Resolution goes to `bazel query`,
+    /// and when that has nothing to say either, the mapped canonical name stands.
+    #[cfg(unix)]
+    #[test]
+    fn external_repo_resolver_never_guesses_for_a_mapped_repository() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        let external = output_base.join("external");
+        fs::create_dir_all(external.join("dep+")).unwrap();
+        let log = workspace.path().join("bazel.log");
+        // Answers `mod dump_repo_mapping` with the mapping and `query` with nothing.
+        let bazel = workspace.path().join("stub-bazel");
+        fs::write(
+            &bazel,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {log}\n\
+                 [ \"$1\" = mod ] && echo '{{\"dep\": \"+_repo_rules+dep\"}}'\nexit 0\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bazel, fs::Permissions::from_mode(0o755)).unwrap();
+        let resolver = ExternalRepoResolver {
+            workspace: workspace.path().to_path_buf(),
+            bazel,
+            output_base,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolver.resolve("dep").unwrap(),
+            external.join("+_repo_rules+dep")
+        );
+        let invocations = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            invocations.lines().collect::<Vec<_>>(),
+            [
+                "mod dump_repo_mapping ",
+                "query @dep//... --keep_going --output location",
+            ]
         );
     }
 
@@ -2559,6 +2664,9 @@ mod tests {
             workspace: workspace.path().to_path_buf(),
             bazel: PathBuf::from("bazel"),
             output_base: workspace.path().join("output"),
+            // A WORKSPACE-style repository: no mapping, so `external/ext` is found by name
+            // without reaching for a Bazel binary.
+            repo_mapping: Arc::new(OnceLock::from(HashMap::new())),
             ..Default::default()
         };
         let modified = BTreeSet::new();

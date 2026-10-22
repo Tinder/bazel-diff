@@ -506,12 +506,28 @@ struct HashContext<'a> {
 }
 
 impl HashContext<'_> {
+    fn cached_rule_digest(&self, key: &str) -> Option<&TargetDigest> {
+        self.cache.get(key).or_else(|| {
+            self.rules
+                .get(key)
+                .and_then(|rule| self.cache.get(&rule.rule.name))
+        })
+    }
+
+    fn rule_overall_digest(&mut self, key: &str, path: &mut Vec<String>) -> Result<DigestBytes> {
+        // Parents do not need a cached dependency vector when propagating a child's digest.
+        if let Some(digest) = self.cached_rule_digest(key) {
+            return Ok(digest.overall);
+        }
+        self.rule_digest(key, path).map(|digest| digest.overall)
+    }
+
     /// Digests one rule, named by its key: its label, or under cquery its configured identity
     /// `label|checksum` (see [`crate::bazel::CONFIGURED_SEPARATOR`]). Two configured instances
     /// of one label are two nodes here, each with its own inputs, so an edge from one instance
     /// to the other is a dependency and not a cycle.
     fn rule_digest(&mut self, key: &str, path: &mut Vec<String>) -> Result<TargetDigest> {
-        if let Some(digest) = self.cache.get(key) {
+        if let Some(digest) = self.cached_rule_digest(key) {
             return Ok(digest.clone());
         }
         let rule = self
@@ -520,9 +536,6 @@ impl HashContext<'_> {
             .cloned()
             .ok_or_else(|| anyhow!("Unable to find rule {key}"))?;
         let canonical_key = rule.rule.name.clone();
-        if let Some(digest) = self.cache.get(&canonical_key) {
-            return Ok(digest.clone());
-        }
         if let Some(index) = path.iter().position(|entry| entry == &canonical_key) {
             // A back edge: the query graph can hold cycles a build never sees (rules_go's
             // `go_context_data` and the nogo analyzers reference each other through non-dependency
@@ -600,8 +613,8 @@ impl HashContext<'_> {
                 .resolve_dependency(&encoded_input, input_label, path)
                 .filter(|dependency| dependency != &canonical_key)
             {
-                let digest = self.rule_digest(&dependency, path)?;
-                builder.transitive(&dependency, digest.overall);
+                let digest = self.rule_overall_digest(&dependency, path)?;
+                builder.transitive(&dependency, digest);
             } else if let Some(digest) = self.source_hasher.soft_digest(input_label, &[])? {
                 self.source_digests.insert(input_label.to_owned(), digest);
                 builder.direct(digest);
@@ -625,8 +638,8 @@ impl HashContext<'_> {
                     continue;
                 }
                 builder.direct(package_group.as_bytes());
-                let digest = self.rule_digest(package_group, path)?;
-                builder.transitive(package_group, digest.overall);
+                let digest = self.rule_overall_digest(package_group, path)?;
+                builder.transitive(package_group, digest);
             }
         }
 
@@ -924,6 +937,8 @@ fn rule_inputs<'a>(
     let external_synthetic = rule
         .rule_input
         .iter()
+        // Query already includes these inputs below; cquery needs the synthetic copy.
+        .filter(|input| use_cquery || !input.starts_with("//external:"))
         .map(|input| transform_external_input(input, fine_grained_repos, canonical_repo_nodes))
         .filter(|input| input.starts_with("//external:"));
     let mut inputs = if use_cquery {
@@ -1487,6 +1502,7 @@ mod tests {
     #[test]
     fn canonical_rule_inputs_are_sorted_and_configuration_sensitive() {
         let rule = Rule {
+            rule_input: vec!["//external:repo".into()],
             configured_rule_input: vec![
                 ConfiguredRuleInput {
                     label: Some("//b:b".into()),
@@ -1503,7 +1519,15 @@ mod tests {
         };
         assert_eq!(
             rule_inputs(&rule, true, &BTreeSet::new(), &HashMap::new()),
-            [String::from("//a:a|1"), String::from("//b:b|2")]
+            [
+                String::from("//a:a|1"),
+                String::from("//b:b|2"),
+                String::from("//external:repo"),
+            ]
+        );
+        assert_eq!(
+            rule_inputs(&rule, false, &BTreeSet::new(), &HashMap::new()),
+            ["//external:repo"]
         );
     }
 

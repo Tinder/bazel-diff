@@ -188,6 +188,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::registry_urls_under_the_workspace_do_not_depend_on_its_path",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::rule_bzl_change_is_scoped_to_consumer",
                 "timeout": "moderate",
             },

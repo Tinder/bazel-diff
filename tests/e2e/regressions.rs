@@ -363,6 +363,62 @@ fn single_version_override_patch_change_reaches_consumer_cquery() {
     ]);
 }
 
+/// Regression for https://github.com/Tinder/bazel-diff/issues/544: the local registry lives inside
+/// the workspace, so the `file://` URLs of `dep`'s registry patch and `MODULE.bazel` name each
+/// checkout's absolute path. Two identical checkouts at different paths must impact nothing,
+/// while a changed registry patch, which changes its integrity, still reaches `//:consumer`.
+#[test]
+fn registry_urls_under_the_workspace_do_not_depend_on_its_path() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    // Each workspace is hashed once: Bazel servers keep a local registry's files in memory.
+    let first = copy_workspace("single_version_override_patch");
+    let second = copy_workspace("single_version_override_patch");
+    let changed = copy_workspace("single_version_override_patch");
+    for (workspace, content) in [
+        (first.path(), "v1"),
+        (second.path(), "v1"),
+        (changed.path(), "v2"),
+    ] {
+        write_local_registry(workspace);
+        add_registry_patch(workspace, content);
+    }
+    let impacted = diff_workspaces(first.path(), second.path(), &[]);
+    assert!(impacted.is_empty(), "{impacted:?}");
+
+    let impacted = diff_workspaces(first.path(), changed.path(), &[]);
+    assert!(
+        impacted
+            .iter()
+            .any(|label| label == "//:consumer" || label == "@@//:consumer"),
+        "{impacted:?}"
+    );
+    assert!(!impacted.contains("//:control"), "{impacted:?}");
+}
+
+/// Adds a registry patch that writes `registry.txt` with `content` to `dep`'s `source.json`, as
+/// written by `write_local_registry`.
+fn add_registry_patch(workspace: &Path, content: &str) {
+    use sha2::{Digest, Sha256};
+
+    let module = workspace.join("registry/modules/dep/1.0");
+    let patch = format!("--- /dev/null\n+++ b/registry.txt\n@@ -0,0 +1 @@\n+{content}\n");
+    fs::create_dir_all(module.join("patches")).unwrap();
+    fs::write(module.join("patches/registry.patch"), &patch).unwrap();
+    let source_path = module.join("source.json");
+    let source = fs::read_to_string(&source_path).unwrap();
+    let source = source.trim_end().strip_suffix('}').unwrap();
+    fs::write(
+        &source_path,
+        format!(
+            "{source}, \"patches\": {{\"registry.patch\": \"sha256-{}\"}}, \"patch_strip\": 1}}\n",
+            base64(&Sha256::digest(patch.as_bytes()))
+        ),
+    )
+    .unwrap();
+}
+
 /// Turns the `single_version_override_patch` fixture into a working Bzlmod registry: zips
 /// `dep_src/` into the archive the registry's `source.json` points at (a `file://` URL and its
 /// integrity depend on the temp path, so neither is checked in) and adds the registry to the

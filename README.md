@@ -749,6 +749,9 @@ A few inputs are normalized or extended on the way in:
   contents and executable bits, symlink targets), so an edit inside it impacts its consumers.
 * A **repository rule** (`//external:*`) that pins its download with `sha256` or `integrity` is
   hashed without its `url`/`urls`, since a mirror or registry move cannot change what it fetches.
+  Likewise, the URLs of registry-provided patches, overlay files and `MODULE.bazel` are left out
+  wherever their own integrity pins them, so a `file://%workspace%/...` registry hashes the same
+  in every checkout; the integrity values themselves are still hashed.
   The main-repository files its attributes name -- patches, build files, lock files -- are hashed
   by content, so a changed patch is a changed repository.
   Bzlmod repositories are read from `bazel mod show_repo`, asked for by name in as many

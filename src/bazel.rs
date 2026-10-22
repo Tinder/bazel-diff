@@ -1827,8 +1827,8 @@ fn repository_local_input_labels(repository: &Repository) -> BTreeSet<String> {
 }
 
 /// Digest of a repository's own definition: its rule, its attributes (less the download URLs
-/// when a `sha256`/`integrity` pins what they fetch, as the hasher treats them), and the local
-/// tree and main-repository files behind them.
+/// when a `sha256`/`integrity` pins what they fetch, and the registry URLs their own integrity
+/// pins, as the hasher treats them), and the local tree and main-repository files behind them.
 fn repository_definition_hash(repository: &Repository, workspace: &Path) -> String {
     let pinned = repository.attribute.iter().any(|attribute| {
         matches!(attribute.name.as_str(), "sha256" | "integrity")
@@ -1846,7 +1846,10 @@ fn repository_definition_hash(repository: &Repository, workspace: &Path) -> Stri
             continue;
         }
         encoded.clear();
-        attribute.encode_length_delimited(&mut encoded);
+        match crate::hash::without_integrity_pinned_urls(attribute, &repository.attribute) {
+            Some(stripped) => stripped.encode_length_delimited(&mut encoded),
+            None => attribute.encode_length_delimited(&mut encoded),
+        }
         hasher.update(&encoded);
     }
     hasher.update([0]);
@@ -3344,6 +3347,31 @@ exit 1
         assert_ne!(
             repository_definition_hash(&unpinned, workspace.path()),
             repository_definition_hash(&moved, workspace.path())
+        );
+
+        // So does the checkout path inside a `file://%workspace%` registry's patch URLs, which
+        // their integrity pins; the integrity still counts.
+        let patched = |root: &str, integrity: &str| Repository {
+            repo_rule_name: Some("http_archive".into()),
+            attribute: vec![Attribute {
+                name: "remote_patches".into(),
+                r#type: attribute::Discriminator::StringDict,
+                string_dict_value: vec![crate::proto::blaze_query::StringDictEntry {
+                    key: format!("file://{root}/registry/patches/fix.patch"),
+                    value: integrity.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            repository_definition_hash(&patched("/one", "sha256-p"), workspace.path()),
+            repository_definition_hash(&patched("/two", "sha256-p"), workspace.path())
+        );
+        assert_ne!(
+            repository_definition_hash(&patched("/one", "sha256-p"), workspace.path()),
+            repository_definition_hash(&patched("/one", "sha256-q"), workspace.path())
         );
     }
 

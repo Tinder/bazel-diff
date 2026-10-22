@@ -364,15 +364,18 @@ fn single_version_override_patch_change_reaches_consumer_cquery() {
 }
 
 /// Regression for https://github.com/Tinder/bazel-diff/issues/544: the local registry lives inside
-/// the workspace, so the `file://` URLs of `dep`'s registry patch and `MODULE.bazel` name each
-/// checkout's absolute path. Two identical checkouts at different paths must impact nothing,
-/// while a changed registry patch, which changes its integrity, still reaches `//:consumer`.
+/// the workspace (`write_local_registry` registers it by its absolute path, which is what
+/// `%workspace%` expands to), so the `file://` URLs of `dep`'s registry patch and `MODULE.bazel`
+/// name each checkout's absolute path. Two identical checkouts at different paths must impact
+/// nothing, while a changed registry patch, which changes its integrity, still reaches
+/// `//:consumer`.
 #[test]
 fn registry_urls_under_the_workspace_do_not_depend_on_its_path() {
     if !supports_mod_show_repo() {
         return;
     }
-    // Each workspace is hashed once: Bazel servers keep a local registry's files in memory.
+    // A fresh copy per state instead of editing one in place: a Bazel server caches a local
+    // registry's files and would not see an edited patch.
     let first = copy_workspace("single_version_override_patch");
     let second = copy_workspace("single_version_override_patch");
     let changed = copy_workspace("single_version_override_patch");
@@ -397,8 +400,8 @@ fn registry_urls_under_the_workspace_do_not_depend_on_its_path() {
     assert!(!impacted.contains("//:control"), "{impacted:?}");
 }
 
-/// Adds a registry patch that writes `registry.txt` with `content` to `dep`'s `source.json`, as
-/// written by `write_local_registry`.
+/// Adds a patch that creates `registry.txt` containing `content` to `dep`'s registry entry (the
+/// `source.json` that `write_local_registry` writes).
 fn add_registry_patch(workspace: &Path, content: &str) {
     use sha2::{Digest, Sha256};
 

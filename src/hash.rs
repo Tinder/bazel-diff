@@ -866,7 +866,7 @@ impl EncodeSink for Sha256Sink<'_> {
 
 /// Repository rules (`//external:*`) that pin their download with `sha256` or `integrity` fetch
 /// byte-identical content from any URL, so a mirror or registry move must not impact every
-/// target that depends on the repository. Only such rules get their URL attributes skipped.
+/// target that depends on the repository. Only such rules get their `url`/`urls` skipped.
 fn pins_download_content(rule: &Rule) -> bool {
     rule.name.starts_with("//external:")
         && rule.attribute.iter().any(|attribute| {
@@ -878,16 +878,23 @@ fn pins_download_content(rule: &Rule) -> bool {
         })
 }
 
-/// Registry-provided patches, overlay files and module files carry their own integrity
-/// (`remote_patches` values, `remote_file_integrity`, `remote_module_file_integrity`), so their
-/// URLs cannot change what is fetched either. A `file://%workspace%/...` registry expands to the
-/// checkout's absolute path, so hashing these URLs would hash identical checkouts at different
-/// paths differently. Returns `attribute` without the URLs its repository pins, or `None` when it
-/// is not one of these attributes.
+/// Registry patches, overlay files and the module's `MODULE.bazel` each carry their own integrity
+/// (the `remote_patches` values, `remote_file_integrity`, `remote_module_file_integrity`), so,
+/// like a pinned `url`/`urls`, their URLs cannot change what is fetched. A
+/// `file://%workspace%/...` registry expands to the checkout's absolute path, so hashing these
+/// URLs would give identical checkouts at different paths different hashes. Returns a copy of
+/// `attribute` without the URLs that an integrity in `repository_attributes` pins, or `None` when
+/// `attribute` is none of `remote_patches`, `remote_file_urls` and `remote_module_file_urls`.
 pub(crate) fn without_integrity_pinned_urls(
     attribute: &crate::proto::blaze_query::Attribute,
     repository_attributes: &[crate::proto::blaze_query::Attribute],
 ) -> Option<crate::proto::blaze_query::Attribute> {
+    if !matches!(
+        attribute.name.as_str(),
+        "remote_patches" | "remote_file_urls" | "remote_module_file_urls"
+    ) {
+        return None;
+    }
     let mut stripped = attribute.clone();
     match attribute.name.as_str() {
         "remote_patches" => {
@@ -2995,7 +3002,12 @@ mod tests {
             }
         }
         // A registry inside the workspace, as Bazel expands `file://%workspace%/registry`.
-        fn registry_rule(root: &str, patches: &[(&str, &str)], overlay_integrity: &str) -> Rule {
+        fn registry_rule(
+            root: &str,
+            patches: &[(&str, &str)],
+            overlay_integrity: &str,
+            module_integrity: &str,
+        ) -> Rule {
             Rule {
                 name: "//external:dep".into(),
                 rule_class: "http_archive".into(),
@@ -3017,7 +3029,7 @@ mod tests {
                     Attribute {
                         name: "remote_module_file_integrity".into(),
                         r#type: attribute::Discriminator::String,
-                        string_value: Some("sha256-module".into()),
+                        string_value: Some(module_integrity.into()),
                         ..Default::default()
                     },
                     Attribute {
@@ -3044,47 +3056,70 @@ mod tests {
         }
         let none = HashSet::new();
         let patches = [("a.patch", "sha256-a"), ("b.patch", "sha256-b")];
-        let here = registry_rule("/checkouts/one", &patches, "sha256-overlay");
+        let at = |root: &str, patches: &[(&str, &str)], overlay: &str, module: &str| {
+            rule_definition_digest(&registry_rule(root, patches, overlay, module), &none)
+        };
+        let here = at(
+            "/checkouts/one",
+            &patches,
+            "sha256-overlay",
+            "sha256-module",
+        );
         assert_eq!(
-            rule_definition_digest(&here, &none),
-            rule_definition_digest(
-                &registry_rule("/checkouts/two", &patches, "sha256-overlay"),
-                &none
+            here,
+            at(
+                "/checkouts/two",
+                &patches,
+                "sha256-overlay",
+                "sha256-module"
             )
         );
 
-        // The pins still count: a changed or reordered patch, or a changed overlay file, is a
-        // different repository.
+        // The pins still count: a changed or reordered patch, or a changed overlay file or
+        // MODULE.bazel, is a different repository.
+        let changed_patch = [("a.patch", "sha256-a2"), ("b.patch", "sha256-b")];
+        let reordered = [("b.patch", "sha256-b"), ("a.patch", "sha256-a")];
         for changed in [
-            registry_rule(
+            at(
                 "/checkouts/one",
-                &[("a.patch", "sha256-a2"), ("b.patch", "sha256-b")],
+                &changed_patch,
                 "sha256-overlay",
+                "sha256-module",
             ),
-            registry_rule(
+            at(
                 "/checkouts/one",
-                &[("b.patch", "sha256-b"), ("a.patch", "sha256-a")],
+                &reordered,
                 "sha256-overlay",
+                "sha256-module",
             ),
-            registry_rule("/checkouts/one", &patches, "sha256-overlay2"),
+            at(
+                "/checkouts/one",
+                &patches,
+                "sha256-overlay2",
+                "sha256-module",
+            ),
+            at(
+                "/checkouts/one",
+                &patches,
+                "sha256-overlay",
+                "sha256-module2",
+            ),
         ] {
-            assert_ne!(
-                rule_definition_digest(&here, &none),
-                rule_definition_digest(&changed, &none)
-            );
+            assert_ne!(here, changed);
         }
 
-        // A URL that nothing pins still counts.
-        assert_ne!(
-            rule_definition_digest(
-                &registry_rule("/checkouts/one", &[("a.patch", "")], ""),
-                &none
-            ),
-            rule_definition_digest(
-                &registry_rule("/checkouts/two", &[("a.patch", "")], ""),
-                &none
-            )
-        );
+        // A URL that its integrity does not pin still counts, for each kind on its own.
+        let unpinned_patch = [("a.patch", ""), ("b.patch", "sha256-b")];
+        for (patches, overlay, module) in [
+            (&unpinned_patch[..], "sha256-overlay", "sha256-module"),
+            (&patches[..], "", "sha256-module"),
+            (&patches[..], "sha256-overlay", ""),
+        ] {
+            assert_ne!(
+                at("/checkouts/one", patches, overlay, module),
+                at("/checkouts/two", patches, overlay, module)
+            );
+        }
     }
 
     #[test]

@@ -1826,9 +1826,10 @@ fn repository_local_input_labels(repository: &Repository) -> BTreeSet<String> {
         .collect()
 }
 
-/// Digest of a repository's own definition: its rule, its attributes (less the download URLs
-/// when a `sha256`/`integrity` pins what they fetch, and the registry URLs their own integrity
-/// pins, as the hasher treats them), and the local tree and main-repository files behind them.
+/// Digest of a repository's own definition: its rule, its attributes, and the local tree and
+/// main-repository files behind them. Like the target hasher, it leaves out URLs whose content an
+/// integrity pins: `url`/`urls` under `sha256`/`integrity`, and the URLs
+/// `without_integrity_pinned_urls` drops.
 fn repository_definition_hash(repository: &Repository, workspace: &Path) -> String {
     let pinned = repository.attribute.iter().any(|attribute| {
         matches!(attribute.name.as_str(), "sha256" | "integrity")
@@ -3349,8 +3350,8 @@ exit 1
             repository_definition_hash(&moved, workspace.path())
         );
 
-        // So does the checkout path inside a `file://%workspace%` registry's patch URLs, which
-        // their integrity pins; the integrity still counts.
+        // The digest also ignores the checkout path in a `file://%workspace%` registry's patch
+        // URLs, which their integrity pins; a changed integrity still changes it.
         let patched = |root: &str, integrity: &str| Repository {
             repo_rule_name: Some("http_archive".into()),
             attribute: vec![Attribute {

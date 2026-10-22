@@ -751,6 +751,12 @@ A few inputs are normalized or extended on the way in:
   hashed without its `url`/`urls`, since a mirror or registry move cannot change what it fetches.
   The main-repository files its attributes name -- patches, build files, lock files -- are hashed
   by content, so a changed patch is a changed repository.
+  Bzlmod repositories are read from `bazel mod show_repo`, asked for by name in as many
+  invocations as the platform's command-line limit allows, or in one `--all_repos` invocation
+  when that would take several. The limit is 8191 characters wherever `cmd.exe` is involved --
+  a `--bazelPath` naming a batch file, or Bazelisk running a workspace's `tools/bazel.bat`
+  wrapper -- so on Windows each invocation is given at most 6 KiB of names. Set
+  `BAZEL_DIFF_MOD_ARGUMENT_BYTE_BUDGET` to a byte count to change that on any platform.
 * A **dependency cycle** in the query graph (which a build never sees, but which rules_go's
   `go_context_data` and nogo analyzers form through non-dependency attributes) no longer fails
   hashing. The back edge is hashed from the entered target's own definition, with a one-line

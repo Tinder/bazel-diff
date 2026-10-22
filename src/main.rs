@@ -1540,7 +1540,6 @@ mod tests {
                                 kind: "Rule".into(),
                                 hash: "rule".into(),
                                 direct_hash: "direct".into(),
-                                deps: vec!["//app:source".into()],
                             },
                         ),
                         (
@@ -1549,7 +1548,6 @@ mod tests {
                                 kind: "SourceFile".into(),
                                 hash: "source".into(),
                                 direct_hash: "source".into(),
-                                deps: Vec::new(),
                             },
                         ),
                     ]),
@@ -1578,7 +1576,6 @@ mod tests {
             kind: "Rule".into(),
             hash: hash.into(),
             direct_hash: direct_hash.into(),
-            deps: Vec::new(),
         };
         let from = HashFileData {
             hashes: BTreeMap::from([

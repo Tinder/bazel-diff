@@ -1864,7 +1864,6 @@ mod tests {
             kind: kind.to_owned(),
             hash: value.into(),
             direct_hash: direct.into(),
-            deps: Vec::new(),
         }
     }
 

@@ -225,17 +225,29 @@ fn hash_targets_with_environment(
         package_bzl_seeds(&targets, &source_hasher)?
     };
 
-    let mut decoded_rules = Vec::<(String, Rule, Option<DigestBytes>)>::new();
+    let mut rules = HashMap::<String, Rc<RuleNode>>::with_capacity(definition_digests.len());
+    let mut decoded_rules = Vec::<(String, Rule)>::new();
     let mut source_targets = Vec::new();
     let mut hash_targets = Vec::with_capacity(targets.len());
     for target in targets {
         match target.r#type {
             target::Discriminator::Rule => {
                 if let Some(rule) = target.rule.into_option() {
-                    let name = rule.name.clone();
-                    hash_targets.push(HashTarget::Rule(name.clone()));
-                    let definition_digest = definition_digests.remove(&name);
-                    decoded_rules.push((name, rule, definition_digest));
+                    hash_targets.push(HashTarget::Rule(rule.name.clone()));
+                    // Generated targets are prehashed and deduplicated; raw callers provide no
+                    // digests and retain the ordered fallback below, including duplicate names.
+                    match definition_digests.remove_entry(&rule.name) {
+                        Some((name, definition_digest)) => {
+                            rules.insert(
+                                name,
+                                Rc::new(RuleNode {
+                                    rule,
+                                    definition_digest,
+                                }),
+                            );
+                        }
+                        None => decoded_rules.push((rule.name.clone(), rule)),
+                    }
                 }
             }
             target::Discriminator::GeneratedFile => {
@@ -277,9 +289,8 @@ fn hash_targets_with_environment(
     let processed_rules = hash_pool().install(|| {
         decoded_rules
             .into_par_iter()
-            .map(|(name, rule, definition_digest)| {
-                let definition_digest = definition_digest
-                    .unwrap_or_else(|| rule_definition_digest(&rule, &options.ignored_attributes));
+            .map(|(name, rule)| {
+                let definition_digest = rule_definition_digest(&rule, &options.ignored_attributes);
                 (
                     name,
                     RuleNode {
@@ -290,7 +301,7 @@ fn hash_targets_with_environment(
             })
             .collect::<Vec<_>>()
     });
-    let mut rules = HashMap::<String, Rc<RuleNode>>::with_capacity(processed_rules.len());
+    rules.reserve(processed_rules.len());
     for (name, node) in processed_rules {
         rules.insert(name, Rc::new(node));
     }

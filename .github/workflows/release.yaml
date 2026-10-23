@@ -97,7 +97,13 @@ jobs:
         env:
           # Prevent Git Bash from rewriting Bazel target labels as Windows paths.
           MSYS2_ARG_CONV_EXCL: '//'
-        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} ${{ matrix.bazel_extra_flags }}
+        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} --config=ci ${{ matrix.bazel_extra_flags }}
+      - name: Report Bazel failures
+        if: failure()
+        shell: bash
+        run: |
+          py=$(command -v python3 || command -v python)
+          "$py" tools/report_bazel_failures.py bazel-bep.json
       - name: Check Linux static linking
         if: runner.os == 'Linux'
         run: .github/workflows/assert_static_binary.sh "bazel-bin/release/${{ matrix.asset }}"

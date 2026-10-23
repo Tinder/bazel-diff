@@ -32,10 +32,16 @@ jobs:
             sleep 10
           done
       - uses: actions/checkout@v4
+      # --config=ci writes bazel-bep.json (see .bazelrc). On failure, the report
+      # step prints the stderr of failed actions and the test.log of failed tests
+      # as annotations and a job summary.
       - name: Check Bazel build and tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        run: ~/go/bin/bazelisk test //:rust_tests //:rust_clippy_check //:rust_format_check //tools/... --enable_bzlmod=true --enable_workspace=false
+        run: ~/go/bin/bazelisk test //:rust_tests //:rust_clippy_check //:rust_format_check //tools/... --enable_bzlmod=true --enable_workspace=false --config=ci
+      - name: Report Bazel failures
+        if: failure()
+        run: python3 tools/report_bazel_failures.py bazel-bep.json
 
   rust-candidate-e2e:
     name: Rust candidate E2E
@@ -67,7 +73,10 @@ jobs:
         env:
           # Read twice: by the outer bazelisk, and by the nested one.
           USE_BAZEL_VERSION: '8.x'
-        run: bazelisk test //tests:e2e_test --enable_bzlmod=true --enable_workspace=false
+        run: bazelisk test //tests:e2e_test --enable_bzlmod=true --enable_workspace=false --config=ci
+      - name: Report Bazel failures
+        if: failure()
+        run: python3 tools/report_bazel_failures.py bazel-bep.json
 
   # Check the generated E2E targets and the generator in //tools/e2e.
   e2e-split-regen:
@@ -90,7 +99,10 @@ jobs:
       - name: Check the e2e test split is up to date
         env:
           USE_BAZEL_VERSION: '8.x'
-        run: ~/go/bin/bazelisk test //tools/e2e:regen_check //tools/e2e:split_e2e_tests_test --enable_bzlmod=true --enable_workspace=false --test_output=errors
+        run: ~/go/bin/bazelisk test //tools/e2e:regen_check //tools/e2e:split_e2e_tests_test --enable_bzlmod=true --enable_workspace=false --test_output=errors --config=ci
+      - name: Report Bazel failures
+        if: failure()
+        run: python3 tools/report_bazel_failures.py bazel-bep.json
 
   rust-candidate-msrv:
     name: Rust candidate MSRV
@@ -118,7 +130,10 @@ jobs:
           ~/go/bin/bazelisk build //src:bazel-diff \
             --extra_toolchains=@bd_msrv//rustc:all \
             --output_groups=-clippy_checks,-rustfmt_checks \
-            --enable_bzlmod=true --enable_workspace=false
+            --enable_bzlmod=true --enable_workspace=false --config=ci
+      - name: Report Bazel failures
+        if: failure()
+        run: python3 tools/report_bazel_failures.py bazel-bep.json
 
   # Enforce 90% line coverage for Rust and Go on Linux and macOS.
   coverage:
@@ -155,14 +170,14 @@ jobs:
       - name: Build license target
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        run: ~/go/bin/bazelisk build //:license --enable_bzlmod=true --enable_workspace=false
+        run: ~/go/bin/bazelisk build //:license --enable_bzlmod=true --enable_workspace=false --config=ci
       - name: Run bazel-diff tests with coverage
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
         # Retries guard against transient toolchain/crate fetch errors failing the whole job.
         run: |
           for i in 1 2 3; do
-            ~/go/bin/bazelisk coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false && break
+            ~/go/bin/bazelisk coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false --config=ci && break
             if [ "$i" = 3 ]; then exit 1; fi
             echo "coverage run failed (attempt $i); retrying in 15s..."
             sleep 15
@@ -179,12 +194,15 @@ jobs:
           # Reuse the coverage step's Bazel version and output directory.
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           COVERAGE_THRESHOLD: '90'
-        run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+        run: ~/go/bin/bazelisk run //tools:coverage-check --config=ci -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
       - name: Enforce Go coverage threshold (>= 90% line coverage under tools/go/)
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
         # Enforce coverage for tools/go/ independently of Rust coverage.
-        run: ~/go/bin/bazelisk run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
+        run: ~/go/bin/bazelisk run //tools:coverage-check --config=ci -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
+      - name: Report Bazel failures
+        if: failure()
+        run: python3 tools/report_bazel_failures.py bazel-bep.json
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()
@@ -378,7 +396,7 @@ jobs:
         env:
           # Prevent Git Bash from rewriting Bazel target labels as Windows paths.
           MSYS2_ARG_CONV_EXCL: '//'
-        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} ${{ matrix.bazel_extra_flags }}
+        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} --config=ci ${{ matrix.bazel_extra_flags }}
       - name: Validate Linux release binary
         if: runner.os == 'Linux'
         run: |
@@ -393,8 +411,14 @@ jobs:
       - name: Build Rust binary (linux-arm64)
         if: runner.os == 'Linux'
         run: |
-          bazelisk build //release:bazel-diff-rust --config=release-linux-arm64
+          bazelisk build //release:bazel-diff-rust --config=release-linux-arm64 --config=ci
           .github/workflows/assert_static_binary.sh bazel-bin/release/bazel-diff-rust-linux-arm64
+      - name: Report Bazel failures
+        if: failure()
+        shell: bash
+        run: |
+          py=$(command -v python3 || command -v python)
+          "$py" tools/report_bazel_failures.py bazel-bep.json
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Linux'
         with:

@@ -121,9 +121,10 @@ py_test(
     deps = [":serve_consistency_lib"],
 )
 
-# Parses Bazel build/test logs into the GitHub Actions job summary. The workflow
-# runs this file with python3 after bazel has already failed, so it stays a
-# plain script (no py_binary) and the test imports the same source.
+# Prints the logs of failed actions and tests from a JSON build event file into
+# the GitHub Actions job summary. The workflow runs this file with python3 after
+# bazel has already failed, so it stays a plain script (no py_binary) and the
+# test imports the same source.
 py_library(
     name = "report_bazel_failures_lib",
     srcs = ["report_bazel_failures.py"],

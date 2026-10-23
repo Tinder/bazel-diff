@@ -54,7 +54,7 @@ jobs:
         env:
           USE_BAZEL_VERSION: '9.x'
           COVERAGE_THRESHOLD: '90'
-        run: .github/workflows/run_bazel.sh -- ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+        run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
       - name: Open PR if coverage badge changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

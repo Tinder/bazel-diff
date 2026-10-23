@@ -32,8 +32,9 @@ jobs:
             sleep 10
           done
       - uses: actions/checkout@v4
-      # run_bazel.sh repeats the Bazel log, then prints failed targets and their
-      # test-log excerpts as annotations and a job summary.
+      # run_bazel.sh records a JSON build event file and, on failure, prints the
+      # stderr of failed actions and the test.log of failed tests as annotations
+      # and a job summary.
       - name: Check Bazel build and tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
@@ -192,12 +193,12 @@ jobs:
           # Reuse the coverage step's Bazel version and output directory.
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           COVERAGE_THRESHOLD: '90'
-        run: .github/workflows/run_bazel.sh -- ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+        run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
       - name: Enforce Go coverage threshold (>= 90% line coverage under tools/go/)
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
         # Enforce coverage for tools/go/ independently of Rust coverage.
-        run: .github/workflows/run_bazel.sh -- ~/go/bin/bazelisk run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
+        run: ~/go/bin/bazelisk run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()
@@ -285,14 +286,7 @@ jobs:
         # GitHub Releases downloading Bazel module deps).
         run: |
           for i in 1 2 3; do
-            args=()
-            if [ "$i" -lt 3 ]; then
-              args+=(--no-report)
-            fi
-            if .github/workflows/run_bazel.sh "${args[@]}" -- \
-                ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD); then
-              break
-            fi
+            ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD) && break
             if [ "$i" = 3 ]; then exit 1; fi
             echo "example script failed (attempt $i); retrying in 15s..."
             sleep 15

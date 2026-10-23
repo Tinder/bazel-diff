@@ -877,7 +877,7 @@ impl EncodeSink for Sha256Sink<'_> {
 
 /// Repository rules (`//external:*`) that pin their download with `sha256` or `integrity` fetch
 /// byte-identical content from any URL, so a mirror or registry move must not impact every
-/// target that depends on the repository. Only such rules get their URL attributes skipped.
+/// target that depends on the repository. Only such rules get their `url`/`urls` skipped.
 fn pins_download_content(rule: &Rule) -> bool {
     rule.name.starts_with("//external:")
         && rule.attribute.iter().any(|attribute| {
@@ -889,6 +889,64 @@ fn pins_download_content(rule: &Rule) -> bool {
         })
 }
 
+/// Registry patches, overlay files and the module's `MODULE.bazel` each carry their own integrity
+/// (the `remote_patches` values, `remote_file_integrity`, `remote_module_file_integrity`), so,
+/// like a pinned `url`/`urls`, their URLs cannot change what is fetched. A
+/// `file://%workspace%/...` registry expands to the checkout's absolute path, so hashing these
+/// URLs would give identical checkouts at different paths different hashes. Returns a copy of
+/// `attribute` without the URLs that an integrity in `repository_attributes` pins, or `None` when
+/// `attribute` is none of `remote_patches`, `remote_file_urls` and `remote_module_file_urls`.
+pub(crate) fn without_integrity_pinned_urls(
+    attribute: &crate::proto::blaze_query::Attribute,
+    repository_attributes: &[crate::proto::blaze_query::Attribute],
+) -> Option<crate::proto::blaze_query::Attribute> {
+    if !matches!(
+        attribute.name.as_str(),
+        "remote_patches" | "remote_file_urls" | "remote_module_file_urls"
+    ) {
+        return None;
+    }
+    let mut stripped = attribute.clone();
+    match attribute.name.as_str() {
+        "remote_patches" => {
+            // Entries keep their order, which is the order the patches apply in.
+            for entry in &mut stripped.string_dict_value {
+                if !entry.value.is_empty() {
+                    entry.key.clear();
+                }
+            }
+        }
+        "remote_module_file_urls" => {
+            let pinned = repository_attributes.iter().any(|other| {
+                other.name == "remote_module_file_integrity"
+                    && other
+                        .string_value
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+            });
+            if pinned {
+                stripped.string_list_value.clear();
+            }
+        }
+        "remote_file_urls" => {
+            let pinned = repository_attributes
+                .iter()
+                .filter(|other| other.name == "remote_file_integrity")
+                .flat_map(|other| &other.string_dict_value)
+                .filter(|entry| !entry.value.is_empty())
+                .map(|entry| entry.key.as_str())
+                .collect::<HashSet<_>>();
+            for entry in &mut stripped.string_list_dict_value {
+                if pinned.contains(entry.key.as_str()) {
+                    entry.value.clear();
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(stripped)
+}
+
 fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes {
     let mut hasher = Sha256::new();
     hasher.update(rule.rule_class.as_bytes());
@@ -897,6 +955,10 @@ fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes
         hasher.update(environment_hash.as_bytes());
     }
     let skip_urls = pins_download_content(rule);
+    let repository_attributes = rule
+        .name
+        .starts_with("//external:")
+        .then_some(rule.attribute.as_slice());
     let mut size_cache = SizeCache::new();
     let attributes_are_sorted = rule
         .attribute
@@ -904,13 +966,27 @@ fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes
         .all(|pair| pair[0].name <= pair[1].name);
     if attributes_are_sorted {
         for attribute in &rule.attribute {
-            hash_attribute(attribute, ignored, skip_urls, &mut size_cache, &mut hasher);
+            hash_attribute(
+                attribute,
+                ignored,
+                skip_urls,
+                repository_attributes,
+                &mut size_cache,
+                &mut hasher,
+            );
         }
     } else {
         let mut attributes = rule.attribute.iter().collect::<Vec<_>>();
         attributes.sort_by_key(|attribute| &attribute.name);
         for attribute in attributes {
-            hash_attribute(attribute, ignored, skip_urls, &mut size_cache, &mut hasher);
+            hash_attribute(
+                attribute,
+                ignored,
+                skip_urls,
+                repository_attributes,
+                &mut size_cache,
+                &mut hasher,
+            );
         }
     }
     hasher.finalize().into()
@@ -927,6 +1003,7 @@ fn hash_attribute(
     attribute: &crate::proto::blaze_query::Attribute,
     ignored: &HashSet<String>,
     skip_urls: bool,
+    repository_attributes: Option<&[crate::proto::blaze_query::Attribute]>,
     size_cache: &mut SizeCache,
     hasher: &mut Sha256,
 ) {
@@ -934,6 +1011,12 @@ fn hash_attribute(
         return;
     }
     if skip_urls && matches!(attribute.name.as_str(), "url" | "urls") {
+        return;
+    }
+    if let Some(stripped) = repository_attributes
+        .and_then(|attributes| without_integrity_pinned_urls(attribute, attributes))
+    {
+        stripped.encode_with_cache(size_cache, &mut Sha256Sink(hasher));
         return;
     }
     attribute.encode_with_cache(size_cache, &mut Sha256Sink(hasher));
@@ -2096,6 +2179,7 @@ mod tests {
             &attribute,
             &HashSet::new(),
             false,
+            None,
             &mut SizeCache::new(),
             &mut included,
         );
@@ -2104,6 +2188,7 @@ mod tests {
             &attribute,
             &HashSet::from(["cmd".to_owned()]),
             false,
+            None,
             &mut SizeCache::new(),
             &mut ignored,
         );
@@ -2906,6 +2991,146 @@ mod tests {
             rule_definition_digest(&main_repo, &none),
             rule_definition_digest(&main_repo_moved, &none)
         );
+    }
+
+    #[test]
+    fn external_rule_digest_ignores_registry_urls_pinned_by_their_integrity() {
+        use crate::proto::blaze_query::{StringDictEntry, StringListDictEntry};
+
+        fn dict(name: &str, entries: Vec<(String, String)>) -> Attribute {
+            Attribute {
+                name: name.into(),
+                r#type: attribute::Discriminator::StringDict,
+                string_dict_value: entries
+                    .into_iter()
+                    .map(|(key, value)| StringDictEntry {
+                        key,
+                        value,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        }
+        // A registry inside the workspace, as Bazel expands `file://%workspace%/registry`.
+        fn registry_rule(
+            root: &str,
+            patches: &[(&str, &str)],
+            overlay_integrity: &str,
+            module_integrity: &str,
+        ) -> Rule {
+            Rule {
+                name: "//external:dep".into(),
+                rule_class: "http_archive".into(),
+                attribute: vec![
+                    dict(
+                        "remote_file_integrity",
+                        vec![("BUILD.bazel".into(), overlay_integrity.into())],
+                    ),
+                    Attribute {
+                        name: "remote_file_urls".into(),
+                        r#type: attribute::Discriminator::StringListDict,
+                        string_list_dict_value: vec![StringListDictEntry {
+                            key: "BUILD.bazel".into(),
+                            value: vec![format!("file://{root}/registry/overlay/BUILD.bazel")],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    Attribute {
+                        name: "remote_module_file_integrity".into(),
+                        r#type: attribute::Discriminator::String,
+                        string_value: Some(module_integrity.into()),
+                        ..Default::default()
+                    },
+                    Attribute {
+                        name: "remote_module_file_urls".into(),
+                        r#type: attribute::Discriminator::StringList,
+                        string_list_value: vec![format!("file://{root}/registry/MODULE.bazel")],
+                        ..Default::default()
+                    },
+                    dict(
+                        "remote_patches",
+                        patches
+                            .iter()
+                            .map(|(name, integrity)| {
+                                (
+                                    format!("file://{root}/registry/patches/{name}"),
+                                    (*integrity).into(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                ],
+                ..Default::default()
+            }
+        }
+        let none = HashSet::new();
+        let patches = [("a.patch", "sha256-a"), ("b.patch", "sha256-b")];
+        let at = |root: &str, patches: &[(&str, &str)], overlay: &str, module: &str| {
+            rule_definition_digest(&registry_rule(root, patches, overlay, module), &none)
+        };
+        let here = at(
+            "/checkouts/one",
+            &patches,
+            "sha256-overlay",
+            "sha256-module",
+        );
+        assert_eq!(
+            here,
+            at(
+                "/checkouts/two",
+                &patches,
+                "sha256-overlay",
+                "sha256-module"
+            )
+        );
+
+        // The pins still count: a changed or reordered patch, or a changed overlay file or
+        // MODULE.bazel, is a different repository.
+        let changed_patch = [("a.patch", "sha256-a2"), ("b.patch", "sha256-b")];
+        let reordered = [("b.patch", "sha256-b"), ("a.patch", "sha256-a")];
+        for changed in [
+            at(
+                "/checkouts/one",
+                &changed_patch,
+                "sha256-overlay",
+                "sha256-module",
+            ),
+            at(
+                "/checkouts/one",
+                &reordered,
+                "sha256-overlay",
+                "sha256-module",
+            ),
+            at(
+                "/checkouts/one",
+                &patches,
+                "sha256-overlay2",
+                "sha256-module",
+            ),
+            at(
+                "/checkouts/one",
+                &patches,
+                "sha256-overlay",
+                "sha256-module2",
+            ),
+        ] {
+            assert_ne!(here, changed);
+        }
+
+        // A URL that its integrity does not pin still counts, for each kind on its own.
+        let unpinned_patch = [("a.patch", ""), ("b.patch", "sha256-b")];
+        for (patches, overlay, module) in [
+            (&unpinned_patch[..], "sha256-overlay", "sha256-module"),
+            (&patches[..], "", "sha256-module"),
+            (&patches[..], "sha256-overlay", ""),
+        ] {
+            assert_ne!(
+                at("/checkouts/one", patches, overlay, module),
+                at("/checkouts/two", patches, overlay, module)
+            );
+        }
     }
 
     #[test]

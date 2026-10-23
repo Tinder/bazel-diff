@@ -31,6 +31,12 @@ tasks:
     build_flags:
     - '--legacy_external_runfiles'
     - '--host_platform=@bazel-diff//platforms:windows_msvc'
+    # Keep exec paths under MAX_PATH (rules_rs#270). The root .bazelrc does
+    # this for bazel-diff's own builds, but a dependent's build never reads
+    # it, and the default "x64_windows-opt-exec-..." output directory pushes
+    # the Rust toolchain's rlib paths past 260 characters on Bazel CI.
+    - '--experimental_platform_in_output_dir'
+    - '--experimental_override_name_platform_in_output_dir=@bazel-diff//platforms:windows_msvc=w'
     build_targets:
     - '@bazel-diff//:bazel-diff'
     - '@bazel-diff//:bazel-diff-rust'
@@ -41,6 +47,12 @@ tasks:
     build_flags:
     - '--legacy_external_runfiles'
     - '--host_platform=@bazel-diff//platforms:windows_msvc'
+    # Keep exec paths under MAX_PATH (rules_rs#270). The root .bazelrc does
+    # this for bazel-diff's own builds, but a dependent's build never reads
+    # it, and the default "x64_windows-opt-exec-..." output directory pushes
+    # the Rust toolchain's rlib paths past 260 characters on Bazel CI.
+    - '--experimental_platform_in_output_dir'
+    - '--experimental_override_name_platform_in_output_dir=@bazel-diff//platforms:windows_msvc=w'
     build_targets:
     - '@bazel-diff//:bazel-diff'
     - '@bazel-diff//:bazel-diff-rust'

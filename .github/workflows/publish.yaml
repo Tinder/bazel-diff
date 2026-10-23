@@ -15,11 +15,20 @@ on:
         description: git tag being released
         required: true
         type: string
+      templates_ref:
+        description: >-
+          git ref to read the .bcr templates from instead of tag_name. Use it to
+          republish a release whose presubmit.yml or other templates had errors;
+          the publish force-pushes the existing registry PR branch, which also
+          re-runs its presubmit.
+        required: false
+        type: string
 jobs:
   publish:
     uses: bazel-contrib/publish-to-bcr/.github/workflows/publish.yaml@v1.2.0
     with:
       tag_name: ${{ inputs.tag_name }}
+      templates_ref: ${{ inputs.templates_ref }}
       # GitHub repository which is a fork of the upstream where the Pull Request will be opened.
       registry_fork: maxwellE/bazel-central-registry
       attest: true

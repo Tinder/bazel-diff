@@ -6,6 +6,10 @@ on:
       tag_name:
         required: true
         type: string
+      attest:
+        required: false
+        type: boolean
+        default: true
     secrets:
       BCR_PUBLISH_TOKEN:
         required: true
@@ -15,14 +19,31 @@ on:
         description: git tag being released
         required: true
         type: string
+      templates_ref:
+        description: >-
+          git ref to read the .bcr templates from instead of tag_name. Use it to
+          republish a release whose presubmit.yml or other templates had errors;
+          the publish force-pushes the existing registry PR branch, which also
+          re-runs its presubmit.
+        required: false
+        type: string
+      attest:
+        description: >-
+          Attest the registry entry and upload the attestations to the release.
+          Turn off when republishing an already-published release: releases are
+          immutable, so the upload cannot replace the existing attestation assets.
+        required: false
+        type: boolean
+        default: true
 jobs:
   publish:
     uses: bazel-contrib/publish-to-bcr/.github/workflows/publish.yaml@v1.2.0
     with:
       tag_name: ${{ inputs.tag_name }}
+      templates_ref: ${{ inputs.templates_ref }}
       # GitHub repository which is a fork of the upstream where the Pull Request will be opened.
       registry_fork: maxwellE/bazel-central-registry
-      attest: true
+      attest: ${{ inputs.attest }}
       author_name: Maxwell Elliott
       author_email: maxwell@elliott.now
       committer_name: Maxwell Elliott

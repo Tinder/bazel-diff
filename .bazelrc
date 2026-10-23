@@ -38,3 +38,9 @@ coverage --coverage_output_generator=//tools/coverage:lcov_merger
 
 # Optional longer timeout for local nested-Bazel integration tests.
 test:no-test-timeouts --test_timeout=21600
+
+# CI writes a JSON build event file so a failed job can print the stderr of
+# failed actions and the test.log of failed tests (tools/report_bazel_failures.py).
+# The relative path resolves against the workspace; bazel-* is gitignored.
+common:ci --build_event_json_file=bazel-bep.json
+common:ci --build_event_json_file_path_conversion=false

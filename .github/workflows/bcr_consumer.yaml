@@ -50,6 +50,4 @@ jobs:
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
         # Keep in sync with the build_targets in .bcr/presubmit.yml.
-        # The consumer module is not the repo root, so invoke the wrapper by its
-        # workspace path. It forwards the bazelisk arguments unchanged.
-        run: "$GITHUB_WORKSPACE/.github/workflows/run_bazel.sh" -- ~/go/bin/bazelisk build @bazel-diff//:bazel-diff @bazel-diff//:bazel-diff-rust
+        run: ~/go/bin/bazelisk build @bazel-diff//:bazel-diff @bazel-diff//:bazel-diff-rust

@@ -140,7 +140,10 @@ class TestFailureTest(unittest.TestCase):
     def test_passing_and_flaky_tests_are_not_failures(self):
         report = parse_bep(PASSING_TEST_BEP, read_log=lambda path: None)
         self.assertEqual(report.failures, [])
-        self.assertEqual(report.notes, ["build finished: SUCCESS"])
+        self.assertEqual(
+            report.notes,
+            ["build finished: SUCCESS", "The last Bazel invocation succeeded; the job failed in another step."],
+        )
 
         flaky = _bep(
             _test_result("//src:rust_tests", "FAILED", "file:///tmp/a1/test.log", attempt=1),
@@ -362,12 +365,17 @@ class MainTest(unittest.TestCase):
             self.assertIn("## Bazel failures", markdown)
             self.assertIn("panicked at src/hash.rs:88:9", markdown)
 
-    def test_missing_bep_file_is_an_error(self):
+    def test_missing_bep_file_is_not_an_error(self):
+        # The report step runs on any job failure, including ones before Bazel ran.
         stderr = StringIO()
         with redirect_stdout(StringIO()), redirect_stderr(stderr):
             status = main(["/no/such/bep.json"])
-        self.assertEqual(status, 2)
-        self.assertIn("cannot read", stderr.getvalue())
+        self.assertEqual(status, 0)
+        self.assertIn("Bazel may not have run", stderr.getvalue())
+
+    def test_usage_error(self):
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            self.assertEqual(main([]), 2)
 
 
 if __name__ == "__main__":

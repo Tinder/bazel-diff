@@ -7,8 +7,9 @@ with the path of its stderr, and every test attempt with the path of its
 `test.log`. Reading those from `--build_event_json_file` takes no guessing
 about the shape of Bazel's console output.
 
-The CI wrapper, .github/workflows/run_bazel.sh, adds that flag to the Bazel
-command and runs this script when the command fails. The script renders:
+CI runs Bazel with `--config=ci`, which .bazelrc maps to
+`--build_event_json_file=bazel-bep.json`, and each job ends with an
+`if: failure()` step that runs this script on that file. The script renders:
 
 * a text block for the end of the Actions log
 * `::error::` annotations, which Actions shows at the top of the failed step
@@ -17,8 +18,9 @@ command and runs this script when the command fails. The script renders:
 Usage:
     report_bazel_failures.py BUILD_EVENT_JSON_FILE
 
-The process exits 0 whenever the file could be read. Callers keep Bazel's own
-exit status.
+The process exits 0 whenever it ran at all, including when the file is
+missing (the job failed before Bazel ran). A failing report step would only
+hide the step that failed.
 """
 
 import json
@@ -164,6 +166,8 @@ def parse_bep(text: str, read_log: "LogReader | None" = None) -> Report:
         # With failures listed, the message only repeats the first of them.
         note = _join("build finished", name)
         notes.append(note if failures else _join(note, message))
+        if name == "SUCCESS" and not failures:
+            notes.append("The last Bazel invocation succeeded; the job failed in another step.")
     if malformed:
         notes.append(f"{malformed} unreadable line(s) in the build event file were skipped.")
     return Report(failures, _dedupe(notes)[:_MAX_NOTES])
@@ -177,7 +181,7 @@ def render_text(report: Report) -> str:
         lines.append("")
     shown = _limited(report.failures)
     if not shown:
-        lines.append("The command failed, but the build event file names no failed action or test.")
+        lines.append("The build event file names no failed action or test.")
     for failure in shown:
         lines.append(_heading(failure))
         for name, path in failure.logs:
@@ -198,7 +202,7 @@ def render_markdown(report: Report) -> str:
         out.append("")
     shown = _limited(report.failures)
     if not shown:
-        out.append("The command failed, but the build event file names no failed action or test.")
+        out.append("The build event file names no failed action or test.")
         out.append("")
     for failure in shown:
         title = _heading(failure).replace("`", "'")
@@ -238,8 +242,8 @@ def main(argv: "list[str] | None" = None) -> int:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             text = handle.read()
     except OSError as exc:
-        print(f"error: cannot read {path}: {exc}", file=sys.stderr)
-        return 2
+        print(f"no build event file to report from ({exc}); Bazel may not have run", file=sys.stderr)
+        return 0
 
     report = parse_bep(text)
     sys.stdout.write(render_text(report))

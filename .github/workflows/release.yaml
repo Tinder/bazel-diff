@@ -22,11 +22,8 @@ jobs:
       release_files: archives/*.*
       # Exclude the nested-Bazel E2E suite. The reusable workflow appends cache
       # flags, so this command must not end with a `--` target terminator.
-      # run_bazel.sh inserts --build_event_json_file after `test`, forwards every
-      # other argument including those appended flags, and prints the logs of
-      # failed actions and tests when the run fails.
       bazel_test_command: >-
-        .github/workflows/run_bazel.sh -- bazel test //src/... //tools/... //:rust_clippy_check //:rust_format_check
+        bazel test //src/... //tools/... //:rust_clippy_check //:rust_format_check
         --build_tests_only --test_output=errors
       prerelease: false
       draft: true
@@ -100,7 +97,13 @@ jobs:
         env:
           # Prevent Git Bash from rewriting Bazel target labels as Windows paths.
           MSYS2_ARG_CONV_EXCL: '//'
-        run: .github/workflows/run_bazel.sh -- bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} ${{ matrix.bazel_extra_flags }}
+        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} --config=ci ${{ matrix.bazel_extra_flags }}
+      - name: Report Bazel failures
+        if: failure()
+        shell: bash
+        run: |
+          py=$(command -v python3 || command -v python)
+          "$py" tools/report_bazel_failures.py bazel-bep.json
       - name: Check Linux static linking
         if: runner.os == 'Linux'
         run: .github/workflows/assert_static_binary.sh "bazel-bin/release/${{ matrix.asset }}"

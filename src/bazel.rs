@@ -201,13 +201,14 @@ impl BazelOptions {
     }
 
     pub fn query_all_targets(&self) -> Result<Vec<Target>> {
-        self.query_all_targets_with(|_| {})
+        let (targets, _module_graph_json) = self.query_all_targets_with(|_| {})?;
+        Ok(targets)
     }
 
     pub(crate) fn query_all_targets_with(
         &self,
         mut transform: impl FnMut(&mut Target),
-    ) -> Result<Vec<Target>> {
+    ) -> Result<(Vec<Target>, Option<String>)> {
         let mut bzlmod = BzlmodRepos::default();
         let mut version = None;
         let (bzlmod_enabled, root_mapping) = self.probe_bzlmod();
@@ -239,6 +240,7 @@ impl BazelOptions {
             targets: bzlmod_repos,
             failed_extensions,
             canonical_to_apparent,
+            module_graph_json,
         } = bzlmod;
         let targets = self.collect_all_targets(bzlmod_repos, |expression, use_cquery| {
             self.query_with(expression, use_cquery, version, &mut transform)
@@ -248,7 +250,7 @@ impl BazelOptions {
             &failed_extensions,
             &canonical_to_apparent,
         )?;
-        Ok(targets)
+        Ok((targets, module_graph_json))
     }
 
     fn collect_all_targets(
@@ -399,6 +401,7 @@ impl BazelOptions {
             targets,
             failed_extensions: failed,
             canonical_to_apparent,
+            module_graph_json: module_graph,
         })
     }
 
@@ -1173,6 +1176,8 @@ struct BzlmodRepos {
     failed_extensions: BTreeSet<String>,
     /// The root module's repository mapping, canonical name -> apparent names.
     canonical_to_apparent: BTreeMap<String, Vec<String>>,
+    /// The accepted module graph, shared by repository edges and hash-file metadata.
+    module_graph_json: Option<String>,
 }
 
 /// What a failed `bazel mod` invocation said about module extensions.

@@ -117,7 +117,6 @@ pub struct TargetHash {
     pub kind: String,
     pub hash: Digest,
     pub direct_hash: Digest,
-    pub deps: Vec<String>,
 }
 
 impl TargetHash {
@@ -135,7 +134,6 @@ impl TargetHash {
             kind: kind.to_owned(),
             hash: Digest::parse(hash),
             direct_hash: Digest::parse(direct_hash),
-            deps: Vec::new(),
         })
     }
 
@@ -674,7 +672,6 @@ mod tests {
             kind: kind.to_owned(),
             hash: hash.into(),
             direct_hash: direct.into(),
-            deps: Vec::new(),
         }
     }
 

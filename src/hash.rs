@@ -394,15 +394,7 @@ fn hash_targets_with_environment(
         };
         digests.push((key, kind, digest));
     }
-    let hashes = aggregate_by_label(digests);
-    let dep_edges = if options.track_deps {
-        hashes
-            .iter()
-            .map(|(label, hash)| (label.clone(), hash.deps.clone()))
-            .collect()
-    } else {
-        BTreeMap::new()
-    };
+    let (hashes, dep_edges) = aggregate_by_label(digests, options.track_deps);
     Ok(HashFileData {
         hashes,
         module_graph_json,
@@ -438,32 +430,41 @@ fn configured_label_instances<'a>(
 /// instance changes the label, and its dependency edges are the union of its instances'.
 fn aggregate_by_label(
     digests: Vec<(String, &'static str, TargetDigest)>,
-) -> BTreeMap<String, TargetHash> {
+    track_deps: bool,
+) -> (BTreeMap<String, TargetHash>, BTreeMap<String, Vec<String>>) {
     let mut digests = digests
         .into_iter()
         .map(|(key, kind, digest)| (target_label(&key).len(), key, kind, digest))
         .collect::<Vec<_>>();
     digests.sort_by(|a, b| a.1[..a.0].cmp(&b.1[..b.0]).then_with(|| a.1.cmp(&b.1)));
     let mut hashes = BTreeMap::new();
+    let mut dep_edges = BTreeMap::new();
+    let mut insert_label = |instances| {
+        let (label, hash, deps) = label_hash(instances);
+        if track_deps {
+            dep_edges.insert(label.clone(), deps);
+        }
+        hashes.insert(label, hash);
+    };
     let mut instances = Vec::<(String, &'static str, TargetDigest)>::new();
     for (label_length, key, kind, digest) in digests {
         if instances
             .last()
             .is_some_and(|last| target_label(&last.0) != &key[..label_length])
         {
-            let (label, hash) = label_hash(std::mem::take(&mut instances));
-            hashes.insert(label, hash);
+            insert_label(std::mem::take(&mut instances));
         }
         instances.push((key, kind, digest));
     }
     if !instances.is_empty() {
-        let (label, hash) = label_hash(instances);
-        hashes.insert(label, hash);
+        insert_label(instances);
     }
-    hashes
+    (hashes, dep_edges)
 }
 
-fn label_hash(mut instances: Vec<(String, &'static str, TargetDigest)>) -> (String, TargetHash) {
+fn label_hash(
+    mut instances: Vec<(String, &'static str, TargetDigest)>,
+) -> (String, TargetHash, Vec<String>) {
     let label = target_label(&instances[0].0).to_owned();
     let kind = instances[0].1;
     let (overall, direct) = if let [(_, _, digest)] = instances.as_slice() {
@@ -494,8 +495,8 @@ fn label_hash(mut instances: Vec<(String, &'static str, TargetDigest)>) -> (Stri
             kind: kind.to_owned(),
             hash: overall.into(),
             direct_hash: direct.into(),
-            deps,
         },
+        deps,
     )
 }
 
@@ -2465,20 +2466,18 @@ esac
         fs::create_dir_all(output_base.join("external")).unwrap();
         let options = hash_options(workspace.path());
 
-        let baseline = hash_targets_for_test(&options, cyclic_targets("a", "b"), &output_base)
-            .unwrap()
-            .hashes;
+        let baseline =
+            hash_targets_for_test(&options, cyclic_targets("a", "b"), &output_base).unwrap();
         // The query order is arbitrary; the hashes must not depend on it.
         let mut reversed = cyclic_targets("a", "b");
         reversed.reverse();
-        let shuffled = hash_targets_for_test(&options, reversed, &output_base)
-            .unwrap()
-            .hashes;
-        assert_eq!(baseline, shuffled);
+        let shuffled = hash_targets_for_test(&options, reversed, &output_base).unwrap();
+        assert_eq!(baseline.hashes, shuffled.hashes);
+        assert_eq!(baseline.dep_edges, shuffled.dep_edges);
         // The dependency edges inside the cycle survive for distance metrics and `explain`.
-        assert_eq!(baseline["//:a"].deps, ["//:b"]);
-        assert_eq!(baseline["//:b"].deps, ["//:a"]);
-        assert_eq!(baseline["//:consumer"].deps, ["//:a"]);
+        assert_eq!(baseline.dep_edges["//:a"], ["//:b"]);
+        assert_eq!(baseline.dep_edges["//:b"], ["//:a"]);
+        assert_eq!(baseline.dep_edges["//:consumer"], ["//:a"]);
 
         // A change to either member reaches both members and everything downstream.
         for changed in [cyclic_targets("a2", "b"), cyclic_targets("a", "b2")] {
@@ -2486,7 +2485,7 @@ esac
                 .unwrap()
                 .hashes;
             for label in ["//:a", "//:b", "//:consumer"] {
-                assert_ne!(hashes[label].hash, baseline[label].hash, "{label}");
+                assert_ne!(hashes[label].hash, baseline.hashes[label].hash, "{label}");
             }
         }
     }

@@ -124,8 +124,8 @@ struct SourceTarget {
 }
 
 /// Wall-clock breakdown of one hash generation, in pipeline order: the `bazel query` for all
-/// targets (including proto parsing), the `bazel mod graph --output=json` call (0 when Bzlmod is
-/// off), and seeding plus hashing every source file and target.
+/// targets (including proto parsing), obtaining the module graph for metadata, and seeding plus
+/// hashing every source file and target.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GenerationTimings {
     pub bazel_query_millis: u64,
@@ -144,7 +144,7 @@ pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
 pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, GenerationTimings)> {
     let mut definition_digests = HashMap::new();
     let query_started = Instant::now();
-    let targets = options.bazel.query_all_targets_with(|target| {
+    let (targets, module_graph_json) = options.bazel.query_all_targets_with(|target| {
         let Some(rule) = target.rule.as_option_mut() else {
             return;
         };
@@ -157,24 +157,26 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
     // The query is the phase worth cancelling; a request abandoned during it stops here instead
     // of hashing targets nobody will read.
     options.bazel.check_cancelled()?;
-    let (data, mut timings) = hash_targets_with_digests(options, targets, definition_digests)?;
+    let (data, mut timings) =
+        hash_targets_with_digests(options, targets, definition_digests, module_graph_json)?;
     timings.bazel_query_millis = bazel_query_millis;
     Ok((data, timings))
 }
 
 pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashFileData> {
-    hash_targets_with_digests(options, targets, HashMap::new()).map(|(data, _)| data)
+    hash_targets_with_digests(options, targets, HashMap::new(), None).map(|(data, _)| data)
 }
 
 fn hash_targets_with_digests(
     options: &HashOptions,
     targets: Vec<Target>,
     definition_digests: HashMap<String, DigestBytes>,
+    module_graph_json: Option<String>,
 ) -> Result<(HashFileData, GenerationTimings)> {
     let hash_started = Instant::now();
     let external_resolver = ExternalRepoResolver::new(&options.bazel)?;
     let module_graph_started = Instant::now();
-    let module_graph_json = options.bazel.module_graph_json();
+    let module_graph_json = module_graph_json.or_else(|| options.bazel.module_graph_json());
     options.bazel.check_cancelled()?;
     let module_graph_millis = elapsed_millis(module_graph_started);
     let data = hash_targets_with_environment(
@@ -1597,6 +1599,63 @@ mod tests {
             r#type: attribute::Discriminator::StringList,
             string_list_value: values.iter().map(|value| (*value).to_owned()).collect(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn generation_reuses_accepted_module_graph() {
+        let graph = r#"{"key":"<root>","name":"root","dependencies":[]}"#;
+        for extension_failure in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let script = workspace.path().join("fake-bazel.sh");
+            let graph_result = if extension_failure {
+                "echo 'ERROR: Results may be incomplete as 1 extension failed.' >&2; exit 2"
+            } else {
+                "exit 0"
+            };
+            fs::write(
+                &script,
+                format!(
+                    r#"#!/bin/sh
+case "$1 $2" in
+  "mod dump_repo_mapping") printf '%s\n' '{{}}' ;;
+  "mod graph")
+    printf '%s\n' graph >> "$PWD/graph-calls"
+    printf '%s\n' '{graph}'
+    {graph_result}
+    ;;
+  "version ") printf '%s\n' 'Build label: 8.7.0' ;;
+  "info output_base") printf '%s\n' "$PWD" ;;
+  "query "*) exit 0 ;;
+  *) exit 80 ;;
+esac
+"#,
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut options = hash_options(workspace.path());
+            options.bazel.bazel = script;
+            options.bazel.no_bazelrc = false;
+            let calls = workspace.path().join("graph-calls");
+
+            let generated = generate_hashes(&options).unwrap();
+            assert!(generated.hashes.is_empty());
+            assert_eq!(generated.module_graph_json.as_deref(), Some(graph));
+            assert_eq!(
+                fs::read_to_string(&calls).unwrap().lines().count(),
+                1,
+                "extension_failure={extension_failure}"
+            );
+
+            let direct = hash_targets(&options, Vec::new()).unwrap();
+            assert_eq!(direct.module_graph_json, generated.module_graph_json);
+            assert_eq!(
+                fs::read_to_string(&calls).unwrap().lines().count(),
+                2,
+                "direct hashing still reads the graph"
+            );
         }
     }
 

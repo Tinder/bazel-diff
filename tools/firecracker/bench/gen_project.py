@@ -37,7 +37,7 @@ from pathlib import Path
 
 # Bazel version the generated workspace pins. Kept in sync with the repo root
 # .bazelversion so a single bazelisk install serves both.
-DEFAULT_BAZEL_VERSION = "8.5.1"
+DEFAULT_BAZEL_VERSION = "8.8.2"
 
 
 def _layer_of(i: int, packages: int, layers: int) -> int:

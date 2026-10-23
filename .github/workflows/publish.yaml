@@ -6,10 +6,6 @@ on:
       tag_name:
         required: true
         type: string
-      attest:
-        required: false
-        type: boolean
-        default: true
     secrets:
       BCR_PUBLISH_TOKEN:
         required: true
@@ -27,14 +23,6 @@ on:
           re-runs its presubmit.
         required: false
         type: string
-      attest:
-        description: >-
-          Attest the registry entry and upload the attestations to the release.
-          Turn off when republishing an already-published release: releases are
-          immutable, so the upload cannot replace the existing attestation assets.
-        required: false
-        type: boolean
-        default: true
 jobs:
   publish:
     uses: bazel-contrib/publish-to-bcr/.github/workflows/publish.yaml@v1.2.0
@@ -43,7 +31,7 @@ jobs:
       templates_ref: ${{ inputs.templates_ref }}
       # GitHub repository which is a fork of the upstream where the Pull Request will be opened.
       registry_fork: maxwellE/bazel-central-registry
-      attest: ${{ inputs.attest }}
+      attest: true
       author_name: Maxwell Elliott
       author_email: maxwell@elliott.now
       committer_name: Maxwell Elliott

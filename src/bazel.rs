@@ -1351,17 +1351,23 @@ fn lower_repositories(
         if let Some(repos) = module_extension_repos.get(canonical) {
             dependencies.extend(repos.iter().cloned());
         }
-        if let Some(spokes) = extension_repo_parts(canonical)
+        let spokes = extension_repo_parts(canonical)
             .filter(|_| extension_edges.is_some_and(|imported| imported.contains(canonical)))
-            .and_then(|(_, extension)| extension_spokes.get(extension))
-        {
-            dependencies.extend(spokes.iter().cloned());
-        }
+            .and_then(|(_, extension)| extension_spokes.get(extension));
+        let dependencies = if dependencies.is_empty() {
+            // Reuse the shared sorted set when it is the complete dependency list.
+            spokes.unwrap_or(&dependencies)
+        } else {
+            if let Some(spokes) = spokes {
+                dependencies.extend(spokes.iter().cloned());
+            }
+            &dependencies
+        };
         for apparent in node_names(canonical) {
             let mut target = repository_target(
                 &repository,
                 &apparent,
-                &dependencies,
+                dependencies,
                 owner_definition_hash,
                 workspace,
             );

@@ -37,7 +37,15 @@ jobs:
         # Retries guard against transient toolchain/crate fetch errors failing the daily cron.
         run: |
           for i in 1 2 3; do
-            ~/go/bin/bazelisk coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... --enable_bzlmod=true --enable_workspace=false && break
+            args=()
+            if [ "$i" -lt 3 ]; then
+              args+=(--no-report)
+            fi
+            if .github/workflows/run_bazel.sh "${args[@]}" -- \
+                ~/go/bin/bazelisk coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... \
+                --enable_bzlmod=true --enable_workspace=false; then
+              break
+            fi
             if [ "$i" = 3 ]; then exit 1; fi
             echo "coverage run failed (attempt $i); retrying in 15s..."
             sleep 15
@@ -46,7 +54,7 @@ jobs:
         env:
           USE_BAZEL_VERSION: '9.x'
           COVERAGE_THRESHOLD: '90'
-        run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+        run: .github/workflows/run_bazel.sh -- ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
       - name: Open PR if coverage badge changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

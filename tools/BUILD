@@ -120,3 +120,20 @@ py_test(
     python_version = "PY3",
     deps = [":serve_consistency_lib"],
 )
+
+# Parses Bazel build/test logs into the GitHub Actions job summary. The workflow
+# runs this file with python3 after bazel has already failed, so it stays a
+# plain script (no py_binary) and the test imports the same source.
+py_library(
+    name = "report_bazel_failures_lib",
+    srcs = ["report_bazel_failures.py"],
+    imports = ["."],
+    visibility = ["//visibility:private"],
+)
+
+py_test(
+    name = "report_bazel_failures_test",
+    srcs = ["report_bazel_failures_test.py"],
+    python_version = "PY3",
+    deps = [":report_bazel_failures_lib"],
+)

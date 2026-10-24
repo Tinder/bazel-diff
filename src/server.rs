@@ -1422,6 +1422,13 @@ fn configuration_fingerprint(config: &ServerConfig) -> String {
             .collect::<Vec<_>>()
             .join(","),
         options
+            .bazel
+            .label_only_module_extensions
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(","),
+        options
             .ignored_attributes
             .iter()
             .cloned()
@@ -1819,6 +1826,7 @@ mod tests {
                     cquery_expression: None,
                     keep_going: false,
                     fine_grained_external_repos: BTreeSet::new(),
+                    label_only_module_extensions: BTreeSet::new(),
                     exclude_external_targets: false,
                     exclude_targets_query: None,
                     no_bazelrc: false,
@@ -2094,6 +2102,14 @@ mod tests {
             .seed_filepaths
             .insert(PathBuf::from("seed.txt"));
         assert_ne!(configuration_fingerprint(&seeded), base_fingerprint);
+
+        let mut label_only = base.clone();
+        label_only
+            .hash_options
+            .bazel
+            .label_only_module_extensions
+            .insert("@rules_rs//rs:extensions.bzl%crate".to_owned());
+        assert_ne!(configuration_fingerprint(&label_only), base_fingerprint);
 
         let mut always_affected = base;
         always_affected

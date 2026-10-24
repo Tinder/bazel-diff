@@ -113,6 +113,16 @@ struct HashingArgs {
     fine_grained_hash_external_repos_file: Option<PathBuf>,
 
     #[arg(
+        long = "labelOnlyModuleExtensions",
+        value_delimiter = ',',
+        help = "Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories use each \
+                other only through labels, never by resolving a toolchain from one another. A \
+                fine-grained target in one of their repositories then does not change whenever any \
+                other repository of the extension does"
+    )]
+    label_only_module_extensions: Vec<String>,
+
+    #[arg(
         long = "useCquery",
         action = ArgAction::Set,
         num_args = 0..=1,
@@ -514,6 +524,7 @@ fn bazel_options(args: &HashingArgs, verbose: bool) -> Result<BazelOptions> {
         cquery_expression: args.cquery_expression.clone(),
         keep_going: args.keep_going,
         fine_grained_external_repos: repos,
+        label_only_module_extensions: args.label_only_module_extensions.iter().cloned().collect(),
         exclude_external_targets: args.exclude_external_targets,
         exclude_targets_query: args.exclude_targets_query.clone(),
         no_bazelrc: false,
@@ -679,6 +690,7 @@ fn get_bazel_options(args: &GetImpactedTargetsArgs, verbose: bool) -> BazelOptio
         cquery_expression: None,
         keep_going: false,
         fine_grained_external_repos: BTreeSet::new(),
+        label_only_module_extensions: BTreeSet::new(),
         exclude_external_targets: false,
         exclude_targets_query: None,
         no_bazelrc: args.no_bazelrc,
@@ -966,6 +978,7 @@ mod tests {
             cquery_command_options: Vec::new(),
             fine_grained_hash_external_repos: Vec::new(),
             fine_grained_hash_external_repos_file: None,
+            label_only_module_extensions: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
             keep_going: false,

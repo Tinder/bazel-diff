@@ -127,10 +127,14 @@ impl BazelOptions {
     /// `bazel mod graph --output=json`. The module graph proper survives a module extension
     /// Bazel cannot evaluate: the whole graph is printed before the extension is reported and
     /// the command exits 2.
-    fn module_graph_json_tolerating(&self, failed: &mut BTreeSet<String>) -> Result<String> {
+    fn module_graph_json_tolerating(
+        &self,
+        failed: &mut BTreeSet<String>,
+    ) -> Result<(String, bool)> {
         let output = self.run_capture(&["mod", "graph", "--output=json"])?;
+        let complete = output.status.success();
         let stdout = self.accept_mod_output(output, "graph --output=json", failed)?;
-        Ok(String::from_utf8_lossy(&stdout).trim().to_owned())
+        Ok((String::from_utf8_lossy(&stdout).trim().to_owned(), complete))
     }
 
     pub fn dependency_fingerprint(&self) -> Result<String> {
@@ -341,11 +345,11 @@ impl BazelOptions {
             }
         };
         let canonical_to_apparent = parse_repo_mapping(&String::from_utf8_lossy(&root_mapping));
-        let module_graph = match self.module_graph_json_tolerating(&mut failed) {
-            Ok(json) => Some(json),
+        let (module_graph, complete_graph) = match self.module_graph_json_tolerating(&mut failed) {
+            Ok((json, complete)) => (Some(json), complete),
             Err(error) if self.keep_going => {
                 eprintln!("[Warn] {error:#}; hashing Bzlmod repositories without module edges");
-                None
+                (None, false)
             }
             Err(error) => return Err(error),
         };
@@ -372,6 +376,7 @@ impl BazelOptions {
         let extension_repos = match self.extension_repositories(
             &canonical_to_apparent,
             hidden_modules.values().cloned().collect(),
+            retain_root_mapping && complete_graph,
             &mut failed,
         ) {
             Ok(repos) => repos,
@@ -390,9 +395,19 @@ impl BazelOptions {
         let repositories = if canonical_names.is_empty() {
             Vec::new()
         } else {
-            self.show_repositories(
+            self.show_repositories_within(
                 &canonical_names.into_iter().collect::<Vec<_>>(),
                 &mut failed,
+                mod_argument_byte_budget(),
+                || {
+                    verified_hidden_modules(
+                        module_graph.as_deref(),
+                        &root_mapping,
+                        &extension_repos.module_mappings,
+                        &hidden_modules,
+                    )
+                    .then_some(&hidden_modules)
+                },
             )?
         };
         let targets = lower_repositories(
@@ -417,39 +432,63 @@ impl BazelOptions {
         })
     }
 
-    /// Runs `bazel mod show_repo --output=streamed_proto` over `canonical_names`.
-    /// Large canonical selections use one bulk read, preserving the explicit result order.
-    fn show_repositories(
-        &self,
-        canonical_names: &[String],
-        failed: &mut BTreeSet<String>,
-    ) -> Result<Vec<Repository>> {
-        self.show_repositories_within(canonical_names, failed, mod_argument_byte_budget())
-    }
-
-    /// [`show_repositories`](Self::show_repositories) under an explicit argument budget.
-    ///
     /// Canonical names that fit one invocation are asked for by name. More are asked of
     /// `--all_repos` in a single invocation, filtered to the names wanted: every invocation costs
     /// a Bazel server round trip (seconds on Windows, whose `cmd.exe` limit is the one that splits
     /// the names most finely, #536), and the names are nearly every repository anyway. A Bazel
     /// without `--all_repos`, or one whose answer a module extension it cannot evaluate
-    /// spoils, is asked by name after all, one invocation per chunk. Hidden module keys stay on
-    /// the explicit path because bulk records do not carry their module key metadata.
-    fn show_repositories_within(
+    /// spoils, is asked by name after all, one invocation per chunk.
+    fn show_repositories_within<'a>(
         &self,
         canonical_names: &[String],
         failed: &mut BTreeSet<String>,
         budget: usize,
+        hidden_bindings: impl FnOnce() -> Option<&'a BTreeMap<String, String>>,
     ) -> Result<Vec<Repository>> {
         // Hidden module keys start with a lowercase module name, after canonical @@ arguments.
         let canonical_count = canonical_names.partition_point(|name| name.starts_with("@@"));
         let (canonical, hidden) = canonical_names.split_at(canonical_count);
         let selected_bytes = canonical.iter().map(|name| name.len() + 1).sum::<usize>();
         if selected_bytes > budget {
-            match self.show_all_repositories(canonical, failed) {
-                Ok(Some(mut repositories)) => {
-                    repositories.extend(self.show_repositories_explicit(hidden, failed, budget)?);
+            match self.show_all_repositories(failed) {
+                Ok(Some(BulkRepositories {
+                    mut by_canonical,
+                    complete,
+                })) => {
+                    // A module-key request prints its canonical definition with one extra
+                    // field. Reuse the bulk answer only when the parents' own repo mappings
+                    // identify every key and the bulk command answered completely.
+                    let hidden_records =
+                        complete
+                            .then(hidden_bindings)
+                            .flatten()
+                            .and_then(|bindings| {
+                                hidden
+                                    .iter()
+                                    .map(|key| {
+                                        let name = bindings.get(key)?;
+                                        let record = by_canonical.get(name)?;
+                                        if record.module_key.is_some()
+                                            || record.apparent_name.is_some()
+                                        {
+                                            return None;
+                                        }
+                                        let mut record = record.clone();
+                                        record.module_key = Some(key.clone());
+                                        Some(record)
+                                    })
+                                    .collect::<Option<Vec<_>>>()
+                            });
+                    // RepoOverride has no streamed-proto record, so missing canonical slots
+                    // remain omitted, in the same order as an explicit read.
+                    let mut repositories: Vec<_> = canonical
+                        .iter()
+                        .filter_map(|name| by_canonical.remove(name.trim_start_matches('@')))
+                        .collect();
+                    repositories.extend(match hidden_records {
+                        Some(records) => records,
+                        None => self.show_repositories_explicit(hidden, failed, budget)?,
+                    });
                     return Ok(repositories);
                 }
                 Ok(None) => {}
@@ -494,17 +533,15 @@ impl BazelOptions {
         Ok(repositories)
     }
 
-    /// `bazel mod show_repo --all_repos --output=streamed_proto`, kept to the repositories
-    /// `canonical_names` wants and in their order. `None` when Bazel did not answer: it
+    /// `bazel mod show_repo --all_repos --output=streamed_proto`. `None` when Bazel did not answer: it
     /// predates the option (every Bazel with the `--output=streamed_proto` this needs, 8.6
     /// and 9.0 on, has it), or a module extension it cannot evaluate failed the whole
     /// invocation. The extensions such a failure names are noted in
     /// `failed`, so the by-name invocations that follow leave their repositories out.
     fn show_all_repositories(
         &self,
-        canonical_names: &[String],
         failed: &mut BTreeSet<String>,
-    ) -> Result<Option<Vec<Repository>>> {
+    ) -> Result<Option<BulkRepositories>> {
         let output_file = NamedTempFile::new().context("create mod show_repo output")?;
         let mut command = self.command();
         command
@@ -548,34 +585,31 @@ impl BazelOptions {
         if !output.stderr.is_empty() {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
         }
-        let mut by_canonical = decode_delimited::<Repository>(output_file.path())?
-            .into_iter()
-            .filter_map(|repository| {
-                let canonical = repository.canonical_name.as_deref()?;
-                let canonical = canonical.trim_start_matches('@');
-                if belongs_to_failed_extension(canonical, failed) {
-                    return None;
-                }
-                Some((canonical.to_owned(), repository))
-            })
-            .collect::<HashMap<_, _>>();
-        // RepoOverride has no streamed-proto record, so a missing slot remains omitted.
-        let repositories = canonical_names
-            .iter()
-            .filter_map(|name| by_canonical.remove(name.trim_start_matches('@')))
-            .collect();
-        Ok(Some(repositories))
+        let mut complete = output.status.success() && failed.is_empty();
+        let mut by_canonical = HashMap::new();
+        for repository in decode_delimited::<Repository>(output_file.path())? {
+            let Some(canonical) = repository.canonical_name.as_deref() else {
+                complete = false;
+                continue;
+            };
+            let canonical = canonical.trim_start_matches('@');
+            if !belongs_to_failed_extension(canonical, failed)
+                && by_canonical
+                    .insert(canonical.to_owned(), repository)
+                    .is_some()
+            {
+                complete = false;
+            }
+        }
+        Ok(Some(BulkRepositories {
+            by_canonical,
+            complete,
+        }))
     }
 
     /// Enumerates every repository generated by a module extension that at least one module
-    /// imports from, in two `bazel mod dump_repo_mapping` rounds: one over the module
-    /// repositories, whose mappings name the extension repos they `use_repo` (and so one
-    /// repository of every extension in use), and one over one such repository per extension,
-    /// whose mapping names all of its siblings -- an extension's repositories see each other
-    /// whether or not any module imports them.
-    ///
-    /// Both rounds together cost well under a second on a workspace with two thousand extension
-    /// repositories; the module resolution that `bazel mod graph` already pays for dominates.
+    /// imports from. Module mappings name the extension repos they `use_repo`. A repository
+    /// of each such extension sees its siblings, whether or not any module imports them.
     ///
     /// An extension Bazel cannot evaluate has no repositories to enumerate: the ones a module
     /// imports from it are left out, and it gets no representative (#531).
@@ -583,6 +617,7 @@ impl BazelOptions {
         &self,
         canonical_to_apparent: &BTreeMap<String, Vec<String>>,
         hidden_module_repos: Vec<String>,
+        complete_inputs: bool,
         failed: &mut BTreeSet<String>,
     ) -> Result<ExtensionRepositories> {
         let visible_module_repos = canonical_to_apparent
@@ -597,23 +632,36 @@ impl BazelOptions {
             .collect::<BTreeSet<_>>();
         let mut module_repos = visible_module_repos.clone();
         module_repos.extend(hidden_module_repos.iter().cloned());
+        let mut module_mappings = BTreeMap::new();
+        let mut complete_mappings =
+            complete_inputs && !hidden_module_repos.is_empty() && failed.is_empty();
         if !module_repos.is_empty() {
             // The hidden modules' repository names are derived, not reported, so a derivation
             // Bazel disagrees with falls back to the root-visible modules alone.
-            let mappings = match self.dump_repo_mappings(&module_repos, failed) {
+            let mappings = match self.dump_repo_mappings(
+                &module_repos,
+                failed,
+                &mut complete_mappings,
+            ) {
                 Ok(mappings) => mappings,
                 Err(error) if !hidden_module_repos.is_empty() => {
                     eprintln!("[Warn] {error:#}; enumerating extension repositories from the root-visible modules only");
-                    self.dump_repo_mappings(&visible_module_repos, failed)?
+                    complete_mappings = false;
+                    self.dump_repo_mappings(&visible_module_repos, failed, &mut complete_mappings)?
                 }
                 Err(error) => return Err(error),
             };
             imported.extend(
                 mappings
-                    .into_iter()
-                    .flat_map(|mapping| mapping.into_values())
-                    .filter(|canonical| is_extension_repo(canonical)),
+                    .iter()
+                    .flat_map(|mapping| mapping.values())
+                    .filter(|canonical| is_extension_repo(canonical))
+                    .cloned(),
             );
+            if complete_mappings {
+                module_mappings.extend(module_repos.iter().cloned().zip(mappings));
+                complete_mappings = module_mappings.len() == module_repos.len();
+            }
         }
         imported.retain(|canonical| !belongs_to_failed_extension(canonical, failed));
         let mut representatives = BTreeMap::new();
@@ -627,14 +675,19 @@ impl BazelOptions {
         let mut generated = imported.clone();
         if !representatives.is_empty() {
             let names = representatives.values().cloned().collect::<Vec<_>>();
-            let mappings = match self.dump_repo_mappings(&names, failed) {
+            let mappings = match self.dump_repo_mappings(&names, failed, &mut complete_mappings) {
                 Ok(mappings) => mappings,
                 Err(_) => {
+                    complete_mappings = false;
                     // One extension that fails to evaluate should not hide the rest; retry
                     // one at a time and report the ones Bazel cannot describe.
                     let mut mappings = Vec::new();
                     for name in &names {
-                        match self.dump_repo_mappings(std::slice::from_ref(name), failed) {
+                        match self.dump_repo_mappings(
+                            std::slice::from_ref(name),
+                            failed,
+                            &mut complete_mappings,
+                        ) {
                             Ok(mapping) => mappings.extend(mapping),
                             Err(error) if self.keep_going => {
                                 eprintln!(
@@ -660,9 +713,13 @@ impl BazelOptions {
         }
         imported.retain(|canonical| !belongs_to_failed_extension(canonical, failed));
         generated.retain(|canonical| !belongs_to_failed_extension(canonical, failed));
+        if !complete_mappings {
+            module_mappings.clear();
+        }
         Ok(ExtensionRepositories {
             imported,
             generated,
+            module_mappings,
         })
     }
 
@@ -672,21 +729,31 @@ impl BazelOptions {
         &self,
         repos: &[String],
         failed: &mut BTreeSet<String>,
-    ) -> Result<Vec<BTreeMap<String, String>>> {
+        complete: &mut bool,
+    ) -> Result<Vec<RepoMapping>> {
         let mut mappings = Vec::new();
         for chunk in chunk_arguments(repos, mod_argument_byte_budget()) {
             let stdout = self.run_mod_over_repos("dump_repo_mapping", chunk, failed, |names| {
                 let mut args = vec!["mod", "dump_repo_mapping"];
                 args.extend(names.iter().map(String::as_str));
                 let output = self.run_capture(&args)?;
+                // Bazel prints mappings in argument order, without repository names. Keep
+                // them bound to the requested names only if every original name was answered.
+                *complete &= output.status.success() && names == chunk;
                 Ok((output.status, output.stderr, output.stdout))
             })?;
             let Some(stdout) = stdout else {
+                *complete = false;
                 continue;
             };
-            mappings.extend(String::from_utf8_lossy(&stdout).lines().filter_map(|line| {
-                serde_json::from_str::<BTreeMap<String, String>>(line.trim()).ok()
-            }));
+            let start = mappings.len();
+            for line in String::from_utf8_lossy(&stdout).lines() {
+                match serde_json::from_str(line.trim()) {
+                    Ok(mapping) => mappings.push(mapping),
+                    Err(_) => *complete = false,
+                }
+            }
+            *complete &= mappings.len() - start == chunk.len();
         }
         Ok(mappings)
     }
@@ -1111,6 +1178,63 @@ struct ExtensionRepositories {
     imported: BTreeSet<String>,
     /// Every repository of every extension in `imported`, the imported ones included.
     generated: BTreeSet<String>,
+    /// Complete module mappings from the ordinary module read, keyed by their requested canonical names.
+    module_mappings: BTreeMap<String, RepoMapping>,
+}
+
+type RepoMapping = BTreeMap<String, String>;
+
+struct BulkRepositories {
+    by_canonical: HashMap<String, Repository>,
+    complete: bool,
+}
+
+/// Resolve each hidden module through its apparent name in its parent's mapping. The
+/// names predicted by `hidden_module_repo_names` alone cannot identify a bulk record.
+fn verified_hidden_modules(
+    graph: Option<&str>,
+    root_mapping: &[u8],
+    mappings: &BTreeMap<String, RepoMapping>,
+    hidden: &BTreeMap<String, String>,
+) -> bool {
+    fn walk(
+        node: &serde_json::Value,
+        parent: &RepoMapping,
+        mappings: &BTreeMap<String, RepoMapping>,
+        hidden: &BTreeMap<String, String>,
+        seen: &mut BTreeSet<String>,
+    ) -> Option<()> {
+        for child in node.get("dependencies")?.as_array()? {
+            let key = child.get("key")?.as_str()?;
+            let canonical = parent.get(child.get("apparentName")?.as_str()?)?;
+            if let Some(expected) = hidden.get(key) {
+                if expected != canonical {
+                    return None;
+                }
+                seen.insert(key.to_owned());
+            }
+            if child
+                .get("dependencies")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|dependencies| !dependencies.is_empty())
+            {
+                walk(child, mappings.get(canonical)?, mappings, hidden, seen)?;
+            }
+        }
+        Some(())
+    }
+    if hidden.is_empty() || mappings.is_empty() {
+        return false;
+    }
+    let Some(graph) = graph.and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+    else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_slice::<RepoMapping>(root_mapping) else {
+        return false;
+    };
+    let mut seen = BTreeSet::new();
+    walk(&graph, &root, mappings, hidden, &mut seen).is_some() && seen.len() == hidden.len()
 }
 
 /// Whether `canonical` names a repository a module extension generated rather than a module's
@@ -3285,7 +3409,9 @@ exit 1
     fn large_repository_reads_preserve_selected_records() {
         let workspace = tempfile::tempdir().unwrap();
         let wanted = ["a+", "b+", "c++ext+x"].map(repository);
-        let mut hidden = repository("hidden+");
+        let mut bulk_hidden = repository("hidden+");
+        bulk_hidden.original_name = Some("upstream_name".into());
+        let mut hidden = bulk_hidden.clone();
         hidden.module_key = Some("hidden@1.0".to_owned());
         let mut by_name = wanted.to_vec();
         by_name.push(hidden.clone());
@@ -3295,7 +3421,7 @@ exit 1
             repository("bazel_tools"),
             repository("unasked++ext+y"),
             repository("failed++ext+x"),
-            repository("hidden+"),
+            bulk_hidden,
         ];
         all.extend(wanted.iter().rev().cloned());
         let script = show_repo_script(workspace.path(), &by_name, &all);
@@ -3336,10 +3462,13 @@ exit 1
             .collect::<Vec<_>>();
         let original_failed = BTreeSet::from(["@@failed+//:ext.bzl%ext".to_owned()]);
         let mut failed = original_failed.clone();
+        let bindings = BTreeMap::from([("hidden@1.0".into(), "hidden+".into())]);
 
         // Canonical names use one bulk invocation; the hidden module retains its explicit record.
         let repositories = options
-            .show_repositories_within(&names, &mut failed, 8)
+            .show_repositories_within(&names, &mut failed, 8, || {
+                panic!("partial bulk output must not inspect hidden bindings")
+            })
             .unwrap();
         assert_eq!(repositories, expected);
         let calls = show_repo_calls(workspace.path());
@@ -3355,7 +3484,9 @@ exit 1
 
         // Names that fit one invocation are still asked for by name.
         let repositories = options
-            .show_repositories_within(&names, &mut failed, 1000)
+            .show_repositories_within(&names, &mut failed, 1000, || {
+                panic!("small selections must not inspect hidden bindings")
+            })
             .unwrap();
         assert_eq!(repositories, expected);
         let calls = show_repo_calls(workspace.path());
@@ -3363,6 +3494,117 @@ exit 1
         assert_eq!(
             calls[2],
             "mod show_repo @@a+ @@b+ @@c++ext+x @@omitted+ hidden@1.0 --output=streamed_proto"
+        );
+
+        // A healthy bulk read can supply the same module-key record, byte for byte.
+        let clean: Vec<_> = names
+            .into_iter()
+            .filter(|name| !name.starts_with("@@failed+"))
+            .collect();
+        let actual = options
+            .show_repositories_within(&clean, &mut BTreeSet::new(), 8, || Some(&bindings))
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            &show_repo_calls(workspace.path())[3..],
+            ["mod show_repo --all_repos --output=streamed_proto"]
+        );
+    }
+
+    #[test]
+    fn hidden_module_keys_follow_each_parents_actual_alias() {
+        let graph = r#"{"dependencies":[{"key":"visible@1","apparentName":"alias","dependencies":[{"key":"hidden@2","apparentName":"other_alias"}]},{"key":"hidden@2","apparentName":"sibling"}]}"#;
+        let hidden = BTreeMap::from([("hidden@2".into(), "hidden+".into())]);
+        let modules = BTreeMap::from([(
+            "visible+".into(),
+            BTreeMap::from([("other_alias".into(), "hidden+".into())]),
+        )]);
+        assert!(verified_hidden_modules(
+            Some(graph),
+            br#"{"alias":"visible+","sibling":"hidden+"}"#,
+            &modules,
+            &hidden
+        ));
+        assert!(!verified_hidden_modules(
+            Some(graph),
+            br#"{"alias":"visible+","sibling":"different+"}"#,
+            &modules,
+            &hidden
+        ));
+        assert!(!verified_hidden_modules(
+            Some(graph),
+            br#"{"alias":"visible+"}"#,
+            &modules,
+            &hidden
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn incomplete_mapping_rows_remain_unbound() {
+        let workspace = tempfile::tempdir().unwrap();
+        let script = workspace.path().join("bazel");
+        executable_script(&script, "#!/bin/sh\ncat reply\n");
+        let options = probe_options(workspace.path(), script);
+        let names = ["first+", "second+"].map(str::to_owned);
+        for (reply, rows, expected_complete) in [
+            ("{}\n{}\n", 2, true),
+            ("{}\n", 1, false),
+            ("{}\ninvalid\n{}\n", 2, false),
+            ("{}\n{}\n{}\n", 3, false),
+        ] {
+            fs::write(workspace.path().join("reply"), reply).unwrap();
+            let mut complete = true;
+            let mappings = options
+                .dump_repo_mappings(&names, &mut BTreeSet::new(), &mut complete)
+                .unwrap();
+            assert_eq!(mappings.len(), rows);
+            assert_eq!(complete, expected_complete);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mappings_preserve_effective_names_in_each_isolated_extension() {
+        let workspace = tempfile::tempdir().unwrap();
+        let first = "mod++_ext+owner+1+first+hub";
+        let second = "mod++_ext+owner+1+second+hub";
+        let library = "mod++_ext+owner+1+first+library";
+        let injected = "mod++_ext+owner+1+second+injected";
+        for (name, map) in [
+            ("dep+", serde_json::json!({"one": first, "two": second})),
+            (
+                first,
+                serde_json::json!({"library": library, "replaced": "other+", "injected": injected}),
+            ),
+            (
+                second,
+                serde_json::json!({"other": "unimported++ext+unused"}),
+            ),
+        ] {
+            fs::write(workspace.path().join(name), format!("{map}\n")).unwrap();
+        }
+        let script = workspace.path().join("bazel");
+        executable_script(
+            &script,
+            "#!/bin/sh\nshift 2\necho \"$*\" >> calls\nfor name do cat \"$name\" || exit 1; done\n",
+        );
+        let options = probe_options(workspace.path(), script);
+        let root = BTreeMap::from([
+            ("dep+".into(), vec!["dep".into()]),
+            (first.into(), vec!["hub".into()]),
+        ]);
+        let result = options
+            .extension_repositories(&root, Vec::new(), true, &mut BTreeSet::new())
+            .unwrap();
+        assert_eq!(result.imported, [first, second].map(str::to_owned).into());
+        assert_eq!(
+            result.generated,
+            [first, second, library, injected].map(str::to_owned).into()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("calls")).unwrap(),
+            format!("dep+\n{first} {second}\n")
         );
     }
 
@@ -3401,7 +3643,7 @@ exit 1
             .to_vec();
         let mut failed = BTreeSet::new();
         let repositories = options
-            .show_repositories_within(&names, &mut failed, 8)
+            .show_repositories_within(&names, &mut failed, 8, || None)
             .unwrap();
         assert_eq!(repositories, wanted);
         assert_eq!(
@@ -3447,7 +3689,7 @@ exit 1
         let names = ["@@a+", "@@b+", "@@c++ext+x"].map(str::to_owned).to_vec();
         let mut failed = BTreeSet::new();
         let repositories = options
-            .show_repositories_within(&names, &mut failed, 8)
+            .show_repositories_within(&names, &mut failed, 8, || None)
             .unwrap();
         assert_eq!(canonical_names(&repositories), ["a+", "b+"]);
         assert_eq!(failed, BTreeSet::from(["@@c+//:ext.bzl%ext".to_owned()]));

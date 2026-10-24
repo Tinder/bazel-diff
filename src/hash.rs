@@ -1,5 +1,6 @@
 use crate::bazel::{
     encode_configured_input, split_configured, target_label, BazelOptions, QueriedTargets,
+    RepositoryInputGroup, RepositoryInputs,
 };
 use crate::cancel::{self, Cancellation};
 use crate::model::{HashFileData, TargetHash};
@@ -150,15 +151,20 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
         targets,
         module_graph_json,
         root_mapping,
-    } = options.bazel.query_all_targets_with(|target| {
-        let Some(rule) = target.rule.as_option_mut() else {
-            return;
-        };
-        definition_digests.insert(
-            rule.name.clone(),
-            prehash_rule(rule, &options.ignored_attributes),
-        );
-    })?;
+    } = options
+        .bazel
+        .query_all_targets_with(|target, shared_inputs| {
+            let Some(rule) = target.rule.as_option_mut() else {
+                return;
+            };
+            definition_digests.insert(
+                rule.name.clone(),
+                PreparedRule {
+                    definition_digest: prehash_rule(rule, &options.ignored_attributes),
+                    shared_inputs,
+                },
+            );
+        })?;
     let bazel_query_millis = elapsed_millis(query_started);
     // The query is the phase worth cancelling; a request abandoned during it stops here instead
     // of hashing targets nobody will read.
@@ -181,7 +187,7 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
 fn hash_targets_with_digests(
     options: &HashOptions,
     targets: Vec<Target>,
-    definition_digests: HashMap<String, DigestBytes>,
+    definition_digests: HashMap<String, PreparedRule>,
     module_graph_json: Option<String>,
     root_mapping: Option<Vec<u8>>,
 ) -> Result<(HashFileData, GenerationTimings)> {
@@ -209,7 +215,7 @@ fn hash_targets_with_digests(
 fn hash_targets_with_environment(
     options: &HashOptions,
     targets: Vec<Target>,
-    mut definition_digests: HashMap<String, DigestBytes>,
+    mut definition_digests: HashMap<String, PreparedRule>,
     external_resolver: ExternalRepoResolver,
     module_graph_json: Option<String>,
 ) -> Result<HashFileData> {
@@ -251,14 +257,8 @@ fn hash_targets_with_environment(
                     // Generated targets are prehashed and deduplicated; raw callers provide no
                     // digests and retain the ordered fallback below, including duplicate names.
                     match definition_digests.remove_entry(&rule.name) {
-                        Some((name, definition_digest)) => {
-                            rules.insert(
-                                name,
-                                Rc::new(RuleNode {
-                                    rule,
-                                    definition_digest,
-                                }),
-                            );
+                        Some((name, prepared)) => {
+                            rules.insert(name, Rc::new(RuleNode { rule, prepared }));
                         }
                         None => decoded_rules.push((rule.name.clone(), rule)),
                     }
@@ -309,7 +309,10 @@ fn hash_targets_with_environment(
                     name,
                     RuleNode {
                         rule,
-                        definition_digest,
+                        prepared: PreparedRule {
+                            definition_digest,
+                            shared_inputs: None,
+                        },
                     },
                 )
             })
@@ -355,6 +358,7 @@ fn hash_targets_with_environment(
         rules,
         label_instances,
         cache: HashMap::new(),
+        repository_input_digests: HashMap::new(),
         seed_hash,
         package_bzl_seeds,
         bzl_digests: HashMap::new(),
@@ -523,6 +527,7 @@ struct HashContext<'a> {
     /// bare label and resolves directly.
     label_instances: Option<HashMap<String, Vec<String>>>,
     cache: HashMap<String, TargetDigest>,
+    repository_input_digests: HashMap<String, (Vec<u8>, Sha256)>,
     seed_hash: DigestBytes,
     package_bzl_seeds: BTreeMap<String, DigestBytes>,
     bzl_digests: HashMap<String, Option<DigestBytes>>,
@@ -532,6 +537,45 @@ struct HashContext<'a> {
 }
 
 impl HashContext<'_> {
+    fn apply_repository_inputs(
+        &mut self,
+        inputs: &RepositoryInputGroup,
+        builder: &mut TargetDigestBuilder,
+    ) -> bool {
+        use std::collections::hash_map::Entry;
+        let (labels, transitive) = match self
+            .repository_input_digests
+            .entry(inputs.extension.clone())
+        {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let mut labels = Vec::new();
+                let mut transitive = Sha256::new();
+                for label in &inputs.labels {
+                    // An unfinished rule may enter a cycle; let the normal traversal decide
+                    // its digest. A source contributes to the owner's direct hash instead.
+                    let Some(digest) = self.cache.get(label) else {
+                        return false;
+                    };
+                    if self.source_digests.contains_key(label) {
+                        return false;
+                    }
+                    labels.extend_from_slice(label.as_bytes());
+                    transitive.update(digest.overall);
+                }
+                entry.insert((labels, transitive))
+            }
+        };
+        // Each hub has its own direct prefix. Its ordered child digests form the
+        // entire transitive prefix; visibility edges, if present, are appended later.
+        builder.direct(labels);
+        builder.overall = transitive.clone();
+        if builder.track_deps {
+            builder.deps.clone_from(&inputs.labels);
+        }
+        true
+    }
+
     fn cached_rule_digest(&self, key: &str) -> Option<&TargetDigest> {
         self.cache.get(key).or_else(|| {
             self.rules
@@ -581,7 +625,7 @@ impl HashContext<'_> {
             }
             let mut hasher = Sha256::new();
             hasher.update(b"cycle");
-            hasher.update(rule.definition_digest);
+            hasher.update(rule.prepared.definition_digest);
             let placeholder: DigestBytes = hasher.finalize().into();
             return Ok(TargetDigest {
                 overall: placeholder,
@@ -592,7 +636,7 @@ impl HashContext<'_> {
         path.push(canonical_key.clone());
 
         let mut builder = TargetDigestBuilder::new(self.options.track_deps);
-        builder.direct(rule.definition_digest);
+        builder.direct(rule.prepared.definition_digest);
         builder.direct(self.seed_hash);
         if let Some(seed) = self.rule_bzl_seed(&rule.rule)? {
             builder.direct(seed);
@@ -633,12 +677,23 @@ impl HashContext<'_> {
         } else {
             &empty_repo_nodes
         };
-        for encoded_input in rule_inputs(
+        let mut inputs = rule_inputs(
             &rule.rule,
             self.options.bazel.use_cquery,
             &self.options.bazel.fine_grained_external_repos,
             canonical_repo_nodes,
-        ) {
+        );
+        if let Some(group) = &rule.prepared.shared_inputs {
+            if !self.apply_repository_inputs(group, &mut builder) {
+                inputs.extend(
+                    group
+                        .labels
+                        .iter()
+                        .map(|input| Cow::Borrowed(input.as_str())),
+                );
+            }
+        }
+        for encoded_input in inputs {
             builder.direct(encoded_input.as_bytes());
             let input_label = target_label(&encoded_input);
             if let Some(source_digest) = self.source_digests.get(input_label) {
@@ -752,7 +807,12 @@ impl HashContext<'_> {
 
 struct RuleNode {
     rule: Rule,
+    prepared: PreparedRule,
+}
+
+struct PreparedRule {
     definition_digest: DigestBytes,
+    shared_inputs: Option<RepositoryInputs>,
 }
 
 fn source_seed(source: &SourceTarget) -> DigestBytes {
@@ -2493,6 +2553,57 @@ esac
             first.hashes["//pkg:rule"].hash,
             tracked.hashes["//pkg:rule"].hash
         );
+    }
+
+    #[test]
+    fn shared_repository_inputs_match_ordered_traversal_through_a_cycle() {
+        let workspace = tempfile::tempdir().unwrap();
+        let options = hash_options(workspace.path());
+        let group = Arc::new(RepositoryInputGroup {
+            extension: "+tools".into(),
+            labels: vec!["//external:a".into(), "//external:z".into()],
+        });
+        let mut targets: Vec<_> = ["a", "hub1", "hub2", "hub3", "z"]
+            .into_iter()
+            .map(|name| {
+                let inputs = match name {
+                    "z" => vec!["//external:hub1".into()],
+                    "hub1" | "hub2" | "hub3" => group.labels.clone(),
+                    _ => Vec::new(),
+                };
+                rule_target(Rule {
+                    name: format!("//external:{name}"),
+                    rule_class: "http_archive".into(),
+                    rule_input: inputs,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let expected = hash_targets_for_test(&options, targets.clone(), workspace.path()).unwrap();
+        let mut prepared = HashMap::new();
+        for target in &mut targets {
+            let rule = target.rule.as_option_mut().unwrap();
+            if rule.rule_input == group.labels {
+                rule.rule_input.clear();
+                prepared.insert(
+                    rule.name.clone(),
+                    PreparedRule {
+                        definition_digest: prehash_rule(rule, &options.ignored_attributes),
+                        shared_inputs: Some(Arc::clone(&group)),
+                    },
+                );
+            }
+        }
+        let actual = hash_targets_with_environment(
+            &options,
+            targets,
+            prepared,
+            ExternalRepoResolver::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(actual.hashes, expected.hashes);
+        assert_eq!(actual.dep_edges, expected.dep_edges);
     }
 
     #[cfg(unix)]

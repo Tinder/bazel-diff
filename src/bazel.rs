@@ -210,13 +210,13 @@ impl BazelOptions {
             targets,
             module_graph_json: _module_graph_json,
             root_mapping: _root_mapping,
-        } = self.query_all_targets_with(|_| {})?;
+        } = self.query_all_targets_with(materialize_repository_inputs)?;
         Ok(targets)
     }
 
     pub(crate) fn query_all_targets_with(
         &self,
-        mut transform: impl FnMut(&mut Target),
+        mut transform: impl FnMut(&mut Target, Option<RepositoryInputs>),
     ) -> Result<QueriedTargets> {
         let mut bzlmod = BzlmodRepos::default();
         let mut version = None;
@@ -253,7 +253,9 @@ impl BazelOptions {
             root_mapping,
         } = bzlmod;
         let targets = self.collect_all_targets(bzlmod_repos, |expression, use_cquery| {
-            self.query_with(expression, use_cquery, version, &mut transform)
+            self.query_with(expression, use_cquery, version, &mut |target| {
+                transform(target, None)
+            })
         })?;
         self.check_failed_extension_references(
             &targets,
@@ -333,7 +335,7 @@ impl BazelOptions {
     fn query_bzlmod_repos(
         &self,
         root_mapping: Option<Vec<u8>>,
-        transform: &mut impl FnMut(&mut Target),
+        transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>),
     ) -> Result<BzlmodRepos> {
         let mut failed = BTreeSet::new();
         // The initial probe returns stdout only on success. The fallback may be partial.
@@ -1416,13 +1418,26 @@ fn chunk_arguments(arguments: &[String], budget: usize) -> Vec<&[String]> {
     chunks
 }
 
+pub(crate) type RepositoryInputs = Arc<RepositoryInputGroup>;
+
+pub(crate) struct RepositoryInputGroup {
+    pub(crate) extension: String,
+    pub(crate) labels: Vec<String>,
+}
+
+fn materialize_repository_inputs(target: &mut Target, shared: Option<RepositoryInputs>) {
+    if let Some(inputs) = shared {
+        target.rule.as_option_mut().unwrap().rule_input = inputs.labels.clone();
+    }
+}
+
 fn lower_repositories(
     repositories: Vec<Repository>,
     canonical_to_apparent: &BTreeMap<String, Vec<String>>,
     module_edges: &BTreeMap<String, BTreeSet<String>>,
     extension_edges: Option<&BTreeSet<String>>,
     workspace: &Path,
-    transform: &mut impl FnMut(&mut Target),
+    transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>),
 ) -> Vec<Target> {
     let workspace = RepositoryWorkspace::new(workspace);
     // A module the root cannot see has no apparent name there; its node is named by canonical
@@ -1496,6 +1511,8 @@ fn lower_repositories(
     }
 
     let mut targets = Vec::new();
+    let mut shared_groups = HashMap::<String, RepositoryInputs>::new();
+    let empty = BTreeSet::new();
     for repository in repositories {
         let canonical = repository.canonical_name.as_deref().unwrap_or_default();
         let extension = extension_usage_prefix(canonical);
@@ -1515,25 +1532,43 @@ fn lower_repositories(
         }
         let spokes = extension
             .filter(|_| extension_edges.is_some_and(|imported| imported.contains(canonical)))
-            .and_then(|extension| extension_spokes.get(extension));
-        let dependencies = if dependencies.is_empty() {
-            // Reuse the shared sorted set when it is the complete dependency list.
-            spokes.unwrap_or(&dependencies)
+            .and_then(|extension| extension_spokes.get_key_value(extension));
+        let group = if dependencies.is_empty() {
+            spokes
         } else {
-            if let Some(spokes) = spokes {
-                dependencies.extend(spokes.iter().cloned());
+            if let Some((_, names)) = spokes {
+                dependencies.extend(names.iter().cloned());
             }
-            &dependencies
+            None
         };
         for apparent in node_names(canonical) {
+            // Imported hubs of one extension share its ordered hidden siblings. Pass
+            // the same allocation to the hash traversal when no owner-specific edge
+            // needs adding or removing. Raw query callers expand it into the protobuf.
+            let (inputs, shared) = match group {
+                Some((extension, names)) if !names.contains(&apparent) => {
+                    let shared = shared_groups.entry(extension.clone()).or_insert_with(|| {
+                        Arc::new(RepositoryInputGroup {
+                            extension: extension.clone(),
+                            labels: names
+                                .iter()
+                                .map(|name| format!("//external:{name}"))
+                                .collect(),
+                        })
+                    });
+                    (&empty, Some(Arc::clone(shared)))
+                }
+                Some((_, names)) => (names, None),
+                None => (&dependencies, None),
+            };
             let mut target = repository_target(
                 &repository,
                 &apparent,
-                dependencies,
+                inputs,
                 owner_definition_hash,
                 &workspace,
             );
-            transform(&mut target);
+            transform(&mut target, shared);
             targets.push(target);
         }
     }
@@ -3173,7 +3208,7 @@ mod tests {
             &edges,
             None,
             Path::new("."),
-            &mut |target| transformed.push(target_name(target).unwrap().to_owned()),
+            &mut |target, _| transformed.push(target_name(target).unwrap().to_owned()),
         );
         assert_eq!(targets.len(), 3);
         assert_eq!(
@@ -3231,7 +3266,7 @@ mod tests {
                 &BTreeMap::new(),
                 None,
                 workspace.path(),
-                &mut |_| {},
+                &mut materialize_repository_inputs,
             );
             assert_eq!(targets.len(), 1);
             let rule = targets[0].rule.as_option().unwrap().clone();
@@ -3285,7 +3320,7 @@ mod tests {
             &parse_module_dependency_edges(graph),
             None,
             Path::new("."),
-            &mut |_| {},
+            &mut materialize_repository_inputs,
         );
         let inputs = |name: &str| {
             targets
@@ -3819,7 +3854,7 @@ exit 1
             &edges,
             Some(&imported),
             Path::new("."),
-            &mut |_| {},
+            &mut materialize_repository_inputs,
         );
         assert_eq!(query.len(), 8);
         // The owning module reaches everything its extensions generate, after its module deps.
@@ -3863,7 +3898,7 @@ exit 1
             &edges,
             None,
             Path::new("."),
-            &mut |_| {},
+            &mut materialize_repository_inputs,
         );
         assert_eq!(cquery.len(), 8);
         assert_eq!(
@@ -3936,7 +3971,7 @@ exit 1
                 &BTreeMap::new(),
                 None,
                 workspace.path(),
-                &mut |_| {},
+                &mut materialize_repository_inputs,
             )
         };
 

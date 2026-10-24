@@ -1,4 +1,6 @@
-use crate::bazel::{encode_configured_input, split_configured, target_label, BazelOptions};
+use crate::bazel::{
+    encode_configured_input, split_configured, target_label, BazelOptions, QueriedTargets,
+};
 use crate::cancel::{self, Cancellation};
 use crate::model::{HashFileData, TargetHash};
 use crate::proto::blaze_query::{target, Rule, Target};
@@ -144,7 +146,11 @@ pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
 pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, GenerationTimings)> {
     let mut definition_digests = HashMap::new();
     let query_started = Instant::now();
-    let (targets, module_graph_json) = options.bazel.query_all_targets_with(|target| {
+    let QueriedTargets {
+        targets,
+        module_graph_json,
+        root_mapping,
+    } = options.bazel.query_all_targets_with(|target| {
         let Some(rule) = target.rule.as_option_mut() else {
             return;
         };
@@ -157,14 +163,19 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
     // The query is the phase worth cancelling; a request abandoned during it stops here instead
     // of hashing targets nobody will read.
     options.bazel.check_cancelled()?;
-    let (data, mut timings) =
-        hash_targets_with_digests(options, targets, definition_digests, module_graph_json)?;
+    let (data, mut timings) = hash_targets_with_digests(
+        options,
+        targets,
+        definition_digests,
+        module_graph_json,
+        root_mapping,
+    )?;
     timings.bazel_query_millis = bazel_query_millis;
     Ok((data, timings))
 }
 
 pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashFileData> {
-    hash_targets_with_digests(options, targets, HashMap::new(), None).map(|(data, _)| data)
+    hash_targets_with_digests(options, targets, HashMap::new(), None, None).map(|(data, _)| data)
 }
 
 fn hash_targets_with_digests(
@@ -172,9 +183,10 @@ fn hash_targets_with_digests(
     targets: Vec<Target>,
     definition_digests: HashMap<String, DigestBytes>,
     module_graph_json: Option<String>,
+    root_mapping: Option<Vec<u8>>,
 ) -> Result<(HashFileData, GenerationTimings)> {
     let hash_started = Instant::now();
-    let external_resolver = ExternalRepoResolver::new(&options.bazel)?;
+    let external_resolver = ExternalRepoResolver::new(&options.bazel, root_mapping)?;
     let module_graph_started = Instant::now();
     let module_graph_json = module_graph_json.or_else(|| options.bazel.module_graph_json());
     options.bazel.check_cancelled()?;
@@ -1308,13 +1320,15 @@ struct ExternalRepoResolver {
     resolved: Arc<Mutex<HashMap<String, PathBuf>>>,
     /// Lazily populated apparent -> canonical repository name mapping.
     repo_mapping: Arc<OnceLock<HashMap<String, String>>>,
+    /// Successful root mapping captured during this generation, parsed lazily when needed.
+    root_mapping: Option<Vec<u8>>,
     /// Lazily populated canonical repository name -> synthetic `//external:` node name, the
     /// inverse of `repo_mapping`; see [`ExternalRepoResolver::canonical_repo_nodes`].
     canonical_repo_nodes: Arc<OnceLock<HashMap<String, String>>>,
 }
 
 impl ExternalRepoResolver {
-    fn new(options: &BazelOptions) -> Result<Self> {
+    fn new(options: &BazelOptions, root_mapping: Option<Vec<u8>>) -> Result<Self> {
         let mut command = options.command_for_hashing();
         command.arg("info").arg("output_base").stdin(Stdio::null());
         let output = cancel::output(options.cancellation.as_deref(), &mut command)
@@ -1332,6 +1346,7 @@ impl ExternalRepoResolver {
             startup_options: options.startup_options.clone(),
             no_bazelrc: options.no_bazelrc,
             cancellation: options.cancellation.clone(),
+            root_mapping,
             ..Default::default()
         })
     }
@@ -1423,6 +1438,16 @@ impl ExternalRepoResolver {
     /// (for example a WORKSPACE-only build), leaving the `bazel query` fallback.
     fn repo_mapping(&self) -> &HashMap<String, String> {
         self.repo_mapping.get_or_init(|| {
+            if self
+                .cancellation
+                .as_deref()
+                .is_some_and(Cancellation::is_cancelled)
+            {
+                return HashMap::new();
+            }
+            if let Some(root_mapping) = &self.root_mapping {
+                return parse_apparent_repo_mapping(&String::from_utf8_lossy(root_mapping));
+            }
             let mut command = self.command();
             command
                 .arg("mod")
@@ -1605,10 +1630,17 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn generation_reuses_accepted_module_graph() {
+    fn generation_reuses_discovery_outputs() {
         let graph = r#"{"key":"<root>","name":"root","dependencies":[]}"#;
         for extension_failure in [false, true] {
             let workspace = tempfile::tempdir().unwrap();
+            let external = workspace.path().join("external/local_config_tool");
+            fs::create_dir_all(&external).unwrap();
+            fs::write(external.join("input"), "mapped input").unwrap();
+            let target = source_target("@tool//:input", &[]);
+            let mut encoded = Vec::new();
+            target.encode_length_delimited(&mut encoded);
+            fs::write(workspace.path().join("targets.pb"), encoded).unwrap();
             let script = workspace.path().join("fake-bazel.sh");
             let graph_result = if extension_failure {
                 "echo 'ERROR: Results may be incomplete as 1 extension failed.' >&2; exit 2"
@@ -1620,7 +1652,10 @@ mod tests {
                 format!(
                     r#"#!/bin/sh
 case "$1 $2" in
-  "mod dump_repo_mapping") printf '%s\n' '{{}}' ;;
+  "mod dump_repo_mapping")
+    printf '%s\n' mapping >> "$PWD/mapping-calls"
+    printf '%s\n' '{{"tool":"local_config_tool"}}'
+    ;;
   "mod graph")
     printf '%s\n' graph >> "$PWD/graph-calls"
     printf '%s\n' '{graph}'
@@ -1628,7 +1663,10 @@ case "$1 $2" in
     ;;
   "version ") printf '%s\n' 'Build label: 8.7.0' ;;
   "info output_base") printf '%s\n' "$PWD" ;;
-  "query "*) exit 0 ;;
+  "query "*)
+    while [ "$1" != --output_file ]; do shift; done
+    cp "$PWD/targets.pb" "$2"
+    ;;
   *) exit 80 ;;
 esac
 "#,
@@ -1639,23 +1677,39 @@ esac
             let mut options = hash_options(workspace.path());
             options.bazel.bazel = script;
             options.bazel.no_bazelrc = false;
+            options
+                .bazel
+                .fine_grained_external_repos
+                .insert("@tool".into());
             let calls = workspace.path().join("graph-calls");
+            let mapping_calls = workspace.path().join("mapping-calls");
 
             let generated = generate_hashes(&options).unwrap();
-            assert!(generated.hashes.is_empty());
+            assert_eq!(generated.hashes.len(), 1);
             assert_eq!(generated.module_graph_json.as_deref(), Some(graph));
             assert_eq!(
                 fs::read_to_string(&calls).unwrap().lines().count(),
                 1,
                 "extension_failure={extension_failure}"
             );
+            assert_eq!(
+                fs::read_to_string(&mapping_calls).unwrap().lines().count(),
+                1,
+                "the resolver reuses the unfiltered root mapping"
+            );
 
-            let direct = hash_targets(&options, Vec::new()).unwrap();
+            let direct = hash_targets(&options, vec![target]).unwrap();
+            assert_eq!(direct.hashes, generated.hashes);
             assert_eq!(direct.module_graph_json, generated.module_graph_json);
             assert_eq!(
                 fs::read_to_string(&calls).unwrap().lines().count(),
                 2,
                 "direct hashing still reads the graph"
+            );
+            assert_eq!(
+                fs::read_to_string(&mapping_calls).unwrap().lines().count(),
+                2,
+                "direct hashing still reads the root mapping"
             );
         }
     }

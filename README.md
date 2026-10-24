@@ -751,6 +751,9 @@ A few inputs are normalized or extended on the way in:
   hashed without its `url`/`urls`, since a mirror or registry move cannot change what it fetches.
   The main-repository files its attributes name -- patches, build files, lock files -- are hashed
   by content, so a changed patch is a changed repository.
+  An attribute that names a workspace path absolutely (a crate or Go module built from a directory
+  in the workspace, a `file://%workspace%` registry URL) is hashed relative to the workspace, so
+  identical checkouts at different paths hash the same.
   Bzlmod repositories are read from `bazel mod show_repo`, asked for by name in as many
   invocations as the platform's command-line limit allows, or in one `--all_repos` invocation
   when that would take several. The limit is 8191 characters wherever `cmd.exe` is involved --

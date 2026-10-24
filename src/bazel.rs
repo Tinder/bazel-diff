@@ -1799,7 +1799,7 @@ fn repository_target(
             .clone()
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "bzlmod_repo".to_owned()),
-        attribute: repository.attribute.clone(),
+        attribute: workspace_relative_attributes(&repository.attribute, workspace),
         ..Default::default()
     };
     let mut push_attribute = |name: &str, value: String| {
@@ -1894,12 +1894,13 @@ fn repository_definition_hash(repository: &Repository, workspace: &Path) -> Stri
     hasher.update(repository.repo_rule_name.as_deref().unwrap_or_default());
     hasher.update([0]);
     let mut encoded = Vec::new();
-    for attribute in &repository.attribute {
+    let attributes = workspace_relative_attributes(&repository.attribute, workspace);
+    for attribute in &attributes {
         if pinned && matches!(attribute.name.as_str(), "url" | "urls") {
             continue;
         }
         encoded.clear();
-        match crate::hash::without_integrity_pinned_urls(attribute, &repository.attribute) {
+        match crate::hash::without_integrity_pinned_urls(attribute, &attributes) {
             Some(stripped) => stripped.encode_length_delimited(&mut encoded),
             None => attribute.encode_length_delimited(&mut encoded),
         }
@@ -1977,6 +1978,80 @@ fn local_repository_content_hash(repository: &Repository, workspace: &Path) -> O
         hasher.update([0]);
     }
     Some(hex::encode(hasher.finalize()))
+}
+
+/// The workspace root as given and as resolved, the two spellings an absolute path in a
+/// repository attribute can start with.
+fn workspace_roots(workspace: &Path) -> Vec<String> {
+    let mut roots = vec![workspace.to_string_lossy().trim_end_matches('/').to_owned()];
+    if let Ok(resolved) = fs::canonicalize(workspace) {
+        let resolved = resolved.to_string_lossy().trim_end_matches('/').to_owned();
+        if !roots.contains(&resolved) {
+            roots.push(resolved);
+        }
+    }
+    roots.retain(|root| !root.is_empty());
+    roots
+}
+
+/// Every string an attribute holds, including dict keys.
+fn attribute_strings(attribute: &Attribute) -> Vec<&str> {
+    let mut strings = Vec::new();
+    strings.extend(attribute.string_value.as_deref());
+    strings.extend(attribute.string_list_value.iter().map(String::as_str));
+    for entry in &attribute.string_dict_value {
+        strings.extend([entry.key.as_str(), entry.value.as_str()]);
+    }
+    for entry in &attribute.string_list_dict_value {
+        strings.push(entry.key.as_str());
+        strings.extend(entry.value.iter().map(String::as_str));
+    }
+    strings
+}
+
+/// Rewrites one string so that the workspace root it names, bare or inside a `file://` URL, reads
+/// `%workspace%`.
+fn workspace_relative(value: &str, roots: &[String]) -> String {
+    let mut value = value.to_owned();
+    for root in roots {
+        if value == *root {
+            return "%workspace%".to_owned();
+        }
+        value = value.replace(&format!("{root}/"), "%workspace%/");
+    }
+    value
+}
+
+/// Repository attributes with the workspace root replaced by `%workspace%`. Repository rules
+/// that build from a directory in the workspace, such as Gazelle's `go_repository` with
+/// `local_path` or a `rules_rs` local crate, get that directory as an absolute path, so the same
+/// repository would otherwise hash differently in every checkout.
+fn workspace_relative_attributes(attributes: &[Attribute], workspace: &Path) -> Vec<Attribute> {
+    let roots = workspace_roots(workspace);
+    attributes
+        .iter()
+        .map(|attribute| {
+            if attribute_strings(attribute)
+                .iter()
+                .all(|value| !roots.iter().any(|root| value.contains(root.as_str())))
+            {
+                return attribute.clone();
+            }
+            let mut relative = attribute.clone();
+            let rewrite = |value: &mut String| *value = workspace_relative(value, &roots);
+            relative.string_value.iter_mut().for_each(rewrite);
+            relative.string_list_value.iter_mut().for_each(rewrite);
+            for entry in &mut relative.string_dict_value {
+                rewrite(&mut entry.key);
+                rewrite(&mut entry.value);
+            }
+            for entry in &mut relative.string_list_dict_value {
+                rewrite(&mut entry.key);
+                entry.value.iter_mut().for_each(rewrite);
+            }
+            relative
+        })
+        .collect()
 }
 
 fn parse_module_dependency_edges(json: &str) -> BTreeMap<String, BTreeSet<String>> {
@@ -2452,6 +2527,62 @@ mod tests {
         assert!(edges["c"].is_empty());
         assert!(parse_module_dependency_edges("not json").is_empty());
         assert!(parse_module_dependency_edges(r#"{"dependencies":[]}"#).is_empty());
+    }
+
+    #[test]
+    fn repository_paths_under_the_workspace_hash_relative_to_it() {
+        fn string(name: &str, value: &str) -> Attribute {
+            Attribute {
+                name: name.into(),
+                r#type: attribute::Discriminator::String,
+                string_value: Some(value.into()),
+                ..Default::default()
+            }
+        }
+        // The same repository in two checkouts: a crate built from `vendored/`, which the rule
+        // names by absolute path, plus an absolute path outside the workspace.
+        let checkout = || {
+            let workspace = tempfile::tempdir().unwrap();
+            fs::create_dir_all(workspace.path().join("vendored/src")).unwrap();
+            fs::write(workspace.path().join("vendored/src/lib.rs"), "v1").unwrap();
+            workspace
+        };
+        let crate_repository = |workspace: &Path| Repository {
+            repo_rule_name: Some("local_crate_repository".into()),
+            attribute: vec![
+                string("path", &format!("{}/vendored", workspace.display())),
+                string("toolchain", "/opt/toolchain"),
+            ],
+            ..Default::default()
+        };
+        let first = checkout();
+        let second = checkout();
+        let hashed_attributes = |workspace: &Path| {
+            let target = repository_target(
+                &crate_repository(workspace),
+                "dep",
+                &BTreeSet::new(),
+                None,
+                workspace,
+            );
+            target.rule.as_option().unwrap().attribute.clone()
+        };
+        assert_eq!(
+            hashed_attributes(first.path()),
+            hashed_attributes(second.path())
+        );
+        assert_eq!(
+            repository_definition_hash(&crate_repository(first.path()), first.path()),
+            repository_definition_hash(&crate_repository(second.path()), second.path())
+        );
+        // A path outside the workspace keeps its spelling.
+        let relative =
+            workspace_relative_attributes(&crate_repository(first.path()).attribute, first.path());
+        assert_eq!(
+            relative[0].string_value.as_deref(),
+            Some("%workspace%/vendored")
+        );
+        assert_eq!(relative[1].string_value.as_deref(), Some("/opt/toolchain"));
     }
 
     #[test]

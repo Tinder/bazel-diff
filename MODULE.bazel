@@ -23,7 +23,7 @@ go_sdk.download(version = "1.23.1")
 # MSVC exec host (rules_rs#271, hermetic-llvm#809). 0.8.19 has none, so Windows
 # builds use the locally installed Visual Studio toolchain.
 bazel_dep(name = "llvm", version = "0.8.19")
-bazel_dep(name = "rules_rs", version = "0.0.112")
+bazel_dep(name = "rules_rs", version = "0.1.3")
 
 # LLVM 22.1.8 reads Rust 1.90's coverage profiles.
 llvm = use_extension("@llvm//extensions:llvm.bzl", "llvm")

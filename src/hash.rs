@@ -147,25 +147,34 @@ pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
 
 pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, GenerationTimings)> {
     let mut definition_digests = HashMap::new();
+    let mut digests = Vec::new();
     let query_started = Instant::now();
     let QueriedTargets {
         targets,
         module_graph_json,
         root_mapping,
-    } = options
-        .bazel
-        .query_all_targets_with(|target, shared_inputs| {
-            let Some(rule) = target.rule.as_option_mut() else {
-                return;
-            };
-            definition_digests.insert(
+    } = options.bazel.query_all_targets_with(|batch, inputs| {
+        let prehash = |target: &mut Target, shared_inputs| {
+            let rule = target.rule.as_option_mut()?;
+            Some((
                 rule.name.clone(),
                 PreparedRule {
                     definition_digest: prehash_rule(rule, &options.ignored_attributes),
                     shared_inputs,
                 },
-            );
-        })?;
+            ))
+        };
+        if let [target] = batch {
+            definition_digests.extend(prehash(target, inputs));
+        } else {
+            // Keep query order for duplicate names, even when the hashes complete out of order.
+            batch
+                .par_iter_mut()
+                .map(|target| prehash(target, inputs.clone()))
+                .collect_into_vec(&mut digests);
+            definition_digests.extend(digests.drain(..).flatten());
+        }
+    })?;
     let bazel_query_millis = elapsed_millis(query_started);
     // The query is the phase worth cancelling; a request abandoned during it stops here instead
     // of hashing targets nobody will read.

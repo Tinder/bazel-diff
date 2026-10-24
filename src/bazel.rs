@@ -210,13 +210,19 @@ impl BazelOptions {
             targets,
             module_graph_json: _module_graph_json,
             root_mapping: _root_mapping,
-        } = self.query_all_targets_with(materialize_repository_inputs)?;
+        } = self.query_all_targets_with(|batch, inputs| {
+            if let Some(inputs) = inputs {
+                for target in batch {
+                    materialize_repository_inputs(target, Some(inputs.clone()));
+                }
+            }
+        })?;
         Ok(targets)
     }
 
     pub(crate) fn query_all_targets_with(
         &self,
-        mut transform: impl FnMut(&mut Target, Option<RepositoryInputs>),
+        mut transform: impl FnMut(&mut [Target], Option<RepositoryInputs>),
     ) -> Result<QueriedTargets> {
         let mut bzlmod = BzlmodRepos::default();
         let mut version = None;
@@ -236,7 +242,9 @@ impl BazelOptions {
                 Err(error) => return Err(error),
             };
             if supports_bzlmod {
-                match self.query_bzlmod_repos(root_mapping, &mut transform) {
+                match self.query_bzlmod_repos(root_mapping, &mut |target, inputs| {
+                    transform(std::slice::from_mut(target), inputs);
+                }) {
                     Ok(repos) => bzlmod = repos,
                     Err(error) if self.keep_going => {
                         eprintln!("[Warn] failed to hash Bzlmod repositories: {error:#}");
@@ -253,8 +261,8 @@ impl BazelOptions {
             root_mapping,
         } = bzlmod;
         let targets = self.collect_all_targets(bzlmod_repos, |expression, use_cquery| {
-            self.query_with(expression, use_cquery, version, &mut |target| {
-                transform(target, None)
+            self.query_with(expression, use_cquery, version, &mut |batch| {
+                transform(batch, None)
             })
         })?;
         self.check_failed_extension_references(
@@ -1020,7 +1028,7 @@ impl BazelOptions {
         expression: &str,
         use_cquery: bool,
         version: Option<BazelVersion>,
-        transform: &mut impl FnMut(&mut Target),
+        transform: &mut impl FnMut(&mut [Target]),
     ) -> Result<Vec<Target>> {
         let version = match version {
             Some(version) => version,
@@ -1088,7 +1096,9 @@ impl BazelOptions {
         }
 
         let mut targets = if use_cquery {
-            decode_cquery_stream(output_file.path(), streamed_cquery, transform)?
+            decode_cquery_stream(output_file.path(), streamed_cquery, &mut |target| {
+                transform(std::slice::from_mut(target));
+            })?
         } else {
             decode_target_stream(output_file.path(), transform)?
         };
@@ -1786,14 +1796,11 @@ fn read_raw_batch(reader: &mut impl BufRead, batch: &mut RawBatch) -> Result<boo
 
 fn decode_target_stream(
     path: &Path,
-    transform: &mut impl FnMut(&mut Target),
+    transform: &mut impl FnMut(&mut [Target]),
 ) -> Result<Vec<Target>> {
     let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
     let mut targets = Vec::new();
     let mut batch = RawBatch::default();
-    // Decoding dominates this phase and is independent per message, so each
-    // batch is decoded in parallel. `transform` stays sequential: callers use it
-    // to accumulate into shared state, and it is the cheaper half.
     let mut decoded = Vec::new();
     while read_raw_batch(&mut reader, &mut batch)? {
         batch
@@ -1804,13 +1811,14 @@ fn decode_target_stream(
                     .map(lower_target)
             })
             .collect_into_vec(&mut decoded);
+        let start = targets.len();
         targets.reserve(decoded.len());
         for lowered in decoded.drain(..) {
-            if let Some(mut target) = lowered? {
-                transform(&mut target);
+            if let Some(target) = lowered? {
                 targets.push(target);
             }
         }
+        transform(&mut targets[start..]);
     }
     Ok(targets)
 }
@@ -2748,8 +2756,12 @@ mod tests {
         let query_path = directory.path().join("query.pb");
         write_delimited(&query_path, &[rule_target("//a:a"), rule_target("//b:b")]);
         let mut seen = Vec::new();
-        let targets = decode_target_stream(&query_path, &mut |target| {
-            seen.push(target_name(target).unwrap().to_owned())
+        let targets = decode_target_stream(&query_path, &mut |batch| {
+            seen.extend(
+                batch
+                    .iter()
+                    .map(|target| target_name(target).unwrap().to_owned()),
+            );
         })
         .unwrap();
         assert_eq!(targets.len(), 2);
@@ -2804,8 +2816,12 @@ mod tests {
             .collect::<Vec<_>>();
         write_delimited(&path, &written);
         let mut seen = Vec::new();
-        let decoded = decode_target_stream(&path, &mut |target| {
-            seen.push(target_name(target).unwrap().to_owned())
+        let decoded = decode_target_stream(&path, &mut |batch| {
+            seen.extend(
+                batch
+                    .iter()
+                    .map(|target| target_name(target).unwrap().to_owned()),
+            );
         })
         .unwrap();
         assert_eq!(decoded.len(), written.len());

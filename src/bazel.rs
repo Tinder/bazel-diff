@@ -201,14 +201,18 @@ impl BazelOptions {
     }
 
     pub fn query_all_targets(&self) -> Result<Vec<Target>> {
-        let (targets, _module_graph_json) = self.query_all_targets_with(|_| {})?;
+        let QueriedTargets {
+            targets,
+            module_graph_json: _module_graph_json,
+            root_mapping: _root_mapping,
+        } = self.query_all_targets_with(|_| {})?;
         Ok(targets)
     }
 
     pub(crate) fn query_all_targets_with(
         &self,
         mut transform: impl FnMut(&mut Target),
-    ) -> Result<(Vec<Target>, Option<String>)> {
+    ) -> Result<QueriedTargets> {
         let mut bzlmod = BzlmodRepos::default();
         let mut version = None;
         let (bzlmod_enabled, root_mapping) = self.probe_bzlmod();
@@ -241,6 +245,7 @@ impl BazelOptions {
             failed_extensions,
             canonical_to_apparent,
             module_graph_json,
+            root_mapping,
         } = bzlmod;
         let targets = self.collect_all_targets(bzlmod_repos, |expression, use_cquery| {
             self.query_with(expression, use_cquery, version, &mut transform)
@@ -250,7 +255,11 @@ impl BazelOptions {
             &failed_extensions,
             &canonical_to_apparent,
         )?;
-        Ok((targets, module_graph_json))
+        Ok(QueriedTargets {
+            targets,
+            module_graph_json,
+            root_mapping,
+        })
     }
 
     fn collect_all_targets(
@@ -322,6 +331,8 @@ impl BazelOptions {
         transform: &mut impl FnMut(&mut Target),
     ) -> Result<BzlmodRepos> {
         let mut failed = BTreeSet::new();
+        // The initial probe returns stdout only on success. The fallback may be partial.
+        let retain_root_mapping = root_mapping.is_some();
         let root_mapping = match root_mapping {
             Some(mapping) => mapping,
             None => {
@@ -402,6 +413,7 @@ impl BazelOptions {
             failed_extensions: failed,
             canonical_to_apparent,
             module_graph_json: module_graph,
+            root_mapping: retain_root_mapping.then_some(root_mapping),
         })
     }
 
@@ -1166,6 +1178,13 @@ fn mod_argument_byte_budget_from(setting: Option<&str>) -> usize {
     }
 }
 
+/// Targets with the accepted module graph and successful unfiltered root mapping from discovery.
+pub(crate) struct QueriedTargets {
+    pub(crate) targets: Vec<Target>,
+    pub(crate) module_graph_json: Option<String>,
+    pub(crate) root_mapping: Option<Vec<u8>>,
+}
+
 /// The repositories `bazel mod` describes for a Bzlmod workspace, lowered to `//external:`
 /// nodes, with what it could not describe.
 #[derive(Default)]
@@ -1178,6 +1197,8 @@ struct BzlmodRepos {
     canonical_to_apparent: BTreeMap<String, Vec<String>>,
     /// The accepted module graph, shared by repository edges and hash-file metadata.
     module_graph_json: Option<String>,
+    /// Unfiltered stdout from a successful initial Bzlmod probe, shared with external hashing.
+    root_mapping: Option<Vec<u8>>,
 }
 
 /// What a failed `bazel mod` invocation said about module extensions.

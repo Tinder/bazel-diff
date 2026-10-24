@@ -60,7 +60,8 @@ pub struct HashOptions {
 struct TargetDigest {
     overall: DigestBytes,
     direct: DigestBytes,
-    deps: Vec<String>,
+    // The traversal cache and the output share these labels until all parents have been hashed.
+    deps: Option<Rc<Vec<String>>>,
 }
 
 struct TargetDigestBuilder {
@@ -97,7 +98,7 @@ impl TargetDigestBuilder {
         TargetDigest {
             overall: self.overall.finalize().into(),
             direct,
-            deps: self.deps,
+            deps: (!self.deps.is_empty()).then(|| Rc::new(self.deps)),
         }
     }
 }
@@ -376,11 +377,7 @@ fn hash_targets_with_environment(
                 generating_rule,
             } => {
                 let mut digest = context.rule_digest(&generating_rule, &mut Vec::new())?;
-                digest.deps = if options.track_deps {
-                    vec![generating_rule]
-                } else {
-                    Vec::new()
-                };
+                digest.deps = options.track_deps.then(|| Rc::new(vec![generating_rule]));
                 (name, "GeneratedFile", digest)
             }
             HashTarget::Source(label) => {
@@ -399,13 +396,14 @@ fn hash_targets_with_environment(
                     TargetDigest {
                         overall: digest,
                         direct: digest,
-                        deps: Vec::new(),
+                        deps: None,
                     },
                 )
             }
         };
         digests.push((key, kind, digest));
     }
+    drop(context);
     let (hashes, dep_edges) = aggregate_by_label(digests, options.track_deps);
     Ok(HashFileData {
         hashes,
@@ -475,7 +473,7 @@ fn aggregate_by_label(
 }
 
 fn label_hash(
-    mut instances: Vec<(String, &'static str, TargetDigest)>,
+    instances: Vec<(String, &'static str, TargetDigest)>,
 ) -> (String, TargetHash, Vec<String>) {
     let label = target_label(&instances[0].0).to_owned();
     let kind = instances[0].1;
@@ -492,8 +490,9 @@ fn label_hash(
     };
     let mut seen = HashSet::new();
     let deps = instances
-        .iter_mut()
-        .flat_map(|(_, _, digest)| digest.deps.drain(..))
+        .into_iter()
+        .filter_map(|(_, _, digest)| digest.deps)
+        .flat_map(Rc::unwrap_or_clone)
         .map(|mut dependency| {
             let length = target_label(&dependency).len();
             dependency.truncate(length);
@@ -586,7 +585,7 @@ impl HashContext<'_> {
             return Ok(TargetDigest {
                 overall: placeholder,
                 direct: placeholder,
-                deps: Vec::new(),
+                deps: None,
             });
         }
         path.push(canonical_key.clone());
@@ -2227,13 +2226,13 @@ esac
         tracked.direct(b"direct");
         tracked.transitive("//dep:a", b"dependency");
         let tracked = tracked.finish();
-        assert_eq!(tracked.deps, ["//dep:a"]);
+        assert_eq!(tracked.deps.unwrap().as_slice(), ["//dep:a"]);
         assert_ne!(tracked.direct, tracked.overall);
 
         let mut untracked = TargetDigestBuilder::new(false);
         untracked.direct(b"direct");
         untracked.transitive("//dep:a", b"dependency");
-        assert!(untracked.finish().deps.is_empty());
+        assert!(untracked.finish().deps.is_none());
         assert_eq!(crate::model::Digest::from([0; 32]).to_string().len(), 64);
     }
 

@@ -1,0 +1,6 @@
+module(name = "ext")
+
+tools = use_extension("//:tools.bzl", "tools")
+use_repo(tools, "tc")
+
+register_toolchains("@tc//:all")

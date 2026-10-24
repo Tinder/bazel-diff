@@ -88,6 +88,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::fine_grained_extension_target_sees_a_toolchain_from_its_extension",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module",
                 "timeout": "moderate",
             },

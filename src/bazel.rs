@@ -241,16 +241,169 @@ impl BazelOptions {
             failed_extensions,
             canonical_to_apparent,
             module_graph_json,
+            imported_extension_repos,
         } = bzlmod;
-        let targets = self.collect_all_targets(bzlmod_repos, |expression, use_cquery| {
+        let mut targets = self.collect_all_targets(bzlmod_repos, |expression, use_cquery| {
             self.query_with(expression, use_cquery, version, &mut transform)
         })?;
+        self.restore_toolchain_siblings(
+            &mut targets,
+            &imported_extension_repos,
+            &canonical_to_apparent,
+            |expression| self.query_with(expression, false, version, &mut |_| {}),
+        );
         self.check_failed_extension_references(
             &targets,
             &failed_extensions,
             &canonical_to_apparent,
         )?;
         Ok((targets, module_graph_json))
+    }
+
+    /// Gives back to each extension view (`extension_view_node`) the imported siblings that define
+    /// toolchains. A target inside the extension names the siblings it uses, except a toolchain it
+    /// resolves: that edge is invisible to a query, so a registered toolchain the same extension
+    /// generates has to stay behind the owning module. Only views some target actually reaches are
+    /// checked, with one `kind(toolchain, ...)` query over their extensions' imported siblings; if
+    /// that query fails, each such view keeps every imported sibling.
+    fn restore_toolchain_siblings(
+        &self,
+        targets: &mut [Target],
+        imported: &BTreeSet<String>,
+        canonical_to_apparent: &BTreeMap<String, Vec<String>>,
+        mut query: impl FnMut(&str) -> Result<Vec<Target>>,
+    ) {
+        let apparent_to_canonical = canonical_to_apparent
+            .iter()
+            .flat_map(|(canonical, apparent)| {
+                apparent
+                    .iter()
+                    .map(move |name| (name.as_str(), canonical.as_str()))
+            })
+            .collect::<HashMap<_, _>>();
+        let canonical_repo = |label: &str| -> Option<String> {
+            let rest = label.strip_prefix('@')?;
+            let (repo, _) = rest.split_once("//")?;
+            match repo.strip_prefix('@') {
+                Some("") => None,
+                Some(canonical) => Some(canonical.to_owned()),
+                None => Some(
+                    apparent_to_canonical
+                        .get(repo)
+                        .map_or(repo, |canonical| *canonical)
+                        .to_owned(),
+                ),
+            }
+        };
+        let node_names = |canonical: &str| {
+            canonical_to_apparent
+                .get(canonical)
+                .cloned()
+                .unwrap_or_else(|| vec![canonical.to_owned()])
+        };
+        // (owner node, extension) of every view, and the ones a target inside the extension reaches.
+        let views = targets
+            .iter()
+            .filter_map(target_name)
+            .filter_map(|name| name.strip_prefix("//external:")?.split_once('%'))
+            .map(|(node, extension)| (node.to_owned(), extension.to_owned()))
+            .collect::<BTreeSet<_>>();
+        if views.is_empty() {
+            return;
+        }
+        let mut reached = BTreeSet::new();
+        for target in targets.iter() {
+            let Some(rule) = target.rule.as_option() else {
+                continue;
+            };
+            let Some(repo) = canonical_repo(&rule.name) else {
+                continue;
+            };
+            let Some((owner, extension)) = extension_repo_parts(&repo) else {
+                continue;
+            };
+            let extension = extension.to_owned();
+            let owner_nodes = node_names(owner);
+            let reaches_owner = rule.rule_input.iter().any(|input| {
+                input
+                    .strip_prefix("//external:")
+                    .map(|node| owner_nodes.iter().any(|owner| owner == node))
+                    .unwrap_or_else(|| canonical_repo(input).as_deref() == Some(owner))
+            });
+            if reaches_owner {
+                for node in &owner_nodes {
+                    if views.contains(&(node.clone(), extension.clone())) {
+                        reached.insert((node.clone(), extension.clone()));
+                    }
+                }
+            }
+        }
+        let siblings = |extension: &str| {
+            imported
+                .iter()
+                .filter(|canonical| {
+                    extension_repo_parts(canonical).is_some_and(|(_, prefix)| prefix == extension)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let candidates = reached
+            .iter()
+            .flat_map(|(_, extension)| siblings(extension))
+            .collect::<BTreeSet<_>>();
+        if candidates.is_empty() {
+            return;
+        }
+        let expression = format!(
+            "kind(toolchain, {})",
+            candidates
+                .iter()
+                .map(|canonical| format!("'@@{canonical}//...'"))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        );
+        let toolchain_repos = match query(&expression) {
+            Ok(found) => found
+                .iter()
+                .filter_map(|target| target.rule.as_option())
+                .filter(|rule| rule.rule_class == "toolchain")
+                .filter_map(|rule| canonical_repo(&rule.name))
+                .collect::<BTreeSet<_>>(),
+            Err(error) => {
+                eprintln!(
+                    "[Warn] could not find the toolchains of module extensions ({error:#}); keeping every imported repository of those extensions behind their owning modules"
+                );
+                candidates.clone()
+            }
+        };
+        for target in targets.iter_mut() {
+            let Some(rule) = target.rule.as_option_mut() else {
+                continue;
+            };
+            let Some((node, extension)) = rule
+                .name
+                .strip_prefix("//external:")
+                .and_then(|name| name.split_once('%'))
+                .map(|(node, extension)| (node.to_owned(), extension.to_owned()))
+            else {
+                continue;
+            };
+            if !reached.contains(&(node, extension.clone())) {
+                continue;
+            }
+            for sibling in siblings(&extension)
+                .into_iter()
+                .filter(|sibling| toolchain_repos.contains(sibling))
+            {
+                rule.rule_input.extend(
+                    node_names(&sibling)
+                        .into_iter()
+                        .map(|name| format!("//external:{name}")),
+                );
+            }
+            rule.rule_input.sort();
+            rule.rule_input.dedup();
+        }
     }
 
     fn collect_all_targets(
@@ -402,6 +555,11 @@ impl BazelOptions {
             failed_extensions: failed,
             canonical_to_apparent,
             module_graph_json: module_graph,
+            imported_extension_repos: if self.use_cquery {
+                BTreeSet::new()
+            } else {
+                extension_repos.imported
+            },
         })
     }
 
@@ -1178,6 +1336,9 @@ struct BzlmodRepos {
     canonical_to_apparent: BTreeMap<String, Vec<String>>,
     /// The accepted module graph, shared by repository edges and hash-file metadata.
     module_graph_json: Option<String>,
+    /// The extension repositories some module imports, in query mode; see
+    /// `restore_toolchain_siblings`.
+    imported_extension_repos: BTreeSet<String>,
 }
 
 /// What a failed `bazel mod` invocation said about module extensions.
@@ -1296,7 +1457,8 @@ fn lower_repositories(
     // uses, so its edge to the owning module goes to a view of that module without the
     // extension's own repositories (`extension_view_node`). Otherwise every repository the
     // extension generates would depend on all of its siblings through the owner, and a
-    // fine-grained spoke would change whenever any other spoke does.
+    // fine-grained spoke would change whenever any other spoke does. A toolchain it resolves is
+    // the sibling it cannot name; `restore_toolchain_siblings` puts those back after the query.
     let mut module_extension_repos = BTreeMap::<String, BTreeMap<String, BTreeSet<String>>>::new();
     let mut extension_spokes = BTreeMap::<String, BTreeSet<String>>::new();
     if let Some(imported) = extension_edges {
@@ -2675,6 +2837,83 @@ mod tests {
         );
         options.exclude_targets_query = Some(" ".into());
         assert_eq!(options.with_exclude_filter("//...".into()), "//...");
+    }
+
+    #[test]
+    fn extension_views_keep_the_toolchains_of_their_extension() {
+        let options = BazelOptions {
+            workspace: PathBuf::new(),
+            bazel: PathBuf::new(),
+            startup_options: Vec::new(),
+            command_options: Vec::new(),
+            cquery_options: Vec::new(),
+            use_cquery: false,
+            cquery_expression: None,
+            keep_going: false,
+            fine_grained_external_repos: BTreeSet::new(),
+            exclude_external_targets: true,
+            exclude_targets_query: None,
+            no_bazelrc: false,
+            verbose: false,
+            cancellation: None,
+        };
+        let mapping = BTreeMap::from([("ext+".to_owned(), vec!["ext".to_owned()])]);
+        // `ext` owns two extensions: `tools`, whose `app` reaches `ext` and whose `tc` and `lib`
+        // some module imports, and `other`, which nothing inside reaches.
+        let imported = BTreeSet::from([
+            "ext++tools+tc".to_owned(),
+            "ext++tools+lib".to_owned(),
+            "ext++other+tc2".to_owned(),
+        ]);
+        let targets = || {
+            let mut app = rule_target("@@ext++tools+app//:lib");
+            app.rule.as_option_mut().unwrap().rule_input = vec!["@ext//:wrapper.sh".to_owned()];
+            vec![
+                app,
+                rule_target("//external:ext%ext++tools"),
+                rule_target("//external:ext%ext++other"),
+            ]
+        };
+        let inputs = |targets: &[Target], name: &str| {
+            targets
+                .iter()
+                .find(|target| target_name(target) == Some(name))
+                .unwrap()
+                .rule
+                .as_option()
+                .unwrap()
+                .rule_input
+                .clone()
+        };
+
+        let mut queries = Vec::new();
+        let mut found = targets();
+        options.restore_toolchain_siblings(&mut found, &imported, &mapping, |expression| {
+            queries.push(expression.to_owned());
+            let mut toolchain = rule_target("@@ext++tools+tc//:tc");
+            toolchain.rule.as_option_mut().unwrap().rule_class = "toolchain".to_owned();
+            Ok(vec![toolchain])
+        });
+        // Only the reached extension's imported repositories are queried.
+        assert_eq!(
+            queries,
+            ["kind(toolchain, '@@ext++tools+lib//...' + '@@ext++tools+tc//...')"]
+        );
+        assert_eq!(
+            inputs(&found, "//external:ext%ext++tools"),
+            ["//external:ext++tools+tc"]
+        );
+        assert!(inputs(&found, "//external:ext%ext++other").is_empty());
+
+        // Without an answer, the view keeps every imported repository of its extension.
+        let mut fallback = targets();
+        options.restore_toolchain_siblings(&mut fallback, &imported, &mapping, |_| {
+            Err(anyhow!("query failed"))
+        });
+        assert_eq!(
+            inputs(&fallback, "//external:ext%ext++tools"),
+            ["//external:ext++tools+lib", "//external:ext++tools+tc"]
+        );
     }
 
     #[test]

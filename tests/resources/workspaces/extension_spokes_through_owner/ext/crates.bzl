@@ -22,6 +22,7 @@ def _crates_impl(mctx):
     for name, version in versions.items():
         spoke(name = "crates__" + name, version = version)
     hub(name = "crates", names = sorted(versions))
+    hub(name = "ext_tools", names = [])
 
 crates = module_extension(
     implementation = _crates_impl,

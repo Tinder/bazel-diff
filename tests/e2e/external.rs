@@ -327,6 +327,33 @@ fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
     );
 }
 
+// Module `ext`'s extension generates `@app` and `@tc`, the toolchain `ext` registers and
+// `@app//:lib` resolves. A query never shows a resolved toolchain as an input, so with `@app`
+// fine-grained the change has to reach `//:uses_app` through `ext`, whose node keeps `@tc` even in
+// the view a target inside the extension sees.
+#[test]
+fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("extension_toolchain_through_owner");
+    let bumped = copy_workspace("extension_toolchain_through_owner");
+    edit(&bumped.path().join("versions.json"), |text| {
+        text.replace("1.0", "2.0")
+    });
+    let impacted = diff_local(
+        first.path(),
+        bumped.path(),
+        &["--fineGrainedHashExternalRepos", "@app"],
+    );
+    assert!(
+        impacted
+            .iter()
+            .any(|label| label == "//:uses_app" || label == "@@//:uses_app"),
+        "{impacted:?}"
+    );
+}
+
 fn diff_local(
     first: &std::path::Path,
     second: &std::path::Path,

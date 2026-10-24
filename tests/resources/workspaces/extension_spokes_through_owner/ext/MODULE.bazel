@@ -1,1 +1,6 @@
 module(name = "ext")
+
+# Like a rules module that uses its own extension for its tools: `ext` imports a
+# repository the extension generates, which defines no toolchain.
+crates = use_extension("//:crates.bzl", "crates")
+use_repo(crates, "ext_tools")

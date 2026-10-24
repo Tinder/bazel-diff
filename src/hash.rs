@@ -600,14 +600,22 @@ impl HashContext<'_> {
 
         // cquery prints canonical labels (`@@rules_rs++crate+bd_crates//:anyhow`), while the
         // synthetic `//external:<repo>` nodes are named by the root's apparent names. Only fetch
-        // the translation when a rule actually names a canonical repository, so a plain `query`
-        // or WORKSPACE run never pays for the extra `bazel mod` call.
+        // the translation when a rule actually names a canonical repository, or a fine-grained
+        // repository is given by its canonical name and has to be recognized under the apparent
+        // name `query` prints, so a plain `query` or WORKSPACE run never pays for the extra
+        // `bazel mod` call.
         let empty_repo_nodes = HashMap::new();
         let canonical_repo_nodes = if rule
             .rule
             .rule_input
             .iter()
             .any(|input| is_canonical_external_label(input))
+            || self
+                .options
+                .bazel
+                .fine_grained_external_repos
+                .iter()
+                .any(|repo| repo.starts_with("@@"))
         {
             self.source_hasher.external_resolver.canonical_repo_nodes()
         } else {
@@ -1096,10 +1104,16 @@ fn transform_external_input<'a>(
     // `//external:<spoke>` seed and changes stop propagating. Users may name the repository by
     // either its apparent name (`@pip`) or, in cquery mode, its canonical name
     // (`@@rules_python++pip+pip`).
+    // A repository given by its canonical name (`@@rules_rs++crate+crates`) is also fine-grained
+    // under the apparent name `query` prints (`@crates//:anyhow`).
     let is_fine_grained = |candidate: &str| {
-        fine_grained_repos
-            .iter()
-            .any(|repo| repo.trim_start_matches('@') == candidate)
+        fine_grained_repos.iter().any(|repo| {
+            let repo = repo.trim_start_matches('@');
+            repo == candidate
+                || canonical_repo_nodes
+                    .get(repo)
+                    .is_some_and(|node| node == candidate)
+        })
     };
     if is_fine_grained(name) || is_fine_grained(node) {
         return Cow::Borrowed(input);
@@ -1850,7 +1864,7 @@ esac
                 "@@rules_rs++crate+bd_crates//:anyhow-1.0.104"
             );
             assert_eq!(
-                transform_external_input("@bd_crates//:anyhow-1.0.104", &apparent, &nodes),
+                transform_external_input("@bd_crates//:anyhow-1.0.104", fine_grained, &nodes),
                 "@bd_crates//:anyhow-1.0.104"
             );
         }

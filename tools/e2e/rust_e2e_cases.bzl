@@ -92,6 +92,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::hub_named_by_canonical_name_is_fine_grained_under_its_apparent_name",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::hub_spoke_version_bump_impacts_consumer_behind_fine_grained_hub",
                 "timeout": "moderate",
             },

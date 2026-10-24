@@ -1,0 +1,6 @@
+module(name = "fine_grained_hub_by_canonical_name_test")
+
+# A crate-universe-style hub: the root imports only `@crates`, whose aliases
+# point at one spoke repository per crate. See external.rs.
+crates = use_extension("//:crates.bzl", "crates")
+use_repo(crates, "crates")

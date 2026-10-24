@@ -2341,7 +2341,6 @@ esac
         assert_ne!(included.finalize().to_vec(), ignored.finalize().to_vec());
     }
 
-    #[cfg(unix)]
     #[test]
     fn generated_alias_keeps_the_shared_rules_dependencies() {
         let workspace = tempfile::tempdir().unwrap();
@@ -2370,6 +2369,7 @@ esac
         assert_eq!(data.dep_edges["//:b"], ["//:dep", "//:a"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn hashes_rules_sources_generated_files_and_visibility_groups() {
         let workspace = tempfile::tempdir().unwrap();

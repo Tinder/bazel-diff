@@ -4074,6 +4074,10 @@ exit 1
             r#"#!/bin/sh
 args="$*"
 echo "$args" >> "{calls}"
+if [ "$1 $2" = "info output_base" ]; then
+  pwd
+  exit 0
+fi
 if echo "$args" | grep -q "mod graph --output=json"; then
   echo '{{"key":"<root>","name":"root","dependencies":[{{"key":"rules_go@0.62.0","name":"rules_go","dependencies":[]}},{{"key":"rules_python@1.8.4","name":"rules_python","dependencies":[]}}]}}'
   exit 0
@@ -4170,6 +4174,12 @@ exit 1
             cancellation: None,
         };
 
+        // A legacy //external rule can have the same name as a synthetic repository.
+        let overlapping = "//external:rules_python++pip+pypi_312_six";
+        write_delimited(
+            &workspace.path().join("query-result.pb"),
+            &[rule_target("//app:lib"), rule_target(overlapping)],
+        );
         let targets = options.query_all_targets().unwrap();
         let names = targets
             .iter()
@@ -4247,6 +4257,20 @@ exit 1
             ),
             "{calls}"
         );
+
+        // Definition hashing must use the same rule that deduplication keeps.
+        let options = crate::hash::HashOptions {
+            bazel: options,
+            content_hashes: None,
+            ignored_attributes: HashSet::new(),
+            seed_filepaths: BTreeSet::new(),
+            modified_filepaths: BTreeSet::new(),
+            track_deps: true,
+            always_affected_tags: HashSet::new(),
+        };
+        let raw = crate::hash::hash_targets(&options, targets).unwrap();
+        let streamed = crate::hash::generate_hashes(&options).unwrap();
+        assert_eq!(raw.hashes[overlapping], streamed.hashes[overlapping]);
     }
 
     #[test]

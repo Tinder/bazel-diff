@@ -2009,17 +2009,23 @@ fn attribute_strings(attribute: &Attribute) -> Vec<&str> {
     strings
 }
 
-/// Rewrites one string so that the workspace root it names, bare or inside a `file://` URL, reads
-/// `%workspace%`.
+/// Rewrites a path rooted at the workspace, bare or as a `file://` URL, to start with
+/// `%workspace%`. Anything else keeps its spelling, including a path that merely contains the
+/// workspace's (`/elsewhere/<workspace>/data`): rewriting it would let two different paths outside
+/// two checkouts hash the same.
 fn workspace_relative(value: &str, roots: &[String]) -> String {
-    let mut value = value.to_owned();
+    let (scheme, path) = value
+        .strip_prefix("file://")
+        .map_or(("", value), |path| ("file://", path));
     for root in roots {
-        if value == *root {
-            return "%workspace%".to_owned();
+        let rest = path
+            .strip_prefix(root.as_str())
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'));
+        if let Some(rest) = rest {
+            return format!("{scheme}%workspace%{rest}");
         }
-        value = value.replace(&format!("{root}/"), "%workspace%/");
     }
-    value
+    value.to_owned()
 }
 
 /// Repository attributes with the workspace root replaced by `%workspace%`. Repository rules
@@ -2583,6 +2589,37 @@ mod tests {
             Some("%workspace%/vendored")
         );
         assert_eq!(relative[1].string_value.as_deref(), Some("/opt/toolchain"));
+    }
+
+    #[test]
+    fn only_paths_rooted_at_the_workspace_are_rewritten() {
+        let roots = vec!["/checkout/repo".to_owned()];
+        for (value, expected) in [
+            ("/checkout/repo", "%workspace%"),
+            ("/checkout/repo/vendored", "%workspace%/vendored"),
+            (
+                "file:///checkout/repo/registry/x.patch",
+                "file://%workspace%/registry/x.patch",
+            ),
+            // Paths that only contain the workspace's spelling, or share its prefix.
+            (
+                "/external/checkout/repo/data",
+                "/external/checkout/repo/data",
+            ),
+            (
+                "file:///external/checkout/repo/data",
+                "file:///external/checkout/repo/data",
+            ),
+            ("/checkout/repo-other/data", "/checkout/repo-other/data"),
+            ("-L/checkout/repo/lib", "-L/checkout/repo/lib"),
+        ] {
+            assert_eq!(workspace_relative(value, &roots), expected, "{value}");
+        }
+        // Two different paths outside two checkouts stay different.
+        assert_ne!(
+            workspace_relative("/data/a/repo/x", &["/a/repo".to_owned()]),
+            workspace_relative("/data/b/repo/x", &["/b/repo".to_owned()])
+        );
     }
 
     #[test]

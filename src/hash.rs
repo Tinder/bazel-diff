@@ -488,18 +488,22 @@ fn label_hash(
         }
         (overall.finalize().into(), direct.finalize().into())
     };
-    let mut seen = HashSet::new();
-    let deps = instances
+    let mut edge_lists = instances
         .into_iter()
         .filter_map(|(_, _, digest)| digest.deps)
-        .flat_map(Rc::unwrap_or_clone)
-        .map(|mut dependency| {
-            let length = target_label(&dependency).len();
-            dependency.truncate(length);
-            dependency
-        })
-        .filter(|dependency| seen.insert(dependency.clone()))
-        .collect();
+        .map(Rc::unwrap_or_clone);
+    let mut deps = edge_lists.next().unwrap_or_default();
+    for mut edges in edge_lists {
+        deps.append(&mut edges);
+    }
+    for dependency in &mut deps {
+        dependency.truncate(target_label(dependency).len());
+    }
+    // Plain-query rule inputs are normally already unique and in label order.
+    if !deps.is_sorted_by(|left, right| left < right) {
+        let mut seen = HashSet::new();
+        deps.retain(|dependency| seen.insert(dependency.clone()));
+    }
     (
         label,
         TargetHash {
@@ -2338,6 +2342,34 @@ esac
     }
 
     #[cfg(unix)]
+    #[test]
+    fn generated_alias_keeps_the_shared_rules_dependencies() {
+        let workspace = tempfile::tempdir().unwrap();
+        let rule = |name: &str, inputs: &[&str]| {
+            rule_target(Rule {
+                name: name.into(),
+                rule_class: "genrule".into(),
+                rule_input: inputs.iter().map(|input| (*input).to_owned()).collect(),
+                ..Default::default()
+            })
+        };
+        // Raw targets can list a rule under a generated file's label. Both rule outputs
+        // then read the generating rule's cached digest, including its edge list.
+        let data = hash_targets_for_test(
+            &hash_options(workspace.path()),
+            vec![
+                rule("//:a", &["//:dep"]),
+                rule("//:dep", &[]),
+                rule("//:b", &[]),
+                generated_target("//:b", "//:a"),
+            ],
+            workspace.path(),
+        )
+        .unwrap();
+        assert_eq!(data.dep_edges["//:a"], ["//:dep"]);
+        assert_eq!(data.dep_edges["//:b"], ["//:dep", "//:a"]);
+    }
+
     #[test]
     fn hashes_rules_sources_generated_files_and_visibility_groups() {
         let workspace = tempfile::tempdir().unwrap();

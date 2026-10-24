@@ -613,12 +613,26 @@ impl HashContext<'_> {
         } else {
             &empty_repo_nodes
         };
+        let extension = self.rule_extension(&rule.rule.name);
         for encoded_input in rule_inputs(
             &rule.rule,
             self.options.bazel.use_cquery,
             &self.options.bazel.fine_grained_external_repos,
             canonical_repo_nodes,
         ) {
+            // A target in an extension's repository reaches its owning module through the view
+            // without that extension's repositories, when there is one (query mode only).
+            let encoded_input = match extension.as_deref().and_then(|extension| {
+                let node = encoded_input.strip_prefix("//external:")?;
+                let view = format!(
+                    "//external:{}",
+                    crate::bazel::extension_view_node(node, extension)
+                );
+                self.rules.contains_key(&view).then_some(view)
+            }) {
+                Some(view) => Cow::Owned(view),
+                None => encoded_input,
+            };
             builder.direct(encoded_input.as_bytes());
             let input_label = target_label(&encoded_input);
             if let Some(source_digest) = self.source_digests.get(input_label) {
@@ -694,6 +708,24 @@ impl HashContext<'_> {
             return None;
         }
         Some(Cow::Owned(fallback.clone()))
+    }
+
+    /// The canonical prefix of the module extension that generated the repository `label` is in
+    /// (`rules_rs++crate` for `@@rules_rs++crate+crates__anyhow//:anyhow`), if any.
+    fn rule_extension(&self, label: &str) -> Option<String> {
+        let label = target_label(label);
+        let repo = label.strip_prefix('@')?.split_once("//")?.0;
+        let canonical = match repo.strip_prefix('@') {
+            Some("") => return None,
+            Some(canonical) => canonical,
+            None => self
+                .source_hasher
+                .external_resolver
+                .repo_mapping()
+                .get(repo)?
+                .as_str(),
+        };
+        crate::bazel::extension_repo_parts(canonical).map(|(_, extension)| extension.to_owned())
     }
 
     fn rule_bzl_seed(&mut self, rule: &Rule) -> Result<Option<DigestBytes>> {
@@ -1523,6 +1555,7 @@ mod tests {
             cquery_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
+            label_only_module_extensions: BTreeSet::new(),
             exclude_external_targets: false,
             exclude_targets_query: None,
             no_bazelrc: true,

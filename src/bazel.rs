@@ -30,6 +30,12 @@ pub struct BazelOptions {
     pub cquery_expression: Option<String>,
     pub keep_going: bool,
     pub fine_grained_external_repos: BTreeSet<String>,
+    /// Module extensions, as `bazel mod show_extension` names them
+    /// (`@rules_rs//rs:extensions.bzl%crate`), whose repositories use each other only through
+    /// labels: no target in one of them resolves a toolchain from another. A target inside such an
+    /// extension's repository reaches the module that owns the extension without the extension's
+    /// other repositories (see `extension_view_node`).
+    pub label_only_module_extensions: BTreeSet<String>,
     pub exclude_external_targets: bool,
     pub exclude_targets_query: Option<String>,
     pub no_bazelrc: bool,
@@ -394,6 +400,7 @@ impl BazelOptions {
             // input, so there the nodes alone carry the change and the stand-in edges would only
             // widen the impacted set.
             (!self.use_cquery).then_some(&extension_repos.imported),
+            &self.label_only_extension_prefixes(&canonical_to_apparent, &extension_repos.generated),
             &self.workspace,
             transform,
         );
@@ -403,6 +410,53 @@ impl BazelOptions {
             canonical_to_apparent,
             module_graph_json: module_graph,
         })
+    }
+
+    /// The canonical prefixes (`rules_rs++crate`) of `label_only_module_extensions`. An entry that
+    /// does not parse, names a module the root cannot see, or matches no generated repository is
+    /// reported and ignored, which leaves that extension on the conservative edges.
+    fn label_only_extension_prefixes(
+        &self,
+        canonical_to_apparent: &BTreeMap<String, Vec<String>>,
+        generated: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let mut prefixes = BTreeSet::new();
+        for id in &self.label_only_module_extensions {
+            let parsed = id.rsplit_once('%').and_then(|(file, name)| {
+                let (repo, _) = file.split_once("//")?;
+                Some((repo, name))
+            });
+            let Some((repo, name)) = parsed.filter(|(_, name)| !name.is_empty()) else {
+                eprintln!(
+                    "[Warn] --labelOnlyModuleExtensions: {id} is not of the form @module//path.bzl%extension"
+                );
+                continue;
+            };
+            let canonical = match repo.strip_prefix("@@") {
+                Some(canonical) => Some(canonical.to_owned()),
+                None => {
+                    let apparent = repo.trim_start_matches('@');
+                    canonical_to_apparent
+                        .iter()
+                        .find(|(_, names)| names.iter().any(|name| name == apparent))
+                        .map(|(canonical, _)| canonical.clone())
+                }
+            };
+            let prefix = canonical.map(|canonical| format!("{canonical}+{name}"));
+            match prefix {
+                Some(prefix)
+                    if generated.iter().any(|repo| {
+                        extension_repo_parts(repo).is_some_and(|(_, extension)| extension == prefix)
+                    }) =>
+                {
+                    prefixes.insert(prefix);
+                }
+                _ => eprintln!(
+                    "[Warn] --labelOnlyModuleExtensions: {id} generates no repository the root module can see"
+                ),
+            }
+        }
+        prefixes
     }
 
     /// Runs `bazel mod show_repo --output=streamed_proto` over `canonical_names`.
@@ -1111,7 +1165,7 @@ fn is_extension_repo(canonical: &str) -> bool {
 /// Splits an extension repository's canonical name into the owning module's repository name
 /// and the extension's canonical prefix: `rules_go++go_sdk+go_default_sdk` is
 /// `("rules_go+", "rules_go++go_sdk")`. `None` for a module repository.
-fn extension_repo_parts(canonical: &str) -> Option<(&str, &str)> {
+pub(crate) fn extension_repo_parts(canonical: &str) -> Option<(&str, &str)> {
     if !is_extension_repo(canonical) {
         return None;
     }
@@ -1264,6 +1318,7 @@ fn lower_repositories(
     canonical_to_apparent: &BTreeMap<String, Vec<String>>,
     module_edges: &BTreeMap<String, BTreeSet<String>>,
     extension_edges: Option<&BTreeSet<String>>,
+    label_only_extensions: &BTreeSet<String>,
     workspace: &Path,
     transform: &mut impl FnMut(&mut Target),
 ) -> Vec<Target> {
@@ -1292,7 +1347,13 @@ fn lower_repositories(
     // and each imported repository of an extension depends on the siblings nobody imports (the
     // `@bd_crates` hub reaches its `bd_crates__*` spokes). Spokes themselves stay leaves, so no
     // cycle forms.
-    let mut module_extension_repos = BTreeMap::<String, BTreeSet<String>>::new();
+    // For an extension the user lists in `label_only_module_extensions`, a target inside one of
+    // its repositories reaches the owning module through a view without the extension's own
+    // repositories (`extension_view_node`): the user asserts that it uses its siblings only
+    // through labels, which the query reports. Otherwise every fine-grained spoke would change
+    // whenever any other spoke does. The view is opt-in because a toolchain resolved from a
+    // sibling is invisible to a query, however it is registered.
+    let mut module_extension_repos = BTreeMap::<String, BTreeMap<String, BTreeSet<String>>>::new();
     let mut extension_spokes = BTreeMap::<String, BTreeSet<String>>::new();
     if let Some(imported) = extension_edges {
         for repository in &repositories {
@@ -1303,6 +1364,8 @@ fn lower_repositories(
             if !module_repo.is_empty() {
                 module_extension_repos
                     .entry(module_repo.to_owned())
+                    .or_default()
+                    .entry(extension.to_owned())
                     .or_default()
                     .extend(node_names(canonical));
             }
@@ -1348,7 +1411,8 @@ fn lower_repositories(
             .filter_map(|dependency| module_to_canonical.get(dependency))
             .flat_map(|canonical| node_names(canonical))
             .collect::<BTreeSet<_>>();
-        if let Some(repos) = module_extension_repos.get(canonical) {
+        let extensions = module_extension_repos.get(canonical);
+        for repos in extensions.into_iter().flat_map(BTreeMap::values) {
             dependencies.extend(repos.iter().cloned());
         }
         if let Some(spokes) = extension_repo_parts(canonical)
@@ -1367,9 +1431,30 @@ fn lower_repositories(
             );
             transform(&mut target);
             targets.push(target);
+            for (extension, repos) in extensions
+                .into_iter()
+                .flatten()
+                .filter(|(extension, _)| label_only_extensions.contains(*extension))
+            {
+                let mut view = repository_target(
+                    &repository,
+                    &extension_view_node(&apparent, extension),
+                    &dependencies.difference(repos).cloned().collect(),
+                    owner_definition_hash,
+                    workspace,
+                );
+                transform(&mut view);
+                targets.push(view);
+            }
         }
     }
     targets
+}
+
+/// The node a target in a repository of `extension` reaches its owning module `node` through:
+/// the module without the extension's own repositories (see `lower_repositories`).
+pub(crate) fn extension_view_node(node: &str, extension: &str) -> String {
+    format!("{node}%{extension}")
 }
 
 fn parse_bazel_version(text: &str) -> Option<BazelVersion> {
@@ -2637,6 +2722,7 @@ mod tests {
             cquery_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
+            label_only_module_extensions: BTreeSet::new(),
             exclude_external_targets: false,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -2664,6 +2750,7 @@ mod tests {
             cquery_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::from(["@repo".to_owned()]),
+            label_only_module_extensions: BTreeSet::new(),
             exclude_external_targets: false,
             exclude_targets_query: Some("attr(tags, manual, //...)".into()),
             no_bazelrc: false,
@@ -2707,6 +2794,7 @@ mod tests {
             cquery_expression: Some("deps(//app:lib)".into()),
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
+            label_only_module_extensions: BTreeSet::new(),
             exclude_external_targets: false,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -2764,6 +2852,7 @@ mod tests {
             &mapping,
             &edges,
             None,
+            &BTreeSet::new(),
             Path::new("."),
             &mut |target| transformed.push(target_name(target).unwrap().to_owned()),
         );
@@ -2822,6 +2911,7 @@ mod tests {
                 &mapping,
                 &BTreeMap::new(),
                 None,
+                &BTreeSet::new(),
                 workspace.path(),
                 &mut |_| {},
             );
@@ -2876,6 +2966,7 @@ mod tests {
             &mapping,
             &parse_module_dependency_edges(graph),
             None,
+            &BTreeSet::new(),
             Path::new("."),
             &mut |_| {},
         );
@@ -3056,6 +3147,7 @@ exit 1
             cquery_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
+            label_only_module_extensions: BTreeSet::new(),
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -3132,6 +3224,7 @@ exit 1
             cquery_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
+            label_only_module_extensions: BTreeSet::new(),
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -3180,6 +3273,7 @@ exit 1
             cquery_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
+            label_only_module_extensions: BTreeSet::new(),
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -3277,10 +3371,11 @@ exit 1
             &mapping,
             &edges,
             Some(&imported),
+            &BTreeSet::from(["rules_go++go_sdk".to_owned(), "rules_rs++crate".to_owned()]),
             Path::new("."),
             &mut |_| {},
         );
-        assert_eq!(query.len(), 7);
+        assert_eq!(query.len(), 9);
         // The owning module reaches everything its extensions generate, after its module deps.
         assert_eq!(
             inputs_of(&query, "//external:rules_go"),
@@ -3297,6 +3392,12 @@ exit 1
                 "//external:rules_rs++crate+bd_crates__anyhow-1.0.104",
             ]
         );
+        // Its view from inside one extension leaves out that extension's repositories.
+        assert_eq!(
+            inputs_of(&query, "//external:rules_go%rules_go++go_sdk"),
+            ["//external:rules_rs"]
+        );
+        assert!(inputs_of(&query, "//external:rules_rs%rules_rs++crate").is_empty());
         // An imported repository reaches the siblings of its extension nobody imports.
         assert_eq!(
             inputs_of(&query, "//external:bd_crates"),
@@ -3320,6 +3421,7 @@ exit 1
             &mapping,
             &edges,
             None,
+            &BTreeSet::new(),
             Path::new("."),
             &mut |_| {},
         );
@@ -3388,6 +3490,7 @@ exit 1
                 &mapping,
                 &BTreeMap::new(),
                 None,
+                &BTreeSet::new(),
                 workspace.path(),
                 &mut |_| {},
             )
@@ -3578,6 +3681,7 @@ exit 1
             cquery_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
+            label_only_module_extensions: BTreeSet::new(),
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -3691,6 +3795,7 @@ exit 1
             cquery_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
+            label_only_module_extensions: BTreeSet::new(),
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -3779,6 +3884,7 @@ exit 1
             cquery_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
+            label_only_module_extensions: BTreeSet::new(),
             exclude_external_targets: false,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -3850,6 +3956,7 @@ exit 1
             cquery_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
+            label_only_module_extensions: BTreeSet::new(),
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -3945,6 +4052,7 @@ exit 1
             cquery_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
+            label_only_module_extensions: BTreeSet::new(),
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,

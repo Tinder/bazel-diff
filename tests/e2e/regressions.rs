@@ -774,6 +774,42 @@ fn referenced_failing_extension_fails_without_keep_going() {
     );
 }
 
+#[test]
+fn same_symbol_extension_failure_keeps_healthy_repo_hashed() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("same_symbol_extension_failure");
+    let query = std::process::Command::new(bazel())
+        .args(["query", "deps(//:uses_healthy)"])
+        .current_dir(workspace.path())
+        .output()
+        .expect("run bazel query");
+    assert!(
+        query.status.success(),
+        "the healthy repository must remain loadable: {}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    assert!(String::from_utf8_lossy(&query.stdout).contains("healthy_repo//:x"));
+
+    for mode in ["--keep_going", "--no-keep_going"] {
+        let output = workspace.path().join(format!("{mode}.json"));
+        let result = generate(
+            workspace.path(),
+            &output,
+            &[mode, "--excludeExternalTargets", "--includeTargetType"],
+        );
+        assert!(
+            result.status.success(),
+            "generate-hashes {mode} must not fail"
+        );
+        assert!(
+            hashes(&output).contains_key("//external:healthy_repo"),
+            "{mode} must hash the healthy repository"
+        );
+    }
+}
+
 /// Reproducer for https://github.com/Tinder/bazel-diff/issues/535: the root maps the apparent
 /// name `dep` to a repository rule (`+_repo_rules+dep`) and, under the apparent name
 /// `module_dep`, also depends on a *module* named `dep`, whose directory is `external/dep+`.

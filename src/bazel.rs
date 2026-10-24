@@ -2009,10 +2009,10 @@ fn attribute_strings(attribute: &Attribute) -> Vec<&str> {
     strings
 }
 
-/// Rewrites a path rooted at the workspace, bare or as a `file://` URL, to start with
-/// `%workspace%`. Anything else keeps its spelling, including a path that merely contains the
-/// workspace's (`/elsewhere/<workspace>/data`): rewriting it would let two different paths outside
-/// two checkouts hash the same.
+/// Rewrites a path inside the workspace, bare or as a `file://` URL, to start with
+/// `%workspace%`. Anything else keeps its spelling: a path that merely contains the workspace's
+/// (`/elsewhere/<workspace>/data`), and one that starts with it but leaves it, through `..` or a
+/// symlink. Rewriting those would let two different paths outside two checkouts hash the same.
 fn workspace_relative(value: &str, roots: &[String]) -> String {
     let (scheme, path) = value
         .strip_prefix("file://")
@@ -2022,10 +2022,43 @@ fn workspace_relative(value: &str, roots: &[String]) -> String {
             .strip_prefix(root.as_str())
             .filter(|rest| rest.is_empty() || rest.starts_with('/'));
         if let Some(rest) = rest {
+            if !stays_inside(root, rest) {
+                break;
+            }
             return format!("{scheme}%workspace%{rest}");
         }
     }
     value.to_owned()
+}
+
+/// Whether `root` followed by `rest` (empty or starting with `/`) names something inside `root`:
+/// its `..` components never climb above `root`, and its deepest existing ancestor, with symlinks
+/// resolved, is still under `root`. A path that does not exist yet is judged by its spelling.
+fn stays_inside(root: &str, rest: &str) -> bool {
+    let mut depth = 0usize;
+    let mut normalized = PathBuf::from(root);
+    for component in rest
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
+        if component == ".." {
+            let Some(up) = depth.checked_sub(1) else {
+                return false;
+            };
+            depth = up;
+            normalized.pop();
+        } else {
+            depth += 1;
+            normalized.push(component);
+        }
+    }
+    let Ok(root) = fs::canonicalize(root) else {
+        return true;
+    };
+    let existing = normalized.ancestors().find(|ancestor| ancestor.exists());
+    existing.is_none_or(|ancestor| {
+        fs::canonicalize(ancestor).is_ok_and(|resolved| resolved.starts_with(&root))
+    })
 }
 
 /// Repository attributes with the workspace root replaced by `%workspace%`. Repository rules
@@ -2620,6 +2653,36 @@ mod tests {
             workspace_relative("/data/a/repo/x", &["/a/repo".to_owned()]),
             workspace_relative("/data/b/repo/x", &["/b/repo".to_owned()])
         );
+        // `..` that stays inside is fine; `..` that leaves is not.
+        assert_eq!(
+            workspace_relative("/checkout/repo/a/../b", &roots),
+            "%workspace%/a/../b"
+        );
+        assert_eq!(
+            workspace_relative("/checkout/repo/../data", &roots),
+            "/checkout/repo/../data"
+        );
+        assert_eq!(
+            workspace_relative("/checkout/repo/a/../../data", &roots),
+            "/checkout/repo/a/../../data"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_workspace_is_not_rewritten() {
+        let outside = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("inside")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("link")).unwrap();
+        let roots = workspace_roots(workspace.path());
+        let root = &roots[0];
+        assert_eq!(
+            workspace_relative(&format!("{root}/inside/data"), &roots),
+            "%workspace%/inside/data"
+        );
+        let escaping = format!("{root}/link/data");
+        assert_eq!(workspace_relative(&escaping, &roots), escaping);
     }
 
     #[test]

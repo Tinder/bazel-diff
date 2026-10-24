@@ -289,6 +289,44 @@ fn hub_spoke_version_bump_impacts_consumer_behind_fine_grained_hub() {
     );
 }
 
+// Module `ext`'s extension generates the `@crates` hub and its spokes, whose targets use a rule
+// `ext` defines. In query mode `//external:ext` stands in for everything its extensions generate,
+// so a fine-grained spoke target reaching `ext` through it would change whenever any other spoke
+// does. Bumping spoke `b` must impact only `//:uses_b`, while a change to `ext` itself still
+// impacts both consumers.
+#[test]
+fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let fine_grained = [
+        "--fineGrainedHashExternalRepos",
+        "@crates,@@ext++crates+crates__a",
+    ];
+    let main = |impacted: BTreeSet<String>| -> BTreeSet<String> {
+        impacted
+            .into_iter()
+            .map(|label| label.trim_start_matches("@@").to_owned())
+            .filter(|label| label.starts_with("//") && !label.starts_with("//external:"))
+            .collect()
+    };
+    let first = copy_workspace("extension_spokes_through_owner");
+    let bumped = copy_workspace("extension_spokes_through_owner");
+    edit(&bumped.path().join("versions.json"), |text| {
+        text.replace("\"b\": \"1.0\"", "\"b\": \"2.0\"")
+    });
+    let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained));
+    assert_eq!(impacted, BTreeSet::from(["//:uses_b".to_owned()]));
+
+    let changed_rule = copy_workspace("extension_spokes_through_owner");
+    fs::write(changed_rule.path().join("ext/tool.sh"), "exit 1\n").unwrap();
+    let impacted = main(diff_local(first.path(), changed_rule.path(), &fine_grained));
+    assert_eq!(
+        impacted,
+        BTreeSet::from(["//:uses_a".to_owned(), "//:uses_b".to_owned()])
+    );
+}
+
 fn diff_local(
     first: &std::path::Path,
     second: &std::path::Path,

@@ -1111,7 +1111,7 @@ fn is_extension_repo(canonical: &str) -> bool {
 /// Splits an extension repository's canonical name into the owning module's repository name
 /// and the extension's canonical prefix: `rules_go++go_sdk+go_default_sdk` is
 /// `("rules_go+", "rules_go++go_sdk")`. `None` for a module repository.
-fn extension_repo_parts(canonical: &str) -> Option<(&str, &str)> {
+pub(crate) fn extension_repo_parts(canonical: &str) -> Option<(&str, &str)> {
     if !is_extension_repo(canonical) {
         return None;
     }
@@ -1292,7 +1292,12 @@ fn lower_repositories(
     // and each imported repository of an extension depends on the siblings nobody imports (the
     // `@bd_crates` hub reaches its `bd_crates__*` spokes). Spokes themselves stay leaves, so no
     // cycle forms.
-    let mut module_extension_repos = BTreeMap::<String, BTreeSet<String>>::new();
+    // A target inside an extension's repository is the exception: it names the siblings it
+    // uses, so its edge to the owning module goes to a view of that module without the
+    // extension's own repositories (`extension_view_node`). Otherwise every repository the
+    // extension generates would depend on all of its siblings through the owner, and a
+    // fine-grained spoke would change whenever any other spoke does.
+    let mut module_extension_repos = BTreeMap::<String, BTreeMap<String, BTreeSet<String>>>::new();
     let mut extension_spokes = BTreeMap::<String, BTreeSet<String>>::new();
     if let Some(imported) = extension_edges {
         for repository in &repositories {
@@ -1303,6 +1308,8 @@ fn lower_repositories(
             if !module_repo.is_empty() {
                 module_extension_repos
                     .entry(module_repo.to_owned())
+                    .or_default()
+                    .entry(extension.to_owned())
                     .or_default()
                     .extend(node_names(canonical));
             }
@@ -1348,7 +1355,8 @@ fn lower_repositories(
             .filter_map(|dependency| module_to_canonical.get(dependency))
             .flat_map(|canonical| node_names(canonical))
             .collect::<BTreeSet<_>>();
-        if let Some(repos) = module_extension_repos.get(canonical) {
+        let extensions = module_extension_repos.get(canonical);
+        for repos in extensions.into_iter().flat_map(BTreeMap::values) {
             dependencies.extend(repos.iter().cloned());
         }
         if let Some(spokes) = extension_repo_parts(canonical)
@@ -1367,9 +1375,26 @@ fn lower_repositories(
             );
             transform(&mut target);
             targets.push(target);
+            for (extension, repos) in extensions.into_iter().flatten() {
+                let mut view = repository_target(
+                    &repository,
+                    &extension_view_node(&apparent, extension),
+                    &dependencies.difference(repos).cloned().collect(),
+                    owner_definition_hash,
+                    workspace,
+                );
+                transform(&mut view);
+                targets.push(view);
+            }
         }
     }
     targets
+}
+
+/// The node a target in a repository of `extension` reaches its owning module `node` through:
+/// the module without the extension's own repositories (see `lower_repositories`).
+pub(crate) fn extension_view_node(node: &str, extension: &str) -> String {
+    format!("{node}%{extension}")
 }
 
 fn parse_bazel_version(text: &str) -> Option<BazelVersion> {
@@ -3280,7 +3305,7 @@ exit 1
             Path::new("."),
             &mut |_| {},
         );
-        assert_eq!(query.len(), 7);
+        assert_eq!(query.len(), 9);
         // The owning module reaches everything its extensions generate, after its module deps.
         assert_eq!(
             inputs_of(&query, "//external:rules_go"),
@@ -3297,6 +3322,12 @@ exit 1
                 "//external:rules_rs++crate+bd_crates__anyhow-1.0.104",
             ]
         );
+        // Its view from inside one extension leaves out that extension's repositories.
+        assert_eq!(
+            inputs_of(&query, "//external:rules_go%rules_go++go_sdk"),
+            ["//external:rules_rs"]
+        );
+        assert!(inputs_of(&query, "//external:rules_rs%rules_rs++crate").is_empty());
         // An imported repository reaches the siblings of its extension nobody imports.
         assert_eq!(
             inputs_of(&query, "//external:bd_crates"),
@@ -3596,9 +3627,11 @@ exit 1
                 "//app:lib",
                 "//external:pypi",
                 "//external:rules_go",
+                "//external:rules_go%rules_go++go_sdk",
                 "//external:rules_go++go_sdk+go_default_sdk",
                 "//external:rules_go++go_sdk+go_toolchains",
                 "//external:rules_python",
+                "//external:rules_python%rules_python++pip",
                 "//external:rules_python++pip+pypi_312_six",
             ])
         );

@@ -196,6 +196,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::same_symbol_extension_failure_keeps_healthy_repo_hashed",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::single_version_override_patch_change_reaches_consumer_cquery",
                 "timeout": "moderate",
             },

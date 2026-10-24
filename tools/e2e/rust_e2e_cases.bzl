@@ -192,6 +192,14 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::repository_named_by_workspace_path_does_not_depend_on_its_path",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::repository_outside_the_workspace_keeps_its_path",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::rule_bzl_change_is_scoped_to_consumer",
                 "timeout": "moderate",
             },

@@ -1,0 +1,7 @@
+module(name = "workspace_outside_repository_test")
+
+# A module extension builds `@outside` from `../data`, next to this workspace,
+# and names that directory by an absolute path that goes through the workspace.
+# See regressions.rs.
+outside = use_extension("//:outside.bzl", "outside")
+use_repo(outside, "outside")

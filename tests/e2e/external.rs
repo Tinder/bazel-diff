@@ -292,7 +292,8 @@ fn hub_spoke_version_bump_impacts_consumer_behind_fine_grained_hub() {
 // The Bzlmod form of the case above, with the hub named by its canonical name. `query` prints the
 // apparent `@crates//:a`, which must still count as fine-grained: otherwise the input falls back to
 // the hub's `//external:crates` node, which depends on every spoke, and bumping one crate impacts
-// every consumer of the hub.
+// every consumer of the hub. The hub's own `versions.txt`, also named by its apparent label, must
+// be hashed by content under either name, or `//:uses_versions` misses the bump.
 #[test]
 fn hub_named_by_canonical_name_is_fine_grained_under_its_apparent_name() {
     if !supports_mod_show_repo() {
@@ -317,7 +318,7 @@ fn hub_named_by_canonical_name_is_fine_grained_under_its_apparent_name() {
             .collect();
         assert_eq!(
             main,
-            BTreeSet::from(["//:uses_a".to_owned()]),
+            BTreeSet::from(["//:uses_a".to_owned(), "//:uses_versions".to_owned()]),
             "{repo}: {impacted:?}"
         );
     }

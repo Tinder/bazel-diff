@@ -1104,21 +1104,30 @@ fn transform_external_input<'a>(
     // `//external:<spoke>` seed and changes stop propagating. Users may name the repository by
     // either its apparent name (`@pip`) or, in cquery mode, its canonical name
     // (`@@rules_python++pip+pip`).
-    // A repository given by its canonical name (`@@rules_rs++crate+crates`) is also fine-grained
-    // under the apparent name `query` prints (`@crates//:anyhow`).
-    let is_fine_grained = |candidate: &str| {
-        fine_grained_repos.iter().any(|repo| {
-            let repo = repo.trim_start_matches('@');
-            repo == candidate
-                || canonical_repo_nodes
-                    .get(repo)
-                    .is_some_and(|node| node == candidate)
-        })
-    };
-    if is_fine_grained(name) || is_fine_grained(node) {
+    if names_fine_grained_repo(name, node, fine_grained_repos, canonical_repo_nodes) {
         return Cow::Borrowed(input);
     }
     Cow::Owned(format!("//external:{node}"))
+}
+
+/// Whether a label's repository -- `name` as the label spells it, `node` its `//external:` node
+/// name -- is one the user fine-grained, by its apparent name (`@crates`) or its canonical name
+/// (`@@rules_rs++crate+crates`). Rule inputs and source files share this, so a repository
+/// fine-grained under either name is treated the same way when it is printed under the other.
+fn names_fine_grained_repo(
+    name: &str,
+    node: &str,
+    fine_grained_repos: &BTreeSet<String>,
+    canonical_repo_nodes: &HashMap<String, String>,
+) -> bool {
+    fine_grained_repos.iter().any(|repo| {
+        let repo = repo.trim_start_matches('@');
+        repo == name
+            || repo == node
+            || canonical_repo_nodes
+                .get(repo)
+                .is_some_and(|repo_node| repo_node == node)
+    })
 }
 
 fn rule_tags(rule: &Rule) -> HashSet<&str> {
@@ -1252,18 +1261,19 @@ impl SourceHasher<'_> {
             let Some((repo, target)) = rest.split_once("//") else {
                 return Ok(None);
             };
-            // A canonical label (`@@rules_jvm_external++maven+maven//...`, as cquery prints)
-            // is fine-grained when the user named the repository either way: by that canonical
-            // name or by the apparent name its `//external:` node carries (`@maven`), the same
-            // rule `transform_external_input` applies to the rule's inputs.
+            // The same matching `transform_external_input` applies to the rule's inputs: a label
+            // printed under either name (`@crates//...` by `query`, `@@rules_rs++crate+crates//...`
+            // by `cquery`) is fine-grained when the user named the repository either way.
             let fine_grained = self.fine_grained_external_repos.contains(repo)
-                || (canonical
-                    && !self.fine_grained_external_repos.is_empty()
-                    && self
-                        .external_resolver
-                        .canonical_repo_nodes()
-                        .get(repo)
-                        .is_some_and(|node| self.fine_grained_external_repos.contains(node)));
+                || (!self.fine_grained_external_repos.is_empty() && {
+                    let nodes = self.external_resolver.canonical_repo_nodes();
+                    let node = if canonical {
+                        nodes.get(repo).map_or(repo, String::as_str)
+                    } else {
+                        repo
+                    };
+                    names_fine_grained_repo(repo, node, &self.fine_grained_external_repos, nodes)
+                });
             if !fine_grained {
                 return Ok(None);
             }
@@ -1983,8 +1993,13 @@ esac
         // Neither name listed: the label is opaque, as before.
         assert!(hasher(&["other"]).resolve(label).unwrap().is_none());
         assert!(hasher(&[]).resolve(label).unwrap().is_none());
-        // An apparent label never consults the translation.
-        assert!(hasher(&["rules_jvm_external++maven+maven"])
+        // An apparent label, as `query` prints it, resolves under the canonical name too.
+        let (path, _) = hasher(&["rules_jvm_external++maven+maven"])
+            .resolve("@maven//:guava.jar")
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, repo_root.join("guava.jar"));
+        assert!(hasher(&["other"])
             .resolve("@maven//:guava.jar")
             .unwrap()
             .is_none());

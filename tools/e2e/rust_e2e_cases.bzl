@@ -188,6 +188,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::partial_extension_without_id_checks_references",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::referenced_failing_extension_fails_without_keep_going",
                 "timeout": "moderate",
             },

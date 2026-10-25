@@ -826,6 +826,51 @@ fn referenced_failing_extension_fails_without_keep_going() {
 }
 
 #[test]
+fn partial_extension_without_id_checks_references() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("partial_extension_without_id");
+    let output = tempfile::tempdir().unwrap();
+    let healthy_output = output.path().join("healthy.json");
+    let healthy_result = generate(workspace.path(), &healthy_output, &[]);
+    assert!(
+        healthy_result.status.success(),
+        "an unused failed extension must preserve healthy repositories: {}",
+        String::from_utf8_lossy(&healthy_result.stderr)
+    );
+    let healthy_hashes = hashes(&healthy_output);
+    assert!(
+        healthy_hashes.contains_key("//:uses_healthy")
+            && healthy_hashes.contains_key("//external:healthy"),
+        "{:?}",
+        healthy_hashes.keys().collect::<Vec<_>>()
+    );
+
+    edit(&workspace.path().join("BUILD"), |text| {
+        text + "\nfilegroup(\n    name = \"uses_missing\",\n    srcs = [\"@@+broken+generated//:data\"],\n)\n"
+    });
+    for mode in ["--no-keep_going", "--keep_going"] {
+        let path = output.path().join(format!("{mode}.json"));
+        let result = generate(workspace.path(), &path, &[mode]);
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{mode} accepted the missing mapping: {error}"
+        );
+        assert!(
+            error.contains("bazel mod dump_repo_mapping failed")
+                && error.contains("error evaluating module extension broken in"),
+            "{mode}: {error}"
+        );
+        assert!(
+            !path.exists(),
+            "{mode} published hashes after a mapping error"
+        );
+    }
+}
+
+#[test]
 fn same_symbol_extension_failure_keeps_healthy_repo_hashed() {
     if !supports_mod_show_repo() {
         return;

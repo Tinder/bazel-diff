@@ -7,6 +7,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use buffa::Message;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
@@ -1299,6 +1300,7 @@ fn lower_repositories(
     workspace: &Path,
     transform: &mut impl FnMut(&mut Target),
 ) -> Vec<Target> {
+    let workspace = RepositoryWorkspace::new(workspace);
     // A module the root cannot see has no apparent name there; its node is named by canonical
     // name, matching the `apparent_names` fallback below.
     let node_names = |canonical: &str| {
@@ -1330,7 +1332,7 @@ fn lower_repositories(
             (!is_extension_repo(canonical)).then(|| {
                 (
                     canonical.to_owned(),
-                    repository_definition_hash(repository, workspace),
+                    repository_definition_hash(repository, &workspace),
                 )
             })
         })
@@ -1405,7 +1407,7 @@ fn lower_repositories(
                 &apparent,
                 dependencies,
                 owner_definition_hash,
-                workspace,
+                &workspace,
             );
             transform(&mut target);
             targets.push(target);
@@ -1832,7 +1834,7 @@ fn repository_target(
     apparent: &str,
     dependencies: &BTreeSet<String>,
     owner_definition_hash: Option<&str>,
-    workspace: &Path,
+    workspace: &RepositoryWorkspace<'_>,
 ) -> Target {
     let mut rule = Rule {
         name: format!("//external:{apparent}"),
@@ -1841,7 +1843,7 @@ fn repository_target(
             .clone()
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "bzlmod_repo".to_owned()),
-        attribute: workspace_relative_attributes(&repository.attribute, workspace),
+        attribute: workspace_relative_attributes(&repository.attribute, &workspace.roots),
         ..Default::default()
     };
     let mut push_attribute = |name: &str, value: String| {
@@ -1851,10 +1853,10 @@ fn repository_target(
         attribute.string_value = Some(value);
         rule.attribute.push(attribute);
     };
-    if let Some(content_hash) = local_repository_content_hash(repository, workspace) {
+    if let Some(content_hash) = local_repository_content_hash(repository, workspace.path) {
         push_attribute("_bazel_diff_content_hash", content_hash);
     }
-    if let Some(inputs_hash) = repository_local_inputs_hash(repository, workspace) {
+    if let Some(inputs_hash) = repository_local_inputs_hash(repository, workspace.path) {
         push_attribute("_bazel_diff_local_inputs_hash", inputs_hash);
     }
     if let Some(owner_hash) = owner_definition_hash {
@@ -1924,7 +1926,10 @@ fn repository_local_input_labels(repository: &Repository) -> BTreeSet<String> {
 /// main-repository files behind them. Like the target hasher, it leaves out URLs whose content an
 /// integrity pins: `url`/`urls` under `sha256`/`integrity`, and the URLs
 /// `without_integrity_pinned_urls` drops.
-fn repository_definition_hash(repository: &Repository, workspace: &Path) -> String {
+fn repository_definition_hash(
+    repository: &Repository,
+    workspace: &RepositoryWorkspace<'_>,
+) -> String {
     let pinned = repository.attribute.iter().any(|attribute| {
         matches!(attribute.name.as_str(), "sha256" | "integrity")
             && attribute
@@ -1936,7 +1941,7 @@ fn repository_definition_hash(repository: &Repository, workspace: &Path) -> Stri
     hasher.update(repository.repo_rule_name.as_deref().unwrap_or_default());
     hasher.update([0]);
     let mut encoded = Vec::new();
-    let attributes = workspace_relative_attributes(&repository.attribute, workspace);
+    let attributes = workspace_relative_attributes(&repository.attribute, &workspace.roots);
     for attribute in &attributes {
         if pinned && matches!(attribute.name.as_str(), "url" | "urls") {
             continue;
@@ -1949,11 +1954,11 @@ fn repository_definition_hash(repository: &Repository, workspace: &Path) -> Stri
         hasher.update(&encoded);
     }
     hasher.update([0]);
-    if let Some(content_hash) = local_repository_content_hash(repository, workspace) {
+    if let Some(content_hash) = local_repository_content_hash(repository, workspace.path) {
         hasher.update(content_hash);
     }
     hasher.update([0]);
-    if let Some(inputs_hash) = repository_local_inputs_hash(repository, workspace) {
+    if let Some(inputs_hash) = repository_local_inputs_hash(repository, workspace.path) {
         hasher.update(inputs_hash);
     }
     hex::encode(hasher.finalize())
@@ -2022,6 +2027,20 @@ fn local_repository_content_hash(repository: &Repository, workspace: &Path) -> O
     Some(hex::encode(hasher.finalize()))
 }
 
+struct RepositoryWorkspace<'a> {
+    path: &'a Path,
+    roots: Vec<String>,
+}
+
+impl<'a> RepositoryWorkspace<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self {
+            path,
+            roots: workspace_roots(path),
+        }
+    }
+}
+
 /// The workspace root as given and as resolved, the two spellings an absolute path in a
 /// repository attribute can start with.
 fn workspace_roots(workspace: &Path) -> Vec<String> {
@@ -2036,26 +2055,11 @@ fn workspace_roots(workspace: &Path) -> Vec<String> {
     roots
 }
 
-/// Every string an attribute holds, including dict keys.
-fn attribute_strings(attribute: &Attribute) -> Vec<&str> {
-    let mut strings = Vec::new();
-    strings.extend(attribute.string_value.as_deref());
-    strings.extend(attribute.string_list_value.iter().map(String::as_str));
-    for entry in &attribute.string_dict_value {
-        strings.extend([entry.key.as_str(), entry.value.as_str()]);
-    }
-    for entry in &attribute.string_list_dict_value {
-        strings.push(entry.key.as_str());
-        strings.extend(entry.value.iter().map(String::as_str));
-    }
-    strings
-}
-
 /// Rewrites a path inside the workspace, bare or as a `file://` URL, to start with
 /// `%workspace%`. Anything else keeps its spelling: a path that merely contains the workspace's
 /// (`/elsewhere/<workspace>/data`), and one that starts with it but leaves it, through `..` or a
 /// symlink. Rewriting those would let two different paths outside two checkouts hash the same.
-fn workspace_relative(value: &str, roots: &[String]) -> String {
+fn workspace_relative<'a>(value: &'a str, roots: &[String]) -> Cow<'a, str> {
     let (scheme, path) = value
         .strip_prefix("file://")
         .map_or(("", value), |path| ("file://", path));
@@ -2067,10 +2071,10 @@ fn workspace_relative(value: &str, roots: &[String]) -> String {
             if !stays_inside(root, rest) {
                 break;
             }
-            return format!("{scheme}%workspace%{rest}");
+            return Cow::Owned(format!("{scheme}%workspace%{rest}"));
         }
     }
-    value.to_owned()
+    Cow::Borrowed(value)
 }
 
 /// Whether `root` followed by `rest` (empty or starting with `/`) names something inside `root`:
@@ -2107,32 +2111,26 @@ fn stays_inside(root: &str, rest: &str) -> bool {
 /// that build from a directory in the workspace, such as Gazelle's `go_repository` with
 /// `local_path` or a `rules_rs` local crate, get that directory as an absolute path, so the same
 /// repository would otherwise hash differently in every checkout.
-fn workspace_relative_attributes(attributes: &[Attribute], workspace: &Path) -> Vec<Attribute> {
-    let roots = workspace_roots(workspace);
+fn workspace_relative_attributes(attributes: &[Attribute], roots: &[String]) -> Vec<Attribute> {
+    let rewrite = |value: &mut String| {
+        if let Cow::Owned(relative) = workspace_relative(value, roots) {
+            *value = relative;
+        }
+    };
+    let mut attributes = attributes.to_vec();
+    for attribute in &mut attributes {
+        attribute.string_value.iter_mut().for_each(rewrite);
+        attribute.string_list_value.iter_mut().for_each(rewrite);
+        for entry in &mut attribute.string_dict_value {
+            rewrite(&mut entry.key);
+            rewrite(&mut entry.value);
+        }
+        for entry in &mut attribute.string_list_dict_value {
+            rewrite(&mut entry.key);
+            entry.value.iter_mut().for_each(rewrite);
+        }
+    }
     attributes
-        .iter()
-        .map(|attribute| {
-            if attribute_strings(attribute)
-                .iter()
-                .all(|value| !roots.iter().any(|root| value.contains(root.as_str())))
-            {
-                return attribute.clone();
-            }
-            let mut relative = attribute.clone();
-            let rewrite = |value: &mut String| *value = workspace_relative(value, &roots);
-            relative.string_value.iter_mut().for_each(rewrite);
-            relative.string_list_value.iter_mut().for_each(rewrite);
-            for entry in &mut relative.string_dict_value {
-                rewrite(&mut entry.key);
-                rewrite(&mut entry.value);
-            }
-            for entry in &mut relative.string_list_dict_value {
-                rewrite(&mut entry.key);
-                entry.value.iter_mut().for_each(rewrite);
-            }
-            relative
-        })
-        .collect()
 }
 
 fn parse_module_dependency_edges(json: &str) -> BTreeMap<String, BTreeSet<String>> {
@@ -2644,7 +2642,7 @@ mod tests {
                 "dep",
                 &BTreeSet::new(),
                 None,
-                workspace,
+                &RepositoryWorkspace::new(workspace),
             );
             target.rule.as_option().unwrap().attribute.clone()
         };
@@ -2653,12 +2651,20 @@ mod tests {
             hashed_attributes(second.path())
         );
         assert_eq!(
-            repository_definition_hash(&crate_repository(first.path()), first.path()),
-            repository_definition_hash(&crate_repository(second.path()), second.path())
+            repository_definition_hash(
+                &crate_repository(first.path()),
+                &RepositoryWorkspace::new(first.path())
+            ),
+            repository_definition_hash(
+                &crate_repository(second.path()),
+                &RepositoryWorkspace::new(second.path())
+            )
         );
         // A path outside the workspace keeps its spelling.
-        let relative =
-            workspace_relative_attributes(&crate_repository(first.path()).attribute, first.path());
+        let relative = workspace_relative_attributes(
+            &crate_repository(first.path()).attribute,
+            &workspace_roots(first.path()),
+        );
         assert_eq!(
             relative[0].string_value.as_deref(),
             Some("%workspace%/vendored")
@@ -2761,7 +2767,7 @@ mod tests {
             "local",
             &BTreeSet::from(["dep".to_owned(), "local".to_owned()]),
             None,
-            workspace.path(),
+            &RepositoryWorkspace::new(workspace.path()),
         );
         let rule = target.rule.as_option().unwrap();
         assert_eq!(rule.name, "//external:local");
@@ -2852,8 +2858,13 @@ mod tests {
             rebuilt
         );
 
-        let target =
-            repository_target(&repository, "dep", &BTreeSet::new(), None, workspace.path());
+        let target = repository_target(
+            &repository,
+            "dep",
+            &BTreeSet::new(),
+            None,
+            &RepositoryWorkspace::new(workspace.path()),
+        );
         let rule = target.rule.as_option().unwrap();
         assert!(rule
             .attribute
@@ -2877,7 +2888,7 @@ mod tests {
             "dep",
             &BTreeSet::new(),
             None,
-            workspace.path(),
+            &RepositoryWorkspace::new(workspace.path()),
         );
         assert!(!target
             .rule
@@ -3707,6 +3718,7 @@ exit 1
         assert_ne!(module_hash(&after, "//external:rules_rust").unwrap(), hub);
 
         // The digest ignores a mirror move of a pinned download, like the hasher does.
+        let paths = RepositoryWorkspace::new(workspace.path());
         let pinned = |urls: &str| Repository {
             repo_rule_name: Some("http_archive".into()),
             attribute: vec![
@@ -3726,16 +3738,16 @@ exit 1
             ..Default::default()
         };
         assert_eq!(
-            repository_definition_hash(&pinned("https://a/x.zip"), workspace.path()),
-            repository_definition_hash(&pinned("https://b/x.zip"), workspace.path())
+            repository_definition_hash(&pinned("https://a/x.zip"), &paths),
+            repository_definition_hash(&pinned("https://b/x.zip"), &paths)
         );
         let mut unpinned = pinned("https://a/x.zip");
         unpinned.attribute.pop();
         let mut moved = pinned("https://b/x.zip");
         moved.attribute.pop();
         assert_ne!(
-            repository_definition_hash(&unpinned, workspace.path()),
-            repository_definition_hash(&moved, workspace.path())
+            repository_definition_hash(&unpinned, &paths),
+            repository_definition_hash(&moved, &paths)
         );
 
         // The digest also ignores the checkout path in a `file://%workspace%` registry's patch
@@ -3755,12 +3767,12 @@ exit 1
             ..Default::default()
         };
         assert_eq!(
-            repository_definition_hash(&patched("/one", "sha256-p"), workspace.path()),
-            repository_definition_hash(&patched("/two", "sha256-p"), workspace.path())
+            repository_definition_hash(&patched("/one", "sha256-p"), &paths),
+            repository_definition_hash(&patched("/two", "sha256-p"), &paths)
         );
         assert_ne!(
-            repository_definition_hash(&patched("/one", "sha256-p"), workspace.path()),
-            repository_definition_hash(&patched("/one", "sha256-q"), workspace.path())
+            repository_definition_hash(&patched("/one", "sha256-p"), &paths),
+            repository_definition_hash(&patched("/one", "sha256-q"), &paths)
         );
     }
 

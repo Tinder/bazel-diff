@@ -455,6 +455,24 @@ fn aggregate_by_label(
     digests: Vec<(String, &'static str, TargetDigest)>,
     track_deps: bool,
 ) -> (BTreeMap<String, TargetHash>, BTreeMap<String, Vec<String>>) {
+    // Hash traversal visits full keys in order. If the resulting labels are strictly
+    // increasing, each has one instance and both output maps can be built in order.
+    if digests.is_sorted_by(|a, b| target_label(&a.0) < target_label(&b.0)) {
+        let mut instances = Vec::with_capacity(1);
+        let mut edges = Vec::with_capacity(if track_deps { digests.len() } else { 0 });
+        let hashes = digests
+            .into_iter()
+            .map(|instance| {
+                instances.push(instance);
+                let (label, hash, deps) = label_hash(&mut instances);
+                if track_deps {
+                    edges.push((label.clone(), deps));
+                }
+                (label, hash)
+            })
+            .collect();
+        return (hashes, edges.into_iter().collect());
+    }
     let mut digests = digests
         .into_iter()
         .map(|(key, kind, digest)| (target_label(&key).len(), key, kind, digest))
@@ -462,7 +480,7 @@ fn aggregate_by_label(
     digests.sort_by(|a, b| a.1[..a.0].cmp(&b.1[..b.0]).then_with(|| a.1.cmp(&b.1)));
     let mut hashes = BTreeMap::new();
     let mut dep_edges = BTreeMap::new();
-    let mut insert_label = |instances| {
+    let mut insert_label = |instances: &mut Vec<_>| {
         let (label, hash, deps) = label_hash(instances);
         if track_deps {
             dep_edges.insert(label.clone(), deps);
@@ -475,34 +493,35 @@ fn aggregate_by_label(
             .last()
             .is_some_and(|last| target_label(&last.0) != &key[..label_length])
         {
-            insert_label(std::mem::take(&mut instances));
+            insert_label(&mut instances);
         }
         instances.push((key, kind, digest));
     }
     if !instances.is_empty() {
-        insert_label(instances);
+        insert_label(&mut instances);
     }
     (hashes, dep_edges)
 }
 
 fn label_hash(
-    instances: Vec<(String, &'static str, TargetDigest)>,
+    instances: &mut Vec<(String, &'static str, TargetDigest)>,
 ) -> (String, TargetHash, Vec<String>) {
-    let label = target_label(&instances[0].0).to_owned();
+    let mut label = std::mem::take(&mut instances[0].0);
+    label.truncate(target_label(&label).len());
     let kind = instances[0].1;
     let (overall, direct) = if let [(_, _, digest)] = instances.as_slice() {
         (digest.overall, digest.direct)
     } else {
         let mut overall = Sha256::new();
         let mut direct = Sha256::new();
-        for (_, _, digest) in &instances {
+        for (_, _, digest) in instances.iter() {
             overall.update(digest.overall);
             direct.update(digest.direct);
         }
         (overall.finalize().into(), direct.finalize().into())
     };
     let mut edge_lists = instances
-        .into_iter()
+        .drain(..)
         .filter_map(|(_, _, digest)| digest.deps)
         .map(Rc::unwrap_or_clone);
     let mut deps = edge_lists.next().unwrap_or_default();
@@ -3511,6 +3530,30 @@ esac
             before.hashes["//:app"].hash, after.hashes["//:app"].hash,
             "the change reaches //:app through its default-configuration instance"
         );
+    }
+
+    #[test]
+    fn a_bare_label_can_collide_with_a_checksum_suffix_in_full_key_order() {
+        let rows = [
+            ("//:a", "//:first"),
+            ("//:a0", "//:middle"),
+            ("//:a|ab", "//:last"),
+        ]
+        .map(|(key, dependency)| {
+            (
+                key.to_owned(),
+                "Rule",
+                TargetDigest {
+                    overall: [0; 32],
+                    direct: [0; 32],
+                    deps: Some(Rc::new(vec![dependency.to_owned()])),
+                },
+            )
+        });
+        let (hashes, edges) = aggregate_by_label(rows.into(), true);
+        assert_eq!(hashes.len(), 2);
+        assert_ne!(hashes["//:a"].hash, hashes["//:a0"].hash);
+        assert_eq!(edges["//:a"], ["//:first", "//:last"]);
     }
 
     #[test]

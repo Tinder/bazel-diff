@@ -2496,9 +2496,6 @@ mod tests {
     use crate::proto::blaze_query::{
         attribute, EnvironmentGroup, GeneratedFile, LabelDictUnaryEntry, SourceFile,
     };
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     fn rule_target(name: &str) -> Target {
         let mut target = Target::default();
         target.r#type = target::Discriminator::Rule;
@@ -3498,7 +3495,7 @@ exit 1
 "#,
             dir = dir.display(),
         );
-        executable_script(&script, &body);
+        fs::write(&script, &body).unwrap();
         script
     }
 
@@ -3556,8 +3553,8 @@ exit 1
         );
         let options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -3673,7 +3670,7 @@ exit 1
     fn incomplete_mapping_rows_remain_unbound() {
         let workspace = tempfile::tempdir().unwrap();
         let script = workspace.path().join("bazel");
-        executable_script(&script, "#!/bin/sh\ncat reply\n");
+        fs::write(&script, "#!/bin/sh\ncat reply\n").unwrap();
         let options = probe_options(workspace.path(), script);
         let names = ["first+", "second+"].map(str::to_owned);
         for (reply, rows, expected_complete) in [
@@ -3714,10 +3711,11 @@ exit 1
             fs::write(workspace.path().join(name), format!("{map}\n")).unwrap();
         }
         let script = workspace.path().join("bazel");
-        executable_script(
+        fs::write(
             &script,
             "#!/bin/sh\nshift 2\necho \"$*\" >> calls\nfor name do cat \"$name\" || exit 1; done\n",
-        );
+        )
+        .unwrap();
         let options = probe_options(workspace.path(), script);
         let root = BTreeMap::from([
             ("dep+".into(), vec!["dep".into()]),
@@ -3753,8 +3751,8 @@ exit 1
         .unwrap();
         let options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -3801,8 +3799,8 @@ exit 1
         .unwrap();
         let options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -4187,9 +4185,6 @@ exit 1
             query = query_proto.display(),
         );
         fs::write(&script, body).unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
         script
     }
 
@@ -4215,8 +4210,8 @@ exit 1
         let script = extension_flow_script(workspace.path(), &repositories, None);
         let options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -4328,8 +4323,8 @@ exit 1
         );
         let mut options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -4410,14 +4405,11 @@ exit 1
             selected_repos_marker.display(),
         );
         fs::write(&script, body).unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
 
         let options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -4481,14 +4473,11 @@ exit 1
             query_proto.display(),
         );
         fs::write(&show_repo_fail_script, body).unwrap();
-        let mut permissions = fs::metadata(&show_repo_fail_script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&show_repo_fail_script, permissions).unwrap();
 
         let mut options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: show_repo_fail_script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![show_repo_fail_script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -4539,19 +4528,11 @@ exit 1
     }
 
     #[cfg(unix)]
-    fn executable_script(path: &Path, body: &str) {
-        fs::write(path, body).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
-    }
-
-    #[cfg(unix)]
     fn probe_options(workspace: &Path, script: PathBuf) -> BazelOptions {
         BazelOptions {
             workspace: workspace.to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -4575,12 +4556,13 @@ exit 1
         let workspace = tempfile::tempdir().unwrap();
         let script = |name: &str, dump: &str, graph: &str| {
             let path = workspace.path().join(name);
-            executable_script(
+            fs::write(
                 &path,
-                &format!(
+                format!(
                     "#!/bin/sh\nif [ \"$2\" = dump_repo_mapping ]; then\n{dump}\nfi\nif [ \"$2\" = graph ]; then\n{graph}\nfi\nexit 1\n"
                 ),
-            );
+            )
+            .unwrap();
             path
         };
         let marker = "echo 'ERROR: error evaluating module extension @@dep+//:ext.bzl%broken' >&2; echo 'ERROR: Results may be incomplete as 1 extension failed.' >&2; exit 2";
@@ -4689,7 +4671,7 @@ exit 1
             repos = repo_proto.display(),
             query = query_proto.display(),
         );
-        executable_script(&script, &body);
+        fs::write(&script, &body).unwrap();
         script
     }
 

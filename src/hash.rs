@@ -2827,9 +2827,9 @@ esac
         fs::create_dir_all(external.join("dep+")).unwrap();
         let log = workspace.path().join("bazel.log");
         // Answers `mod dump_repo_mapping` with the mapping and `query` with nothing.
-        let bazel = workspace.path().join("stub-bazel");
+        let script = workspace.path().join("stub-bazel");
         fs::write(
-            &bazel,
+            &script,
             format!(
                 "#!/bin/sh\necho \"$@\" >> {log}\n\
                  [ \"$1\" = mod ] && echo '{{\"dep\": \"+_repo_rules+dep\"}}'\nexit 0\n",
@@ -2837,11 +2837,11 @@ esac
             ),
         )
         .unwrap();
-        fs::set_permissions(&bazel, fs::Permissions::from_mode(0o755)).unwrap();
         let resolver = ExternalRepoResolver {
             workspace: workspace.path().to_path_buf(),
-            bazel,
+            bazel: PathBuf::from("/bin/sh"),
             output_base,
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             ..Default::default()
         };
         assert_eq!(

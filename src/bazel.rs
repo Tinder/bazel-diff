@@ -891,6 +891,7 @@ impl BazelOptions {
     }
 
     fn note_failed_extensions(&self, failed: &mut FailedExtensions, extensions: BTreeSet<String>) {
+        failed.observed = true;
         for extension in extensions {
             if failed.extensions.insert(extension.clone()) {
                 eprintln!(
@@ -909,7 +910,7 @@ impl BazelOptions {
         failed: &mut FailedExtensions,
         canonical_to_apparent: &BTreeMap<String, Vec<String>>,
     ) -> Result<()> {
-        if failed.extensions.is_empty() {
+        if failed.is_empty() {
             return Ok(());
         }
         let apparent_to_canonical = canonical_to_apparent
@@ -1443,6 +1444,8 @@ struct BzlmodRepos {
 /// Extension diagnostics and the canonical repositories whose mappings actually failed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct FailedExtensions {
+    /// Bazel reported an extension failure, even if its diagnostic had no parseable ID.
+    observed: bool,
     /// Extension ids printed by Bazel.
     extensions: BTreeSet<String>,
     /// Canonical repository names whose mapping keys failed.
@@ -1451,7 +1454,7 @@ struct FailedExtensions {
 
 impl FailedExtensions {
     fn is_empty(&self) -> bool {
-        self.extensions.is_empty() && self.unavailable.is_empty()
+        !self.observed && self.extensions.is_empty() && self.unavailable.is_empty()
     }
 }
 
@@ -3633,6 +3636,7 @@ exit 1
             .chain(std::iter::once(hidden))
             .collect::<Vec<_>>();
         let original_failed = FailedExtensions {
+            observed: true,
             extensions: BTreeSet::from(["@@failed+//:ext.bzl%ext".to_owned()]),
             unavailable: BTreeSet::from(["failed++ext+x".to_owned()]),
         };

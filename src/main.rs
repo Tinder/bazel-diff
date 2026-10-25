@@ -613,26 +613,25 @@ fn fingerprint_flags(
     ])
 }
 
+fn write_json_file(file: File, value: &impl Serialize) -> Result<()> {
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer(&mut writer, value)?;
+    writer.flush()?;
+    Ok(())
+}
+
 fn write_json(path: Option<&Path>, value: &impl Serialize) -> Result<()> {
-    match path {
-        Some(path) if path != Path::new("-") => {
-            let mut writer = BufWriter::new(
-                File::create(path)
-                    .with_context(|| format!("failed to create {}", path.display()))?,
-            );
-            serde_json::to_writer(&mut writer, value)
-                .with_context(|| format!("failed to write {}", path.display()))?;
-            writer
-                .flush()
-                .with_context(|| format!("failed to write {}", path.display()))?;
-        }
-        _ => {
-            let stdout = io::stdout();
-            let mut writer = stdout.lock();
-            serde_json::to_writer(&mut writer, value)?;
-            writer.write_all(b"\n")?;
-        }
+    if let Some(path) = path.filter(|path| *path != Path::new("-")) {
+        let file =
+            File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+        return write_json_file(file, value)
+            .with_context(|| format!("failed to write {}", path.display()));
     }
+
+    let mut writer = BufWriter::new(io::stdout().lock());
+    serde_json::to_writer(&mut writer, value)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -662,8 +661,9 @@ fn run_generate_with(
         &data.serialized(args.include_target_type, false),
     )?;
     if let Some(path) = &args.dep_edges_file {
-        fs::write(path, serde_json::to_vec(&data.dep_edges)?)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        let context = || format!("failed to write {}", path.display());
+        let file = File::create(path).with_context(context)?;
+        write_json_file(file, &data.dep_edges).with_context(context)?;
     }
     Ok(data)
 }
@@ -1551,7 +1551,10 @@ mod tests {
                             },
                         ),
                     ]),
-                    dep_edges: BTreeMap::from([("//app:rule".into(), vec!["//app:source".into()])]),
+                    dep_edges: BTreeMap::from([
+                        ("//app:rule".into(), vec!["//app:source".into()]),
+                        ("//app:source".into(), vec![]),
+                    ]),
                     ..Default::default()
                 })
             },
@@ -1561,7 +1564,10 @@ mod tests {
         let written: serde_json::Value =
             serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
         assert_eq!(written["//app:rule"], "Rule#rule~direct");
-        assert!(fs::read_to_string(deps).unwrap().contains("//app:source"));
+        assert_eq!(
+            fs::read(deps).unwrap(),
+            br#"{"//app:rule":["//app:source"],"//app:source":[]}"#
+        );
     }
 
     #[test]

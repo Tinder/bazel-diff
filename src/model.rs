@@ -953,4 +953,117 @@ mod tests {
             .unwrap();
         assert_eq!((cycle.target_distance, cycle.package_distance), (1, 0));
     }
+
+    /// An indirectly impacted target whose dep edges name no impacted dependency (a stale or
+    /// partial dep-edges file, #268) cannot be placed: it is reported at distance 0 rather than
+    /// dropped or left at `usize::MAX`, and the fallback is memoised like any other answer so a
+    /// dependent is one hop past it.
+    #[test]
+    fn unattributable_indirect_impact_falls_back_to_distance_zero() {
+        let from = BTreeMap::from([
+            ("//a:orphan".into(), target("Rule", "old", "same")),
+            ("//b:dependent".into(), target("Rule", "old-b", "same-b")),
+        ]);
+        let to = BTreeMap::from([
+            ("//a:orphan".into(), target("Rule", "new", "same")),
+            ("//b:dependent".into(), target("Rule", "new-b", "same-b")),
+        ]);
+        // The orphan's only edge points at an unimpacted target; the dependent reaches the
+        // orphan through it.
+        let edges = BTreeMap::from([
+            ("//a:orphan".into(), vec!["//c:unchanged".into()]),
+            ("//b:dependent".into(), vec!["//a:orphan".into()]),
+        ]);
+        let result = impacted_targets_with_distances(&from, &to, &edges, None, false).unwrap();
+        assert_eq!(
+            result,
+            [
+                ImpactedTargetWithDistance {
+                    label: "//a:orphan".into(),
+                    target_distance: 0,
+                    package_distance: 0,
+                },
+                ImpactedTargetWithDistance {
+                    label: "//b:dependent".into(),
+                    target_distance: 1,
+                    package_distance: 1,
+                },
+            ]
+        );
+
+        // The same without any edges at all: every indirect impact is unattributable.
+        let result =
+            impacted_targets_with_distances(&from, &to, &BTreeMap::new(), None, false).unwrap();
+        assert!(
+            result
+                .iter()
+                .all(|target| (target.target_distance, target.package_distance) == (0, 0)),
+            "{result:?}"
+        );
+    }
+
+    /// A target deleted between the revisions has nothing left to build, so it is never
+    /// impacted, with or without distances.
+    #[test]
+    fn deleted_targets_are_not_impacted() {
+        let from = BTreeMap::from([
+            ("//a:kept".into(), target("Rule", "same", "same")),
+            ("//a:deleted".into(), target("Rule", "gone", "gone")),
+        ]);
+        let to = BTreeMap::from([("//a:kept".into(), target("Rule", "same", "same"))]);
+        assert!(impacted_types(&from, &to).is_empty());
+        assert!(impacted_targets(&from, &to, None, false)
+            .unwrap()
+            .is_empty());
+        assert!(
+            impacted_targets_with_distances(&from, &to, &BTreeMap::new(), None, false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Ordering puts source files first, then generated files, then rules; any other kind
+    /// sorts after those, and a label known to neither revision sorts last. Within one rank
+    /// labels are alphabetical, so a `//z` source file still precedes an `//a` rule.
+    #[test]
+    fn unknown_kinds_and_unknown_labels_sort_after_the_known_kinds() {
+        let from = BTreeMap::from([("//from:only".into(), target("Rule", "a", "a"))]);
+        let to = BTreeMap::from([
+            ("//z:source".into(), target("SourceFile", "a", "a")),
+            ("//m:rule".into(), target("Rule", "a", "a")),
+            ("//a:package_group".into(), target("PackageGroup", "a", "a")),
+            ("//a:untyped".into(), target("", "a", "a")),
+        ]);
+        let labels = [
+            "//nowhere:label",
+            "//a:untyped",
+            "//a:package_group",
+            "//m:rule",
+            "//z:source",
+            "//from:only",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            filter_and_sort_labels(labels, &from, &to, None, false).unwrap(),
+            [
+                "//z:source",
+                "//from:only",
+                "//m:rule",
+                "//a:package_group",
+                "//a:untyped",
+                "//nowhere:label",
+            ]
+        );
+
+        let from = BTreeMap::new();
+        let distances = impacted_targets_with_distances(&from, &to, &BTreeMap::new(), None, false)
+            .unwrap()
+            .into_iter()
+            .map(|target| target.label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            distances,
+            ["//z:source", "//m:rule", "//a:package_group", "//a:untyped"]
+        );
+    }
 }

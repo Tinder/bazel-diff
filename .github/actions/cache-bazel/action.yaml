@@ -27,7 +27,7 @@ description: |
 
 inputs:
   bazel-version:
-    description: Bazel version label for the cache keys, e.g. `${{ matrix.bazel }}`.
+    description: Bazel version label for the cache keys, e.g. the job's `matrix.bazel` value.
     required: true
   disk-cache:
     description: |

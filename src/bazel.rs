@@ -5179,4 +5179,215 @@ exit 1
         assert_eq!(target_label("//a:a|"), "//a:a|");
         assert_eq!(target_label("//a:a|abc123"), "//a:a");
     }
+
+    /// Fake Bazel for the `query`/`cquery` runners: `version` reports `version`; the
+    /// compatible-target cquery (`--output starlark`) lists `compatible`, one per line, with a
+    /// blank line that the runner must ignore; the proto cquery copies `cquery_proto` to its
+    /// `--output_file`, or prints it when the runner redirects stdout instead (a Bazel older
+    /// than 8.2); `query` copies `query_proto` the same way and exits with `query_exit`,
+    /// reporting on stderr when that is non-zero. Every invocation is appended to `calls.log`.
+    #[cfg(unix)]
+    fn query_script(
+        workspace: &Path,
+        version: &str,
+        compatible: &[&str],
+        query_exit: i32,
+    ) -> PathBuf {
+        let result = results(vec![
+            configured(rule_target("//app:lib"), Some("abc123"), 1),
+            configured(rule_target("//app:incompatible"), Some("abc123"), 1),
+            configured(rule_target("//app:tool"), Some("def456"), 2),
+        ]);
+        let streamed_proto = workspace.join("cquery-stream.pb");
+        write_delimited(&streamed_proto, std::slice::from_ref(&result));
+        let proto = workspace.join("cquery-result.pb");
+        fs::write(&proto, result.encode_to_vec()).unwrap();
+        let query_proto = workspace.join("query-result.pb");
+        write_delimited(&query_proto, &[rule_target("//app:lib")]);
+        let script = workspace.join("fake-bazel.sh");
+        let body = format!(
+            r#"#!/bin/sh
+echo "$*" >> "{calls}"
+copy_or_print() {{
+  for arg do
+    if [ "$next" = 1 ]; then cp "$1" "$arg"; return 0; fi
+    [ "$arg" = "--output_file" ] && next=1
+  done
+  cat "$1"
+}}
+if [ "$1" = version ]; then
+  echo "Build label: {version}"
+  exit 0
+fi
+if [ "$1" = cquery ]; then
+  if echo "$*" | grep -q -- "--output starlark"; then
+    printf '{compatible}'
+    exit 0
+  fi
+  if echo "$*" | grep -q -- "--output proto"; then
+    copy_or_print "{proto}" "$@"
+  else
+    copy_or_print "{streamed}" "$@"
+  fi
+  exit 0
+fi
+if [ "$1" = query ]; then
+  copy_or_print "{query}" "$@"
+  if [ {query_exit} -ne 0 ]; then
+    echo "ERROR: no such package 'missing': BUILD file not found" >&2
+  fi
+  exit {query_exit}
+fi
+exit 1
+"#,
+            calls = workspace.join("calls.log").display(),
+            compatible = compatible
+                .iter()
+                .map(|label| format!("{label}\n"))
+                .collect::<String>()
+                .replacen('\n', "\n\n", 1),
+            streamed = streamed_proto.display(),
+            proto = proto.display(),
+            query = query_proto.display(),
+        );
+        fs::write(&script, body).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    fn query_calls(workspace: &Path) -> Vec<String> {
+        fs::read_to_string(workspace.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// `cquery` first asks Bazel which targets are compatible with the target platform, then
+    /// streams the configured targets and keeps only the compatible ones, matched by label
+    /// with the configuration checksum stripped. A Bazel before 7.0 has no streamed cquery
+    /// output, so the runner asks for `--output proto` instead, and one before 8.2 has no
+    /// `--output_file`, so stdout is redirected to the output file.
+    #[test]
+    #[cfg(unix)]
+    fn cquery_filters_to_compatible_targets_across_bazel_versions() {
+        for (version, output, output_file) in [
+            ("8.7.0", "streamed_proto", true),
+            ("7.4.1", "streamed_proto", false),
+            ("6.5.0", "proto", false),
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let script = query_script(workspace.path(), version, &["//app:lib", "//app:tool"], 0);
+            let mut options = probe_options(workspace.path(), script);
+            options.use_cquery = true;
+            options.cquery_options = vec!["--define=flavor=test".into()];
+            options.command_options = vec!["--query-only".into()];
+
+            let targets = options.query("deps(//app:all)", true).unwrap();
+            let names = targets.iter().filter_map(target_name).collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                ["//app:lib|abc123", "//app:tool|def456"],
+                "Bazel {version}: the incompatible target is dropped, the rest keep their configuration"
+            );
+
+            let calls = query_calls(workspace.path());
+            assert_eq!(calls.len(), 3, "{calls:?}");
+            assert_eq!(calls[0], "version");
+            let compatible = &calls[1];
+            assert!(
+                compatible.starts_with("cquery --output starlark --starlark:file "),
+                "{compatible}"
+            );
+            assert!(
+                compatible.contains("--define=flavor=test --consistent_labels --query_file"),
+                "{compatible}"
+            );
+            assert!(!compatible.contains("--query-only"), "{compatible}");
+            let streamed = &calls[2];
+            assert!(
+                streamed.starts_with(&format!(
+                    "cquery --transitions=lite --output {output} --proto:instantiation_stack --define=flavor=test --consistent_labels --query_file "
+                )),
+                "Bazel {version}: {streamed}"
+            );
+            assert!(!streamed.contains("--order_output=no"), "{streamed}");
+            assert!(!streamed.contains("--keep_going"), "{streamed}");
+            assert_eq!(
+                streamed.contains("--output_file"),
+                output_file,
+                "Bazel {version}: {streamed}"
+            );
+        }
+    }
+
+    /// A failed compatible-target cquery stops the query instead of silently keeping every
+    /// target, and a plain `query` that exits non-zero is an error that quotes Bazel's stderr --
+    /// unless `--keep_going` was asked for and Bazel exited 3, the code it uses for a partial
+    /// answer, in which case the output it did produce is used.
+    #[test]
+    #[cfg(unix)]
+    fn query_surfaces_bazel_failures_and_tolerates_partial_answers_with_keep_going() {
+        let workspace = tempfile::tempdir().unwrap();
+        let script = query_script(workspace.path(), "8.7.0", &[], 1);
+        let mut options = probe_options(workspace.path(), script);
+        options.command_options = vec!["--noimplicit_deps".into()];
+
+        let error = options.query("//app:all", false).unwrap_err().to_string();
+        assert!(
+            error.contains("Bazel query failed, exit code 1: ERROR: no such package 'missing'"),
+            "{error}"
+        );
+        let calls = query_calls(workspace.path());
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(
+            calls[1].starts_with(
+                "query --output streamed_proto --proto:instantiation_stack --order_output=no --noimplicit_deps --query_file "
+            ),
+            "{}",
+            calls[1]
+        );
+
+        // Exit code 1 is still an error under --keep_going; only 3 is a partial answer.
+        options.keep_going = true;
+        let error = options.query("//app:all", false).unwrap_err().to_string();
+        assert!(error.contains("Bazel query failed, exit code 1"), "{error}");
+        assert!(
+            query_calls(workspace.path())[3].contains("--keep_going"),
+            "{:?}",
+            query_calls(workspace.path())
+        );
+
+        let partial = tempfile::tempdir().unwrap();
+        let script = query_script(partial.path(), "8.7.0", &[], 3);
+        let mut options = probe_options(partial.path(), script);
+        let error = options.query("//app:all", false).unwrap_err().to_string();
+        assert!(error.contains("Bazel query failed, exit code 3"), "{error}");
+        options.keep_going = true;
+        let targets = options.query("//app:all", false).unwrap();
+        assert_eq!(
+            targets.iter().filter_map(target_name).collect::<Vec<_>>(),
+            ["//app:lib"]
+        );
+
+        // The compatible-target cquery failing is an error of its own, before any proto cquery.
+        let incompatible = tempfile::tempdir().unwrap();
+        let script = incompatible.path().join("fake-bazel.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho \"$*\" >> calls.log\nif [ \"$1\" = version ]; then echo 'Build label: 8.7.0'; exit 0; fi\necho 'ERROR: no such target' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut options = probe_options(incompatible.path(), script);
+        options.use_cquery = true;
+        let error = options
+            .query("deps(//app:all)", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("compatible-target cquery failed: ERROR: no such target"),
+            "{error}"
+        );
+        assert_eq!(query_calls(incompatible.path()).len(), 2);
+    }
 }

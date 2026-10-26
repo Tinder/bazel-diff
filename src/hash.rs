@@ -1110,6 +1110,9 @@ fn prehash_rule(rule: &mut Rule, ignored: &HashSet<String>) -> DigestBytes {
     let digest = rule_definition_digest(rule, ignored);
     rule.attribute
         .retain(|attribute| attribute.name == "tags" || attribute.name == "visibility");
+    if rule.attribute.is_empty() {
+        rule.attribute = Vec::new();
+    }
     digest
 }
 
@@ -1934,6 +1937,24 @@ esac
                 .collect::<Vec<_>>(),
             ["tags", "visibility"]
         );
+    }
+
+    #[test]
+    fn streamed_rule_preprocessing_releases_unused_attribute_storage() {
+        let mut rule = Rule {
+            attribute: vec![Attribute {
+                name: "$internal_attr_hash".into(),
+                r#type: attribute::Discriminator::String,
+                string_value: Some("value".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let ignored = HashSet::new();
+        let expected = rule_definition_digest(&rule, &ignored);
+
+        assert_eq!(prehash_rule(&mut rule, &ignored), expected);
+        assert_eq!(rule.attribute.capacity(), 0);
     }
 
     #[test]

@@ -3116,6 +3116,26 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         );
         assert!(response.starts_with("HTTP/1.1 404"));
 
+        // The query endpoints take GET and POST only, and the method is checked before the
+        // parameters are, so a well-formed query under the wrong method is still refused.
+        for path in [
+            "/impacted_targets",
+            "/impacted_targets_with_distances",
+            "/dependency_edges",
+        ] {
+            let response = request(
+                &state,
+                &format!(
+                    "PUT {path}?from=a&to=b HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            assert!(response.starts_with("HTTP/1.1 405"), "{path}: {response}");
+            assert!(
+                response.contains("method not allowed, use GET or POST"),
+                "{path}: {response}"
+            );
+        }
+
         let response = request(
             &state,
             "GET /impacted_targets HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",

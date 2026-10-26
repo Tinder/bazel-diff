@@ -795,7 +795,7 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "66.0.0")
+bazel_dep(name = "bazel-diff", version = "67.0.0")
 ```
 
 You can now run the tool with:
@@ -845,11 +845,11 @@ bazel run :bazel-diff --config=verbose -- --help
 <table>
   <tr>
     <td align="center"><a href="https://github.com/tinder-maxwellelliott"><img src="https://avatars.githubusercontent.com/u/56700854?s=64" width="64" alt="Maxwell Elliott"/><br/><sub><b>Maxwell Elliott</b></sub></a></td>
+    <td align="center"><a href="https://github.com/tamird"><img src="https://avatars.githubusercontent.com/u/1535036?s=64" width="64" alt="Tamir Duberstein"/><br/><sub><b>Tamir Duberstein</b></sub></a></td>
     <td align="center"><a href="https://github.com/honnix"><img src="https://avatars.githubusercontent.com/u/158892?s=64" width="64" alt="Honnix"/><br/><sub><b>Honnix</b></sub></a></td>
     <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="eric wang"/><br/><sub><b>eric wang</b></sub></a></td>
     <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="Eric Wang"/><br/><sub><b>Eric Wang</b></sub></a></td>
     <td align="center"><a href="https://github.com/tgeng"><img src="https://avatars.githubusercontent.com/u/29584386?s=64" width="64" alt="Tianyu Geng"/><br/><sub><b>Tianyu Geng</b></sub></a></td>
-    <td align="center"><a href="https://github.com/tamird"><img src="https://avatars.githubusercontent.com/u/1535036?s=64" width="64" alt="Tamir Duberstein"/><br/><sub><b>Tamir Duberstein</b></sub></a></td>
   </tr>
   <tr>
     <td align="center"><a href="https://github.com/BalestraPatrick"><img src="https://avatars.githubusercontent.com/u/3658887?s=64" width="64" alt="Patrick Balestra"/><br/><sub><b>Patrick Balestra</b></sub></a></td>

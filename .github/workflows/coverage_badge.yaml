@@ -31,6 +31,10 @@ jobs:
           done
           export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
+      # Repository cache shared with ci.yaml (.github/actions/cache-bazel).
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: '9.x'
       - name: Run bazel-diff tests with coverage
         env:
           USE_BAZEL_VERSION: '9.x'

@@ -795,7 +795,7 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "67.0.0")
+bazel_dep(name = "bazel-diff", version = "67.0.1")
 ```
 
 You can now run the tool with:

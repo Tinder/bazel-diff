@@ -12,6 +12,7 @@ produce a false green -- most importantly the JSON key-order difference that is 
 hosts and must not be reported as divergence.
 """
 
+import gzip
 import json
 import unittest
 
@@ -53,8 +54,37 @@ class DecodePayloadTest(unittest.TestCase):
         self.assertEqual(graph, '{"root":"x"}')
         self.assertEqual(edges, {"//:mid": ["//:core"]})
 
+    def test_gzip_compressed_entry(self):
+        # Since #525 the shared tier holds `<key>.json.gz`: the same JSON, gzip-framed. This is
+        # what every instance now writes, so a comparator that cannot read it fails every case.
+        hashes, graph, edges = sc.decode_payload(gzip.compress(_payload(HASHES)))
+        self.assertEqual(hashes, HASHES)
+        self.assertIsNone(graph)
+        self.assertEqual(edges, {})
+
+    def test_gzip_compressed_wrapped_entry(self):
+        body = _payload(HASHES, module_graph='{"root":"x"}', dep_edges={"//:mid": ["//:core"]})
+        hashes, graph, edges = sc.decode_payload(gzip.compress(body))
+        self.assertEqual(hashes, HASHES)
+        self.assertEqual(graph, '{"root":"x"}')
+        self.assertEqual(edges, {"//:mid": ["//:core"]})
+
+    def test_truncated_gzip_is_a_parse_error(self):
+        # Must surface as the ValueError family `compare_payloads` records per instance, not
+        # escape as an OSError/EOFError and abort the run.
+        with self.assertRaises(ValueError):
+            sc.decode_payload(gzip.compress(_payload(HASHES))[:-6])
+
 
 class ComparePayloadsTest(unittest.TestCase):
+    def test_identical_gzip_payloads_pass(self):
+        gz = gzip.compress(_payload(HASHES))
+        div = sc.compare_payloads({"i0": gz, "i1": gz, "i2": gz})
+        self.assertEqual(div.parse_errors, {})
+        self.assertEqual(div.hash_mismatches, [])
+        status, _ = sc.divergence_verdict(div)
+        self.assertEqual(status, sc.base.PASS)
+
     def test_identical_payloads_pass(self):
         div = sc.compare_payloads({"i0": _payload(HASHES), "i1": _payload(HASHES)})
         self.assertTrue(div.byte_identical)

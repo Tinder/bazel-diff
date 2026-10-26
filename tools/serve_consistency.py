@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import gzip
 import hashlib
 import json
 import os
@@ -198,13 +199,28 @@ class Instance:
 # ----------------------------------------------------------------------------------------------
 
 
+GZIP_MAGIC = b"\x1f\x8b"
+
+
 def decode_payload(body: bytes):
     """Parses a cached hash entry into (hashes, module_graph_json, dep_edges).
 
-    `HashService.serialize` emits one of two shapes: a bare `{label: hash}` object when there is no
+    Since #525 `serve` publishes shared-tier entries gzip-compressed under `<key>.json.gz`
+    (`RemoteCache::put` in `src/server.rs`); entries written before that are plain `<key>.json`.
+    Both are accepted here, told apart by the gzip magic bytes rather than the object name, so the
+    comparator keeps working if the suffix convention changes but the framing does not.
+
+    The decompressed JSON has one of two shapes: a bare `{label: hash}` object when there is no
     metadata, or `{"hashes": {...}, "metadata": {"moduleGraphJson": ..., "depEdges": {...}}}` when
     there is. Labels always start with `//` or `@`, so the `"hashes"` key cannot be ambiguous.
     """
+    if body[:2] == GZIP_MAGIC:
+        try:
+            body = gzip.decompress(body)
+        except (OSError, EOFError) as exc:
+            # Surfaces as a parse error in `compare_payloads`, i.e. a FAIL naming the instance,
+            # the same way a truncated JSON body would.
+            raise ValueError(f"invalid gzip entry: {exc}") from exc
     obj = json.loads(body.decode("utf-8"))
     if isinstance(obj, dict) and isinstance(obj.get("hashes"), dict):
         meta = obj.get("metadata") or {}

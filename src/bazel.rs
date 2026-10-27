@@ -1817,12 +1817,18 @@ fn is_external_package_error(message: &str) -> bool {
         || message.contains("//external package is not available")
 }
 
-fn deduplicate_targets(targets: Vec<Target>) -> Result<Vec<Target>> {
-    let mut seen = HashSet::new();
-    Ok(targets
-        .into_iter()
-        .filter(|target| target_name(target).is_some_and(|name| seen.insert(name.to_owned())))
-        .collect())
+fn deduplicate_targets(mut targets: Vec<Target>) -> Result<Vec<Target>> {
+    // Decide which targets to keep while their names can still be borrowed.
+    let mut keep = {
+        let mut seen = HashSet::new();
+        targets
+            .iter()
+            .map(|target| target_name(target).is_some_and(|name| seen.insert(name)))
+            .collect::<Vec<_>>()
+            .into_iter()
+    };
+    targets.retain(|_| keep.next().expect("one decision per target"));
+    Ok(targets)
 }
 
 pub fn decode_delimited<M: Message>(path: &Path) -> Result<Vec<M>> {
@@ -2850,14 +2856,12 @@ mod tests {
 
     #[test]
     fn deduplicates_named_targets_and_preserves_first() {
-        let targets = vec![
-            rule_target("//a:a"),
-            rule_target("//a:a"),
-            rule_target("//b:b"),
-        ];
-        let targets = deduplicate_targets(targets).unwrap();
-        let names = targets.iter().filter_map(target_name).collect::<Vec<_>>();
-        assert_eq!(names, ["//a:a", "//b:b"]);
+        let first = rule_target("//a:a");
+        let mut duplicate = first.clone();
+        duplicate.rule.as_option_mut().unwrap().rule_class = "other".into();
+        let last = rule_target("//b:b");
+        let targets = vec![first.clone(), Target::default(), last.clone(), duplicate];
+        assert_eq!(deduplicate_targets(targets).unwrap(), [first, last]);
         assert!(is_external_package_error("no such package 'external'"));
         assert!(is_external_package_error(
             "//external package is not available"

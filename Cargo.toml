@@ -14,7 +14,7 @@ name = "bazel-diff"
 path = "src/main.rs"
 
 [features]
-default = ["vendored-protoc"]
+default = ["mimalloc", "vendored-protoc"]
 vendored-protoc = ["dep:protoc-bin-vendored"]
 
 [dependencies]
@@ -24,7 +24,7 @@ buffa = "0.9.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 flate2 = "1.1"
 hex = "0.4"
-mimalloc = "0.1"
+mimalloc = { version = "0.1", optional = true }
 rayon = "1.10"
 rustls-pki-types = "1.15"
 rust-s3 = { version = "=0.36.0", default-features = false, features = ["sync-rustls-tls"] }

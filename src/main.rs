@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // Use mimalloc's per-thread heaps for parallel protobuf decoding in generate-hashes.
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

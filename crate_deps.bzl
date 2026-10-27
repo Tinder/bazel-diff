@@ -32,6 +32,10 @@ def _deps(kinds):
         deps.extend(data[kind])
     return sorted(deps)
 
+def crate_features(exclude = []):
+    """Enabled Cargo features of the root package."""
+    return [feature for feature in _root_package()["crate_features"] if feature not in exclude]
+
 def normal_crate_deps():
     """Normal dependencies of the root Cargo package."""
     return _deps(["deps"])

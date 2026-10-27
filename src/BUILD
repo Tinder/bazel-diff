@@ -2,7 +2,7 @@ load("@rules_rs//rs:cargo_build_script.bzl", "cargo_build_script")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
-load("//:crate_deps.bzl", "normal_crate_deps")
+load("//:crate_deps.bzl", "crate_features", "normal_crate_deps")
 load("//tools/coverage:defs.bzl", "coverage_enforced_test")
 
 cargo_build_script(
@@ -39,9 +39,18 @@ rust_library(
     deps = normal_crate_deps() + [":build_script"],
 )
 
+config_setting(
+    name = "without_mimalloc",
+    values = {"features": "-mimalloc"},
+)
+
 rust_binary(
     name = "bazel-diff",
     srcs = ["main.rs"],
+    crate_features = select({
+        ":without_mimalloc": crate_features(exclude = ["mimalloc"]),
+        "//conditions:default": crate_features(),
+    }),
     crate_root = "main.rs",
     rustc_env = {
         "CARGO_PKG_VERSION": module_version() if module_version() else "unknown",

@@ -298,18 +298,17 @@ fn hash_targets_with_environment(
     let source_digests = hash_pool()
         .install(|| {
             source_targets
-                .par_iter()
+                .into_par_iter()
                 .map(|source| {
-                    let seed = source_seed(source);
+                    let seed = source_seed(&source);
                     source_hasher
                         .digest(&source.name, &seed)
-                        .map(|digest| (source.name.clone(), digest))
+                        .map(|digest| (source.name, digest))
                 })
                 .collect::<Result<Vec<_>>>()
         })?
         .into_iter()
         .collect::<HashMap<_, _>>();
-    drop(source_targets);
     let processed_rules = hash_pool().install(|| {
         decoded_rules
             .into_par_iter()

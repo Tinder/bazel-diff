@@ -2246,7 +2246,7 @@ fn repository_target(
 /// Every main-repository label a repository rule's attributes point at: `patches`, `build_file`,
 /// a `requirements_lock`, and so on. Attributes only name these files; a repository fetched with
 /// a changed patch is a different repository, so their contents must reach its hash.
-fn repository_local_input_labels(repository: &Repository) -> BTreeSet<String> {
+fn repository_local_input_labels(repository: &Repository) -> BTreeSet<&str> {
     repository
         .attribute
         .iter()
@@ -2254,40 +2254,34 @@ fn repository_local_input_labels(repository: &Repository) -> BTreeSet<String> {
             attribute
                 .string_value
                 .iter()
-                .cloned()
-                .chain(attribute.string_list_value.iter().cloned())
-                .chain(
-                    attribute
-                        .string_dict_value
-                        .iter()
-                        .map(|entry| entry.value.clone()),
-                )
+                .chain(&attribute.string_list_value)
+                .chain(attribute.string_dict_value.iter().map(|entry| &entry.value))
                 .chain(
                     attribute
                         .label_dict_unary_value
                         .iter()
-                        .flat_map(|entry| [entry.key.clone(), entry.value.clone()]),
+                        .flat_map(|entry| [&entry.key, &entry.value]),
                 )
                 .chain(
                     attribute
                         .label_keyed_string_dict_value
                         .iter()
-                        .map(|entry| entry.key.clone()),
+                        .map(|entry| &entry.key),
                 )
                 .chain(
                     attribute
                         .label_list_dict_value
                         .iter()
-                        .flat_map(|entry| entry.value.iter().cloned()),
+                        .flat_map(|entry| &entry.value),
                 )
                 .chain(
                     attribute
                         .string_list_dict_value
                         .iter()
-                        .flat_map(|entry| entry.value.iter().cloned()),
+                        .flat_map(|entry| &entry.value),
                 )
-                .collect::<Vec<_>>()
         })
+        .map(String::as_str)
         .filter(|value| crate::hash::main_repo_path(value).is_some())
         .collect()
 }
@@ -2340,7 +2334,7 @@ fn repository_local_inputs_hash(repository: &Repository, workspace: &Path) -> Op
     let mut hasher = Sha256::new();
     let mut hashed_any = false;
     for label in repository_local_input_labels(repository) {
-        let Some(path) = crate::hash::main_repo_path(&label) else {
+        let Some(path) = crate::hash::main_repo_path(label) else {
             continue;
         };
         let absolute = workspace.join(path);
@@ -3204,10 +3198,10 @@ mod tests {
         assert_eq!(
             repository_local_input_labels(&repository),
             BTreeSet::from([
-                "@@//:dep.patch".to_owned(),
-                "//:missing.patch".to_owned(),
-                "//third_party:dep.BUILD".to_owned(),
-                "//third_party:overlay".to_owned(),
+                "@@//:dep.patch",
+                "//:missing.patch",
+                "//third_party:dep.BUILD",
+                "//third_party:overlay",
             ])
         );
         let baseline = repository_local_inputs_hash(&repository, workspace.path()).unwrap();

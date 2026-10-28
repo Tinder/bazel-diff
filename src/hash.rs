@@ -635,8 +635,8 @@ impl HashContext<'_> {
             .get(key)
             .cloned()
             .ok_or_else(|| anyhow!("Unable to find rule {key}"))?;
-        let canonical_key = rule.rule.name.clone();
-        if let Some(index) = path.iter().position(|entry| entry == &canonical_key) {
+        let canonical_key = &rule.rule.name;
+        if let Some(index) = path.iter().position(|entry| entry == canonical_key) {
             // A back edge: the query graph can hold cycles a build never sees (rules_go's
             // `go_context_data` and the nogo analyzers reference each other through non-dependency
             // attributes). The target is still being hashed, so stand in with a digest of its own
@@ -645,7 +645,7 @@ impl HashContext<'_> {
             if self.cycle_warnings.insert(canonical_key.clone()) {
                 let cycle = path[index..]
                     .iter()
-                    .chain(std::iter::once(&canonical_key))
+                    .chain(std::iter::once(canonical_key))
                     .cloned()
                     .collect::<Vec<_>>()
                     .join(" -> ");
@@ -730,7 +730,7 @@ impl HashContext<'_> {
                 builder.direct(source_digest);
             } else if let Some(dependency) = self
                 .resolve_dependency(&encoded_input, input_label, path)
-                .filter(|dependency| dependency != &canonical_key)
+                .filter(|dependency| dependency.as_ref() != canonical_key)
             {
                 let digest = self.rule_overall_digest(&dependency, path)?;
                 builder.transitive(&dependency, digest);
@@ -747,7 +747,7 @@ impl HashContext<'_> {
 
         if !self.options.ignored_attributes.contains("visibility") {
             for package_group in visibility_package_groups(&rule.rule) {
-                if package_group == target_label(&canonical_key) {
+                if package_group == target_label(canonical_key) {
                     continue;
                 }
                 let Some(group) = self.rules.get(package_group) else {
@@ -762,7 +762,7 @@ impl HashContext<'_> {
             }
         }
 
-        path.pop();
+        let canonical_key = path.pop().expect("rule path contains the current rule");
         let digest = builder.finish();
         self.cache.insert(canonical_key, digest.clone());
         Ok(digest)

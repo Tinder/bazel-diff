@@ -707,7 +707,12 @@ impl HashContext<'_> {
         } else {
             &empty_repo_nodes
         };
-        let extension = self.rule_extension(&rule.rule.name);
+        // Only a listed extension has views, so a run without the flag never resolves the
+        // rule's repository, which can cost a `bazel mod` call.
+        let extension = (!self.options.bazel.use_cquery
+            && !self.options.bazel.label_only_module_extensions.is_empty())
+        .then(|| self.rule_extension(&rule.rule.name))
+        .flatten();
         let mut inputs = rule_inputs(
             &rule.rule,
             self.options.bazel.use_cquery,

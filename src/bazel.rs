@@ -518,7 +518,9 @@ impl BazelOptions {
 
     /// The usage prefixes (`rules_rs++crate`) of `label_only_module_extensions`. An entry that
     /// does not parse, names a module the root cannot see, or matches no generated repository is
-    /// reported and ignored, which leaves that extension on the conservative edges.
+    /// reported and ignored, which leaves that extension on the conservative edges. So is one
+    /// whose prefix Bazel may have given to another extension: two `.bzl` files of one module
+    /// that export the same extension name are told apart only by a numeric suffix.
     fn label_only_extension_prefixes(
         &self,
         canonical_to_apparent: &BTreeMap<String, Vec<String>>,
@@ -559,6 +561,17 @@ impl BazelOptions {
                 );
                 continue;
             };
+            let disambiguated = prefixes_in_use.iter().any(|other| {
+                other.strip_prefix(prefix.as_str()).is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+            });
+            if disambiguated {
+                eprintln!(
+                    "[Warn] --labelOnlyModuleExtensions: {id} shares its name with another extension of its module, so its repositories cannot be told apart"
+                );
+                continue;
+            }
             prefixes.insert(prefix);
         }
         prefixes
@@ -4247,6 +4260,39 @@ exit 1
         assert!(inputs_of(&cquery, "//external:rules_rs").is_empty());
         assert!(inputs_of(&cquery, "//external:bd_crates").is_empty());
         assert!(inputs_of(&cquery, "//external:rules_go++go_sdk+go_toolchains").is_empty());
+    }
+
+    #[test]
+    fn label_only_extensions_resolve_to_unambiguous_usage_prefixes() {
+        let mapping = parse_repo_mapping(
+            r#"{"":"","rules_rs":"rules_rs+","rs":"rules_rs+","rules_go":"rules_go+"}"#,
+        );
+        let generated = [
+            "rules_rs++crate+crates",
+            "rules_go++go_sdk+go_toolchains",
+            // Two `.bzl` files of rules_go export `pip`; Bazel names the second usage `pip2`.
+            "rules_go++pip+pypi",
+            "rules_go++pip2+pypi",
+        ]
+        .map(str::to_owned)
+        .into();
+        let mut options = probe_options(Path::new("."), PathBuf::from("unused"));
+        options.label_only_module_extensions = [
+            "@rules_rs//rs:extensions.bzl%crate",
+            "@rs//rs:extensions.bzl%crate",
+            "@@rules_go+//go:extensions.bzl%go_sdk",
+            "@rules_go//python:extensions.bzl%pip",
+            "@rules_go//go:extensions.bzl%nogo",
+            "@unknown//:extensions.bzl%crate",
+            "rules_rs.bzl%crate",
+            "@rules_rs//rs:extensions.bzl%",
+        ]
+        .map(str::to_owned)
+        .into();
+        assert_eq!(
+            options.label_only_extension_prefixes(&mapping, &generated),
+            BTreeSet::from(["rules_go++go_sdk".to_owned(), "rules_rs++crate".to_owned()])
+        );
     }
 
     #[test]

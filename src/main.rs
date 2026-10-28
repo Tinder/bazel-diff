@@ -608,6 +608,16 @@ fn fingerprint_flags(
                 .join(","),
         ),
         (
+            "labelOnlyModuleExtensions".into(),
+            args.label_only_module_extensions
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        (
             "ignoredRuleHashingAttributes".into(),
             args.ignored_rule_hashing_attributes
                 .iter()
@@ -1237,8 +1247,10 @@ mod tests {
         first.exclude_external_targets = true;
         first.fine_grained_hash_external_repos = vec!["maven".into(), "abc".into()];
         first.ignored_rule_hashing_attributes = vec!["z".into(), "a".into()];
+        first.label_only_module_extensions = vec!["@b//:e.bzl%b".into(), "@a//:e.bzl%a".into()];
         let mut second = first.clone();
         second.fine_grained_hash_external_repos.reverse();
+        second.label_only_module_extensions.reverse();
         second.ignored_rule_hashing_attributes.reverse();
 
         let first_flags = fingerprint_flags(&first, true, &["Rule".into(), "GeneratedFile".into()]);
@@ -1248,6 +1260,10 @@ mod tests {
         assert_eq!(first_flags["bazelStartupOptions"], "--a --b");
         assert_eq!(first_flags["targetType"], "GeneratedFile,Rule");
         assert_eq!(first_flags["fineGrainedHashExternalRepos"], "abc,maven");
+        assert_eq!(
+            first_flags["labelOnlyModuleExtensions"],
+            "@a//:e.bzl%a,@b//:e.bzl%b"
+        );
     }
 
     #[test]

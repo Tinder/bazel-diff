@@ -497,7 +497,9 @@ A few inputs are normalized or extended on the way in:
   `--labelOnlyModuleExtensions` (for example `@rules_rs//rs:extensions.bzl%crate`) asserts that
   its repositories use each other only through labels, so such a target reaches the owning module
   without them. Do not list an extension whose targets resolve a toolchain the same extension
-  generates: that change would be missed.
+  generates: that change would be missed. An extension whose name another `.bzl` file of the same
+  module also exports is reported and ignored, since Bazel tells their repositories apart only by
+  a numeric suffix.
   Bzlmod repositories are read from `bazel mod show_repo`, asked for by name in as many
   invocations as the platform's command-line limit allows, or in one `--all_repos` invocation
   when that would take several. The limit is 8191 characters wherever `cmd.exe` is involved --

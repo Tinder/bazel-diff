@@ -101,3 +101,98 @@ bazel test //tools/perf:tango_compare_test
 
 The harness is not a `py_binary` (it builds bazel-diff with `bazel build`, which would deadlock under
 `bazel run`); the test covers the pure helpers between raw tool output and the summary.
+
+## Cache probe experiment
+
+[`cache_probe_bench.py`](cache_probe_bench.py) is an **experiment, not a feature**. bazel-diff has
+no cache-probe mode and the top-level README does not mention one. The
+[`cache-probe-bench` workflow](../../.github/workflows/cache-probe-bench.yml) runs this harness
+nightly so the decision to add one (or not) rests on trend data rather than on a blog post. The
+rule: the mode is not advertised until the cron shows it is **sound** (never misses a test that
+ground truth ran) and a **win** on precision or wall time against the hash-based flow.
+
+### The technique under test
+
+Aspect's [`aspect cache diff`](https://aspect.build/blog/selective-testing-with-cache-diff) asks the
+remote cache which actions it already holds instead of hashing targets. One `bazel test //...`
+under `--experimental_remote_require_cached` executes nothing: every action is either a cache hit
+or an `EXECUTION_DENIED` miss, and `--remote_grpc_log` records a `GetActionResult` per probed
+action labelled with its target and mnemonic. A test is unaffected when its own `TestRunner`
+action hits, because that action's key folds in the digests of its runfiles. Bazel enforces
+require-cached only on the remote-execution path, so the probe points `--remote_executor` at
+[`cache_probe/dummy_executor`](cache_probe/dummy_executor/main.go), a Go REAPI server that
+advertises execution and never receives an `Execute` call (the harness counts them; any call
+fails the run).
+
+Two Bazel details the harness had to learn the hard way, both reproduced in its docstring:
+
+- On a warm server Bazel memoizes action nodes and never re-queries the cache for them. The probe
+  therefore runs two passes: pass 1 flips `--remote_default_exec_properties`, which changes the
+  action-execution salt and drops every action node without re-analysis; pass 2 runs with the
+  baseline flags plus `--nouse_action_cache` so each action's lookup uses the baseline's key.
+- Seeding must start from `bazel clean`: on a warm output base `bazel test` executes nothing and
+  uploads nothing. The harness verifies every seed with a clean-tree probe that must report zero
+  misses before it measures anything.
+
+### What is measured
+
+Per synthetic workload (the Tango presets plus two `check_test` targets per package, see
+`gen_project.py --tests-per-package`) and per change scenario:
+
+| Scenario | Edit | Why |
+|---|---|---|
+| `leaf_edit` | one source file ~75% deep in the graph | a PR-sized change |
+| `identical_output` | an input whose genrule ignores its content | the action key moves, the output and everything downstream stay byte-identical: bazel-diff must flag the closure, the cache knows better |
+| `wide_edit` | a layer-0 source with the most dependents | a shared-library change; stresses the miss frontier and rdeps attribution |
+
+Three selectors are scored against **ground truth**, the tests a real `bazel test //...` against
+the seeded cache actually executes (what CI pays with no selector at all):
+
+| Selector | Flow | Timed as |
+|---|---|---|
+| bazel-diff | checkout base, `generate-hashes`, checkout head, `generate-hashes --depEdgesFile`, `get-impacted-targets`, filtered to test targets | the five stages, cold and warm |
+| probe overreport | pass 1 + pass 2, decode the gRPC log, one `tests(rdeps(//..., set(<frontier misses>)))` query | both passes, the decode and the query, cold and warm |
+| probe precise | `bazel build //...` with upload (executes the missed non-test actions), then the probe; affected = tests whose own action missed | the build plus the probe |
+
+Recall below 100% is a soundness failure (`--require-sound` makes it fail the run). Precision is
+ground truth / flagged. The cache directory is snapshotted after the seed and restored before every
+iteration so precise mode's uploads never leak into the next measurement. Medians are reported.
+
+### Running locally
+
+```bash
+# Build the fixtures once (bazel-remote at the pinned version, the dummy executor) ...
+python3 tools/perf/cache_probe_bench.py --install-fixtures-only --fixture-dir ~/cache-probe-bin
+
+# ... then the smoke profile against an existing bazel-diff binary.
+python3 tools/perf/cache_probe_bench.py --quick --skip-build --bazel-diff bazel-bin/src/bazel-diff \
+    --fixture-dir ~/cache-probe-bin --bazel ~/go/bin/bazelisk
+
+# The nightly legs, keeping the scratch directory and writing the report files the workflow publishes.
+python3 tools/perf/cache_probe_bench.py --workload small --workload medium --iterations 3 \
+    --fixture-dir ~/cache-probe-bin --workdir /tmp/cpb --keep-workdir \
+    --metrics-out metrics.json --summary-out summary.md --require-sound
+```
+
+Requirements: `git`, `go` 1.25+, a `bazel`/`bazelisk` binary, Python 3.9+, stdlib only. All Bazel
+commands run with `--nohome_rc` (bazel-diff included, through `--bazelStartupOptions`) so a
+developer's own rc never changes action keys or streams to a BES. Unit tests for the pure helpers
+(the proto-runtime-free gRPC log decoder, verdicts, result-line classification, accuracy math,
+rendering):
+
+```bash
+bazel test //tools/perf:cache_probe_bench_test
+```
+
+### Known limits of the technique (what the trend has to answer)
+
+- gRPC caches only: `--remote_grpc_log` is a gRPC client interceptor, so an HTTP remote cache or a
+  disk cache yields no verdict at all.
+- A hit is sound; a miss is ambiguous (changed, never uploaded, or evicted). A sparse cache turns
+  into overreporting, never into a missed test.
+- Flag parity: the run that fills the cache and the probe must agree on every flag that enters an
+  action key.
+- Actions tagged `local`, `no-remote` or `no-cache` bypass the gate and execute during the probe.
+- The probe's analysis phase is paid in full every time (the salt flip throws away incremental
+  execution state); whether that beats two `generate-hashes` runs is exactly what the cold/warm
+  columns measure.

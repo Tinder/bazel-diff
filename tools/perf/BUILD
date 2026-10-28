@@ -20,3 +20,20 @@ py_test(
     python_version = "PY3",
     deps = [":tango_compare_lib"],
 )
+
+# cache_probe_bench.py (the cache-probe EXPERIMENT behind cache-probe-bench.yml) is not a py_binary
+# for the same reason. It imports tango_compare for its shared helpers.
+py_library(
+    name = "cache_probe_bench_lib",
+    srcs = ["cache_probe_bench.py"],
+    imports = ["."],
+    visibility = ["//visibility:private"],
+    deps = [":tango_compare_lib"],
+)
+
+py_test(
+    name = "cache_probe_bench_test",
+    srcs = ["cache_probe_bench_test.py"],
+    python_version = "PY3",
+    deps = [":cache_probe_bench_lib"],
+)

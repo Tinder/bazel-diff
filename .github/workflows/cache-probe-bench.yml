@@ -1,0 +1,128 @@
+name: "Perf: cache probe vs bazel-diff"
+
+# Nightly EXPERIMENT, not a product feature. bazel-diff does not ship a cache-probe mode and the
+# README does not mention one; this cron exists to decide whether it should. It runs
+# tools/perf/cache_probe_bench.py, which stands up a local REAPI cache (bazel-remote) plus a dummy
+# remote executor, seeds the cache from a base commit, and for each synthetic workload and change
+# scenario measures three selectors against ground truth (the tests a real `bazel test //...` against
+# that cache actually executes):
+#
+#   bazel-diff        the README recipe (two checkouts, two generate-hashes, one diff)
+#   probe overreport  one --experimental_remote_require_cached invocation read through
+#                     --remote_grpc_log, misses attributed to tests with one rdeps query
+#   probe precise     the same after building and uploading the missed non-test actions
+#
+# Soundness (every ground-truth test flagged) is a gate: a selector that misses a test is a bug in
+# this harness or the technique, and the run fails. Precision and wall time are the trend data.
+# See tools/perf/README.md ("Cache probe experiment") for the methodology and the decision rule.
+# Note: scheduled + dispatched workflows run from the default branch, so this must land on master
+# before the cron fires.
+on:
+  workflow_dispatch:
+    inputs:
+      workloads:
+        description: "Comma-separated synthetic presets (tiny, small, medium, large, xlarge)"
+        type: string
+        default: "small,medium,large"
+      iterations:
+        description: "Timed iterations per scenario"
+        type: string
+        default: "3"
+      quick:
+        description: "Smoke profile: tiny workload, one iteration (overrides workloads/iterations)"
+        type: boolean
+        default: false
+  schedule:
+    # Nightly at 05:15 UTC, offset from the Tango perf cron (45 3), serve-consistency (30 3), the
+    # serve crons (30 6, 30 8, 30 10, 30 14, 0 */12) and the format/badge crons (12:00-13:00) so the
+    # jobs never contend for runners.
+    - cron: "15 5 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  CacheProbeBench:
+    runs-on: ubuntu-latest
+    # Each workload pays two full builds of its synthetic graph (the cache seed and the ground
+    # truth) before any timed iteration, so the default legs are the three mid sizes; xlarge is a
+    # dispatch-only leg. Generous timeout so a slow runner yields data, not a kill.
+    timeout-minutes: 180
+    steps:
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.25.0'
+          cache: false
+        id: go
+      - name: Setup Bazelisk
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
+      - uses: actions/checkout@v4
+      - name: Build bazel-diff
+        # Built here rather than by the harness so the Rust build has its own step and log. The
+        # .bazelrc lint aspects are skipped: this is a measurement binary, CI lints it elsewhere.
+        run: >
+          ~/go/bin/bazelisk build //src:bazel-diff -c opt
+          --output_groups=-clippy_checks,-rustfmt_checks
+          --enable_bzlmod=true --enable_workspace=false
+      - name: Build cache fixtures (bazel-remote + dummy executor)
+        # bazel-remote is pinned in the harness (BAZEL_REMOTE_MODULE) so a cache-server change never
+        # silently moves the baseline. The dummy executor is this repo's own Go module.
+        run: |
+          for i in 1 2 3; do
+            python3 tools/perf/cache_probe_bench.py --install-fixtures-only --fixture-dir "$HOME/cache-probe-bin" && break
+            echo "fixture build failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
+      - name: Run cache probe harness
+        # Dispatch inputs reach the harness through the environment and a bash array, never by
+        # interpolating them into the command line. Scheduled runs see empty inputs and take the
+        # defaults.
+        env:
+          IN_WORKLOADS: ${{ inputs.workloads || 'small,medium,large' }}
+          IN_ITERATIONS: ${{ inputs.iterations || '3' }}
+          IN_QUICK: ${{ inputs.quick && 'true' || 'false' }}
+        run: |
+          args=()
+          if [ "$IN_QUICK" = "true" ]; then
+            args+=(--quick)
+          else
+            IFS=',' read -ra WLS <<< "$IN_WORKLOADS"
+            for w in "${WLS[@]}"; do
+              w="${w//[[:space:]]/}"
+              [ -n "$w" ] && args+=(--workload "$w")
+            done
+            args+=(--iterations "$IN_ITERATIONS")
+          fi
+          echo "harness args: ${args[*]}"
+          python3 tools/perf/cache_probe_bench.py \
+            --bazel "$HOME/go/bin/bazelisk" \
+            --bazel-diff bazel-bin/src/bazel-diff \
+            --skip-build \
+            --fixture-dir "$HOME/cache-probe-bin" \
+            --require-sound \
+            --metrics-out cache-probe-metrics.json \
+            --summary-out cache-probe-summary.md \
+            "${args[@]}"
+      - name: Publish step summary
+        if: always()
+        run: |
+          if [ -f cache-probe-summary.md ]; then
+            cat cache-probe-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-probe-${{ github.run_id }}
+          path: |
+            cache-probe-metrics.json
+            cache-probe-summary.md
+          if-no-files-found: warn
+          retention-days: 90

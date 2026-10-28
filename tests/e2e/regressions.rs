@@ -363,6 +363,57 @@ fn single_version_override_patch_change_reaches_consumer_cquery() {
     ]);
 }
 
+/// A repository built from a directory in the workspace that its rule names by absolute path, as
+/// `rules_rs` local crates and Gazelle's `local_path` do. Two identical checkouts at different
+/// paths must impact nothing, with or without the repository fine-grained: `//:tool_user` depends
+/// on `ext`, whose node has an edge to `@vendored`. Fine-grained, an edit to the directory still
+/// reaches `//:consumer`.
+#[test]
+fn repository_named_by_workspace_path_does_not_depend_on_its_path() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("workspace_path_repository");
+    let second = copy_workspace("workspace_path_repository");
+    let edited = copy_workspace("workspace_path_repository");
+    fs::write(edited.path().join("vendored/data.txt"), "v2\n").unwrap();
+    let fine_grained = ["--fineGrainedHashExternalRepos=@vendored"];
+    for args in [&[][..], &fine_grained[..]] {
+        let impacted = diff_workspaces(first.path(), second.path(), args);
+        assert!(impacted.is_empty(), "{args:?}: {impacted:?}");
+    }
+
+    let impacted = diff_workspaces(first.path(), edited.path(), &fine_grained);
+    assert!(
+        impacted
+            .iter()
+            .any(|label| label == "//:consumer" || label == "@@//:consumer"),
+        "{impacted:?}"
+    );
+    assert!(!impacted.contains("//:tool_user"), "{impacted:?}");
+    assert!(!impacted.contains("//:control"), "{impacted:?}");
+}
+
+/// A repository built from `<workspace>/../data`, a directory next to the workspace rather than
+/// in it. The path starts with the workspace's, but the two checkouts' `data` directories differ,
+/// so the consumer must be impacted: the path cannot be hashed relative to the workspace.
+#[test]
+fn repository_outside_the_workspace_keeps_its_path() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("workspace_outside_repository");
+    let second = copy_workspace("workspace_outside_repository");
+    fs::write(second.path().join("data/data.txt"), "v2\n").unwrap();
+    let impacted = diff_workspaces(&first.path().join("ws"), &second.path().join("ws"), &[]);
+    assert!(
+        impacted
+            .iter()
+            .any(|label| label == "//:consumer" || label == "@@//:consumer"),
+        "{impacted:?}"
+    );
+}
+
 /// Regression for https://github.com/Tinder/bazel-diff/issues/544: the local registry lives inside
 /// the workspace (`write_local_registry` registers it by its absolute path, which is what
 /// `%workspace%` expands to), so the `file://` URLs of `dep`'s registry patch and `MODULE.bazel`
@@ -772,6 +823,87 @@ fn referenced_failing_extension_fails_without_keep_going() {
         "{:?}",
         hashes.keys().collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn partial_extension_without_id_checks_references() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("partial_extension_without_id");
+    let output = tempfile::tempdir().unwrap();
+    let healthy_output = output.path().join("healthy.json");
+    let healthy_result = generate(workspace.path(), &healthy_output, &[]);
+    assert!(
+        healthy_result.status.success(),
+        "an unused failed extension must preserve healthy repositories: {}",
+        String::from_utf8_lossy(&healthy_result.stderr)
+    );
+    let healthy_hashes = hashes(&healthy_output);
+    assert!(
+        healthy_hashes.contains_key("//:uses_healthy")
+            && healthy_hashes.contains_key("//external:healthy"),
+        "{:?}",
+        healthy_hashes.keys().collect::<Vec<_>>()
+    );
+
+    edit(&workspace.path().join("BUILD"), |text| {
+        text + "\nfilegroup(\n    name = \"uses_missing\",\n    srcs = [\"@@+broken+generated//:data\"],\n)\n"
+    });
+    for mode in ["--no-keep_going", "--keep_going"] {
+        let path = output.path().join(format!("{mode}.json"));
+        let result = generate(workspace.path(), &path, &[mode]);
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{mode} accepted the missing mapping: {error}"
+        );
+        assert!(
+            error.contains("bazel mod dump_repo_mapping failed")
+                && error.contains("error evaluating module extension broken in"),
+            "{mode}: {error}"
+        );
+        assert!(
+            !path.exists(),
+            "{mode} published hashes after a mapping error"
+        );
+    }
+}
+
+#[test]
+fn same_symbol_extension_failure_keeps_healthy_repo_hashed() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("same_symbol_extension_failure");
+    let query = std::process::Command::new(bazel())
+        .args(["query", "deps(//:uses_healthy)"])
+        .current_dir(workspace.path())
+        .output()
+        .expect("run bazel query");
+    assert!(
+        query.status.success(),
+        "the healthy repository must remain loadable: {}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    assert!(String::from_utf8_lossy(&query.stdout).contains("healthy_repo//:x"));
+
+    for mode in ["--keep_going", "--no-keep_going"] {
+        let output = workspace.path().join(format!("{mode}.json"));
+        let result = generate(
+            workspace.path(),
+            &output,
+            &[mode, "--excludeExternalTargets", "--includeTargetType"],
+        );
+        assert!(
+            result.status.success(),
+            "generate-hashes {mode} must not fail"
+        );
+        assert!(
+            hashes(&output).contains_key("//external:healthy_repo"),
+            "{mode} must hash the healthy repository"
+        );
+    }
 }
 
 /// Reproducer for https://github.com/Tinder/bazel-diff/issues/535: the root maps the apparent

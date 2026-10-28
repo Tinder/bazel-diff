@@ -100,6 +100,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::hub_named_by_canonical_name_is_fine_grained_under_its_apparent_name",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::hub_spoke_version_bump_impacts_consumer_behind_fine_grained_hub",
                 "timeout": "moderate",
             },
@@ -192,6 +196,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::partial_extension_without_id_checks_references",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::referenced_failing_extension_fails_without_keep_going",
                 "timeout": "moderate",
             },
@@ -200,7 +208,19 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::repository_named_by_workspace_path_does_not_depend_on_its_path",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::repository_outside_the_workspace_keeps_its_path",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::rule_bzl_change_is_scoped_to_consumer",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::same_symbol_extension_failure_keeps_healthy_repo_hashed",
                 "timeout": "moderate",
             },
             {

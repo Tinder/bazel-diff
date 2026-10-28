@@ -289,6 +289,41 @@ fn hub_spoke_version_bump_impacts_consumer_behind_fine_grained_hub() {
     );
 }
 
+// The Bzlmod form of the case above, with the hub named by its canonical name. `query` prints the
+// apparent `@crates//:a`, which must still count as fine-grained: otherwise the input falls back to
+// the hub's `//external:crates` node, which depends on every spoke, and bumping one crate impacts
+// every consumer of the hub. The hub's own `versions.txt`, also named by its apparent label, must
+// be hashed by content under either name, or `//:uses_versions` misses the bump.
+#[test]
+fn hub_named_by_canonical_name_is_fine_grained_under_its_apparent_name() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("fine_grained_hub_by_canonical_name");
+    let second = copy_workspace("fine_grained_hub_by_canonical_name");
+    edit(&second.path().join("versions.json"), |text| {
+        text.replace("\"a\": \"1.0\"", "\"a\": \"2.0\"")
+    });
+    for repo in ["@crates", "@@+crates+crates"] {
+        let impacted = diff_local(
+            first.path(),
+            second.path(),
+            &["--fineGrainedHashExternalRepos", repo],
+        );
+        let main: BTreeSet<_> = impacted
+            .iter()
+            .filter(|label| !label.starts_with("//external:") && !label.starts_with("@@crates"))
+            .map(|label| label.trim_start_matches("@@").to_owned())
+            .filter(|label| label.starts_with("//"))
+            .collect();
+        assert_eq!(
+            main,
+            BTreeSet::from(["//:uses_a".to_owned(), "//:uses_versions".to_owned()]),
+            "{repo}: {impacted:?}"
+        );
+    }
+}
+
 // Module `ext`'s extension generates the `@crates` hub and its spokes, whose targets use a rule
 // `ext` defines. In query mode `//external:ext` stands in for everything its extensions generate,
 // so a fine-grained spoke target reaching `ext` through it changes whenever any other spoke does.

@@ -301,4 +301,64 @@ mod tests {
         )
         .is_err());
     }
+
+    /// `bazel version` is parsed when it works, and a Bazel that exits non-zero or prints
+    /// nothing recognisable is recorded as "unknown" rather than failing the fingerprint.
+    #[test]
+    #[cfg(unix)]
+    fn bazel_version_is_read_from_bazel_and_unknown_when_it_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = workspace.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+
+        let working = script(
+            "bazel",
+            "[ \"$1\" = version ] || exit 1\necho 'Bazelisk version: v1.22.0'\necho 'Build label: 8.7.0'",
+        );
+        assert_eq!(bazel_version(workspace.path(), &working), "8.7.0");
+        let inputs = gather(workspace.path(), &working, BTreeMap::new());
+        assert_eq!(inputs.bazel_version, "8.7.0");
+        assert_eq!(inputs.module_lock_content, None);
+
+        let failing = script("failing-bazel", "echo 'Build label: 8.7.0'\nexit 1");
+        assert_eq!(bazel_version(workspace.path(), &failing), "unknown");
+
+        let silent = script("silent-bazel", "echo 'nothing like a version'");
+        assert_eq!(bazel_version(workspace.path(), &silent), "unknown");
+
+        // The two versions must not fingerprint alike.
+        let flags = BTreeMap::new();
+        assert_ne!(
+            compute(&gather(workspace.path(), &working, flags.clone())).fingerprint,
+            compute(&gather(workspace.path(), &failing, flags)).fingerprint
+        );
+    }
+
+    /// An imported rc file outside the workspace is keyed by its absolute path, since there is
+    /// no workspace-relative name for it, and an `import` line naming nothing is skipped.
+    #[test]
+    fn bazelrc_imports_outside_the_workspace_keep_their_absolute_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let shared = elsewhere.path().join("shared.bazelrc");
+        fs::write(&shared, "build --remote_cache=x\n").unwrap();
+        fs::write(
+            workspace.path().join(".bazelrc"),
+            format!("import {}\nimport\ntry-import \n", shared.display()),
+        )
+        .unwrap();
+
+        let files = read_bazelrcs(workspace.path());
+        assert_eq!(files.len(), 2, "{:?}", files.keys());
+        assert_eq!(
+            files[&shared.to_string_lossy().into_owned()],
+            b"build --remote_cache=x\n".to_vec()
+        );
+    }
 }

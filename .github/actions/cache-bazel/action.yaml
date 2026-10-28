@@ -1,0 +1,119 @@
+name: Bazel caches
+description: |
+  GitHub Actions cache for Bazel's repository cache and, on request, its disk
+  cache. Hosted runners start empty, so without this every job re-downloads the
+  LLVM and Rust toolchains and crate sources (~1.5 GB per OS) and recompiles
+  the ~150 third-party crates (thousands of actions whose critical path is a
+  minute or two).
+
+  Repository cache: every Bazel on the runner uses it, including the nested
+  Bazel the e2e fixtures and the example script run, because the flag goes in
+  the system rc (/etc/bazel.bazelrc, or %ProgramData%\bazel.bazelrc). Keyed
+  by OS, Bazel version, and the lockfiles; an exact hit is never re-saved.
+
+  Disk cache: only the outer Bazel command uses it, via the BAZEL_DISK_CACHE
+  env this action exports (append `$BAZEL_DISK_CACHE` to the command). Keeping
+  it off the system rc stops hundreds of nested fixture builds from each
+  running garbage collection over the cache. Keyed by OS, the `disk-cache`
+  scope, and the commit, with a prefix fallback to the newest entry. Bazel's
+  LRU garbage collection (hits refresh mtimes) caps each entry right after the
+  build, before the post step saves it.
+
+  Both caches are read on every ref and saved only from master, so a PR never
+  writes an entry. Fork PRs can read master's entries. GitHub keeps 10 GB per
+  repository and evicts least-recently-used entries past that, so the cap
+  below and the number of `disk-cache` scopes are what keep the repository
+  caches, which every run reads, from being evicted.
+
+inputs:
+  bazel-version:
+    description: Bazel version label for the cache keys, e.g. the job's `matrix.bazel` value.
+    required: true
+  disk-cache:
+    description: |
+      Scope name for a disk cache, e.g. `candidate-8.x`. Empty (the default)
+      means no disk cache and an empty BAZEL_DISK_CACHE.
+    required: false
+    default: ''
+  disk-cache-max-size:
+    description: Size Bazel trims the disk cache to after each build.
+    required: false
+    default: 1536M
+
+runs:
+  using: composite
+  steps:
+    - id: paths
+      shell: bash
+      run: |
+        case "$RUNNER_OS" in
+          Windows) root="$(cygpath -m "$USERPROFILE")/.cache" ;;
+          *) root="$HOME/.cache" ;;
+        esac
+        echo "repo=$root/bazel-repo" >> "$GITHUB_OUTPUT"
+        echo "disk=$root/bazel-disk" >> "$GITHUB_OUTPUT"
+
+    # actions/cache saves in its post step; actions/cache/restore never saves.
+    # Pairing them on `github.ref` is what makes master the only writer.
+    - name: Restore repository cache
+      if: github.ref != 'refs/heads/master'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.paths.outputs.repo }}
+        key: bazel-repo-${{ runner.os }}-${{ inputs.bazel-version }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', '.bazelversion') }}
+        restore-keys: |
+          bazel-repo-${{ runner.os }}-${{ inputs.bazel-version }}-
+    - name: Restore repository cache (master saves on miss)
+      if: github.ref == 'refs/heads/master'
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.paths.outputs.repo }}
+        key: bazel-repo-${{ runner.os }}-${{ inputs.bazel-version }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', '.bazelversion') }}
+        restore-keys: |
+          bazel-repo-${{ runner.os }}-${{ inputs.bazel-version }}-
+
+    - name: Restore disk cache
+      if: inputs.disk-cache != '' && github.ref != 'refs/heads/master'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.paths.outputs.disk }}
+        key: bazel-disk-${{ runner.os }}-${{ inputs.disk-cache }}-${{ github.sha }}
+        restore-keys: |
+          bazel-disk-${{ runner.os }}-${{ inputs.disk-cache }}-
+    - name: Restore disk cache (master saves)
+      if: inputs.disk-cache != '' && github.ref == 'refs/heads/master'
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.paths.outputs.disk }}
+        key: bazel-disk-${{ runner.os }}-${{ inputs.disk-cache }}-${{ github.sha }}
+        restore-keys: |
+          bazel-disk-${{ runner.os }}-${{ inputs.disk-cache }}-
+
+    - name: Point every Bazel at the repository cache
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        REPO: ${{ steps.paths.outputs.repo }}
+      run: echo "common --repository_cache=$REPO" | sudo tee -a /etc/bazel.bazelrc >/dev/null
+    - name: Point every Bazel at the repository cache (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        REPO: ${{ steps.paths.outputs.repo }}
+      run: |
+        New-Item -ItemType Directory -Force -Path "$env:ProgramData" | Out-Null
+        Add-Content -Path "$env:ProgramData\bazel.bazelrc" -Value "common --repository_cache=$env:REPO"
+
+    - name: Export BAZEL_DISK_CACHE
+      shell: bash
+      env:
+        SCOPE: ${{ inputs.disk-cache }}
+        DISK: ${{ steps.paths.outputs.disk }}
+        MAX: ${{ inputs.disk-cache-max-size }}
+      run: |
+        flags=""
+        if [ -n "$SCOPE" ]; then
+          # Idle delay 0 runs the LRU collection as soon as the build ends.
+          flags="--disk_cache=$DISK --experimental_disk_cache_gc_max_size=$MAX --experimental_disk_cache_gc_idle_delay=0"
+        fi
+        echo "BAZEL_DISK_CACHE=$flags" >> "$GITHUB_ENV"

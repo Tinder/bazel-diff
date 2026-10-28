@@ -1,0 +1,8 @@
+module(name = "same_symbol_extension_failure")
+
+# Bazel disambiguates equal extension symbols from different files in canonical repo names.
+healthy = use_extension("//:healthy.bzl", "repos")
+use_repo(healthy, "healthy_repo")
+
+broken = use_extension("//:broken.bzl", "repos")
+use_repo(broken, "missing_repo")

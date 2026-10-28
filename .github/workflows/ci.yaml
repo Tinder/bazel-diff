@@ -32,13 +32,20 @@ jobs:
             sleep 10
           done
       - uses: actions/checkout@v4
+      # GitHub-cached repository and disk caches (.github/actions/cache-bazel):
+      # read on every ref, saved from master. $BAZEL_DISK_CACHE holds the
+      # disk-cache flags for the outer command only.
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: ${{ matrix.bazel }}
+          disk-cache: candidate-${{ matrix.bazel }}
       # --config=ci writes bazel-bep.json (see .bazelrc). On failure, the report
       # step prints the stderr of failed actions and the test.log of failed tests
       # as annotations and a job summary.
       - name: Check Bazel build and tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        run: ~/go/bin/bazelisk test //:rust_tests //:rust_clippy_check //:rust_format_check //tools/... --enable_bzlmod=true --enable_workspace=false --config=ci
+        run: ~/go/bin/bazelisk test //:rust_tests //:rust_clippy_check //:rust_format_check //tools/... --enable_bzlmod=true --enable_workspace=false --config=ci $BAZEL_DISK_CACHE
       - name: Report Bazel failures
         if: failure()
         run: python3 tools/report_bazel_failures.py bazel-bep.json
@@ -69,11 +76,15 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           echo "BAZEL=$(go env GOPATH)/bin/bazelisk" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: '8.x'
+          disk-cache: e2e-8.x
       - name: Run native behavioral suite
         env:
           # Read twice: by the outer bazelisk, and by the nested one.
           USE_BAZEL_VERSION: '8.x'
-        run: bazelisk test //tests:e2e_test --enable_bzlmod=true --enable_workspace=false --config=ci
+        run: bazelisk test //tests:e2e_test --enable_bzlmod=true --enable_workspace=false --config=ci $BAZEL_DISK_CACHE
       - name: Report Bazel failures
         if: failure()
         run: python3 tools/report_bazel_failures.py bazel-bep.json
@@ -96,6 +107,9 @@ jobs:
             sleep 10
           done
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: '8.x'
       - name: Check the e2e test split is up to date
         env:
           USE_BAZEL_VERSION: '8.x'
@@ -121,6 +135,9 @@ jobs:
             sleep 10
           done
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: '8.x'
       # Match Cargo.toml's rust-version. --extra_toolchains takes precedence
       # over registered toolchains. Clippy and rustfmt use the default compiler.
       - name: Check declared minimum Rust version
@@ -167,6 +184,9 @@ jobs:
           done
           export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: ${{ matrix.bazel }}
       - name: Build license target
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
@@ -279,6 +299,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # The example script runs Bazel itself; the repository cache reaches it
+      # through the system rc the action writes.
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: ${{ matrix.bazel }}
       - name: Run bazel-diff example script (Linux)
         if: runner.os != 'Windows'
         env:
@@ -380,6 +405,9 @@ jobs:
           }
           echo "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: bazelversion
       # Use the same archive script as release_prep.sh.
       - name: Build release source archive
         if: matrix.upload_archive

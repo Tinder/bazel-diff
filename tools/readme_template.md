@@ -487,6 +487,9 @@ A few inputs are normalized or extended on the way in:
   hashed without its `url`/`urls`, since a mirror or registry move cannot change what it fetches.
   The main-repository files its attributes name -- patches, build files, lock files -- are hashed
   by content, so a changed patch is a changed repository.
+  An attribute that names a workspace path absolutely (a crate or Go module built from a directory
+  in the workspace, a `file://%workspace%` registry URL) is hashed relative to the workspace, so
+  identical checkouts at different paths hash the same.
   In query mode the module that owns a module extension stands in for every repository the
   extension generates, because a toolchain resolved from one of them is not a query input. A
   fine-grained target inside one of those repositories that uses a rule from the owning module

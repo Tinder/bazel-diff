@@ -7,6 +7,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use buffa::Message;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
@@ -120,6 +121,67 @@ impl BazelOptions {
         (enabled, None)
     }
 
+    /// For a module workspace the hashing pass needs the graph and the root and module
+    /// mappings. Ask Bazel for those mappings together when the graph's module names fit
+    /// in one call. Only actual mapping answers are used; a rejected or incomplete batch
+    /// falls back to the independent root probe, including for a broken unused extension.
+    fn probe_query_repositories(
+        &self,
+        supported: bool,
+        survey: &mut ModuleSurvey,
+    ) -> (bool, Option<Vec<u8>>) {
+        if supported && self.workspace.join("MODULE.bazel").is_file() {
+            survey.graph = self.run_capture(&["mod", "graph", "--output=json"]).ok();
+            if let Some(prefetched) = survey
+                .graph
+                .as_ref()
+                .and_then(|graph| self.prefetch_module_mappings(graph))
+            {
+                let (root, mappings) = prefetched;
+                survey.mappings = mappings;
+                return (true, Some(root));
+            }
+        }
+        self.probe_bzlmod()
+    }
+
+    fn prefetch_module_mappings(
+        &self,
+        graph: &Output,
+    ) -> Option<(Vec<u8>, BTreeMap<String, RepoMapping>)> {
+        let complete = |output: &Output| {
+            output.status.success() && !String::from_utf8_lossy(&output.stderr).contains("ERROR:")
+        };
+        if !complete(graph) {
+            return None;
+        }
+        let candidates =
+            hidden_module_repo_names(&String::from_utf8_lossy(&graph.stdout), &BTreeMap::new())
+                .into_values()
+                .filter(|name| !is_extension_repo(name))
+                .collect::<BTreeSet<_>>();
+        let size = 1 + candidates.iter().map(|name| name.len() + 1).sum::<usize>();
+        if candidates.is_empty() || size > mod_argument_byte_budget() {
+            return None;
+        }
+        let mut args = vec!["mod", "dump_repo_mapping", ""];
+        args.extend(candidates.iter().map(String::as_str));
+        let output = self.run_capture(&args).ok()?;
+        if !complete(&output) {
+            return None;
+        }
+        // Bazel prints one JSON object per argument, in order. Keep the root's
+        // original bytes for external hashing and reject partial or extra rows.
+        let mut rows = output.stdout.split_inclusive(|&byte| byte == b'\n');
+        let root = rows.next()?;
+        serde_json::from_slice::<RepoMapping>(root).ok()?;
+        let mut mappings = BTreeMap::new();
+        for name in candidates {
+            mappings.insert(name, serde_json::from_slice(rows.next()?).ok()?);
+        }
+        rows.next().is_none().then(|| (root.to_vec(), mappings))
+    }
+
     /// The module graph for the hash file's metadata. A failed module extension is reported
     /// by the hashing pass, so this one takes the partial answer silently.
     pub fn module_graph_json(&self) -> Option<String> {
@@ -133,10 +195,18 @@ impl BazelOptions {
     /// `bazel mod graph --output=json`. The module graph proper survives a module extension
     /// Bazel cannot evaluate: the whole graph is printed before the extension is reported and
     /// the command exits 2.
-    fn module_graph_json_tolerating(&self, failed: &mut BTreeSet<String>) -> Result<String> {
-        let output = self.run_capture(&["mod", "graph", "--output=json"])?;
+    fn module_graph_json_tolerating(
+        &self,
+        output: Option<Output>,
+        failed: &mut FailedExtensions,
+    ) -> Result<(String, bool)> {
+        let output = match output {
+            Some(output) => output,
+            None => self.run_capture(&["mod", "graph", "--output=json"])?,
+        };
+        let complete = output.status.success();
         let stdout = self.accept_mod_output(output, "graph --output=json", failed)?;
-        Ok(String::from_utf8_lossy(&stdout).trim().to_owned())
+        Ok((String::from_utf8_lossy(&stdout).trim().to_owned(), complete))
     }
 
     pub fn dependency_fingerprint(&self) -> Result<String> {
@@ -207,56 +277,73 @@ impl BazelOptions {
     }
 
     pub fn query_all_targets(&self) -> Result<Vec<Target>> {
-        let (targets, _module_graph_json) = self.query_all_targets_with(|_| {})?;
+        let QueriedTargets {
+            targets,
+            module_graph_json: _module_graph_json,
+            root_mapping: _root_mapping,
+        } = self.query_all_targets_with(materialize_repository_inputs_for_batch)?;
         Ok(targets)
     }
 
     pub(crate) fn query_all_targets_with(
         &self,
-        mut transform: impl FnMut(&mut Target),
-    ) -> Result<(Vec<Target>, Option<String>)> {
+        mut transform: impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) -> Result<QueriedTargets> {
         let mut bzlmod = BzlmodRepos::default();
-        let mut version = None;
-        let (bzlmod_enabled, root_mapping) = self.probe_bzlmod();
-        if bzlmod_enabled {
-            let supports_bzlmod = match self.version() {
-                Ok(found) => {
-                    version = Some(found);
-                    found >= BazelVersion(8, 6, 0) && found != BazelVersion(9, 0, 0)
-                }
-                Err(error) if self.keep_going => {
+        let checked_version = self.version();
+        let supports_bzlmod = checked_version
+            .as_ref()
+            .is_ok_and(|found| *found >= BazelVersion(8, 6, 0) && *found != BazelVersion(9, 0, 0));
+        let mut survey = ModuleSurvey::default();
+        let (bzlmod_enabled, root_mapping) =
+            self.probe_query_repositories(supports_bzlmod, &mut survey);
+        let version = match checked_version {
+            Ok(found) => Some(found),
+            Err(error) => {
+                if bzlmod_enabled {
+                    if !self.keep_going {
+                        return Err(error);
+                    }
                     eprintln!(
                         "[Warn] failed to check Bazel version for Bzlmod repositories: {error:#}"
                     );
-                    false
+                }
+                None
+            }
+        };
+        if bzlmod_enabled && supports_bzlmod {
+            match self.query_bzlmod_repos(root_mapping, survey, &mut |target, inputs| {
+                transform(std::slice::from_mut(target), inputs);
+            }) {
+                Ok(repos) => bzlmod = repos,
+                Err(error) if self.keep_going => {
+                    eprintln!("[Warn] failed to hash Bzlmod repositories: {error:#}");
                 }
                 Err(error) => return Err(error),
-            };
-            if supports_bzlmod {
-                match self.query_bzlmod_repos(root_mapping, &mut transform) {
-                    Ok(repos) => bzlmod = repos,
-                    Err(error) if self.keep_going => {
-                        eprintln!("[Warn] failed to hash Bzlmod repositories: {error:#}");
-                    }
-                    Err(error) => return Err(error),
-                }
             }
         }
         let BzlmodRepos {
             targets: bzlmod_repos,
-            failed_extensions,
+            mut failed_extensions,
             canonical_to_apparent,
             module_graph_json,
+            root_mapping,
         } = bzlmod;
         let targets = self.collect_all_targets(bzlmod_repos, |expression, use_cquery| {
-            self.query_with(expression, use_cquery, version, &mut transform)
+            self.query_with(expression, use_cquery, version, &mut |batch| {
+                transform(batch, None)
+            })
         })?;
         self.check_failed_extension_references(
             &targets,
-            &failed_extensions,
+            &mut failed_extensions,
             &canonical_to_apparent,
         )?;
-        Ok((targets, module_graph_json))
+        Ok(QueriedTargets {
+            targets,
+            module_graph_json,
+            root_mapping,
+        })
     }
 
     fn collect_all_targets(
@@ -325,9 +412,12 @@ impl BazelOptions {
     fn query_bzlmod_repos(
         &self,
         root_mapping: Option<Vec<u8>>,
-        transform: &mut impl FnMut(&mut Target),
+        survey: ModuleSurvey,
+        transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>),
     ) -> Result<BzlmodRepos> {
-        let mut failed = BTreeSet::new();
+        let mut failed = FailedExtensions::default();
+        // The initial probe returns stdout only on success. The fallback may be partial.
+        let retain_root_mapping = root_mapping.is_some();
         let root_mapping = match root_mapping {
             Some(mapping) => mapping,
             None => {
@@ -336,14 +426,15 @@ impl BazelOptions {
             }
         };
         let canonical_to_apparent = parse_repo_mapping(&String::from_utf8_lossy(&root_mapping));
-        let module_graph = match self.module_graph_json_tolerating(&mut failed) {
-            Ok(json) => Some(json),
-            Err(error) if self.keep_going => {
-                eprintln!("[Warn] {error:#}; hashing Bzlmod repositories without module edges");
-                None
-            }
-            Err(error) => return Err(error),
-        };
+        let (module_graph, complete_graph) =
+            match self.module_graph_json_tolerating(survey.graph, &mut failed) {
+                Ok((json, complete)) => (Some(json), complete),
+                Err(error) if self.keep_going => {
+                    eprintln!("[Warn] {error:#}; hashing Bzlmod repositories without module edges");
+                    (None, false)
+                }
+                Err(error) => return Err(error),
+            };
         let module_edges = module_graph
             .as_deref()
             .map(parse_module_dependency_edges)
@@ -367,6 +458,8 @@ impl BazelOptions {
         let extension_repos = match self.extension_repositories(
             &canonical_to_apparent,
             hidden_modules.values().cloned().collect(),
+            survey.mappings,
+            retain_root_mapping && complete_graph,
             &mut failed,
         ) {
             Ok(repos) => repos,
@@ -385,9 +478,19 @@ impl BazelOptions {
         let repositories = if canonical_names.is_empty() {
             Vec::new()
         } else {
-            self.show_repositories(
+            self.show_repositories_within(
                 &canonical_names.into_iter().collect::<Vec<_>>(),
                 &mut failed,
+                mod_argument_byte_budget(),
+                || {
+                    verified_hidden_modules(
+                        module_graph.as_deref(),
+                        &root_mapping,
+                        &extension_repos.module_mappings,
+                        &hidden_modules,
+                    )
+                    .then_some(&hidden_modules)
+                },
             )?
         };
         let targets = lower_repositories(
@@ -409,10 +512,11 @@ impl BazelOptions {
             failed_extensions: failed,
             canonical_to_apparent,
             module_graph_json: module_graph,
+            root_mapping: retain_root_mapping.then_some(root_mapping),
         })
     }
 
-    /// The canonical prefixes (`rules_rs++crate`) of `label_only_module_extensions`. An entry that
+    /// The usage prefixes (`rules_rs++crate`) of `label_only_module_extensions`. An entry that
     /// does not parse, names a module the root cannot see, or matches no generated repository is
     /// reported and ignored, which leaves that extension on the conservative edges.
     fn label_only_extension_prefixes(
@@ -420,6 +524,10 @@ impl BazelOptions {
         canonical_to_apparent: &BTreeMap<String, Vec<String>>,
         generated: &BTreeSet<String>,
     ) -> BTreeSet<String> {
+        let prefixes_in_use = generated
+            .iter()
+            .filter_map(|repo| extension_usage_prefix(repo))
+            .collect::<BTreeSet<_>>();
         let mut prefixes = BTreeSet::new();
         for id in &self.label_only_module_extensions {
             let parsed = id.rsplit_once('%').and_then(|(file, name)| {
@@ -442,56 +550,77 @@ impl BazelOptions {
                         .map(|(canonical, _)| canonical.clone())
                 }
             };
-            let prefix = canonical.map(|canonical| format!("{canonical}+{name}"));
-            match prefix {
-                Some(prefix)
-                    if generated.iter().any(|repo| {
-                        extension_repo_parts(repo).is_some_and(|(_, extension)| extension == prefix)
-                    }) =>
-                {
-                    prefixes.insert(prefix);
-                }
-                _ => eprintln!(
+            let Some(prefix) = canonical
+                .map(|canonical| format!("{canonical}+{name}"))
+                .filter(|prefix| prefixes_in_use.contains(prefix.as_str()))
+            else {
+                eprintln!(
                     "[Warn] --labelOnlyModuleExtensions: {id} generates no repository the root module can see"
-                ),
-            }
+                );
+                continue;
+            };
+            prefixes.insert(prefix);
         }
         prefixes
     }
 
-    /// Runs `bazel mod show_repo --output=streamed_proto` over `canonical_names`.
-    /// Large canonical selections use one bulk read, preserving the explicit result order.
-    fn show_repositories(
-        &self,
-        canonical_names: &[String],
-        failed: &mut BTreeSet<String>,
-    ) -> Result<Vec<Repository>> {
-        self.show_repositories_within(canonical_names, failed, mod_argument_byte_budget())
-    }
-
-    /// [`show_repositories`](Self::show_repositories) under an explicit argument budget.
-    ///
     /// Canonical names that fit one invocation are asked for by name. More are asked of
     /// `--all_repos` in a single invocation, filtered to the names wanted: every invocation costs
     /// a Bazel server round trip (seconds on Windows, whose `cmd.exe` limit is the one that splits
     /// the names most finely, #536), and the names are nearly every repository anyway. A Bazel
     /// without `--all_repos`, or one whose answer a module extension it cannot evaluate
-    /// spoils, is asked by name after all, one invocation per chunk. Hidden module keys stay on
-    /// the explicit path because bulk records do not carry their module key metadata.
-    fn show_repositories_within(
+    /// spoils, is asked by name after all, one invocation per chunk.
+    fn show_repositories_within<'a>(
         &self,
         canonical_names: &[String],
-        failed: &mut BTreeSet<String>,
+        failed: &mut FailedExtensions,
         budget: usize,
+        hidden_bindings: impl FnOnce() -> Option<&'a BTreeMap<String, String>>,
     ) -> Result<Vec<Repository>> {
         // Hidden module keys start with a lowercase module name, after canonical @@ arguments.
         let canonical_count = canonical_names.partition_point(|name| name.starts_with("@@"));
         let (canonical, hidden) = canonical_names.split_at(canonical_count);
         let selected_bytes = canonical.iter().map(|name| name.len() + 1).sum::<usize>();
         if selected_bytes > budget {
-            match self.show_all_repositories(canonical, failed) {
-                Ok(Some(mut repositories)) => {
-                    repositories.extend(self.show_repositories_explicit(hidden, failed, budget)?);
+            match self.show_all_repositories(failed) {
+                Ok(Some(BulkRepositories {
+                    mut by_canonical,
+                    complete,
+                })) => {
+                    // A module-key request prints its canonical definition with one extra
+                    // field. Reuse the bulk answer only when the parents' own repo mappings
+                    // identify every key and the bulk command answered completely.
+                    let hidden_records =
+                        complete
+                            .then(hidden_bindings)
+                            .flatten()
+                            .and_then(|bindings| {
+                                hidden
+                                    .iter()
+                                    .map(|key| {
+                                        let name = bindings.get(key)?;
+                                        let record = by_canonical.get(name)?;
+                                        if record.module_key.is_some()
+                                            || record.apparent_name.is_some()
+                                        {
+                                            return None;
+                                        }
+                                        let mut record = record.clone();
+                                        record.module_key = Some(key.clone());
+                                        Some(record)
+                                    })
+                                    .collect::<Option<Vec<_>>>()
+                            });
+                    // RepoOverride has no streamed-proto record, so missing canonical slots
+                    // remain omitted, in the same order as an explicit read.
+                    let mut repositories: Vec<_> = canonical
+                        .iter()
+                        .filter_map(|name| by_canonical.remove(name.trim_start_matches('@')))
+                        .collect();
+                    repositories.extend(match hidden_records {
+                        Some(records) => records,
+                        None => self.show_repositories_explicit(hidden, failed, budget)?,
+                    });
                     return Ok(repositories);
                 }
                 Ok(None) => {}
@@ -507,7 +636,7 @@ impl BazelOptions {
     fn show_repositories_explicit(
         &self,
         canonical_names: &[String],
-        failed: &mut BTreeSet<String>,
+        failed: &mut FailedExtensions,
         budget: usize,
     ) -> Result<Vec<Repository>> {
         let mut repositories = Vec::new();
@@ -536,17 +665,15 @@ impl BazelOptions {
         Ok(repositories)
     }
 
-    /// `bazel mod show_repo --all_repos --output=streamed_proto`, kept to the repositories
-    /// `canonical_names` wants and in their order. `None` when Bazel did not answer: it
+    /// `bazel mod show_repo --all_repos --output=streamed_proto`. `None` when Bazel did not answer: it
     /// predates the option (every Bazel with the `--output=streamed_proto` this needs, 8.6
     /// and 9.0 on, has it), or a module extension it cannot evaluate failed the whole
-    /// invocation. The extensions such a failure names are noted in
-    /// `failed`, so the by-name invocations that follow leave their repositories out.
+    /// invocation. Failures are noted for the explicit reads that follow to identify
+    /// unavailable canonical repositories.
     fn show_all_repositories(
         &self,
-        canonical_names: &[String],
-        failed: &mut BTreeSet<String>,
-    ) -> Result<Option<Vec<Repository>>> {
+        failed: &mut FailedExtensions,
+    ) -> Result<Option<BulkRepositories>> {
         let output_file = NamedTempFile::new().context("create mod show_repo output")?;
         let mut command = self.command();
         command
@@ -590,42 +717,40 @@ impl BazelOptions {
         if !output.stderr.is_empty() {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
         }
-        let mut by_canonical = decode_delimited::<Repository>(output_file.path())?
-            .into_iter()
-            .filter_map(|repository| {
-                let canonical = repository.canonical_name.as_deref()?;
-                let canonical = canonical.trim_start_matches('@');
-                if belongs_to_failed_extension(canonical, failed) {
-                    return None;
-                }
-                Some((canonical.to_owned(), repository))
-            })
-            .collect::<HashMap<_, _>>();
-        // RepoOverride has no streamed-proto record, so a missing slot remains omitted.
-        let repositories = canonical_names
-            .iter()
-            .filter_map(|name| by_canonical.remove(name.trim_start_matches('@')))
-            .collect();
-        Ok(Some(repositories))
+        let mut complete = output.status.success() && failed.is_empty();
+        let mut by_canonical = HashMap::new();
+        for repository in decode_delimited::<Repository>(output_file.path())? {
+            let Some(canonical) = repository.canonical_name.as_deref() else {
+                complete = false;
+                continue;
+            };
+            let canonical = canonical.trim_start_matches('@');
+            if !has_unavailable_mapping(canonical, failed)
+                && by_canonical
+                    .insert(canonical.to_owned(), repository)
+                    .is_some()
+            {
+                complete = false;
+            }
+        }
+        Ok(Some(BulkRepositories {
+            by_canonical,
+            complete,
+        }))
     }
 
     /// Enumerates every repository generated by a module extension that at least one module
-    /// imports from, in two `bazel mod dump_repo_mapping` rounds: one over the module
-    /// repositories, whose mappings name the extension repos they `use_repo` (and so one
-    /// repository of every extension in use), and one over one such repository per extension,
-    /// whose mapping names all of its siblings -- an extension's repositories see each other
-    /// whether or not any module imports them.
+    /// imports from. Module mappings name the extension repos they `use_repo`. A repository
+    /// of each such extension sees its siblings, whether or not any module imports them.
     ///
-    /// Both rounds together cost well under a second on a workspace with two thousand extension
-    /// repositories; the module resolution that `bazel mod graph` already pays for dominates.
-    ///
-    /// An extension Bazel cannot evaluate has no repositories to enumerate: the ones a module
-    /// imports from it are left out, and it gets no representative (#531).
+    /// Mapping failures identify the unavailable canonical repositories before excluding them.
     fn extension_repositories(
         &self,
         canonical_to_apparent: &BTreeMap<String, Vec<String>>,
         hidden_module_repos: Vec<String>,
-        failed: &mut BTreeSet<String>,
+        prefetched: BTreeMap<String, RepoMapping>,
+        complete_inputs: bool,
+        failed: &mut FailedExtensions,
     ) -> Result<ExtensionRepositories> {
         let visible_module_repos = canonical_to_apparent
             .keys()
@@ -639,25 +764,39 @@ impl BazelOptions {
             .collect::<BTreeSet<_>>();
         let mut module_repos = visible_module_repos.clone();
         module_repos.extend(hidden_module_repos.iter().cloned());
+        let mut module_mappings = BTreeMap::new();
+        let mut complete_mappings =
+            complete_inputs && !hidden_module_repos.is_empty() && failed.is_empty();
         if !module_repos.is_empty() {
             // The hidden modules' repository names are derived, not reported, so a derivation
             // Bazel disagrees with falls back to the root-visible modules alone.
-            let mappings = match self.dump_repo_mappings(&module_repos, failed) {
+            let mappings = match self.module_mappings(
+                &module_repos,
+                prefetched,
+                failed,
+                &mut complete_mappings,
+            ) {
                 Ok(mappings) => mappings,
                 Err(error) if !hidden_module_repos.is_empty() => {
                     eprintln!("[Warn] {error:#}; enumerating extension repositories from the root-visible modules only");
-                    self.dump_repo_mappings(&visible_module_repos, failed)?
+                    complete_mappings = false;
+                    self.dump_repo_mappings(&visible_module_repos, failed, &mut complete_mappings)?
                 }
                 Err(error) => return Err(error),
             };
             imported.extend(
                 mappings
-                    .into_iter()
-                    .flat_map(|mapping| mapping.into_values())
-                    .filter(|canonical| is_extension_repo(canonical)),
+                    .iter()
+                    .flat_map(|mapping| mapping.values())
+                    .filter(|canonical| is_extension_repo(canonical))
+                    .cloned(),
             );
+            if complete_mappings {
+                module_mappings.extend(module_repos.iter().cloned().zip(mappings));
+                complete_mappings = module_mappings.len() == module_repos.len();
+            }
         }
-        imported.retain(|canonical| !belongs_to_failed_extension(canonical, failed));
+        imported.retain(|canonical| !has_unavailable_mapping(canonical, failed));
         let mut representatives = BTreeMap::new();
         for canonical in &imported {
             if let Some((prefix, _)) = canonical.rsplit_once('+') {
@@ -669,14 +808,19 @@ impl BazelOptions {
         let mut generated = imported.clone();
         if !representatives.is_empty() {
             let names = representatives.values().cloned().collect::<Vec<_>>();
-            let mappings = match self.dump_repo_mappings(&names, failed) {
+            let mappings = match self.dump_repo_mappings(&names, failed, &mut complete_mappings) {
                 Ok(mappings) => mappings,
                 Err(_) => {
+                    complete_mappings = false;
                     // One extension that fails to evaluate should not hide the rest; retry
                     // one at a time and report the ones Bazel cannot describe.
                     let mut mappings = Vec::new();
                     for name in &names {
-                        match self.dump_repo_mappings(std::slice::from_ref(name), failed) {
+                        match self.dump_repo_mappings(
+                            std::slice::from_ref(name),
+                            failed,
+                            &mut complete_mappings,
+                        ) {
                             Ok(mapping) => mappings.extend(mapping),
                             Err(error) if self.keep_going => {
                                 eprintln!(
@@ -700,12 +844,49 @@ impl BazelOptions {
                     }),
             );
         }
-        imported.retain(|canonical| !belongs_to_failed_extension(canonical, failed));
-        generated.retain(|canonical| !belongs_to_failed_extension(canonical, failed));
+        imported.retain(|canonical| !has_unavailable_mapping(canonical, failed));
+        generated.retain(|canonical| !has_unavailable_mapping(canonical, failed));
+        if !complete_mappings {
+            module_mappings.clear();
+        }
         Ok(ExtensionRepositories {
             imported,
             generated,
+            module_mappings,
         })
+    }
+
+    fn module_mappings(
+        &self,
+        repos: &[String],
+        mut prefetched: BTreeMap<String, RepoMapping>,
+        failed: &mut FailedExtensions,
+        complete: &mut bool,
+    ) -> Result<Vec<RepoMapping>> {
+        if prefetched.is_empty() {
+            return self.dump_repo_mappings(repos, failed, complete);
+        }
+        let mut missing = Vec::new();
+        let mut mappings = Vec::with_capacity(repos.len());
+        for repo in repos {
+            let mapping = prefetched.remove(repo);
+            if mapping.is_none() {
+                missing.push(repo.clone());
+            }
+            mappings.push(mapping);
+        }
+        let mut complete_missing = true;
+        let answers = self.dump_repo_mappings(&missing, failed, &mut complete_missing)?;
+        if !complete_missing {
+            return self.dump_repo_mappings(repos, failed, complete);
+        }
+        let mut answers = answers.into_iter();
+        Ok(mappings
+            .into_iter()
+            .map(|mapping| {
+                mapping.unwrap_or_else(|| answers.next().expect("one answer per missing module"))
+            })
+            .collect())
     }
 
     /// `bazel mod dump_repo_mapping` over `repos` (canonical names without `@@`), one
@@ -713,22 +894,32 @@ impl BazelOptions {
     fn dump_repo_mappings(
         &self,
         repos: &[String],
-        failed: &mut BTreeSet<String>,
-    ) -> Result<Vec<BTreeMap<String, String>>> {
+        failed: &mut FailedExtensions,
+        complete: &mut bool,
+    ) -> Result<Vec<RepoMapping>> {
         let mut mappings = Vec::new();
         for chunk in chunk_arguments(repos, mod_argument_byte_budget()) {
             let stdout = self.run_mod_over_repos("dump_repo_mapping", chunk, failed, |names| {
                 let mut args = vec!["mod", "dump_repo_mapping"];
                 args.extend(names.iter().map(String::as_str));
                 let output = self.run_capture(&args)?;
+                // Bazel prints mappings in argument order, without repository names. Keep
+                // them bound to the requested names only if every original name was answered.
+                *complete &= output.status.success() && names == chunk;
                 Ok((output.status, output.stderr, output.stdout))
             })?;
             let Some(stdout) = stdout else {
+                *complete = false;
                 continue;
             };
-            mappings.extend(String::from_utf8_lossy(&stdout).lines().filter_map(|line| {
-                serde_json::from_str::<BTreeMap<String, String>>(line.trim()).ok()
-            }));
+            let start = mappings.len();
+            for line in String::from_utf8_lossy(&stdout).lines() {
+                match serde_json::from_str(line.trim()) {
+                    Ok(mapping) => mappings.push(mapping),
+                    Err(_) => *complete = false,
+                }
+            }
+            *complete &= mappings.len() - start == chunk.len();
         }
         Ok(mappings)
     }
@@ -742,13 +933,13 @@ impl BazelOptions {
         &self,
         subcommand: &str,
         repos: &[String],
-        failed: &mut BTreeSet<String>,
+        failed: &mut FailedExtensions,
         mut attempt: impl FnMut(&[String]) -> Result<(ExitStatus, Vec<u8>, T)>,
     ) -> Result<Option<T>> {
-        let without_failed = |repos: &[String], failed: &BTreeSet<String>| {
+        let without_failed = |repos: &[String], failed: &FailedExtensions| {
             repos
                 .iter()
-                .filter(|repo| !belongs_to_failed_extension(repo, failed))
+                .filter(|repo| !has_unavailable_mapping(repo, failed))
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -772,6 +963,7 @@ impl BazelOptions {
             if failure.answered {
                 return Ok(Some(value));
             }
+            self.find_unavailable_repositories(&repos, failed)?;
             let remaining = without_failed(&repos, failed);
             if remaining.len() == repos.len() {
                 bail!(
@@ -783,13 +975,59 @@ impl BazelOptions {
         }
     }
 
+    /// Identifies unavailable canonical repositories by splitting failed mapping batches.
+    /// Successful batches need no per-repository calls. Unlike extension ids in diagnostics,
+    /// these names include Bazel's disambiguation of equal symbols from different files.
+    /// A successful mapping does not prove the internal repository itself exists.
+    fn find_unavailable_repositories(
+        &self,
+        repos: &[String],
+        failed: &mut FailedExtensions,
+    ) -> Result<()> {
+        let repos = repos
+            .iter()
+            .map(|repo| repo.trim_start_matches('@'))
+            .filter(|repo| is_extension_repo(repo) && !failed.unavailable.contains(*repo))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut pending = chunk_arguments(&repos, mod_argument_byte_budget());
+        pending.reverse();
+        while let Some(repos) = pending.pop() {
+            let mut args = vec!["mod", "dump_repo_mapping"];
+            args.extend(repos.iter().map(String::as_str));
+            let output = self.run_capture(&args)?;
+            if output.status.success() {
+                continue;
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // dump_repo_mapping returns before the inspector's partial-answer path.
+            let failure = extension_failure(&stderr).filter(|failure| !failure.answered);
+            let Some(failure) = failure else {
+                bail!(
+                    "bazel mod dump_repo_mapping failed with {}: {}",
+                    output.status,
+                    stderr.trim()
+                );
+            };
+            if let [repo] = repos {
+                self.note_failed_extensions(failed, failure.extensions);
+                failed.unavailable.insert(repo.clone());
+            } else {
+                let (left, right) = repos.split_at(repos.len() / 2);
+                pending.push(right);
+                pending.push(left);
+            }
+        }
+        Ok(())
+    }
+
     /// The stdout of a `bazel mod` invocation that takes no repository names, kept when the
     /// invocation only failed because a module extension in the graph cannot be evaluated.
     fn accept_mod_output(
         &self,
         output: Output,
         subcommand: &str,
-        failed: &mut BTreeSet<String>,
+        failed: &mut FailedExtensions,
     ) -> Result<Vec<u8>> {
         if output.status.success() {
             return Ok(output.stdout);
@@ -808,46 +1046,83 @@ impl BazelOptions {
         }
     }
 
-    fn note_failed_extensions(&self, failed: &mut BTreeSet<String>, extensions: BTreeSet<String>) {
+    fn note_failed_extensions(&self, failed: &mut FailedExtensions, extensions: BTreeSet<String>) {
+        failed.observed = true;
         for extension in extensions {
-            if failed.insert(extension.clone()) {
+            if failed.extensions.insert(extension.clone()) {
                 eprintln!(
-                    "[Warn] module extension {extension} cannot be evaluated: the repositories it generates are not hashed, and a target that depends on one fails this run unless --keep_going is set"
+                    "[Warn] Bazel reported that module extension {extension} cannot be evaluated"
                 );
             }
         }
     }
 
-    /// A module extension Bazel cannot evaluate only matters to the targets that depend on
-    /// one of its repositories, and `bazel query //...:all-targets` lists those without
-    /// loading their dependencies, so nothing else reports the missing input (#531). Fails on
-    /// the first such target, or warns under `--keep_going`.
+    /// `bazel query //...:all-targets` lists repository inputs without loading their
+    /// dependencies, so it does not report their failed mappings (#531). Checks those inputs
+    /// after an extension failure. Returns an error, or warns under `--keep_going`.
     fn check_failed_extension_references(
         &self,
         targets: &[Target],
-        failed: &BTreeSet<String>,
+        failed: &mut FailedExtensions,
         canonical_to_apparent: &BTreeMap<String, Vec<String>>,
     ) -> Result<()> {
         if failed.is_empty() {
             return Ok(());
         }
-        let apparent_to_extension = canonical_to_apparent
+        let apparent_to_canonical = canonical_to_apparent
             .iter()
-            .filter_map(|(canonical, apparent)| {
-                failed_extension_of(canonical, failed)
-                    .map(|extension| (apparent, extension.to_owned()))
-            })
-            .flat_map(|(apparent, extension)| {
+            .flat_map(|(canonical, apparent)| {
                 apparent
                     .iter()
-                    .map(move |name| (name.clone(), extension.clone()))
+                    .map(move |name| (name.as_str(), canonical.as_str()))
             })
             .collect::<BTreeMap<_, _>>();
-        let extension_of = |label: &str| -> Option<String> {
-            let (repo, _) = label.split_once("//")?;
+        let mut referenced = BTreeSet::new();
+        for target in targets {
+            let mut labels = vec![target_name(target).unwrap_or_default()];
+            if let Some(rule) = target.rule.as_option() {
+                labels.extend(rule.rule_input.iter().map(String::as_str));
+                labels.extend(
+                    rule.configured_rule_input
+                        .iter()
+                        .filter_map(|input| input.label.as_deref()),
+                );
+            }
+            for label in labels {
+                let Some((repo, _)) = label.split_once("//") else {
+                    continue;
+                };
+                let canonical = repo.strip_prefix("@@").or_else(|| {
+                    let apparent = repo.strip_prefix('@')?;
+                    apparent_to_canonical.get(apparent).copied()
+                });
+                if let Some(canonical) = canonical {
+                    referenced.insert(canonical);
+                }
+            }
+        }
+        self.find_unavailable_repositories(
+            &referenced
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            failed,
+        )?;
+        let unavailable_apparent = apparent_to_canonical
+            .into_iter()
+            .filter_map(|(apparent, canonical)| {
+                has_unavailable_mapping(canonical, failed).then_some(apparent)
+            })
+            .collect::<BTreeSet<_>>();
+        let unavailable = |label: &str| -> bool {
+            let Some((repo, _)) = label.split_once("//") else {
+                return false;
+            };
             match repo.strip_prefix("@@") {
-                Some(canonical) => failed_extension_of(canonical, failed).map(str::to_owned),
-                None => apparent_to_extension.get(repo.strip_prefix('@')?).cloned(),
+                Some(canonical) => has_unavailable_mapping(canonical, failed),
+                None => repo
+                    .strip_prefix('@')
+                    .is_some_and(|apparent| unavailable_apparent.contains(apparent)),
             }
         };
         let mut offenders = Vec::new();
@@ -862,12 +1137,9 @@ impl BazelOptions {
                         .filter_map(|input| input.label.as_deref()),
                 );
             }
-            if let Some((label, extension)) = labels
-                .into_iter()
-                .find_map(|label| extension_of(label).map(|extension| (label, extension)))
-            {
+            if let Some(label) = labels.into_iter().find(|label| unavailable(label)) {
                 offenders.push(format!(
-                    "{name} depends on {label}, a repository of module extension {extension}"
+                    "{name} depends on {label}, whose repository mapping failed"
                 ));
             }
         }
@@ -887,10 +1159,20 @@ impl BazelOptions {
             shown
         };
         if self.keep_going {
-            eprintln!("[Warn] hashes do not cover inputs from a module extension Bazel cannot evaluate: {summary}");
+            eprintln!(
+                "[Warn] hashes do not cover inputs with failed repository mappings: {summary}"
+            );
             Ok(())
         } else {
-            bail!("a module extension Bazel cannot evaluate is depended on: {summary}")
+            let reported = failed
+                .extensions
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "repository mappings needed by targets failed: {summary}; reported module extensions: {reported}"
+            )
         }
     }
 
@@ -903,7 +1185,7 @@ impl BazelOptions {
         expression: &str,
         use_cquery: bool,
         version: Option<BazelVersion>,
-        transform: &mut impl FnMut(&mut Target),
+        transform: &mut impl FnMut(&mut [Target]),
     ) -> Result<Vec<Target>> {
         let version = match version {
             Some(version) => version,
@@ -971,7 +1253,9 @@ impl BazelOptions {
         }
 
         let mut targets = if use_cquery {
-            decode_cquery_stream(output_file.path(), streamed_cquery, transform)?
+            decode_cquery_stream(output_file.path(), streamed_cquery, &mut |target| {
+                transform(std::slice::from_mut(target));
+            })?
         } else {
             decode_target_stream(output_file.path(), transform)?
         };
@@ -1030,8 +1314,11 @@ impl BazelOptions {
 
     fn canonical_bzlmod_repo_names(&self) -> Result<Vec<String>> {
         let mapping_output = self.run_capture(&["mod", "dump_repo_mapping", ""])?;
-        let mapping =
-            self.accept_mod_output(mapping_output, "dump_repo_mapping", &mut BTreeSet::new())?;
+        let mapping = self.accept_mod_output(
+            mapping_output,
+            "dump_repo_mapping",
+            &mut FailedExtensions::default(),
+        )?;
         Ok(parse_repo_mapping(&String::from_utf8_lossy(&mapping))
             .keys()
             .filter(|name| name.contains('+') || name.contains('~'))
@@ -1046,7 +1333,7 @@ impl BazelOptions {
         let output = self.run_mod_over_repos(
             "show_repo",
             canonical_names,
-            &mut BTreeSet::new(),
+            &mut FailedExtensions::default(),
             |names| {
                 let mut command = self.command();
                 command
@@ -1145,6 +1432,12 @@ fn parse_repo_mapping(text: &str) -> BTreeMap<String, Vec<String>> {
     canonical_to_apparent
 }
 
+#[derive(Default)]
+struct ModuleSurvey {
+    graph: Option<Output>,
+    mappings: BTreeMap<String, RepoMapping>,
+}
+
 /// Canonical names of the repositories module extensions generate.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ExtensionRepositories {
@@ -1153,6 +1446,63 @@ struct ExtensionRepositories {
     imported: BTreeSet<String>,
     /// Every repository of every extension in `imported`, the imported ones included.
     generated: BTreeSet<String>,
+    /// Complete module mappings from the ordinary module read, keyed by their requested canonical names.
+    module_mappings: BTreeMap<String, RepoMapping>,
+}
+
+type RepoMapping = BTreeMap<String, String>;
+
+struct BulkRepositories {
+    by_canonical: HashMap<String, Repository>,
+    complete: bool,
+}
+
+/// Resolve each hidden module through its apparent name in its parent's mapping. The
+/// names predicted by `hidden_module_repo_names` alone cannot identify a bulk record.
+fn verified_hidden_modules(
+    graph: Option<&str>,
+    root_mapping: &[u8],
+    mappings: &BTreeMap<String, RepoMapping>,
+    hidden: &BTreeMap<String, String>,
+) -> bool {
+    fn walk(
+        node: &serde_json::Value,
+        parent: &RepoMapping,
+        mappings: &BTreeMap<String, RepoMapping>,
+        hidden: &BTreeMap<String, String>,
+        seen: &mut BTreeSet<String>,
+    ) -> Option<()> {
+        for child in node.get("dependencies")?.as_array()? {
+            let key = child.get("key")?.as_str()?;
+            let canonical = parent.get(child.get("apparentName")?.as_str()?)?;
+            if let Some(expected) = hidden.get(key) {
+                if expected != canonical {
+                    return None;
+                }
+                seen.insert(key.to_owned());
+            }
+            if child
+                .get("dependencies")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|dependencies| !dependencies.is_empty())
+            {
+                walk(child, mappings.get(canonical)?, mappings, hidden, seen)?;
+            }
+        }
+        Some(())
+    }
+    if hidden.is_empty() || mappings.is_empty() {
+        return false;
+    }
+    let Some(graph) = graph.and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+    else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_slice::<RepoMapping>(root_mapping) else {
+        return false;
+    };
+    let mut seen = BTreeSet::new();
+    walk(&graph, &root, mappings, hidden, &mut seen).is_some() && seen.len() == hidden.len()
 }
 
 /// Whether `canonical` names a repository a module extension generated rather than a module's
@@ -1162,16 +1512,27 @@ fn is_extension_repo(canonical: &str) -> bool {
     canonical.matches('+').count() >= 2
 }
 
-/// Splits an extension repository's canonical name into the owning module's repository name
-/// and the extension's canonical prefix: `rules_go++go_sdk+go_default_sdk` is
-/// `("rules_go+", "rules_go++go_sdk")`. `None` for a module repository.
-pub(crate) fn extension_repo_parts(canonical: &str) -> Option<(&str, &str)> {
+/// The canonical prefix shared by repositories generated by one extension usage.
+pub(crate) fn extension_usage_prefix(canonical: &str) -> Option<&str> {
     if !is_extension_repo(canonical) {
         return None;
     }
-    let (prefix, _repo) = canonical.rsplit_once('+')?;
-    let (module_repo, _extension) = prefix.rsplit_once('+')?;
-    Some((module_repo, prefix))
+    canonical.rsplit_once('+').map(|(prefix, _repo)| prefix)
+}
+
+/// Finds the emitted defining module and its definition hash from an extension usage prefix.
+/// Ordinary module canonicals include the module/version `+` separator, and those components
+/// contain no `+`. Special bare names never have versioned forms, so emitted names cannot
+/// nest at separator boundaries.
+fn extension_repo_owner<'a>(
+    usage_prefix: &str,
+    module_definitions: &'a BTreeMap<String, String>,
+) -> Option<(&'a String, &'a String)> {
+    usage_prefix
+        .match_indices('+')
+        .find_map(|(separator, _matched)| {
+            module_definitions.get_key_value(&usage_prefix[..separator])
+        })
 }
 
 /// Upper bound on the bytes of repository names one `bazel mod` invocation is given, unless
@@ -1220,18 +1581,43 @@ fn mod_argument_byte_budget_from(setting: Option<&str>) -> usize {
     }
 }
 
+/// Targets with the accepted module graph and successful unfiltered root mapping from discovery.
+pub(crate) struct QueriedTargets {
+    pub(crate) targets: Vec<Target>,
+    pub(crate) module_graph_json: Option<String>,
+    pub(crate) root_mapping: Option<Vec<u8>>,
+}
+
 /// The repositories `bazel mod` describes for a Bzlmod workspace, lowered to `//external:`
 /// nodes, with what it could not describe.
 #[derive(Default)]
 struct BzlmodRepos {
     targets: Vec<Target>,
-    /// Module extensions Bazel could not evaluate, by the id it prints
-    /// (`@@transitive_dep+//:extensions.bzl%broken`). Their repositories have no node.
-    failed_extensions: BTreeSet<String>,
+    /// Extension diagnostics and canonical repositories whose mappings failed.
+    failed_extensions: FailedExtensions,
     /// The root module's repository mapping, canonical name -> apparent names.
     canonical_to_apparent: BTreeMap<String, Vec<String>>,
     /// The accepted module graph, shared by repository edges and hash-file metadata.
     module_graph_json: Option<String>,
+    /// Unfiltered stdout from a successful initial Bzlmod probe, shared with external hashing.
+    root_mapping: Option<Vec<u8>>,
+}
+
+/// Extension diagnostics and the canonical repositories whose mappings actually failed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FailedExtensions {
+    /// Bazel reported an extension failure, even if its diagnostic had no parseable ID.
+    observed: bool,
+    /// Extension ids printed by Bazel.
+    extensions: BTreeSet<String>,
+    /// Canonical repository names whose mapping keys failed.
+    unavailable: BTreeSet<String>,
+}
+
+impl FailedExtensions {
+    fn is_empty(&self) -> bool {
+        !self.observed && self.extensions.is_empty() && self.unavailable.is_empty()
+    }
 }
 
 /// What a failed `bazel mod` invocation said about module extensions.
@@ -1248,10 +1634,8 @@ struct ExtensionFailure {
 const EXTENSION_FAILURE_MARKER: &str = "Results may be incomplete as";
 
 /// Reads a failed `bazel mod` invocation's stderr for module extensions it could not
-/// evaluate. Bazel words the failure by cause -- `error evaluating module extension <id>`,
-/// `module extension <id> does not generate repository "x"` -- but always names the
-/// extension as `@@<repo>//<package>:<file>.bzl%<name>`. `None` when no extension is named
-/// and Bazel did not say one failed: the invocation failed for another reason.
+/// evaluate. It retains ids printed as `@@<repo>//<package>:<file>.bzl%<name>` and also
+/// recognizes the partial-answer marker when no id is present. `None` when neither is found.
 fn extension_failure(stderr: &str) -> Option<ExtensionFailure> {
     let answered = stderr.contains(EXTENSION_FAILURE_MARKER);
     let extensions = stderr
@@ -1267,29 +1651,10 @@ fn extension_failure(stderr: &str) -> Option<ExtensionFailure> {
     })
 }
 
-/// Canonical-name prefix of the repositories an extension generates: those of
-/// `@@transitive_dep+//:extensions.bzl%broken` are `transitive_dep++broken+<name>`, those of
-/// the root module's `@@//:deps.bzl%deps` are `+deps+<name>`.
-fn extension_repo_prefix(extension: &str) -> Option<String> {
-    let (repo, label) = extension.strip_prefix("@@")?.split_once("//")?;
-    let (_, name) = label.rsplit_once('%')?;
-    let separator = if repo.contains('~') { '~' } else { '+' };
-    Some(format!("{repo}{separator}{name}{separator}"))
-}
-
-/// The extension in `failed` that generates `canonical` (given with or without the `@@`).
-fn failed_extension_of<'a>(canonical: &str, failed: &'a BTreeSet<String>) -> Option<&'a str> {
-    let canonical = canonical.trim_start_matches('@');
+fn has_unavailable_mapping(canonical: &str, failed: &FailedExtensions) -> bool {
     failed
-        .iter()
-        .find(|extension| {
-            extension_repo_prefix(extension).is_some_and(|prefix| canonical.starts_with(&prefix))
-        })
-        .map(String::as_str)
-}
-
-fn belongs_to_failed_extension(canonical: &str, failed: &BTreeSet<String>) -> bool {
-    failed_extension_of(canonical, failed).is_some()
+        .unavailable
+        .contains(canonical.trim_start_matches('@'))
 }
 
 /// Splits `arguments` into consecutive runs of at most `budget` bytes (separators included),
@@ -1313,6 +1678,27 @@ fn chunk_arguments(arguments: &[String], budget: usize) -> Vec<&[String]> {
     chunks
 }
 
+pub(crate) type RepositoryInputs = Arc<RepositoryInputGroup>;
+
+pub(crate) struct RepositoryInputGroup {
+    pub(crate) extension: String,
+    pub(crate) labels: Vec<String>,
+}
+
+fn materialize_repository_inputs_for_batch(batch: &mut [Target], inputs: Option<RepositoryInputs>) {
+    if let Some(inputs) = inputs {
+        for target in batch {
+            materialize_repository_inputs(target, Some(inputs.clone()));
+        }
+    }
+}
+
+fn materialize_repository_inputs(target: &mut Target, shared: Option<RepositoryInputs>) {
+    if let Some(inputs) = shared {
+        target.rule.as_option_mut().unwrap().rule_input = inputs.labels.clone();
+    }
+}
+
 fn lower_repositories(
     repositories: Vec<Repository>,
     canonical_to_apparent: &BTreeMap<String, Vec<String>>,
@@ -1320,8 +1706,9 @@ fn lower_repositories(
     extension_edges: Option<&BTreeSet<String>>,
     label_only_extensions: &BTreeSet<String>,
     workspace: &Path,
-    transform: &mut impl FnMut(&mut Target),
+    transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>),
 ) -> Vec<Target> {
+    let workspace = RepositoryWorkspace::new(workspace);
     // A module the root cannot see has no apparent name there; its node is named by canonical
     // name, matching the `apparent_names` fallback below.
     let node_names = |canonical: &str| {
@@ -1338,6 +1725,25 @@ fn lower_repositories(
                 .then(|| (canonical.split('+').next().unwrap_or(canonical), canonical))
         })
         .map(|(module, canonical)| (module.to_owned(), canonical.to_owned()))
+        .collect::<BTreeMap<_, _>>();
+
+    // An extension's repositories are built by the owning module's extension code, from tags
+    // the owning module's definition shapes, so that definition -- attributes, override patches,
+    // a local override's tree -- is folded into each of them as an attribute: a patched
+    // `rules_rs` is a different `@rules_rust` and `@bd_crates`, which is how a target that never
+    // names `@rules_rs//` sees the patch. An attribute rather than an edge, so the query-mode
+    // edges from a module to its extension repositories below do not close a cycle.
+    let module_definitions = repositories
+        .iter()
+        .filter_map(|repository| {
+            let canonical = repository.canonical_name.as_deref()?;
+            (!is_extension_repo(canonical)).then(|| {
+                (
+                    canonical.to_owned(),
+                    repository_definition_hash(repository, &workspace),
+                )
+            })
+        })
         .collect::<BTreeMap<_, _>>();
 
     // Query mode cannot see how a target reaches an extension's repositories: a toolchain is
@@ -1358,12 +1764,15 @@ fn lower_repositories(
     if let Some(imported) = extension_edges {
         for repository in &repositories {
             let canonical = repository.canonical_name.as_deref().unwrap_or_default();
-            let Some((module_repo, extension)) = extension_repo_parts(canonical) else {
+            let Some(extension) = extension_usage_prefix(canonical) else {
                 continue;
             };
-            if !module_repo.is_empty() {
+            if let Some((module_repo, _definition_hash)) =
+                extension_repo_owner(extension, &module_definitions)
+                    .filter(|(module_repo, _definition_hash)| !module_repo.is_empty())
+            {
                 module_extension_repos
-                    .entry(module_repo.to_owned())
+                    .entry(module_repo.clone())
                     .or_default()
                     .entry(extension.to_owned())
                     .or_default()
@@ -1378,31 +1787,15 @@ fn lower_repositories(
         }
     }
 
-    // An extension's repositories are built by the owning module's extension code, from tags
-    // the owning module's definition shapes, so that definition -- attributes, override patches,
-    // a local override's tree -- is folded into each of them as an attribute: a patched
-    // `rules_rs` is a different `@rules_rust` and `@bd_crates`, which is how a target that never
-    // names `@rules_rs//` sees the patch. An attribute rather than an edge, so the query-mode
-    // edges from a module to its extension repositories above do not close a cycle.
-    let module_definitions = repositories
-        .iter()
-        .filter_map(|repository| {
-            let canonical = repository.canonical_name.as_deref()?;
-            (!is_extension_repo(canonical)).then(|| {
-                (
-                    canonical.to_owned(),
-                    repository_definition_hash(repository, workspace),
-                )
-            })
-        })
-        .collect::<BTreeMap<_, _>>();
-
     let mut targets = Vec::new();
+    let mut shared_groups = HashMap::<String, RepositoryInputs>::new();
+    let empty = BTreeSet::new();
     for repository in repositories {
         let canonical = repository.canonical_name.as_deref().unwrap_or_default();
-        let owner_definition_hash = extension_repo_parts(canonical)
-            .and_then(|(module_repo, _)| module_definitions.get(module_repo))
-            .map(String::as_str);
+        let extension = extension_usage_prefix(canonical);
+        let owner_definition_hash = extension
+            .and_then(|extension| extension_repo_owner(extension, &module_definitions))
+            .map(|(_module_repo, definition_hash)| definition_hash.as_str());
         let module = (canonical.matches('+').count() == 1)
             .then(|| canonical.split('+').next().unwrap_or(canonical));
         let mut dependencies = module
@@ -1415,21 +1808,45 @@ fn lower_repositories(
         for repos in extensions.into_iter().flat_map(BTreeMap::values) {
             dependencies.extend(repos.iter().cloned());
         }
-        if let Some(spokes) = extension_repo_parts(canonical)
+        let spokes = extension
             .filter(|_| extension_edges.is_some_and(|imported| imported.contains(canonical)))
-            .and_then(|(_, extension)| extension_spokes.get(extension))
-        {
-            dependencies.extend(spokes.iter().cloned());
-        }
+            .and_then(|extension| extension_spokes.get_key_value(extension));
+        let group = if dependencies.is_empty() {
+            spokes
+        } else {
+            if let Some((_, names)) = spokes {
+                dependencies.extend(names.iter().cloned());
+            }
+            None
+        };
         for apparent in node_names(canonical) {
+            // Imported hubs of one extension share its ordered hidden siblings. Pass
+            // the same allocation to the hash traversal when no owner-specific edge
+            // needs adding or removing. Raw query callers expand it into the protobuf.
+            let (inputs, shared) = match group {
+                Some((extension, names)) if !names.contains(&apparent) => {
+                    let shared = shared_groups.entry(extension.clone()).or_insert_with(|| {
+                        Arc::new(RepositoryInputGroup {
+                            extension: extension.clone(),
+                            labels: names
+                                .iter()
+                                .map(|name| format!("//external:{name}"))
+                                .collect(),
+                        })
+                    });
+                    (&empty, Some(Arc::clone(shared)))
+                }
+                Some((_, names)) => (names, None),
+                None => (&dependencies, None),
+            };
             let mut target = repository_target(
                 &repository,
                 &apparent,
-                &dependencies,
+                inputs,
                 owner_definition_hash,
-                workspace,
+                &workspace,
             );
-            transform(&mut target);
+            transform(&mut target, shared);
             targets.push(target);
             for (extension, repos) in extensions
                 .into_iter()
@@ -1441,9 +1858,9 @@ fn lower_repositories(
                     &extension_view_node(&apparent, extension),
                     &dependencies.difference(repos).cloned().collect(),
                     owner_definition_hash,
-                    workspace,
+                    &workspace,
                 );
-                transform(&mut view);
+                transform(&mut view, None);
                 targets.push(view);
             }
         }
@@ -1486,12 +1903,18 @@ fn is_external_package_error(message: &str) -> bool {
         || message.contains("//external package is not available")
 }
 
-fn deduplicate_targets(targets: Vec<Target>) -> Result<Vec<Target>> {
-    let mut seen = HashSet::new();
-    Ok(targets
-        .into_iter()
-        .filter(|target| target_name(target).is_some_and(|name| seen.insert(name.to_owned())))
-        .collect())
+fn deduplicate_targets(mut targets: Vec<Target>) -> Result<Vec<Target>> {
+    // Decide which targets to keep while their names can still be borrowed.
+    let mut keep = {
+        let mut seen = HashSet::new();
+        targets
+            .iter()
+            .map(|target| target_name(target).is_some_and(|name| seen.insert(name)))
+            .collect::<Vec<_>>()
+            .into_iter()
+    };
+    targets.retain(|_| keep.next().expect("one decision per target"));
+    Ok(targets)
 }
 
 pub fn decode_delimited<M: Message>(path: &Path) -> Result<Vec<M>> {
@@ -1583,14 +2006,11 @@ fn read_raw_batch(reader: &mut impl BufRead, batch: &mut RawBatch) -> Result<boo
 
 fn decode_target_stream(
     path: &Path,
-    transform: &mut impl FnMut(&mut Target),
+    transform: &mut impl FnMut(&mut [Target]),
 ) -> Result<Vec<Target>> {
     let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
     let mut targets = Vec::new();
     let mut batch = RawBatch::default();
-    // Decoding dominates this phase and is independent per message, so each
-    // batch is decoded in parallel. `transform` stays sequential: callers use it
-    // to accumulate into shared state, and it is the cheaper half.
     let mut decoded = Vec::new();
     while read_raw_batch(&mut reader, &mut batch)? {
         batch
@@ -1601,13 +2021,14 @@ fn decode_target_stream(
                     .map(lower_target)
             })
             .collect_into_vec(&mut decoded);
+        let start = targets.len();
         targets.reserve(decoded.len());
         for lowered in decoded.drain(..) {
-            if let Some(mut target) = lowered? {
-                transform(&mut target);
+            if let Some(target) = lowered? {
                 targets.push(target);
             }
         }
+        transform(&mut targets[start..]);
     }
     Ok(targets)
 }
@@ -1875,7 +2296,7 @@ fn repository_target(
     apparent: &str,
     dependencies: &BTreeSet<String>,
     owner_definition_hash: Option<&str>,
-    workspace: &Path,
+    workspace: &RepositoryWorkspace<'_>,
 ) -> Target {
     let mut rule = Rule {
         name: format!("//external:{apparent}"),
@@ -1884,7 +2305,7 @@ fn repository_target(
             .clone()
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "bzlmod_repo".to_owned()),
-        attribute: repository.attribute.clone(),
+        attribute: workspace_relative_attributes(&repository.attribute, &workspace.roots),
         ..Default::default()
     };
     let mut push_attribute = |name: &str, value: String| {
@@ -1894,10 +2315,10 @@ fn repository_target(
         attribute.string_value = Some(value);
         rule.attribute.push(attribute);
     };
-    if let Some(content_hash) = local_repository_content_hash(repository, workspace) {
+    if let Some(content_hash) = local_repository_content_hash(repository, workspace.path) {
         push_attribute("_bazel_diff_content_hash", content_hash);
     }
-    if let Some(inputs_hash) = repository_local_inputs_hash(repository, workspace) {
+    if let Some(inputs_hash) = repository_local_inputs_hash(repository, workspace.path) {
         push_attribute("_bazel_diff_local_inputs_hash", inputs_hash);
     }
     if let Some(owner_hash) = owner_definition_hash {
@@ -1917,7 +2338,7 @@ fn repository_target(
 /// Every main-repository label a repository rule's attributes point at: `patches`, `build_file`,
 /// a `requirements_lock`, and so on. Attributes only name these files; a repository fetched with
 /// a changed patch is a different repository, so their contents must reach its hash.
-fn repository_local_input_labels(repository: &Repository) -> BTreeSet<String> {
+fn repository_local_input_labels(repository: &Repository) -> BTreeSet<&str> {
     repository
         .attribute
         .iter()
@@ -1925,40 +2346,34 @@ fn repository_local_input_labels(repository: &Repository) -> BTreeSet<String> {
             attribute
                 .string_value
                 .iter()
-                .cloned()
-                .chain(attribute.string_list_value.iter().cloned())
-                .chain(
-                    attribute
-                        .string_dict_value
-                        .iter()
-                        .map(|entry| entry.value.clone()),
-                )
+                .chain(&attribute.string_list_value)
+                .chain(attribute.string_dict_value.iter().map(|entry| &entry.value))
                 .chain(
                     attribute
                         .label_dict_unary_value
                         .iter()
-                        .flat_map(|entry| [entry.key.clone(), entry.value.clone()]),
+                        .flat_map(|entry| [&entry.key, &entry.value]),
                 )
                 .chain(
                     attribute
                         .label_keyed_string_dict_value
                         .iter()
-                        .map(|entry| entry.key.clone()),
+                        .map(|entry| &entry.key),
                 )
                 .chain(
                     attribute
                         .label_list_dict_value
                         .iter()
-                        .flat_map(|entry| entry.value.iter().cloned()),
+                        .flat_map(|entry| &entry.value),
                 )
                 .chain(
                     attribute
                         .string_list_dict_value
                         .iter()
-                        .flat_map(|entry| entry.value.iter().cloned()),
+                        .flat_map(|entry| &entry.value),
                 )
-                .collect::<Vec<_>>()
         })
+        .map(String::as_str)
         .filter(|value| crate::hash::main_repo_path(value).is_some())
         .collect()
 }
@@ -1967,7 +2382,10 @@ fn repository_local_input_labels(repository: &Repository) -> BTreeSet<String> {
 /// main-repository files behind them. Like the target hasher, it leaves out URLs whose content an
 /// integrity pins: `url`/`urls` under `sha256`/`integrity`, and the URLs
 /// `without_integrity_pinned_urls` drops.
-fn repository_definition_hash(repository: &Repository, workspace: &Path) -> String {
+fn repository_definition_hash(
+    repository: &Repository,
+    workspace: &RepositoryWorkspace<'_>,
+) -> String {
     let pinned = repository.attribute.iter().any(|attribute| {
         matches!(attribute.name.as_str(), "sha256" | "integrity")
             && attribute
@@ -1979,23 +2397,24 @@ fn repository_definition_hash(repository: &Repository, workspace: &Path) -> Stri
     hasher.update(repository.repo_rule_name.as_deref().unwrap_or_default());
     hasher.update([0]);
     let mut encoded = Vec::new();
-    for attribute in &repository.attribute {
+    let attributes = workspace_relative_attributes(&repository.attribute, &workspace.roots);
+    for attribute in &attributes {
         if pinned && matches!(attribute.name.as_str(), "url" | "urls") {
             continue;
         }
         encoded.clear();
-        match crate::hash::without_integrity_pinned_urls(attribute, &repository.attribute) {
+        match crate::hash::without_integrity_pinned_urls(attribute, &attributes) {
             Some(stripped) => stripped.encode_length_delimited(&mut encoded),
             None => attribute.encode_length_delimited(&mut encoded),
         }
         hasher.update(&encoded);
     }
     hasher.update([0]);
-    if let Some(content_hash) = local_repository_content_hash(repository, workspace) {
+    if let Some(content_hash) = local_repository_content_hash(repository, workspace.path) {
         hasher.update(content_hash);
     }
     hasher.update([0]);
-    if let Some(inputs_hash) = repository_local_inputs_hash(repository, workspace) {
+    if let Some(inputs_hash) = repository_local_inputs_hash(repository, workspace.path) {
         hasher.update(inputs_hash);
     }
     hex::encode(hasher.finalize())
@@ -2007,7 +2426,7 @@ fn repository_local_inputs_hash(repository: &Repository, workspace: &Path) -> Op
     let mut hasher = Sha256::new();
     let mut hashed_any = false;
     for label in repository_local_input_labels(repository) {
-        let Some(path) = crate::hash::main_repo_path(&label) else {
+        let Some(path) = crate::hash::main_repo_path(label) else {
             continue;
         };
         let absolute = workspace.join(path);
@@ -2062,6 +2481,112 @@ fn local_repository_content_hash(repository: &Repository, workspace: &Path) -> O
         hasher.update([0]);
     }
     Some(hex::encode(hasher.finalize()))
+}
+
+struct RepositoryWorkspace<'a> {
+    path: &'a Path,
+    roots: Vec<String>,
+}
+
+impl<'a> RepositoryWorkspace<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self {
+            path,
+            roots: workspace_roots(path),
+        }
+    }
+}
+
+/// The workspace root as given and as resolved, the two spellings an absolute path in a
+/// repository attribute can start with.
+fn workspace_roots(workspace: &Path) -> Vec<String> {
+    let mut roots = vec![workspace.to_string_lossy().trim_end_matches('/').to_owned()];
+    if let Ok(resolved) = fs::canonicalize(workspace) {
+        let resolved = resolved.to_string_lossy().trim_end_matches('/').to_owned();
+        if !roots.contains(&resolved) {
+            roots.push(resolved);
+        }
+    }
+    roots.retain(|root| !root.is_empty());
+    roots
+}
+
+/// Rewrites a path inside the workspace, bare or as a `file://` URL, to start with
+/// `%workspace%`. Anything else keeps its spelling: a path that merely contains the workspace's
+/// (`/elsewhere/<workspace>/data`), and one that starts with it but leaves it, through `..` or a
+/// symlink. Rewriting those would let two different paths outside two checkouts hash the same.
+fn workspace_relative<'a>(value: &'a str, roots: &[String]) -> Cow<'a, str> {
+    let (scheme, path) = value
+        .strip_prefix("file://")
+        .map_or(("", value), |path| ("file://", path));
+    for root in roots {
+        let rest = path
+            .strip_prefix(root.as_str())
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'));
+        if let Some(rest) = rest {
+            if !stays_inside(root, rest) {
+                break;
+            }
+            return Cow::Owned(format!("{scheme}%workspace%{rest}"));
+        }
+    }
+    Cow::Borrowed(value)
+}
+
+/// Whether `root` followed by `rest` (empty or starting with `/`) names something inside `root`:
+/// its `..` components never climb above `root`, and its deepest existing ancestor, with symlinks
+/// resolved, is still under `root`. A path that does not exist yet is judged by its spelling.
+fn stays_inside(root: &str, rest: &str) -> bool {
+    let mut depth = 0usize;
+    let mut normalized = PathBuf::from(root);
+    for component in rest
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
+        if component == ".." {
+            let Some(up) = depth.checked_sub(1) else {
+                return false;
+            };
+            depth = up;
+            normalized.pop();
+        } else {
+            depth += 1;
+            normalized.push(component);
+        }
+    }
+    let Ok(root) = fs::canonicalize(root) else {
+        return true;
+    };
+    let existing = normalized.ancestors().find(|ancestor| ancestor.exists());
+    existing.is_none_or(|ancestor| {
+        fs::canonicalize(ancestor).is_ok_and(|resolved| resolved.starts_with(&root))
+    })
+}
+
+/// Repository attributes with the workspace root replaced by `%workspace%`. Repository rules
+/// that build from a directory in the workspace, such as Gazelle's `go_repository` with
+/// `local_path` or a `rules_rs` local crate, get that directory as an absolute path, so the same
+/// repository would otherwise hash differently in every checkout.
+fn workspace_relative_attributes(attributes: &[Attribute], roots: &[String]) -> Vec<Attribute> {
+    let rewrite = |value: &mut String| {
+        if let Cow::Owned(relative) = workspace_relative(value, roots) {
+            *value = relative;
+        }
+    };
+    let mut attributes = attributes.to_vec();
+    for attribute in &mut attributes {
+        attribute.string_value.iter_mut().for_each(rewrite);
+        attribute.string_list_value.iter_mut().for_each(rewrite);
+        for entry in &mut attribute.string_dict_value {
+            rewrite(&mut entry.key);
+            rewrite(&mut entry.value);
+        }
+        for entry in &mut attribute.string_list_dict_value {
+            rewrite(&mut entry.key);
+            entry.value.iter_mut().for_each(rewrite);
+        }
+    }
+    attributes
 }
 
 fn parse_module_dependency_edges(json: &str) -> BTreeMap<String, BTreeSet<String>> {
@@ -2218,9 +2743,6 @@ mod tests {
     use crate::proto::blaze_query::{
         attribute, EnvironmentGroup, GeneratedFile, LabelDictUnaryEntry, SourceFile,
     };
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     fn rule_target(name: &str) -> Target {
         let mut target = Target::default();
         target.r#type = target::Discriminator::Rule;
@@ -2414,14 +2936,12 @@ mod tests {
 
     #[test]
     fn deduplicates_named_targets_and_preserves_first() {
-        let targets = vec![
-            rule_target("//a:a"),
-            rule_target("//a:a"),
-            rule_target("//b:b"),
-        ];
-        let targets = deduplicate_targets(targets).unwrap();
-        let names = targets.iter().filter_map(target_name).collect::<Vec<_>>();
-        assert_eq!(names, ["//a:a", "//b:b"]);
+        let first = rule_target("//a:a");
+        let mut duplicate = first.clone();
+        duplicate.rule.as_option_mut().unwrap().rule_class = "other".into();
+        let last = rule_target("//b:b");
+        let targets = vec![first.clone(), Target::default(), last.clone(), duplicate];
+        assert_eq!(deduplicate_targets(targets).unwrap(), [first, last]);
         assert!(is_external_package_error("no such package 'external'"));
         assert!(is_external_package_error(
             "//external package is not available"
@@ -2435,8 +2955,12 @@ mod tests {
         let query_path = directory.path().join("query.pb");
         write_delimited(&query_path, &[rule_target("//a:a"), rule_target("//b:b")]);
         let mut seen = Vec::new();
-        let targets = decode_target_stream(&query_path, &mut |target| {
-            seen.push(target_name(target).unwrap().to_owned())
+        let targets = decode_target_stream(&query_path, &mut |batch| {
+            seen.extend(
+                batch
+                    .iter()
+                    .map(|target| target_name(target).unwrap().to_owned()),
+            );
         })
         .unwrap();
         assert_eq!(targets.len(), 2);
@@ -2491,8 +3015,12 @@ mod tests {
             .collect::<Vec<_>>();
         write_delimited(&path, &written);
         let mut seen = Vec::new();
-        let decoded = decode_target_stream(&path, &mut |target| {
-            seen.push(target_name(target).unwrap().to_owned())
+        let decoded = decode_target_stream(&path, &mut |batch| {
+            seen.extend(
+                batch
+                    .iter()
+                    .map(|target| target_name(target).unwrap().to_owned()),
+            );
         })
         .unwrap();
         assert_eq!(decoded.len(), written.len());
@@ -2540,6 +3068,131 @@ mod tests {
     }
 
     #[test]
+    fn repository_paths_under_the_workspace_hash_relative_to_it() {
+        fn string(name: &str, value: &str) -> Attribute {
+            Attribute {
+                name: name.into(),
+                r#type: attribute::Discriminator::String,
+                string_value: Some(value.into()),
+                ..Default::default()
+            }
+        }
+        // The same repository in two checkouts: a crate built from `vendored/`, which the rule
+        // names by absolute path, plus an absolute path outside the workspace.
+        let checkout = || {
+            let workspace = tempfile::tempdir().unwrap();
+            fs::create_dir_all(workspace.path().join("vendored/src")).unwrap();
+            fs::write(workspace.path().join("vendored/src/lib.rs"), "v1").unwrap();
+            workspace
+        };
+        let crate_repository = |workspace: &Path| Repository {
+            repo_rule_name: Some("local_crate_repository".into()),
+            attribute: vec![
+                string("path", &format!("{}/vendored", workspace.display())),
+                string("toolchain", "/opt/toolchain"),
+            ],
+            ..Default::default()
+        };
+        let first = checkout();
+        let second = checkout();
+        let hashed_attributes = |workspace: &Path| {
+            let target = repository_target(
+                &crate_repository(workspace),
+                "dep",
+                &BTreeSet::new(),
+                None,
+                &RepositoryWorkspace::new(workspace),
+            );
+            target.rule.as_option().unwrap().attribute.clone()
+        };
+        assert_eq!(
+            hashed_attributes(first.path()),
+            hashed_attributes(second.path())
+        );
+        assert_eq!(
+            repository_definition_hash(
+                &crate_repository(first.path()),
+                &RepositoryWorkspace::new(first.path())
+            ),
+            repository_definition_hash(
+                &crate_repository(second.path()),
+                &RepositoryWorkspace::new(second.path())
+            )
+        );
+        // A path outside the workspace keeps its spelling.
+        let relative = workspace_relative_attributes(
+            &crate_repository(first.path()).attribute,
+            &workspace_roots(first.path()),
+        );
+        assert_eq!(
+            relative[0].string_value.as_deref(),
+            Some("%workspace%/vendored")
+        );
+        assert_eq!(relative[1].string_value.as_deref(), Some("/opt/toolchain"));
+    }
+
+    #[test]
+    fn only_paths_rooted_at_the_workspace_are_rewritten() {
+        let roots = vec!["/checkout/repo".to_owned()];
+        for (value, expected) in [
+            ("/checkout/repo", "%workspace%"),
+            ("/checkout/repo/vendored", "%workspace%/vendored"),
+            (
+                "file:///checkout/repo/registry/x.patch",
+                "file://%workspace%/registry/x.patch",
+            ),
+            // Paths that only contain the workspace's spelling, or share its prefix.
+            (
+                "/external/checkout/repo/data",
+                "/external/checkout/repo/data",
+            ),
+            (
+                "file:///external/checkout/repo/data",
+                "file:///external/checkout/repo/data",
+            ),
+            ("/checkout/repo-other/data", "/checkout/repo-other/data"),
+            ("-L/checkout/repo/lib", "-L/checkout/repo/lib"),
+        ] {
+            assert_eq!(workspace_relative(value, &roots), expected, "{value}");
+        }
+        // Two different paths outside two checkouts stay different.
+        assert_ne!(
+            workspace_relative("/data/a/repo/x", &["/a/repo".to_owned()]),
+            workspace_relative("/data/b/repo/x", &["/b/repo".to_owned()])
+        );
+        // `..` that stays inside is fine; `..` that leaves is not.
+        assert_eq!(
+            workspace_relative("/checkout/repo/a/../b", &roots),
+            "%workspace%/a/../b"
+        );
+        assert_eq!(
+            workspace_relative("/checkout/repo/../data", &roots),
+            "/checkout/repo/../data"
+        );
+        assert_eq!(
+            workspace_relative("/checkout/repo/a/../../data", &roots),
+            "/checkout/repo/a/../../data"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_workspace_is_not_rewritten() {
+        let outside = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("inside")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("link")).unwrap();
+        let roots = workspace_roots(workspace.path());
+        let root = &roots[0];
+        assert_eq!(
+            workspace_relative(&format!("{root}/inside/data"), &roots),
+            "%workspace%/inside/data"
+        );
+        let escaping = format!("{root}/link/data");
+        assert_eq!(workspace_relative(&escaping, &roots), escaping);
+    }
+
+    #[test]
     fn local_repository_hash_is_stable_and_ignores_lockfile() {
         let workspace = tempfile::tempdir().unwrap();
         let repository_root = workspace.path().join("local");
@@ -2573,7 +3226,7 @@ mod tests {
             "local",
             &BTreeSet::from(["dep".to_owned(), "local".to_owned()]),
             None,
-            workspace.path(),
+            &RepositoryWorkspace::new(workspace.path()),
         );
         let rule = target.rule.as_option().unwrap();
         assert_eq!(rule.name, "//external:local");
@@ -2635,10 +3288,10 @@ mod tests {
         assert_eq!(
             repository_local_input_labels(&repository),
             BTreeSet::from([
-                "@@//:dep.patch".to_owned(),
-                "//:missing.patch".to_owned(),
-                "//third_party:dep.BUILD".to_owned(),
-                "//third_party:overlay".to_owned(),
+                "@@//:dep.patch",
+                "//:missing.patch",
+                "//third_party:dep.BUILD",
+                "//third_party:overlay",
             ])
         );
         let baseline = repository_local_inputs_hash(&repository, workspace.path()).unwrap();
@@ -2664,8 +3317,13 @@ mod tests {
             rebuilt
         );
 
-        let target =
-            repository_target(&repository, "dep", &BTreeSet::new(), None, workspace.path());
+        let target = repository_target(
+            &repository,
+            "dep",
+            &BTreeSet::new(),
+            None,
+            &RepositoryWorkspace::new(workspace.path()),
+        );
         let rule = target.rule.as_option().unwrap();
         assert!(rule
             .attribute
@@ -2689,7 +3347,7 @@ mod tests {
             "dep",
             &BTreeSet::new(),
             None,
-            workspace.path(),
+            &RepositoryWorkspace::new(workspace.path()),
         );
         assert!(!target
             .rule
@@ -2854,7 +3512,7 @@ mod tests {
             None,
             &BTreeSet::new(),
             Path::new("."),
-            &mut |target| transformed.push(target_name(target).unwrap().to_owned()),
+            &mut |target, _| transformed.push(target_name(target).unwrap().to_owned()),
         );
         assert_eq!(targets.len(), 3);
         assert_eq!(
@@ -2913,7 +3571,7 @@ mod tests {
                 None,
                 &BTreeSet::new(),
                 workspace.path(),
-                &mut |_| {},
+                &mut materialize_repository_inputs,
             );
             assert_eq!(targets.len(), 1);
             let rule = targets[0].rule.as_option().unwrap().clone();
@@ -2968,7 +3626,7 @@ mod tests {
             None,
             &BTreeSet::new(),
             Path::new("."),
-            &mut |_| {},
+            &mut materialize_repository_inputs,
         );
         let inputs = |name: &str| {
             targets
@@ -2987,27 +3645,40 @@ mod tests {
     }
 
     #[test]
-    fn extension_repo_names_are_recognised_and_split() {
+    fn extension_repo_names_identify_usage_and_owner() {
         assert!(is_extension_repo("rules_go++go_sdk+go_default_sdk"));
         assert!(is_extension_repo("platforms+host_platform+host_platform"));
         assert!(is_extension_repo("+ext+repo"));
         assert!(!is_extension_repo("rules_go+"));
         assert!(!is_extension_repo("dep+1.0"));
         assert!(!is_extension_repo("platforms"));
-        assert_eq!(
-            extension_repo_parts("rules_go++go_sdk+go_default_sdk"),
-            Some(("rules_go+", "rules_go++go_sdk"))
-        );
-        assert_eq!(
-            extension_repo_parts("dep+1.0+ext+repo"),
-            Some(("dep+1.0", "dep+1.0+ext"))
-        );
-        assert_eq!(
-            extension_repo_parts("platforms+host_platform+host_platform"),
-            Some(("platforms", "platforms+host_platform"))
-        );
-        assert_eq!(extension_repo_parts("+ext+repo"), Some(("", "+ext")));
-        assert_eq!(extension_repo_parts("rules_go+"), None);
+        let cases = [
+            (
+                "rules_go++go_sdk+go_default_sdk",
+                "rules_go+",
+                "rules_go++go_sdk",
+            ),
+            ("dep+1.0+ext+repo", "dep+1.0", "dep+1.0+ext"),
+            (
+                "platforms+host_platform+host_platform",
+                "platforms",
+                "platforms+host_platform",
+            ),
+            ("+ext+repo", "", "+ext"),
+        ];
+        let module_definitions = cases
+            .iter()
+            .map(|(_canonical, owner, _prefix)| ((*owner).to_owned(), String::new()))
+            .collect();
+        for (canonical, owner, prefix) in cases {
+            assert_eq!(extension_usage_prefix(canonical), Some(prefix));
+            assert_eq!(
+                extension_repo_owner(prefix, &module_definitions)
+                    .map(|(owner, _definition_hash)| owner.as_str()),
+                Some(owner)
+            );
+        }
+        assert_eq!(extension_usage_prefix("rules_go+"), None);
     }
 
     #[test]
@@ -3083,7 +3754,7 @@ exit 1
 "#,
             dir = dir.display(),
         );
-        executable_script(&script, &body);
+        fs::write(&script, &body).unwrap();
         script
     }
 
@@ -3118,7 +3789,9 @@ exit 1
     fn large_repository_reads_preserve_selected_records() {
         let workspace = tempfile::tempdir().unwrap();
         let wanted = ["a+", "b+", "c++ext+x"].map(repository);
-        let mut hidden = repository("hidden+");
+        let mut bulk_hidden = repository("hidden+");
+        bulk_hidden.original_name = Some("upstream_name".into());
+        let mut hidden = bulk_hidden.clone();
         hidden.module_key = Some("hidden@1.0".to_owned());
         let mut by_name = wanted.to_vec();
         by_name.push(hidden.clone());
@@ -3128,7 +3801,7 @@ exit 1
             repository("bazel_tools"),
             repository("unasked++ext+y"),
             repository("failed++ext+x"),
-            repository("hidden+"),
+            bulk_hidden,
         ];
         all.extend(wanted.iter().rev().cloned());
         let script = show_repo_script(workspace.path(), &by_name, &all);
@@ -3139,8 +3812,8 @@ exit 1
         );
         let options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -3168,12 +3841,19 @@ exit 1
             .into_iter()
             .chain(std::iter::once(hidden))
             .collect::<Vec<_>>();
-        let original_failed = BTreeSet::from(["@@failed+//:ext.bzl%ext".to_owned()]);
+        let original_failed = FailedExtensions {
+            observed: true,
+            extensions: BTreeSet::from(["@@failed+//:ext.bzl%ext".to_owned()]),
+            unavailable: BTreeSet::from(["failed++ext+x".to_owned()]),
+        };
         let mut failed = original_failed.clone();
+        let bindings = BTreeMap::from([("hidden@1.0".into(), "hidden+".into())]);
 
         // Canonical names use one bulk invocation; the hidden module retains its explicit record.
         let repositories = options
-            .show_repositories_within(&names, &mut failed, 8)
+            .show_repositories_within(&names, &mut failed, 8, || {
+                panic!("partial bulk output must not inspect hidden bindings")
+            })
             .unwrap();
         assert_eq!(repositories, expected);
         let calls = show_repo_calls(workspace.path());
@@ -3189,7 +3869,9 @@ exit 1
 
         // Names that fit one invocation are still asked for by name.
         let repositories = options
-            .show_repositories_within(&names, &mut failed, 1000)
+            .show_repositories_within(&names, &mut failed, 1000, || {
+                panic!("small selections must not inspect hidden bindings")
+            })
             .unwrap();
         assert_eq!(repositories, expected);
         let calls = show_repo_calls(workspace.path());
@@ -3197,6 +3879,126 @@ exit 1
         assert_eq!(
             calls[2],
             "mod show_repo @@a+ @@b+ @@c++ext+x @@omitted+ hidden@1.0 --output=streamed_proto"
+        );
+
+        // A healthy bulk read can supply the same module-key record, byte for byte.
+        let clean: Vec<_> = names
+            .into_iter()
+            .filter(|name| !name.starts_with("@@failed+"))
+            .collect();
+        let actual = options
+            .show_repositories_within(&clean, &mut FailedExtensions::default(), 8, || {
+                Some(&bindings)
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            &show_repo_calls(workspace.path())[3..],
+            ["mod show_repo --all_repos --output=streamed_proto"]
+        );
+    }
+
+    #[test]
+    fn hidden_module_keys_follow_each_parents_actual_alias() {
+        let graph = r#"{"dependencies":[{"key":"visible@1","apparentName":"alias","dependencies":[{"key":"hidden@2","apparentName":"other_alias"}]},{"key":"hidden@2","apparentName":"sibling"}]}"#;
+        let hidden = BTreeMap::from([("hidden@2".into(), "hidden+".into())]);
+        let modules = BTreeMap::from([(
+            "visible+".into(),
+            BTreeMap::from([("other_alias".into(), "hidden+".into())]),
+        )]);
+        assert!(verified_hidden_modules(
+            Some(graph),
+            br#"{"alias":"visible+","sibling":"hidden+"}"#,
+            &modules,
+            &hidden
+        ));
+        assert!(!verified_hidden_modules(
+            Some(graph),
+            br#"{"alias":"visible+","sibling":"different+"}"#,
+            &modules,
+            &hidden
+        ));
+        assert!(!verified_hidden_modules(
+            Some(graph),
+            br#"{"alias":"visible+"}"#,
+            &modules,
+            &hidden
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn incomplete_mapping_rows_remain_unbound() {
+        let workspace = tempfile::tempdir().unwrap();
+        let script = workspace.path().join("bazel");
+        fs::write(&script, "#!/bin/sh\ncat reply\n").unwrap();
+        let options = probe_options(workspace.path(), script);
+        let names = ["first+", "second+"].map(str::to_owned);
+        for (reply, rows, expected_complete) in [
+            ("{}\n{}\n", 2, true),
+            ("{}\n", 1, false),
+            ("{}\ninvalid\n{}\n", 2, false),
+            ("{}\n{}\n{}\n", 3, false),
+        ] {
+            fs::write(workspace.path().join("reply"), reply).unwrap();
+            let mut complete = true;
+            let mappings = options
+                .dump_repo_mappings(&names, &mut FailedExtensions::default(), &mut complete)
+                .unwrap();
+            assert_eq!(mappings.len(), rows);
+            assert_eq!(complete, expected_complete);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mappings_preserve_effective_names_in_each_isolated_extension() {
+        let workspace = tempfile::tempdir().unwrap();
+        let first = "mod++_ext+owner+1+first+hub";
+        let second = "mod++_ext+owner+1+second+hub";
+        let library = "mod++_ext+owner+1+first+library";
+        let injected = "mod++_ext+owner+1+second+injected";
+        for (name, map) in [
+            ("dep+", serde_json::json!({"one": first, "two": second})),
+            (
+                first,
+                serde_json::json!({"library": library, "replaced": "other+", "injected": injected}),
+            ),
+            (
+                second,
+                serde_json::json!({"other": "unimported++ext+unused"}),
+            ),
+        ] {
+            fs::write(workspace.path().join(name), format!("{map}\n")).unwrap();
+        }
+        let script = workspace.path().join("bazel");
+        fs::write(
+            &script,
+            "#!/bin/sh\nshift 2\necho \"$*\" >> calls\nfor name do cat \"$name\" || exit 1; done\n",
+        )
+        .unwrap();
+        let options = probe_options(workspace.path(), script);
+        let root = BTreeMap::from([
+            ("dep+".into(), vec!["dep".into()]),
+            (first.into(), vec!["hub".into()]),
+        ]);
+        let result = options
+            .extension_repositories(
+                &root,
+                Vec::new(),
+                BTreeMap::new(),
+                true,
+                &mut FailedExtensions::default(),
+            )
+            .unwrap();
+        assert_eq!(result.imported, [first, second].map(str::to_owned).into());
+        assert_eq!(
+            result.generated,
+            [first, second, library, injected].map(str::to_owned).into()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("calls")).unwrap(),
+            format!("dep+\n{first} {second}\n")
         );
     }
 
@@ -3216,8 +4018,8 @@ exit 1
         .unwrap();
         let options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -3234,9 +4036,9 @@ exit 1
         let names = ["@@a+", "@@b+", "@@c++ext+x", "hidden@1.0"]
             .map(str::to_owned)
             .to_vec();
-        let mut failed = BTreeSet::new();
+        let mut failed = FailedExtensions::default();
         let repositories = options
-            .show_repositories_within(&names, &mut failed, 8)
+            .show_repositories_within(&names, &mut failed, 8, || None)
             .unwrap();
         assert_eq!(repositories, wanted);
         assert_eq!(
@@ -3249,12 +4051,12 @@ exit 1
                 "mod show_repo hidden@1.0 --output=streamed_proto",
             ]
         );
-        assert!(failed.is_empty());
+        assert_eq!(failed, FailedExtensions::default());
     }
 
     #[test]
     #[cfg(unix)]
-    fn an_extension_that_spoils_all_repos_is_left_out_of_the_by_name_chunks() {
+    fn an_extension_that_spoils_all_repos_is_checked_by_name() {
         let workspace = tempfile::tempdir().unwrap();
         let wanted = ["a+", "b+", "c++ext+x"].map(repository);
         let script = show_repo_script(workspace.path(), &wanted, &[]);
@@ -3265,8 +4067,8 @@ exit 1
         .unwrap();
         let options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -3281,18 +4083,23 @@ exit 1
             cancellation: None,
         };
         let names = ["@@a+", "@@b+", "@@c++ext+x"].map(str::to_owned).to_vec();
-        let mut failed = BTreeSet::new();
+        let mut failed = FailedExtensions::default();
         let repositories = options
-            .show_repositories_within(&names, &mut failed, 8)
+            .show_repositories_within(&names, &mut failed, 8, || None)
             .unwrap();
-        assert_eq!(canonical_names(&repositories), ["a+", "b+"]);
-        assert_eq!(failed, BTreeSet::from(["@@c+//:ext.bzl%ext".to_owned()]));
+        assert_eq!(canonical_names(&repositories), ["a+", "b+", "c++ext+x"]);
+        assert_eq!(
+            failed.extensions,
+            BTreeSet::from(["@@c+//:ext.bzl%ext".to_owned()])
+        );
+        assert!(failed.unavailable.is_empty());
         assert_eq!(
             show_repo_calls(workspace.path()),
             [
                 "mod show_repo --all_repos --output=streamed_proto",
                 "mod show_repo @@a+ --output=streamed_proto",
                 "mod show_repo @@b+ --output=streamed_proto",
+                "mod show_repo @@c++ext+x --output=streamed_proto",
             ]
         );
     }
@@ -3338,6 +4145,8 @@ exit 1
                 "rules_rs+",
                 "rules_rs++crate+bd_crates",
                 "rules_rs++crate+bd_crates__anyhow-1.0.104",
+                // An isolated root usage adds empty module/version components and its exported name.
+                "rules_rs++_crate+++isolated_crates+crate_repo",
                 "rules_go++go_sdk+go_toolchains",
                 "rules_go++go_sdk+go_default_sdk",
                 "+local+root_ext_repo",
@@ -3373,9 +4182,9 @@ exit 1
             Some(&imported),
             &BTreeSet::from(["rules_go++go_sdk".to_owned(), "rules_rs++crate".to_owned()]),
             Path::new("."),
-            &mut |_| {},
+            &mut materialize_repository_inputs,
         );
-        assert_eq!(query.len(), 9);
+        assert_eq!(query.len(), 10);
         // The owning module reaches everything its extensions generate, after its module deps.
         assert_eq!(
             inputs_of(&query, "//external:rules_go"),
@@ -3389,15 +4198,20 @@ exit 1
             inputs_of(&query, "//external:rules_rs"),
             [
                 "//external:bd_crates",
+                "//external:rules_rs++_crate+++isolated_crates+crate_repo",
                 "//external:rules_rs++crate+bd_crates__anyhow-1.0.104",
             ]
         );
-        // Its view from inside one extension leaves out that extension's repositories.
+        // Its view from inside one extension leaves out that extension's repositories, and keeps
+        // those of its other usages, an isolated usage of the same extension included.
         assert_eq!(
             inputs_of(&query, "//external:rules_go%rules_go++go_sdk"),
             ["//external:rules_rs"]
         );
-        assert!(inputs_of(&query, "//external:rules_rs%rules_rs++crate").is_empty());
+        assert_eq!(
+            inputs_of(&query, "//external:rules_rs%rules_rs++crate"),
+            ["//external:rules_rs++_crate+++isolated_crates+crate_repo"]
+        );
         // An imported repository reaches the siblings of its extension nobody imports.
         assert_eq!(
             inputs_of(&query, "//external:bd_crates"),
@@ -3423,9 +4237,9 @@ exit 1
             None,
             &BTreeSet::new(),
             Path::new("."),
-            &mut |_| {},
+            &mut materialize_repository_inputs,
         );
-        assert_eq!(cquery.len(), 7);
+        assert_eq!(cquery.len(), 8);
         assert_eq!(
             inputs_of(&cquery, "//external:rules_go"),
             ["//external:rules_rs"]
@@ -3466,6 +4280,11 @@ exit 1
                     ..Default::default()
                 },
                 Repository {
+                    canonical_name: Some("rules_rs++_crate+++isolated_crates+crate_repo".into()),
+                    repo_rule_name: Some("crate_repo".into()),
+                    ..Default::default()
+                },
+                Repository {
                     canonical_name: Some("+local+root_repo".into()),
                     ..Default::default()
                 },
@@ -3492,17 +4311,19 @@ exit 1
                 None,
                 &BTreeSet::new(),
                 workspace.path(),
-                &mut |_| {},
+                &mut materialize_repository_inputs,
             )
         };
 
         let before = lower();
         let hub = module_hash(&before, "//external:rules_rust").unwrap();
         // Every repository of the module's extensions carries the same digest of the module.
-        assert_eq!(
-            module_hash(&before, "//external:rules_rs++crate+bd_crates__anyhow"),
-            Some(hub.clone())
-        );
+        for name in [
+            "//external:rules_rs++crate+bd_crates__anyhow",
+            "//external:rules_rs++_crate+++isolated_crates+crate_repo",
+        ] {
+            assert_eq!(module_hash(&before, name), Some(hub.clone()));
+        }
         // The module itself and the root's own extension repos carry none.
         assert!(module_hash(&before, "//external:rules_rs").is_none());
         assert!(module_hash(&before, "//external:+local+root_repo").is_none());
@@ -3514,6 +4335,7 @@ exit 1
         assert_ne!(module_hash(&after, "//external:rules_rust").unwrap(), hub);
 
         // The digest ignores a mirror move of a pinned download, like the hasher does.
+        let paths = RepositoryWorkspace::new(workspace.path());
         let pinned = |urls: &str| Repository {
             repo_rule_name: Some("http_archive".into()),
             attribute: vec![
@@ -3533,16 +4355,16 @@ exit 1
             ..Default::default()
         };
         assert_eq!(
-            repository_definition_hash(&pinned("https://a/x.zip"), workspace.path()),
-            repository_definition_hash(&pinned("https://b/x.zip"), workspace.path())
+            repository_definition_hash(&pinned("https://a/x.zip"), &paths),
+            repository_definition_hash(&pinned("https://b/x.zip"), &paths)
         );
         let mut unpinned = pinned("https://a/x.zip");
         unpinned.attribute.pop();
         let mut moved = pinned("https://b/x.zip");
         moved.attribute.pop();
         assert_ne!(
-            repository_definition_hash(&unpinned, workspace.path()),
-            repository_definition_hash(&moved, workspace.path())
+            repository_definition_hash(&unpinned, &paths),
+            repository_definition_hash(&moved, &paths)
         );
 
         // The digest also ignores the checkout path in a `file://%workspace%` registry's patch
@@ -3562,12 +4384,12 @@ exit 1
             ..Default::default()
         };
         assert_eq!(
-            repository_definition_hash(&patched("/one", "sha256-p"), workspace.path()),
-            repository_definition_hash(&patched("/two", "sha256-p"), workspace.path())
+            repository_definition_hash(&patched("/one", "sha256-p"), &paths),
+            repository_definition_hash(&patched("/two", "sha256-p"), &paths)
         );
         assert_ne!(
-            repository_definition_hash(&patched("/one", "sha256-p"), workspace.path()),
-            repository_definition_hash(&patched("/one", "sha256-q"), workspace.path())
+            repository_definition_hash(&patched("/one", "sha256-p"), &paths),
+            repository_definition_hash(&patched("/one", "sha256-q"), &paths)
         );
     }
 
@@ -3592,8 +4414,16 @@ exit 1
             r#"#!/bin/sh
 args="$*"
 echo "$args" >> "{calls}"
+if [ "$1 $2" = "info output_base" ]; then
+  pwd
+  exit 0
+fi
 if echo "$args" | grep -q "mod graph --output=json"; then
-  echo '{{"key":"<root>","name":"root","dependencies":[{{"key":"rules_go@0.62.0","name":"rules_go","dependencies":[]}},{{"key":"rules_python@1.8.4","name":"rules_python","dependencies":[]}}]}}'
+  if [ -f omit-graph-hint ]; then
+    echo '{{"key":"<root>","name":"root","dependencies":[{{"key":"rules_go@0.62.0","name":"rules_go","dependencies":[]}}]}}'
+  else
+    echo '{{"key":"<root>","name":"root","dependencies":[{{"key":"rules_go@0.62.0","name":"rules_go","dependencies":[]}},{{"key":"rules_python@1.8.4","name":"rules_python","dependencies":[]}}]}}'
+  fi
   exit 0
 fi
 if echo "$args" | grep -q "mod graph"; then
@@ -3604,22 +4434,22 @@ if echo "$args" | grep -q "version"; then
   echo "Build label: 8.7.0"
   exit 0
 fi
-if [ "$2" = "dump_repo_mapping" ] && [ -z "$3" ]; then
-  echo '{{"":"","rules_go":"rules_go+","rules_python":"rules_python+","pypi":"rules_python++pip+pypi","bazel_tools":"bazel_tools"}}'
-  exit 0
-fi
-if [ "$2" = "dump_repo_mapping" ] && [ "$3" = "rules_go+" ]; then
-  echo '{{"go_toolchains":"rules_go++go_sdk+go_toolchains","bazel_tools":"bazel_tools","rules_go":"rules_go+"}}'
-  echo '{{"pypi":"rules_python++pip+pypi","rules_python":"rules_python+"}}'
-  exit 0
-fi
-if echo "$args" | grep -q "mod dump_repo_mapping"; then
-  for repo in $(echo "$args" | sed 's/.*dump_repo_mapping//'); do
+if [ "$2" = "dump_repo_mapping" ]; then
+  shift 2
+  if [ -z "$1" ]; then
+    echo '{{"":"","rules_go":"rules_go+","rules_python":"rules_python+","pypi":"rules_python++pip+pypi","bazel_tools":"bazel_tools"}}'
+    shift
+    if [ "$#" -eq 0 ] || [ -f truncated-survey ]; then exit 0; fi
+    if [ -f unavailable-survey ]; then exit 2; fi
+  fi
+  for repo in "$@"; do
     if [ "$repo" = "{fail}" ]; then
       echo "ERROR: extension evaluation failed for $repo" >&2
       exit 2
     fi
     case "$repo" in
+      rules_go+) echo '{{"go_toolchains":"rules_go++go_sdk+go_toolchains","bazel_tools":"bazel_tools","rules_go":"rules_go+"}}' ;;
+      rules_python+) echo '{{"pypi":"rules_python++pip+pypi","rules_python":"rules_python+"}}' ;;
       rules_go++go_sdk+*) echo '{{"go_toolchains":"rules_go++go_sdk+go_toolchains","go_default_sdk":"rules_go++go_sdk+go_default_sdk","rules_go":"rules_go+"}}' ;;
       rules_python++pip+*) echo '{{"pypi":"rules_python++pip+pypi","pypi_312_six":"rules_python++pip+pypi_312_six","rules_python":"rules_python+"}}' ;;
       *) echo '{{"rules_go":"rules_go+","pypi":"rules_python++pip+pypi","rules_python":"rules_python+"}}' ;;
@@ -3645,9 +4475,6 @@ exit 1
             query = query_proto.display(),
         );
         fs::write(&script, body).unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
         script
     }
 
@@ -3673,8 +4500,8 @@ exit 1
         let script = extension_flow_script(workspace.path(), &repositories, None);
         let options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -3689,6 +4516,12 @@ exit 1
             cancellation: None,
         };
 
+        // A legacy //external rule can have the same name as a synthetic repository.
+        let overlapping = "//external:rules_python++pip+pypi_312_six";
+        write_delimited(
+            &workspace.path().join("query-result.pb"),
+            &[rule_target("//app:lib"), rule_target(overlapping)],
+        );
         let targets = options.query_all_targets().unwrap();
         let names = targets
             .iter()
@@ -3766,6 +4599,103 @@ exit 1
             ),
             "{calls}"
         );
+
+        // Definition hashing must use the same rule that deduplication keeps.
+        let options = crate::hash::HashOptions {
+            bazel: options,
+            content_hashes: None,
+            ignored_attributes: HashSet::new(),
+            seed_filepaths: BTreeSet::new(),
+            modified_filepaths: BTreeSet::new(),
+            track_deps: true,
+            always_affected_tags: HashSet::new(),
+        };
+        let raw = crate::hash::hash_targets(&options, targets).unwrap();
+        let streamed = crate::hash::generate_hashes(&options).unwrap();
+        assert_eq!(raw.hashes[overlapping], streamed.hashes[overlapping]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn module_survey_preserves_ordered_targets_and_falls_back_on_incomplete_answers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path();
+        let repo = Repository {
+            canonical_name: Some("rules_go++go_sdk+go_default_sdk".into()),
+            repo_rule_name: Some("http_archive".into()),
+            ..Default::default()
+        };
+        let options = probe_options(path, extension_flow_script(path, &[repo], None));
+        let original = options
+            .query_all_targets_with(materialize_repository_inputs_for_batch)
+            .unwrap();
+        fs::write(path.join("MODULE.bazel"), "").unwrap();
+        for (marker, expected_dumps) in [
+            (None, 2),
+            (Some("truncated-survey"), 4),
+            (Some("unavailable-survey"), 4),
+        ] {
+            if let Some(name) = marker {
+                fs::write(path.join(name), "").unwrap();
+            }
+            fs::write(path.join("calls.log"), "").unwrap();
+            let queried = options
+                .query_all_targets_with(materialize_repository_inputs_for_batch)
+                .unwrap();
+            assert_eq!(queried.targets, original.targets);
+            assert_eq!(queried.root_mapping, original.root_mapping);
+            assert_eq!(queried.module_graph_json, original.module_graph_json);
+            let calls = fs::read_to_string(path.join("calls.log")).unwrap();
+            let dumps = calls
+                .lines()
+                .filter(|line| line.contains("mod dump_repo_mapping"))
+                .collect::<Vec<_>>();
+            assert_eq!(dumps.len(), expected_dumps, "{calls}");
+            assert!(
+                dumps[0].ends_with("mod dump_repo_mapping  rules_go+ rules_python+"),
+                "{calls}"
+            );
+            assert_eq!(
+                calls
+                    .lines()
+                    .filter(|line| line.contains("mod graph --output=json"))
+                    .count(),
+                1,
+                "{calls}"
+            );
+            if let Some(name) = marker {
+                fs::remove_file(path.join(name)).unwrap();
+            }
+        }
+
+        // The root mapping, not the graph hint, decides which modules must be read.
+        fs::remove_file(path.join("MODULE.bazel")).unwrap();
+        fs::write(path.join("omit-graph-hint"), "").unwrap();
+        let original = options
+            .query_all_targets_with(materialize_repository_inputs_for_batch)
+            .unwrap();
+        fs::write(path.join("MODULE.bazel"), "").unwrap();
+        fs::write(path.join("calls.log"), "").unwrap();
+        let queried = options
+            .query_all_targets_with(materialize_repository_inputs_for_batch)
+            .unwrap();
+        assert_eq!(queried.targets, original.targets);
+        assert_eq!(queried.root_mapping, original.root_mapping);
+        assert_eq!(queried.module_graph_json, original.module_graph_json);
+        let calls = fs::read_to_string(path.join("calls.log")).unwrap();
+        let dumps = calls
+            .lines()
+            .filter(|line| line.contains("mod dump_repo_mapping"))
+            .collect::<Vec<_>>();
+        assert_eq!(dumps.len(), 3, "{calls}");
+        assert!(
+            dumps[0].ends_with("mod dump_repo_mapping  rules_go+"),
+            "{calls}"
+        );
+        assert!(
+            dumps[1].ends_with("mod dump_repo_mapping rules_python+"),
+            "{calls}"
+        );
     }
 
     #[test]
@@ -3787,8 +4717,8 @@ exit 1
         );
         let mut options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -3870,14 +4800,11 @@ exit 1
             selected_repos_marker.display(),
         );
         fs::write(&script, body).unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
 
         let options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -3942,14 +4869,11 @@ exit 1
             query_proto.display(),
         );
         fs::write(&show_repo_fail_script, body).unwrap();
-        let mut permissions = fs::metadata(&show_repo_fail_script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&show_repo_fail_script, permissions).unwrap();
 
         let mut options = BazelOptions {
             workspace: workspace.path().to_path_buf(),
-            bazel: show_repo_fail_script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![show_repo_fail_script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -4000,52 +4924,12 @@ exit 1
         assert!(extension_failure("ERROR: Unknown command 'dump_repo_mapping'\n").is_none());
     }
 
-    #[test]
-    fn extension_repo_prefix_follows_bazels_naming() {
-        assert_eq!(
-            extension_repo_prefix("@@transitive_dep+//:extensions.bzl%broken").as_deref(),
-            Some("transitive_dep++broken+")
-        );
-        assert_eq!(
-            extension_repo_prefix("@@//:deps.bzl%deps").as_deref(),
-            Some("+deps+")
-        );
-        assert_eq!(
-            extension_repo_prefix("@@rules_go~//go:extensions.bzl%go_sdk").as_deref(),
-            Some("rules_go~~go_sdk~")
-        );
-        assert_eq!(extension_repo_prefix("not an extension"), None);
-
-        let failed = BTreeSet::from(["@@transitive_dep+//:extensions.bzl%broken".to_owned()]);
-        assert!(belongs_to_failed_extension(
-            "@@transitive_dep++broken+missing_repo",
-            &failed
-        ));
-        assert!(belongs_to_failed_extension(
-            "transitive_dep++broken+other",
-            &failed
-        ));
-        assert!(!belongs_to_failed_extension("transitive_dep+", &failed));
-        assert!(!belongs_to_failed_extension(
-            "transitive_dep++other+missing_repo",
-            &failed
-        ));
-    }
-
-    #[cfg(unix)]
-    fn executable_script(path: &Path, body: &str) {
-        fs::write(path, body).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
-    }
-
     #[cfg(unix)]
     fn probe_options(workspace: &Path, script: PathBuf) -> BazelOptions {
         BazelOptions {
             workspace: workspace.to_path_buf(),
-            bazel: script,
-            startup_options: Vec::new(),
+            bazel: PathBuf::from("/bin/sh"),
+            startup_options: vec![script.to_str().unwrap().to_owned()],
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
@@ -4070,12 +4954,13 @@ exit 1
         let workspace = tempfile::tempdir().unwrap();
         let script = |name: &str, dump: &str, graph: &str| {
             let path = workspace.path().join(name);
-            executable_script(
+            fs::write(
                 &path,
-                &format!(
+                format!(
                     "#!/bin/sh\nif [ \"$2\" = dump_repo_mapping ]; then\n{dump}\nfi\nif [ \"$2\" = graph ]; then\n{graph}\nfi\nexit 1\n"
                 ),
-            );
+            )
+            .unwrap();
             path
         };
         let marker = "echo 'ERROR: error evaluating module extension @@dep+//:ext.bzl%broken' >&2; echo 'ERROR: Results may be incomplete as 1 extension failed.' >&2; exit 2";
@@ -4115,6 +5000,7 @@ exit 1
     /// `show_repo`) without the `Results may be incomplete` line.
     #[cfg(unix)]
     fn failed_extension_script(workspace: &Path, query_targets: &[Target]) -> PathBuf {
+        fs::write(workspace.join("MODULE.bazel"), "").unwrap();
         let repo_proto = workspace.join("show-repo.pb");
         write_delimited(
             &repo_proto,
@@ -4165,7 +5051,7 @@ if echo "$args" | grep -q "mod dump_repo_mapping"; then
       transitive_dep+) echo '{{"missing_repo":"transitive_dep++broken+missing_repo","transitive_dep":"transitive_dep+","bazel_tools":"bazel_tools"}}' ;;
     esac
   done
-  echo "$err" >&2; echo "$marker" >&2; exit 2
+  exit 0
 fi
 if echo "$args" | grep -q "mod show_repo"; then
   cat "{repos}"
@@ -4184,7 +5070,7 @@ exit 1
             repos = repo_proto.display(),
             query = query_proto.display(),
         );
-        executable_script(&script, &body);
+        fs::write(&script, &body).unwrap();
         script
     }
 
@@ -4252,7 +5138,7 @@ exit 1
                 rule_with_inputs("//app:uses_missing", &["//app:lib", "@missing_repo//:x"]),
                 rule_with_inputs(
                     "//app:uses_missing_canonical",
-                    &["@@transitive_dep++broken+missing_repo//:x"],
+                    &["@@transitive_dep++broken+unimported_repo//:x"],
                 ),
             ],
         );
@@ -4260,12 +5146,18 @@ exit 1
 
         let error = options.query_all_targets().unwrap_err().to_string();
         assert!(
-            error.contains("//app:uses_missing depends on @missing_repo//:x, a repository of module extension @@transitive_dep+//:extensions.bzl%broken"),
+            error.contains(
+                "//app:uses_missing depends on @missing_repo//:x, whose repository mapping failed"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("reported module extensions: @@transitive_dep+//:extensions.bzl%broken"),
             "{error}"
         );
         assert!(
             error.contains(
-                "//app:uses_missing_canonical depends on @@transitive_dep++broken+missing_repo//:x"
+                "//app:uses_missing_canonical depends on @@transitive_dep++broken+unimported_repo//:x"
             ),
             "{error}"
         );
@@ -4397,5 +5289,216 @@ exit 1
         );
         assert_eq!(target_label("//a:a|"), "//a:a|");
         assert_eq!(target_label("//a:a|abc123"), "//a:a");
+    }
+
+    /// Fake Bazel for the `query`/`cquery` runners: `version` reports `version`; the
+    /// compatible-target cquery (`--output starlark`) lists `compatible`, one per line, with a
+    /// blank line that the runner must ignore; the proto cquery copies `cquery_proto` to its
+    /// `--output_file`, or prints it when the runner redirects stdout instead (a Bazel older
+    /// than 8.2); `query` copies `query_proto` the same way and exits with `query_exit`,
+    /// reporting on stderr when that is non-zero. Every invocation is appended to `calls.log`.
+    #[cfg(unix)]
+    fn query_script(
+        workspace: &Path,
+        version: &str,
+        compatible: &[&str],
+        query_exit: i32,
+    ) -> PathBuf {
+        let result = results(vec![
+            configured(rule_target("//app:lib"), Some("abc123"), 1),
+            configured(rule_target("//app:incompatible"), Some("abc123"), 1),
+            configured(rule_target("//app:tool"), Some("def456"), 2),
+        ]);
+        let streamed_proto = workspace.join("cquery-stream.pb");
+        write_delimited(&streamed_proto, std::slice::from_ref(&result));
+        let proto = workspace.join("cquery-result.pb");
+        fs::write(&proto, result.encode_to_vec()).unwrap();
+        let query_proto = workspace.join("query-result.pb");
+        write_delimited(&query_proto, &[rule_target("//app:lib")]);
+        let script = workspace.join("fake-bazel.sh");
+        let body = format!(
+            r#"#!/bin/sh
+echo "$*" >> "{calls}"
+copy_or_print() {{
+  for arg do
+    if [ "$next" = 1 ]; then cp "$1" "$arg"; return 0; fi
+    [ "$arg" = "--output_file" ] && next=1
+  done
+  cat "$1"
+}}
+if [ "$1" = version ]; then
+  echo "Build label: {version}"
+  exit 0
+fi
+if [ "$1" = cquery ]; then
+  if echo "$*" | grep -q -- "--output starlark"; then
+    printf '{compatible}'
+    exit 0
+  fi
+  if echo "$*" | grep -q -- "--output proto"; then
+    copy_or_print "{proto}" "$@"
+  else
+    copy_or_print "{streamed}" "$@"
+  fi
+  exit 0
+fi
+if [ "$1" = query ]; then
+  copy_or_print "{query}" "$@"
+  if [ {query_exit} -ne 0 ]; then
+    echo "ERROR: no such package 'missing': BUILD file not found" >&2
+  fi
+  exit {query_exit}
+fi
+exit 1
+"#,
+            calls = workspace.join("calls.log").display(),
+            compatible = compatible
+                .iter()
+                .map(|label| format!("{label}\n"))
+                .collect::<String>()
+                .replacen('\n', "\n\n", 1),
+            streamed = streamed_proto.display(),
+            proto = proto.display(),
+            query = query_proto.display(),
+        );
+        fs::write(&script, body).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    fn query_calls(workspace: &Path) -> Vec<String> {
+        fs::read_to_string(workspace.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// `cquery` first asks Bazel which targets are compatible with the target platform, then
+    /// streams the configured targets and keeps only the compatible ones, matched by label
+    /// with the configuration checksum stripped. A Bazel before 7.0 has no streamed cquery
+    /// output, so the runner asks for `--output proto` instead, and one before 8.2 has no
+    /// `--output_file`, so stdout is redirected to the output file.
+    #[test]
+    #[cfg(unix)]
+    fn cquery_filters_to_compatible_targets_across_bazel_versions() {
+        for (version, output, output_file) in [
+            ("8.7.0", "streamed_proto", true),
+            ("7.4.1", "streamed_proto", false),
+            ("6.5.0", "proto", false),
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let script = query_script(workspace.path(), version, &["//app:lib", "//app:tool"], 0);
+            let mut options = probe_options(workspace.path(), script);
+            options.use_cquery = true;
+            options.cquery_options = vec!["--define=flavor=test".into()];
+            options.command_options = vec!["--query-only".into()];
+
+            let targets = options.query("deps(//app:all)", true).unwrap();
+            let names = targets.iter().filter_map(target_name).collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                ["//app:lib|abc123", "//app:tool|def456"],
+                "Bazel {version}: the incompatible target is dropped, the rest keep their configuration"
+            );
+
+            let calls = query_calls(workspace.path());
+            assert_eq!(calls.len(), 3, "{calls:?}");
+            assert_eq!(calls[0], "version");
+            let compatible = &calls[1];
+            assert!(
+                compatible.starts_with("cquery --output starlark --starlark:file "),
+                "{compatible}"
+            );
+            assert!(
+                compatible.contains("--define=flavor=test --consistent_labels --query_file"),
+                "{compatible}"
+            );
+            assert!(!compatible.contains("--query-only"), "{compatible}");
+            let streamed = &calls[2];
+            assert!(
+                streamed.starts_with(&format!(
+                    "cquery --transitions=lite --output {output} --proto:instantiation_stack --define=flavor=test --consistent_labels --query_file "
+                )),
+                "Bazel {version}: {streamed}"
+            );
+            assert!(!streamed.contains("--order_output=no"), "{streamed}");
+            assert!(!streamed.contains("--keep_going"), "{streamed}");
+            assert_eq!(
+                streamed.contains("--output_file"),
+                output_file,
+                "Bazel {version}: {streamed}"
+            );
+        }
+    }
+
+    /// A failed compatible-target cquery stops the query instead of silently keeping every
+    /// target, and a plain `query` that exits non-zero is an error that quotes Bazel's stderr --
+    /// unless `--keep_going` was asked for and Bazel exited 3, the code it uses for a partial
+    /// answer, in which case the output it did produce is used.
+    #[test]
+    #[cfg(unix)]
+    fn query_surfaces_bazel_failures_and_tolerates_partial_answers_with_keep_going() {
+        let workspace = tempfile::tempdir().unwrap();
+        let script = query_script(workspace.path(), "8.7.0", &[], 1);
+        let mut options = probe_options(workspace.path(), script);
+        options.command_options = vec!["--noimplicit_deps".into()];
+
+        let error = options.query("//app:all", false).unwrap_err().to_string();
+        assert!(
+            error.contains("Bazel query failed, exit code 1: ERROR: no such package 'missing'"),
+            "{error}"
+        );
+        let calls = query_calls(workspace.path());
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(
+            calls[1].starts_with(
+                "query --output streamed_proto --proto:instantiation_stack --order_output=no --noimplicit_deps --query_file "
+            ),
+            "{}",
+            calls[1]
+        );
+
+        // Exit code 1 is still an error under --keep_going; only 3 is a partial answer.
+        options.keep_going = true;
+        let error = options.query("//app:all", false).unwrap_err().to_string();
+        assert!(error.contains("Bazel query failed, exit code 1"), "{error}");
+        assert!(
+            query_calls(workspace.path())[3].contains("--keep_going"),
+            "{:?}",
+            query_calls(workspace.path())
+        );
+
+        let partial = tempfile::tempdir().unwrap();
+        let script = query_script(partial.path(), "8.7.0", &[], 3);
+        let mut options = probe_options(partial.path(), script);
+        let error = options.query("//app:all", false).unwrap_err().to_string();
+        assert!(error.contains("Bazel query failed, exit code 3"), "{error}");
+        options.keep_going = true;
+        let targets = options.query("//app:all", false).unwrap();
+        assert_eq!(
+            targets.iter().filter_map(target_name).collect::<Vec<_>>(),
+            ["//app:lib"]
+        );
+
+        // The compatible-target cquery failing is an error of its own, before any proto cquery.
+        let incompatible = tempfile::tempdir().unwrap();
+        let script = incompatible.path().join("fake-bazel.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho \"$*\" >> calls.log\nif [ \"$1\" = version ]; then echo 'Build label: 8.7.0'; exit 0; fi\necho 'ERROR: no such target' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut options = probe_options(incompatible.path(), script);
+        options.use_cquery = true;
+        let error = options
+            .query("deps(//app:all)", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("compatible-target cquery failed: ERROR: no such target"),
+            "{error}"
+        );
+        assert_eq!(query_calls(incompatible.path()).len(), 2);
     }
 }

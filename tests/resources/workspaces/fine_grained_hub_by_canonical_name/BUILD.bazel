@@ -1,0 +1,14 @@
+filegroup(
+    name = "uses_a",
+    srcs = ["@crates//:a"],
+)
+
+filegroup(
+    name = "uses_b",
+    srcs = ["@crates//:b"],
+)
+
+filegroup(
+    name = "uses_versions",
+    srcs = ["@crates//:versions.txt"],
+)

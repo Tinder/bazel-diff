@@ -4,8 +4,8 @@ The harness itself needs git, go, bazel, bazel-remote and the dummy executor, so
 by the cache-probe-bench workflow rather than here. What *is* unit-testable is everything between
 Bazel's raw output and the numbers in the step summary: decoding --remote_grpc_log without a proto
 runtime, turning lookups into per-label verdicts, telling require-cached denials from real errors,
-classifying `bazel test` result lines, the rdeps attribution query, the accuracy math, and the
-markdown rendering.
+classifying `bazel test` result lines, the rdeps attribution query, the partial-seed target choice,
+the accuracy math, and the markdown rendering.
 
 Run via Bazel:
     bazel test //tools/perf:cache_probe_bench_test
@@ -155,6 +155,14 @@ class AttributionAndAccuracyTest(unittest.TestCase):
         probe = {"verdict": {"misses": {"//a:t": "TestRunner", "//b:lib": "Genrule", "//x:t": "TestRunner"}}}
         self.assertEqual(cp.precise_affected(probe, {"//a:t", "//b:t"}), ["//a:t"])
 
+    def test_partial_seed_targets_takes_the_lower_packages(self):
+        tests = {f"//pkg/p{i:05d}:t{j}" for i in range(10) for j in range(2)} | {"//:odd_one_out"}
+        got = cp.partial_seed_targets(tests, 0.5)
+        self.assertEqual(len(got), 10)
+        self.assertTrue(all(t.startswith("//pkg/p0000") for t in got))  # p00000..p00004
+        self.assertEqual(got, sorted(got))
+        self.assertEqual(cp.partial_seed_targets({"//:odd_one_out"}, 0.5), [])
+
 
 class RenderSummaryTest(unittest.TestCase):
     def test_renders_tables_and_flags_unsound_selectors(self):
@@ -171,14 +179,24 @@ class RenderSummaryTest(unittest.TestCase):
                                 "bazel_diff": cp.accuracy({"//a:t"} | {f"//x:{i}" for i in range(6)}, {"//a:t"} | {f"//x:{i}" for i in range(13)}),
                                 "overreport": cp.accuracy({"//a:t"}, {"//a:t", "//b:t"}),
                                 "precise": cp.accuracy({"//a:t", "//b:t"}, {"//a:t"}),
+                                "hybrid": cp.accuracy({"//a:t"}, {"//a:t"}),
                             },
                             "timing": {
                                 k: cp.summarize([1.0, 2.0, 3.0])
-                                for k in ("bazel_diff_cold", "bazel_diff_warm", "probe_cold", "probe_cold_single", "probe_warm", "precise")
+                                for k in ("bazel_diff_cold", "bazel_diff_warm", "probe_cold", "probe_cold_single", "probe_warm", "precise", "hybrid")
                             },
                             "probe_breakdown": {"pass1_s": 0.5, "pass2_s": 1.0, "parse_s": 0.01, "attribute_s": 0.2, "frontier": 1, "lookups": 300},
-                        }
+                            "hybrid_breakdown": {"candidates": 14, "build_s": 0.7, "probe_s": 0.3, "lookups": 40},
+                        },
+                        {
+                            "name": "partial_leaf_edit", "seed": "partial", "truth": {"count": 7, "time_s": 3.0},
+                            "cache_truth": {"count": 60, "time_s": 9.0, "ok": True},
+                            "accuracy": {"bazel_diff": cp.accuracy({"//a:t"}, {"//a:t"})},
+                            "timing": {"bazel_diff_warm": cp.summarize([1.0])},
+                            "probe_breakdown": {"pass1_s": None, "pass2_s": None, "parse_s": None, "attribute_s": None, "frontier": None, "lookups": None},
+                        },
                     ],
+                    "partial_seed": {"seed_s": 6.0, "tests": 60, "of": 120, "fraction": 0.5, "unseeded_actions": 150},
                 }
             ],
             "failures": [{"where": "tiny/seed", "error": "boom"}],
@@ -187,9 +205,15 @@ class RenderSummaryTest(unittest.TestCase):
         md = cp.render_summary(report)
         self.assertIn("### tiny: 60 packages, 300 rule targets, 120 tests", md)
         self.assertIn("verified (0 misses)", md)
-        self.assertIn("| leaf_edit | 7 | 14 (50% precise) | 2 (50% precise) | 1 (100% precise) **MISSED 1** |", md)
-        self.assertIn("| leaf_edit | 3.00s | 2.00s | 2.00s | 2.00s | 2.00s | 2.00s | 2.00s |", md)
+        self.assertIn("| leaf_edit | 7 | 14 (50% precise) | 2 (50% precise) | 1 (100% precise) **MISSED 1** | 1 (100% precise) |", md)
+        self.assertIn("| leaf_edit | 3.00s | 2.00s | 2.00s | 2.00s | 2.00s | 2.00s | 2.00s | 2.00s |", md)
         self.assertIn("frontier 1 misses, 300 lookups", md)
+        self.assertIn("- leaf_edit hybrid: 14 candidates from bazel-diff; build 0.70s, probe 0.30s (40 lookups).", md)
+        self.assertIn("Partial seed (`partial_*` scenarios): 60 of 120 tests, the lower 50% of packages, 6.00s; a clean-tree probe found 150 unseeded actions.", md)
+        self.assertIn("| partial_leaf_edit | 7 | 1 (100% precise) | n/a | n/a | n/a |", md)
+        self.assertIn("| partial_leaf_edit | 3.00s | n/a | 1.00s | n/a | n/a | n/a | n/a | n/a |", md)
+        self.assertIn("- partial_leaf_edit: against the partial seed a full `bazel test //...` ran 60 tests in 9.00s (the change needs 7; the rest were never run on base).", md)
+        self.assertNotIn("partial_leaf_edit probe (cold medians)", md)
         self.assertIn("- **tiny/seed**: boom", md)
         self.assertIn("### Soundness failures", md)
 

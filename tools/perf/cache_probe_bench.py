@@ -22,12 +22,18 @@ Per synthetic workload the harness:
        identical_output  an input whose genrule ignores its content: the action key moves, the
                          output and everything downstream stay byte-identical
        wide_edit         a layer-0 source with the most dependents (a shared-library change)
+       partial_*         the leaf_edit and identical_output changes again, but the selectors run
+                         against a cache seeded from only the lower half of the packages: what the
+                         probe sees when main's CI does not build everything
   2. seeds a fresh bazel-remote from `base` (`bazel clean` first: on a warm output base Bazel
      executes nothing and uploads nothing) and verifies the seed with a clean-tree probe that must
-     report zero misses, then snapshots the cache directory;
-  3. per scenario establishes GROUND TRUTH: the tests a real `bazel test //...` against the seeded
-     cache actually executes (not "(cached)"), which is what CI would have paid without any
-     selector;
+     report zero misses, then snapshots the cache directory; then seeds a second, PARTIAL cache
+     from `bazel test` over the lower PARTIAL_SEED_FRACTION of packages and snapshots that too;
+  3. per scenario establishes GROUND TRUTH: the tests a real `bazel test //...` against the fully
+     seeded cache actually executes (not "(cached)"), which is what CI would have paid without any
+     selector. The partial scenarios keep that change-based truth (the question is what each
+     selector flags for the same change under a thinner cache) and also record how many tests a
+     full run against the partial cache executes;
   4. per iteration times, cold (Bazel server stopped) and warm:
        bazel-diff        the README recipe: checkout base, generate-hashes, checkout head,
                          generate-hashes --depEdgesFile, get-impacted-targets
@@ -36,7 +42,12 @@ Per synthetic workload the harness:
                          `tests(rdeps(//..., set(<frontier misses>)))` query
        probe precise     `bazel build //...` with upload (executes the missed non-test actions),
                          then the probe again; affected = tests whose own action missed
-     and restores the cache snapshot so one iteration's uploads never leak into the next;
+       probe hybrid      bazel-diff's impacted tests as candidates (recall), then `bazel build` of
+                         just those with upload and a probe scoped to just those (precision);
+                         affected = candidates whose own action missed. Timed as bazel-diff warm +
+                         build + probe, what a serve-backed hybrid would pay
+     and restores the cache snapshot so one iteration's uploads never leak into the next. The
+     partial scenarios run one iteration of the warm selectors only: their point is accuracy;
   5. scores every selector against ground truth: recall (must be 1.0; a miss is a soundness bug
      and fails the run under --require-sound) and precision (truth / flagged).
 
@@ -76,8 +87,12 @@ DUMMY_EXECUTOR_SRC = REPO_ROOT / "tools" / "perf" / "cache_probe" / "dummy_execu
 # Pinned so a cache-server change never silently moves the baseline. Bump deliberately.
 BAZEL_REMOTE_MODULE = "github.com/buchgr/bazel-remote/v2@v2.6.4"
 
-SCENARIOS = ("leaf_edit", "identical_output", "wide_edit")
+SCENARIOS = ("leaf_edit", "identical_output", "wide_edit", "partial_leaf_edit", "partial_identical_output")
 TESTS_PER_PACKAGE = 2
+# The partial seed: tests of the lower half of the packages by index. Lower indices are lower
+# layers, so the unseeded upper half has unbuilt chains of its own (the "libraries are built on
+# main, the apps are not" shape) rather than only missing test results.
+PARTIAL_SEED_FRACTION = 0.5
 PHASES = ("cold", "warm")
 
 GET_ACTION_RESULT = "build.bazel.remote.execution.v2.ActionCache/GetActionResult"
@@ -230,6 +245,20 @@ def rdeps_query(frontier: list[str]) -> str:
     return "tests(rdeps(//..., set(" + " ".join(sorted(set(frontier))) + ")))"
 
 
+def partial_seed_targets(tests: set[str], fraction: float) -> list[str]:
+    """The tests a partial main CI 'runs': those in the lower `fraction` of packages by index.
+    Labels are //pkg/pNNNNN:tJ (gen_project.py); anything else is left out of the seed."""
+    by_index: dict[int, list[str]] = {}
+    for t in tests:
+        pkg = t.split(":", 1)[0].rsplit("/p", 1)[-1]
+        if pkg.isdigit():
+            by_index.setdefault(int(pkg), []).append(t)
+    if not by_index:
+        return []
+    cutoff = (max(by_index) + 1) * fraction
+    return sorted(t for i, ts in by_index.items() if i < cutoff for t in ts)
+
+
 def accuracy(truth: set[str], flagged: set[str]) -> dict[str, Any]:
     """Recall (1.0 = sound) and precision (truth / flagged) of a selector against ground truth."""
     missed = sorted(truth - flagged)
@@ -272,8 +301,10 @@ def render_summary(report: dict[str, Any]) -> str:
         "## Cache probe vs bazel-diff (experiment)",
         "",
         "Flagged counts are test targets; precision is ground truth / flagged, and recall below 100% "
-        "is a soundness failure. Ground truth is what `bazel test //...` against the seeded cache "
-        "executed. Times are medians over the iterations.",
+        "is a soundness failure. Ground truth is what `bazel test //...` against the fully seeded cache "
+        "executed. The `partial_*` scenarios run the selectors against a cache seeded from only the lower "
+        "half of the packages, scored against that same change-based truth. Times are medians over the "
+        "iterations.",
         "",
         f"Bazel {env.get('bazel_version', '?')}, bazel-diff {env.get('bazel_diff_version', '?')}, "
         f"{env.get('bazel_remote', '?')}, {env.get('cpu_count', '?')} CPUs, {env.get('platform', '?')}.",
@@ -292,21 +323,29 @@ def render_summary(report: dict[str, Any]) -> str:
             f"Seed: {tc.fmt_s(seed.get('seed_s'))} to build and upload base; clean-tree probe "
             + ("verified (0 misses)." if verified else f"**NOT verified** ({seed.get('misses', '?')} misses).")
         )
+        pseed = wl.get("partial_seed")
+        if pseed:
+            lines.append("")
+            lines.append(
+                f"Partial seed (`partial_*` scenarios): {pseed.get('tests', '?')} of {pseed.get('of', '?')} tests, the lower "
+                f"{_pct(pseed.get('fraction'))} of packages, {tc.fmt_s(pseed.get('seed_s'))}; a clean-tree probe found "
+                f"{pseed.get('unseeded_actions', '?')} unseeded actions."
+            )
         lines.append("")
-        lines.append("| Scenario | Truth (tests run) | bazel-diff | probe overreport | probe precise |")
-        lines.append("|---|---:|---:|---:|---:|")
+        lines.append("| Scenario | Truth (tests run) | bazel-diff | probe overreport | probe precise | probe hybrid |")
+        lines.append("|---|---:|---:|---:|---:|---:|")
         for sc in wl.get("scenarios", []):
             acc = sc.get("accuracy", {})
             lines.append(
                 f"| {sc['name']} | {sc.get('truth', {}).get('count', 'n/a')} | {_cell(acc.get('bazel_diff'))} "
-                f"| {_cell(acc.get('overreport'))} | {_cell(acc.get('precise'))} |"
+                f"| {_cell(acc.get('overreport'))} | {_cell(acc.get('precise'))} | {_cell(acc.get('hybrid'))} |"
             )
         lines.append("")
         lines.append(
             "| Scenario | truth run | bazel-diff cold | bazel-diff warm | probe cold (2 passes) | probe cold (pass 2 only) "
-            "| probe warm | precise (build + probe) |"
+            "| probe warm | precise (build + probe) | hybrid (bazel-diff warm + build + probe) |"
         )
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
         for sc in wl.get("scenarios", []):
             t = sc.get("timing", {})
 
@@ -315,17 +354,31 @@ def render_summary(report: dict[str, Any]) -> str:
 
             lines.append(
                 f"| {sc['name']} | {tc.fmt_s(sc.get('truth', {}).get('time_s'))} | {med('bazel_diff_cold')} "
-                f"| {med('bazel_diff_warm')} | {med('probe_cold')} | {med('probe_cold_single')} | {med('probe_warm')} | {med('precise')} |"
+                f"| {med('bazel_diff_warm')} | {med('probe_cold')} | {med('probe_cold_single')} | {med('probe_warm')} | {med('precise')} "
+                f"| {med('hybrid')} |"
             )
         lines.append("")
         for sc in wl.get("scenarios", []):
             st = sc.get("probe_breakdown", {})
-            if st:
+            if st and st.get("pass2_s") is not None:
                 lines.append(
                     f"- {sc['name']} probe (cold medians): pass 1 {tc.fmt_s(st.get('pass1_s'))}, pass 2 "
                     f"{tc.fmt_s(st.get('pass2_s'))}, log parse {tc.fmt_s(st.get('parse_s'))}, rdeps "
                     f"{tc.fmt_s(st.get('attribute_s'))}; frontier {st.get('frontier', '?')} misses, "
                     f"{st.get('lookups', '?')} lookups."
+                )
+            hb = sc.get("hybrid_breakdown")
+            if hb:
+                lines.append(
+                    f"- {sc['name']} hybrid: {hb.get('candidates', '?')} candidates from bazel-diff; build "
+                    f"{tc.fmt_s(hb.get('build_s'))}, probe {tc.fmt_s(hb.get('probe_s'))} ({hb.get('lookups', '?')} lookups)."
+                )
+            ct = sc.get("cache_truth")
+            if ct:
+                lines.append(
+                    f"- {sc['name']}: against the partial seed a full `bazel test //...` ran {ct.get('count', '?')} tests "
+                    f"in {tc.fmt_s(ct.get('time_s'))} (the change needs {sc.get('truth', {}).get('count', '?')}; the rest "
+                    f"were never run on base)."
                 )
         lines.append("")
     failures = report.get("failures", [])
@@ -377,7 +430,7 @@ class CacheServer:
     def __init__(self, binary: Path, root: Path, grpc_port: int, http_port: int):
         self.binary = binary
         self.dir = root / "cache"
-        self.snapshot_dir = root / "cache-snapshot"
+        self.snapshot_root = root
         self.log_path = root / "bazel-remote.log"
         self.grpc_port = grpc_port
         self.http_port = http_port
@@ -412,17 +465,26 @@ class CacheServer:
         while tc.port_in_use(self.grpc_port) and time.monotonic() < deadline:
             time.sleep(0.1)
 
-    def snapshot(self) -> None:
+    def _snapshot_dir(self, name: str) -> Path:
+        return self.snapshot_root / f"cache-snapshot-{name}"
+
+    def snapshot(self, name: str = "full") -> None:
         self.stop()
-        if self.snapshot_dir.exists():
-            shutil.rmtree(self.snapshot_dir)
-        shutil.copytree(self.dir, self.snapshot_dir)
+        if self._snapshot_dir(name).exists():
+            shutil.rmtree(self._snapshot_dir(name))
+        shutil.copytree(self.dir, self._snapshot_dir(name))
         self.start()
 
-    def restore(self) -> None:
+    def restore(self, name: str = "full") -> None:
         self.stop()
         shutil.rmtree(self.dir)
-        shutil.copytree(self.snapshot_dir, self.dir)
+        shutil.copytree(self._snapshot_dir(name), self.dir)
+        self.start()
+
+    def wipe(self) -> None:
+        """An empty cache (for seeding a second variant); the snapshots are untouched."""
+        self.stop()
+        shutil.rmtree(self.dir)
         self.start()
 
 
@@ -507,9 +569,12 @@ def seed_cache(bz: Bazel) -> float:
     return secs
 
 
-def run_probe(bz: Bazel, exec_uri: str, out_dir: Path, name: str, pass1: bool, anchor: str) -> dict[str, Any]:
-    """The two-pass require-cached probe. Returns timings and the decoded verdict, or an error."""
+def run_probe(bz: Bazel, exec_uri: str, out_dir: Path, name: str, pass1: bool, anchor: str,
+              targets_file: Path | None = None) -> dict[str, Any]:
+    """The two-pass require-cached probe over //... (or over the patterns in `targets_file`).
+    Returns timings and the decoded verdict, or an error."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    universe = [f"--target_pattern_file={targets_file}"] if targets_file is not None else ["//..."]
     log_path = out_dir / f"{name}.grpc.binpb"
     if log_path.exists():
         log_path.unlink()
@@ -526,7 +591,7 @@ def run_probe(bz: Bazel, exec_uri: str, out_dir: Path, name: str, pass1: bool, a
         result["pass1_s"] = 0.0
     result["pass2_s"], proc = tc.timed(
         lambda: bz.run(
-            ["test", "//...", *common, "--nouse_action_cache", f"--remote_grpc_log={log_path}"],
+            ["test", *universe, *common, "--nouse_action_cache", f"--remote_grpc_log={log_path}"],
             check=False, capture_to=out_dir / f"{name}.pass2.log",
         )
     )
@@ -593,6 +658,7 @@ def ground_truth(bz: Bazel, out_dir: Path) -> dict[str, Any]:
     """What CI pays without a selector: a cold `bazel test //...` against the seeded cache, from a
     clean output base so local state cannot stand in for the cache. No upload, so the cache stays
     the seed."""
+    out_dir.mkdir(parents=True, exist_ok=True)
     bz.clean()
     bz.shutdown()
     # --remote_upload_local_results defaults to true: say no explicitly so head's results never
@@ -616,6 +682,8 @@ class Scenario:
     name: str
     sha: str
     file: str
+    seed: str = "full"  # cache snapshot the selectors run against
+    full: bool = True  # every selector, cold and warm, all iterations; False = warm accuracy pass only
 
 
 @dataclass
@@ -647,6 +715,10 @@ def make_workload(name: str, params: dict[str, int], workdir: Path, bazel_versio
         tc.git(out, "add", "-A")
         tc.git(out, "commit", "--quiet", "-m", scenario)
         wl.scenarios.append(Scenario(scenario, tc.git(out, "rev-parse", "HEAD"), rel))
+    # The partial-seed scenarios reuse two of the change commits against the thinner cache.
+    by_name = {sc.name: sc for sc in wl.scenarios}
+    for base in ("leaf_edit", "identical_output"):
+        wl.scenarios.append(Scenario(f"partial_{base}", by_name[base].sha, by_name[base].file, seed="partial", full=False))
     tc.git(out, "checkout", "--quiet", "--force", wl.base_sha)
     return wl
 
@@ -681,31 +753,69 @@ def bench_workload(wl: Workload, args: argparse.Namespace, bazel_diff: Path, fix
         if not report["seed"]["verified"]:
             failures.append({"where": f"{wl.name}/seed", "error": f"seed verification failed: {check.get('error') or f'{misses} misses on a clean tree'}"})
             return report
-        cache.snapshot()
+        cache.snapshot("full")
+        snapshots = {"full"}
+
+        # The partial seed: what the cache looks like when main's CI builds and tests only part of
+        # the repository. Seeded from clean for the same reason as the full seed; the clean-tree
+        # probe is recorded (how many actions a full run would find unseeded), not required to be 0.
+        partial = partial_seed_targets(tests, PARTIAL_SEED_FRACTION)
+        if any(not sc.full for sc in wl.scenarios) and partial:
+            tc.log(f"[{wl.name}] seeding the partial cache from {len(partial)} of {len(tests)} tests")
+            cache.wipe()
+            pattern = root / "partial-seed.txt"
+            pattern.write_text("\n".join(partial) + "\n")
+            bz.clean()
+            pseed_s, _ = tc.timed(
+                lambda: bz.run(["test", f"--target_pattern_file={pattern}", bz.cache_flag, "--remote_upload_local_results"])
+            )
+            bz.shutdown()
+            check = run_probe(bz, dummy.uri, root / "seed", "verify-partial", pass1=False, anchor=anchor)
+            pmisses = len(check.get("verdict", {}).get("misses", {})) if check["ok"] else None
+            report["partial_seed"] = {"seed_s": round(pseed_s, 3), "tests": len(partial), "of": len(tests),
+                                      "fraction": PARTIAL_SEED_FRACTION, "unseeded_actions": pmisses, "error": check.get("error")}
+            tc.log(f"[{wl.name}] partial seed {tc.fmt_s(pseed_s)}; clean-tree probe: {pmisses} unseeded actions")
+            if check["ok"]:
+                cache.snapshot("partial")
+                snapshots.add("partial")
+            else:
+                failures.append({"where": f"{wl.name}/partial-seed", "error": f"partial seed probe failed: {check.get('error')}"})
 
         for sc in wl.scenarios:
+            if sc.seed not in snapshots:
+                continue
             sc_dir = root / sc.name
             sc_dir.mkdir(parents=True, exist_ok=True)
             tc.log(f"[{wl.name}/{sc.name}] ground truth")
-            cache.restore()
+            # Truth is always the change's: what the fully seeded cache makes a real run execute.
+            cache.restore("full")
             tc.git(wl.path, "checkout", "--quiet", "--force", sc.sha)
             truth = ground_truth(bz, sc_dir)
-            sc_report: dict[str, Any] = {"name": sc.name, "file": sc.file, "truth": {k: v for k, v in truth.items() if k != "executed"}}
+            sc_report: dict[str, Any] = {"name": sc.name, "file": sc.file, "seed": sc.seed,
+                                         "truth": {k: v for k, v in truth.items() if k != "executed"}}
             if not truth["ok"]:
                 failures.append({"where": f"{wl.name}/{sc.name}/truth", "error": f"ground-truth run not clean (exit {truth['exit']}, not built: {truth['not_built'][:5]})"})
                 report["scenarios"].append(sc_report)
                 continue
             truth_set = set(truth["executed"])
             tc.log(f"[{wl.name}/{sc.name}] truth: {len(truth_set)} of {len(tests)} tests ran in {tc.fmt_s(truth['time_s'])}")
+            if sc.seed != "full":
+                # And what a full run against the thinner cache would have cost: the change's tests
+                # plus everything main never ran.
+                cache.restore(sc.seed)
+                ct = ground_truth(bz, sc_dir / "cache-truth")
+                sc_report["cache_truth"] = {"count": ct["count"], "time_s": ct["time_s"], "ok": ct["ok"]}
+                tc.log(f"[{wl.name}/{sc.name}] against the {sc.seed} seed a full run executes {ct['count']} tests")
 
             samples: dict[str, list[float]] = {
-                k: [] for k in ("bazel_diff_cold", "bazel_diff_warm", "probe_cold", "probe_cold_single", "probe_warm", "precise")
+                k: [] for k in ("bazel_diff_cold", "bazel_diff_warm", "probe_cold", "probe_cold_single", "probe_warm", "precise", "hybrid")
             }
             breakdown: dict[str, list[float]] = {k: [] for k in ("pass1_s", "pass2_s", "parse_s", "attribute_s")}
             last: dict[str, Any] = {}
-            for it in range(args.iterations):
-                cache.restore()
-                for phase in PHASES:
+            phases = PHASES if sc.full else ("warm",)
+            for it in range(args.iterations if sc.full else 1):
+                cache.restore(sc.seed)
+                for phase in phases:
                     if phase == "cold":
                         bz.shutdown()
                     r = run_bazel_diff(bazel_diff, bz, wl.base_sha, sc.sha, sc_dir / "bazel-diff")
@@ -714,7 +824,7 @@ def bench_workload(wl: Workload, args: argparse.Namespace, bazel_diff: Path, fix
                         continue
                     samples[f"bazel_diff_{phase}"].append(r["total_s"])
                     last["bazel_diff"] = r
-                for phase in PHASES:
+                for phase in phases:
                     if phase == "cold":
                         bz.shutdown()
                     pr = run_probe(bz, dummy.uri, sc_dir / "probe", f"{phase}{it}", pass1=True, anchor=anchor)
@@ -724,22 +834,23 @@ def bench_workload(wl: Workload, args: argparse.Namespace, bazel_diff: Path, fix
                     at = attribute_overreport(bz, pr, tests, sc_dir / "probe")
                     total = pr["total_s"] + at["attribute_s"]
                     samples[f"probe_{phase}"].append(total)
+                    last["overreport"] = at["affected"]
                     if phase == "cold":
                         for k in ("pass1_s", "pass2_s", "parse_s"):
                             breakdown[k].append(pr[k])
                         breakdown["attribute_s"].append(at["attribute_s"])
                         last["probe"] = {**{k: v for k, v in pr.items() if k != "verdict"}, "frontier": at["frontier"],
                                          "own_misses": at["own_misses"], "lookups": pr["verdict"]["looked_up"]}
-                        last["overreport"] = at["affected"]
                 # A fresh server has nothing memoized, so pass 1 is redundant there: this is what a
                 # cold CI runner would actually pay for the probe.
-                bz.shutdown()
-                pr = run_probe(bz, dummy.uri, sc_dir / "probe", f"single{it}", pass1=False, anchor=anchor)
-                if pr["ok"]:
-                    at = attribute_overreport(bz, pr, tests, sc_dir / "probe")
-                    samples["probe_cold_single"].append(pr["total_s"] + at["attribute_s"])
-                else:
-                    failures.append({"where": f"{wl.name}/{sc.name}/probe/cold-single", "error": f"{pr['error']}\n{pr.get('stderr_tail', '')}"})
+                if sc.full:
+                    bz.shutdown()
+                    pr = run_probe(bz, dummy.uri, sc_dir / "probe", f"single{it}", pass1=False, anchor=anchor)
+                    if pr["ok"]:
+                        at = attribute_overreport(bz, pr, tests, sc_dir / "probe")
+                        samples["probe_cold_single"].append(pr["total_s"] + at["attribute_s"])
+                    else:
+                        failures.append({"where": f"{wl.name}/{sc.name}/probe/cold-single", "error": f"{pr['error']}\n{pr.get('stderr_tail', '')}"})
                 # precise: build the frontier with upload (executes real actions), then probe. From a
                 # clean output base, like a CI runner: on a warm one Bazel would find the frontier
                 # already built by the ground-truth run, execute nothing and upload nothing, and the
@@ -761,6 +872,41 @@ def bench_workload(wl: Workload, args: argparse.Namespace, bazel_diff: Path, fix
                 last["precise"] = precise_affected(pr, tests)
                 last["precise_build_s"] = build_s
 
+                # hybrid: bazel-diff's impacted tests are the candidates (recall), the cache trims
+                # them (precision). Build only the candidates with upload, probe only the candidates;
+                # affected = candidates whose own TestRunner action missed. No pass 1: the test
+                # actions were never evaluated on this server, so every one of them is looked up.
+                # From clean, for the same reason as precise.
+                bd = last.get("bazel_diff")
+                if bd is None:
+                    continue
+                candidates = sorted(set(bd["labels"]) & tests)
+                hy_dir = sc_dir / "hybrid"
+                hy_dir.mkdir(parents=True, exist_ok=True)
+                if not candidates:
+                    samples["hybrid"].append(bd["total_s"])
+                    last["hybrid"] = []
+                    last["hybrid_breakdown"] = {"candidates": 0, "build_s": 0.0, "probe_s": 0.0, "lookups": 0}
+                    continue
+                pattern = hy_dir / f"candidates{it}.txt"
+                pattern.write_text("\n".join(candidates) + "\n")
+                bz.clean()
+                hbuild_s, hp = tc.timed(
+                    lambda: bz.run(["build", f"--target_pattern_file={pattern}", bz.cache_flag, "--remote_upload_local_results", "--keep_going"],
+                                   check=False, capture_to=hy_dir / f"build{it}.log")
+                )
+                if hp.returncode != 0:
+                    failures.append({"where": f"{wl.name}/{sc.name}/hybrid/build", "error": "\n".join(hp.stdout.splitlines()[-10:])})
+                    continue
+                pr = run_probe(bz, dummy.uri, hy_dir, f"probe{it}", pass1=False, anchor=anchor, targets_file=pattern)
+                if not pr["ok"]:
+                    failures.append({"where": f"{wl.name}/{sc.name}/hybrid/probe", "error": f"{pr['error']}\n{pr.get('stderr_tail', '')}"})
+                    continue
+                samples["hybrid"].append(bd["total_s"] + hbuild_s + pr["total_s"])
+                last["hybrid"] = precise_affected(pr, set(candidates))
+                last["hybrid_breakdown"] = {"candidates": len(candidates), "build_s": hbuild_s, "probe_s": pr["total_s"],
+                                            "lookups": pr["verdict"]["looked_up"]}
+
             acc: dict[str, Any] = {}
             if "bazel_diff" in last:
                 acc["bazel_diff"] = accuracy(truth_set, set(last["bazel_diff"]["labels"]) & tests)
@@ -768,6 +914,8 @@ def bench_workload(wl: Workload, args: argparse.Namespace, bazel_diff: Path, fix
                 acc["overreport"] = accuracy(truth_set, set(last["overreport"]))
             if "precise" in last:
                 acc["precise"] = accuracy(truth_set, set(last["precise"]))
+            if "hybrid" in last:
+                acc["hybrid"] = accuracy(truth_set, set(last["hybrid"]))
             for selector, a in acc.items():
                 if a["recall"] < 1.0:
                     unsound.append(f"{wl.name}/{sc.name}: {selector} missed {len(a['missed'])} test(s) that ground truth ran, e.g. {a['missed'][:3]}")
@@ -778,6 +926,7 @@ def bench_workload(wl: Workload, args: argparse.Namespace, bazel_diff: Path, fix
                 probe_breakdown={**{k: (tc.median(v) if v else None) for k, v in breakdown.items()},
                                  "frontier": last.get("probe", {}).get("frontier"), "lookups": last.get("probe", {}).get("lookups"),
                                  "log_bytes": last.get("probe", {}).get("log_bytes"), "precise_build_s": last.get("precise_build_s")},
+                hybrid_breakdown=last.get("hybrid_breakdown"),
             )
             tc.log(f"[{wl.name}/{sc.name}] " + " | ".join(f"{k}: {_cell(v)}" for k, v in acc.items()))
             report["scenarios"].append(sc_report)

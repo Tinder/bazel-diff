@@ -144,15 +144,21 @@ Per synthetic workload (the Tango presets plus two `check_test` targets per pack
 | `leaf_edit` | one source file ~75% deep in the graph | a PR-sized change |
 | `identical_output` | an input whose genrule ignores its content | the action key moves, the output and everything downstream stay byte-identical: bazel-diff must flag the closure, the cache knows better |
 | `wide_edit` | a layer-0 source with the most dependents | a shared-library change; stresses the miss frontier and rdeps attribution |
+| `partial_leaf_edit`, `partial_identical_output` | the same two changes, selectors run against a cache seeded from only the lower half of the packages | what the probe sees when main's CI does not build everything: a miss then means "changed, or never run on main", and the probe cannot tell which |
 
-Three selectors are scored against **ground truth**, the tests a real `bazel test //...` against
-the seeded cache actually executes (what CI pays with no selector at all):
+Four selectors are scored against **ground truth**, the tests a real `bazel test //...` against
+the fully seeded cache actually executes (what CI pays with no selector at all). The `partial_*`
+scenarios keep that change-based truth, so recall still means "never misses a changed test" and
+precision shows how much each selector overreports under a thinner cache; they also record how
+many tests a full run against the partial cache executes (the change's tests plus everything main
+never ran). They run one iteration of the warm selectors only, since their point is accuracy.
 
 | Selector | Flow | Timed as |
 |---|---|---|
 | bazel-diff | checkout base, `generate-hashes`, checkout head, `generate-hashes --depEdgesFile`, `get-impacted-targets`, filtered to test targets | the five stages, cold and warm |
 | probe overreport | pass 1 + pass 2, decode the gRPC log, one `tests(rdeps(//..., set(<frontier misses>)))` query | both passes, the decode and the query, cold and warm |
 | probe precise | `bazel build //...` with upload (executes the missed non-test actions), then the probe; affected = tests whose own action missed | the build plus the probe |
+| probe hybrid | bazel-diff's impacted tests as candidates (recall), then `bazel build` of just those with upload and a probe scoped to just those (precision); affected = candidates whose own action missed | bazel-diff warm plus the build plus the probe, what a serve-backed hybrid would pay |
 
 Recall below 100% is a soundness failure (`--require-sound` makes it fail the run). Precision is
 ground truth / flagged. The cache directory is snapshotted after the seed and restored before every
@@ -196,3 +202,6 @@ bazel test //tools/perf:cache_probe_bench_test
 - The probe's analysis phase is paid in full every time (the salt flip throws away incremental
   execution state); whether that beats two `generate-hashes` runs is exactly what the cold/warm
   columns measure.
+- The probe answers "is this result cached", not "did this change touch it". With a fully seeded
+  cache the two coincide; the `partial_*` scenarios measure how far they drift apart when they do
+  not, and whether bounding the probe by bazel-diff's candidates (hybrid) keeps the drift in check.

@@ -4,13 +4,17 @@ name: "Perf: cache probe vs bazel-diff"
 # README does not mention one; this cron exists to decide whether it should. It runs
 # tools/perf/cache_probe_bench.py, which stands up a local REAPI cache (bazel-remote) plus a dummy
 # remote executor, seeds the cache from a base commit, and for each synthetic workload and change
-# scenario measures three selectors against ground truth (the tests a real `bazel test //...` against
+# scenario measures four selectors against ground truth (the tests a real `bazel test //...` against
 # that cache actually executes):
 #
 #   bazel-diff        the README recipe (two checkouts, two generate-hashes, one diff)
 #   probe overreport  one --experimental_remote_require_cached invocation read through
 #                     --remote_grpc_log, misses attributed to tests with one rdeps query
 #   probe precise     the same after building and uploading the missed non-test actions
+#   probe hybrid      bazel-diff's impacted tests as candidates, trimmed by a probe scoped to them
+#
+# The partial_* scenarios rerun two changes against a cache seeded from only half the packages:
+# what the probe sees when main's CI does not build everything.
 #
 # Soundness (every ground-truth test flagged) is a gate: a selector that misses a test is a bug in
 # this harness or the technique, and the run fails. Precision and wall time are the trend data.
@@ -47,7 +51,7 @@ jobs:
     # Each workload pays two full builds of its synthetic graph (the cache seed and the ground
     # truth) before any timed iteration, so the default legs are the three mid sizes; xlarge is a
     # dispatch-only leg. Generous timeout so a slow runner yields data, not a kill.
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - name: Setup Go environment
         uses: actions/setup-go@v5

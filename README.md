@@ -809,7 +809,7 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "67.0.3")
+bazel_dep(name = "bazel-diff", version = "68.0.0")
 ```
 
 You can now run the tool with:
@@ -868,9 +868,9 @@ bazel run :bazel-diff --config=verbose -- --help
   <tr>
     <td align="center"><a href="https://github.com/BalestraPatrick"><img src="https://avatars.githubusercontent.com/u/3658887?s=64" width="64" alt="Patrick Balestra"/><br/><sub><b>Patrick Balestra</b></sub></a></td>
     <td align="center"><a href="https://github.com/purkhusid"><img src="https://avatars.githubusercontent.com/u/5622403?s=64" width="64" alt="Daniel P. Purkhus"/><br/><sub><b>Daniel P. Purkhus</b></sub></a></td>
+    <td align="center"><a href="https://github.com/Spikhalskiy"><img src="https://avatars.githubusercontent.com/u/532108?s=64" width="64" alt="Dmitry Spikhalsky"/><br/><sub><b>Dmitry Spikhalsky</b></sub></a></td>
     <td align="center"><a href="https://github.com/alexeagle"><img src="https://avatars.githubusercontent.com/u/47395?s=64" width="64" alt="Alex Eagle"/><br/><sub><b>Alex Eagle</b></sub></a></td>
     <td align="center"><a href="https://github.com/Malinskiy"><img src="https://avatars.githubusercontent.com/u/2089114?s=64" width="64" alt="Anton Malinskiy"/><br/><sub><b>Anton Malinskiy</b></sub></a></td>
-    <td align="center"><a href="https://github.com/Spikhalskiy"><img src="https://avatars.githubusercontent.com/u/532108?s=64" width="64" alt="Dmitry Spikhalsky"/><br/><sub><b>Dmitry Spikhalsky</b></sub></a></td>
     <td align="center"><a href="https://github.com/rdark"><img src="https://avatars.githubusercontent.com/u/260691?s=64" width="64" alt="rdark"/><br/><sub><b>rdark</b></sub></a></td>
   </tr>
   <tr>

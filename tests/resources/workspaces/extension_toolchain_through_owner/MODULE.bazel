@@ -1,0 +1,10 @@
+module(name = "extension_toolchain_through_owner_test")
+
+bazel_dep(name = "ext")
+local_path_override(module_name = "ext", path = "ext")
+
+# Module `ext`'s extension generates `@app`, whose rule resolves a toolchain, and
+# `@tc`, the toolchain `ext` registers. See external.rs.
+tools = use_extension("@ext//:tools.bzl", "tools")
+tools.lock(file = "//:versions.json")
+use_repo(tools, "app")

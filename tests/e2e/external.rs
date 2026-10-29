@@ -324,6 +324,96 @@ fn hub_named_by_canonical_name_is_fine_grained_under_its_apparent_name() {
     }
 }
 
+// Module `ext`'s extension generates the `@crates` hub and its spokes, whose targets use a rule
+// `ext` defines. In query mode `//external:ext` stands in for everything its extensions generate,
+// so a fine-grained spoke target reaching `ext` through it changes whenever any other spoke does.
+// With the extension listed in `--labelOnlyModuleExtensions`, bumping spoke `b` impacts only
+// `//:uses_b`, while a change to `ext` itself still impacts both consumers. Without it, the
+// conservative edge stays and the bump impacts both.
+#[test]
+fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let fine_grained = [
+        "--fineGrainedHashExternalRepos",
+        "@crates,@@ext++crates+crates__a",
+        "--labelOnlyModuleExtensions",
+        "@ext//:crates.bzl%crates",
+    ];
+    let main = |impacted: BTreeSet<String>| -> BTreeSet<String> {
+        impacted
+            .into_iter()
+            .map(|label| label.trim_start_matches("@@").to_owned())
+            .filter(|label| label.starts_with("//") && !label.starts_with("//external:"))
+            .collect()
+    };
+    let first = copy_workspace("extension_spokes_through_owner");
+    let bumped = copy_workspace("extension_spokes_through_owner");
+    edit(&bumped.path().join("versions.json"), |text| {
+        text.replace("\"b\": \"1.0\"", "\"b\": \"2.0\"")
+    });
+    let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained));
+    assert_eq!(impacted, BTreeSet::from(["//:uses_b".to_owned()]));
+    let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained[..2]));
+    assert_eq!(
+        impacted,
+        BTreeSet::from(["//:uses_a".to_owned(), "//:uses_b".to_owned()])
+    );
+
+    let changed_rule = copy_workspace("extension_spokes_through_owner");
+    fs::write(changed_rule.path().join("ext/tool.sh"), "exit 1\n").unwrap();
+    let impacted = main(diff_local(first.path(), changed_rule.path(), &fine_grained));
+    assert_eq!(
+        impacted,
+        BTreeSet::from(["//:uses_a".to_owned(), "//:uses_b".to_owned()])
+    );
+}
+
+// Module `ext`'s extension generates `@app`, whose rule resolves a toolchain, and the repositories
+// that toolchain can come from. A query never shows a resolved toolchain as an input, so with
+// `@app` fine-grained the change has to reach `//:uses_app` through `ext`, however `ext` registers
+// the toolchain: from a repository it imports, through an alias whose toolchain lives in a
+// repository nobody imports, or by canonical label without importing anything. This is why
+// `--labelOnlyModuleExtensions` is opt-in: an extension like this one must not be listed.
+#[test]
+fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    for registration in [
+        "use_repo(tools, \"tc\")\nregister_toolchains(\"@tc//:all\")",
+        "use_repo(tools, \"tc_alias\")\nregister_toolchains(\"@tc_alias//:tc\")",
+        "register_toolchains(\"@@ext++tools+tc//:tc\")",
+    ] {
+        let first = copy_workspace("extension_toolchain_through_owner");
+        let bumped = copy_workspace("extension_toolchain_through_owner");
+        for workspace in [&first, &bumped] {
+            fs::write(
+                workspace.path().join("ext/MODULE.bazel"),
+                format!(
+                    "module(name = \"ext\")\n\ntools = use_extension(\"//:tools.bzl\", \"tools\")\n{registration}\n"
+                ),
+            )
+            .unwrap();
+        }
+        edit(&bumped.path().join("versions.json"), |text| {
+            text.replace("1.0", "2.0")
+        });
+        let impacted = diff_local(
+            first.path(),
+            bumped.path(),
+            &["--fineGrainedHashExternalRepos", "@app"],
+        );
+        assert!(
+            impacted
+                .iter()
+                .any(|label| label == "//:uses_app" || label == "@@//:uses_app"),
+            "{registration}: {impacted:?}"
+        );
+    }
+}
+
 fn diff_local(
     first: &std::path::Path,
     second: &std::path::Path,

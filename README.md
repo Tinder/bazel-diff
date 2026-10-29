@@ -522,6 +522,8 @@ Options:
           
       --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
           
+      --labelOnlyModuleExtensions <LABEL_ONLY_MODULE_EXTENSIONS>
+          Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories use each other only through labels, never by resolving a toolchain from one another. A fine-grained target in one of their repositories then does not change whenever any other repository of the extension does
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
       --cqueryExpression <CQUERY_EXPRESSION>
@@ -668,6 +670,8 @@ Options:
           
       --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
           
+      --labelOnlyModuleExtensions <LABEL_ONLY_MODULE_EXTENSIONS>
+          Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories use each other only through labels, never by resolving a toolchain from one another. A fine-grained target in one of their repositories then does not change whenever any other repository of the extension does
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
       --cqueryExpression <CQUERY_EXPRESSION>
@@ -754,6 +758,16 @@ A few inputs are normalized or extended on the way in:
   An attribute that names a workspace path absolutely (a crate or Go module built from a directory
   in the workspace, a `file://%workspace%` registry URL) is hashed relative to the workspace, so
   identical checkouts at different paths hash the same.
+  In query mode the module that owns a module extension stands in for every repository the
+  extension generates, because a toolchain resolved from one of them is not a query input. A
+  fine-grained target inside one of those repositories that uses a rule from the owning module
+  therefore changes whenever any repository of the extension does. Listing the extension in
+  `--labelOnlyModuleExtensions` (for example `@rules_rs//rs:extensions.bzl%crate`) asserts that
+  its repositories use each other only through labels, so such a target reaches the owning module
+  without them. Do not list an extension whose targets resolve a toolchain the same extension
+  generates: that change would be missed. An extension whose name another `.bzl` file of the same
+  module also exports is reported and ignored, since Bazel tells their repositories apart only by
+  a numeric suffix.
   Bzlmod repositories are read from `bazel mod show_repo`, asked for by name in as many
   invocations as the platform's command-line limit allows, or in one `--all_repos` invocation
   when that would take several. The limit is 8191 characters wherever `cmd.exe` is involved --

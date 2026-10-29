@@ -48,6 +48,14 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "core::serve_partial_graph_derives_source_edits",
+                "timeout": "moderate",
+            },
+            {
+                "name": "core::serve_partial_graph_rebuilds_for_local_repository_edits",
+                "timeout": "moderate",
+            },
+            {
                 "name": "core::target_distance_metrics",
                 "timeout": "moderate",
             },

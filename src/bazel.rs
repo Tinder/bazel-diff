@@ -2352,8 +2352,13 @@ fn repository_target(
 /// a `requirements_lock`, and so on. Attributes only name these files; a repository fetched with
 /// a changed patch is a different repository, so their contents must reach its hash.
 fn repository_local_input_labels(repository: &Repository) -> BTreeSet<&str> {
-    repository
-        .attribute
+    attribute_main_repo_labels(&repository.attribute).collect()
+}
+
+/// Every main-repository label among the attributes' values: the files and directories a
+/// repository rule reads from the workspace (`build_file`, `patches`, a requirements file).
+pub(crate) fn attribute_main_repo_labels(attributes: &[Attribute]) -> impl Iterator<Item = &str> {
+    attributes
         .iter()
         .flat_map(|attribute| {
             attribute
@@ -2388,7 +2393,6 @@ fn repository_local_input_labels(repository: &Repository) -> BTreeSet<&str> {
         })
         .map(String::as_str)
         .filter(|value| crate::hash::main_repo_path(value).is_some())
-        .collect()
 }
 
 /// Digest of a repository's own definition: its rule, its attributes, and the local tree and
@@ -4655,6 +4659,7 @@ exit 1
             modified_filepaths: BTreeSet::new(),
             track_deps: true,
             always_affected_tags: HashSet::new(),
+            partial_tree: None,
         };
         let raw = crate::hash::hash_targets(&options, targets).unwrap();
         let streamed = crate::hash::generate_hashes(&options).unwrap();

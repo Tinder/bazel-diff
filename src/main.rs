@@ -374,6 +374,25 @@ struct ServeArgs {
     )]
     dependency_fingerprint: bool,
 
+    /// Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query`
+    /// when the diff between them only edits regular source files; every entry then also records
+    /// the hashing recipes that makes possible. Incompatible with --useCquery,
+    /// --fineGrainedHashExternalRepos and --alwaysAffectedTags
+    #[arg(
+        long = "partialGraph",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = false
+    )]
+    partial_graph: bool,
+
+    /// Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file
+    /// name) of workspace paths whose change always forces a full generation under --partialGraph
+    #[arg(long = "partialGraphRebuildPattern", value_delimiter = ',')]
+    partial_graph_rebuild_patterns: Vec<String>,
+
     #[arg(long = "no-initial-fetch")]
     no_initial_fetch: bool,
 
@@ -560,6 +579,7 @@ fn hash_options(
         modified_filepaths: read_lines(modified_filepaths)?,
         track_deps,
         always_affected_tags: args.always_affected_tags.iter().cloned().collect(),
+        partial_tree: None,
     })
 }
 
@@ -880,7 +900,7 @@ impl ServeArgs {
             ),
             _ => None,
         };
-        Ok(bazel_diff::server::ServerConfig {
+        let config = bazel_diff::server::ServerConfig {
             hash_options: hash_options(&self.hashing, None, None, self.track_deps, verbose)?,
             git_path: self.git_path.clone(),
             port: self.port,
@@ -888,6 +908,12 @@ impl ServeArgs {
             cache_dir: self.cache_dir.clone(),
             track_deps: self.track_deps,
             dependency_fingerprint: self.dependency_fingerprint,
+            partial_graph: self.partial_graph,
+            partial_graph_rebuild_patterns: self
+                .partial_graph_rebuild_patterns
+                .iter()
+                .map(|pattern| bazel_diff::partial::Glob::new(pattern))
+                .collect::<Result<Vec<_>>>()?,
             no_initial_fetch: self.no_initial_fetch,
             warmup_revisions: self.warmup_revisions.clone(),
             cache_max_age: self
@@ -914,7 +940,9 @@ impl ServeArgs {
             nexus_prefix: self.nexus_prefix.clone(),
             nexus_credentials,
             nexus_ca_cert: self.nexus_ca_cert.clone(),
-        })
+        };
+        bazel_diff::server::validate_partial_graph(&config)?;
+        Ok(config)
     }
 }
 
@@ -1419,6 +1447,69 @@ mod tests {
         assert!(
             serve_args(&["--nexusUrl", "https://host", "--nexusRepository", "a/b"])
                 .to_config_with_nexus_password(false, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn serve_partial_graph_is_opt_in_and_validated() {
+        let serve_args = |extra: &[&str]| {
+            let mut argv = vec![
+                "bazel-diff",
+                "serve",
+                "--workspacePath",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+            ];
+            argv.extend_from_slice(extra);
+            let Commands::Serve(args) = parse(&argv).command else {
+                panic!("expected serve");
+            };
+            args
+        };
+        let config = serve_args(&[]).to_config(false).unwrap();
+        assert!(!config.partial_graph);
+        assert!(config.partial_graph_rebuild_patterns.is_empty());
+
+        let config = serve_args(&[
+            "--partialGraph",
+            "--partialGraphRebuildPattern",
+            "*.lock,tools/**",
+            "--partialGraphRebuildPattern",
+            "requirements.txt",
+        ])
+        .to_config(false)
+        .unwrap();
+        assert!(config.partial_graph);
+        assert_eq!(
+            config
+                .partial_graph_rebuild_patterns
+                .iter()
+                .map(|glob| glob.pattern())
+                .collect::<Vec<_>>(),
+            ["*.lock", "tools/**", "requirements.txt"]
+        );
+        assert!(
+            !serve_args(&["--partialGraph=false"])
+                .to_config(false)
+                .unwrap()
+                .partial_graph
+        );
+
+        let error = serve_args(&["--partialGraph", "--useCquery"])
+            .to_config(false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--useCquery"), "{error}");
+        let error = serve_args(&["--partialGraph", "--alwaysAffectedTags", "flaky"])
+            .to_config(false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--alwaysAffectedTags"), "{error}");
+        assert!(
+            serve_args(&["--partialGraph", "--partialGraphRebuildPattern", ""])
+                .to_config(false)
                 .is_err()
         );
     }

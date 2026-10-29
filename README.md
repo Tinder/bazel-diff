@@ -421,6 +421,39 @@ Notes and operational guidance:
   not part of the cache key: a guarded server rewrites unguarded entries with a fingerprint as it
   regenerates them, and an unguarded server serves guarded entries as-is.
 
+* Partial graph updates (`--partialGraph`) are opt-in. A full generation pays for a `bazel query`
+  over the whole graph even when the change cannot have altered that graph: editing the body of a
+  source file changes what Bazel builds, never which targets exist or how they depend on each
+  other. With the flag on, every generated entry also records a hashing *recipe* per target (the
+  digest of everything that feeds its hash except source content, plus its ordered source inputs
+  and dependencies), and a request whose `to` revision is not cached is answered by re-evaluating
+  the cached `from` entry's recipes against `git ls-tree` of `to` -- no checkout, no `bazel query`
+  -- when `git diff` between the two only modifies the content of regular files. Anything else
+  falls back to a full generation: an added, deleted, renamed or type-changed path; a symlink or
+  submodule on either side; a change to a file Bazel reads while loading (`BUILD`, `BUILD.bazel`,
+  `*.bzl`, `*.scl`, `MODULE.bazel`, `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`,
+  `VENDOR.bazel`, `*bazelrc`, `.bazelversion`, `.bazelignore`, `.bazeliskrc`, `tools/bazel`,
+  `*.BUILD`, `BUILD.*`, `*.patch`, `*.diff`); a file `MODULE.bazel` or a `WORKSPACE` file names
+  by label (a requirements or lock file a module extension reads); anything a repository rule
+  read from the workspace while the graph was generated (the root of a `local_repository` or
+  `local_path_override`, the files its attributes name, and the files Bazel's repository marker
+  files record as read), which every entry records; a `--seed-filepaths` file; or
+  a path matching `--partialGraphRebuildPattern` (a glob: `*` within a path segment, `**` across,
+  a pattern without `/` matches the file name; repeatable). A fallback costs speed, never
+  correctness. A modified file no target reads impacts nothing, as it would in a full generation.
+  The entry a derivation writes is byte-identical to the one a full generation under the flag
+  writes for the same revision, so derived entries are themselves bases for later derivations and
+  are shared through the S3 or Nexus tier like any other. Hashes under the flag follow a slightly
+  different formula from the default mode's, so the flag is part of the cache key and entries of
+  the two modes are never compared with one another. The profile reports how an entry was
+  produced (`generation.mode` is `derived` or `full`, with `partialFallbackReason`, `changedSources`,
+  `unmatchedPaths`, `classifyMillis` and `deriveMillis`), `/metrics` counts both under
+  `partialGraph`, and the server log says which path each generation took. Not supported together
+  with `--useCquery`, `--fineGrainedHashExternalRepos` or `--alwaysAffectedTags` (the server
+  refuses to start): a derivation reads only the git tree and keys recipes by bare label. The
+  nightly [`partial-graph-bench`](.github/workflows/partial-graph-bench.yml) workflow checks the
+  mode's speed and its exact agreement with the default mode (see `tools/perf/README.md`).
+
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
   so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.
@@ -698,6 +731,10 @@ Options:
           [default: false] [possible values: true, false]
       --dependencyFingerprint[=<DEPENDENCY_FINGERPRINT>]
           Opt-in: only serve cached entries whose external-dependency fingerprint still matches [default: false] [possible values: true, false]
+      --partialGraph[=<PARTIAL_GRAPH>]
+          Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query` when the diff between them only edits regular source files; every entry then also records the hashing recipes that makes possible. Incompatible with --useCquery, --fineGrainedHashExternalRepos and --alwaysAffectedTags [default: false] [possible values: true, false]
+      --partialGraphRebuildPattern <PARTIAL_GRAPH_REBUILD_PATTERNS>
+          Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file name) of workspace paths whose change always forces a full generation under --partialGraph
       --no-initial-fetch
           
       --warmupRevision <WARMUP_REVISIONS>

@@ -4655,6 +4655,7 @@ exit 1
             modified_filepaths: BTreeSet::new(),
             track_deps: true,
             always_affected_tags: HashSet::new(),
+            partial_tree: None,
         };
         let raw = crate::hash::hash_targets(&options, targets).unwrap();
         let streamed = crate::hash::generate_hashes(&options).unwrap();

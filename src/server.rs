@@ -5,6 +5,7 @@ use crate::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
 };
 use crate::module_graph::impacted_with_module_changes;
+use crate::partial::{self, Classification, ClassifyInputs, Glob, TreeIndex, MODULE_FILES};
 use anyhow::{anyhow, bail, Context, Result};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -17,7 +18,7 @@ use s3::{Bucket, Region};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
@@ -39,6 +40,12 @@ pub struct ServerConfig {
     pub track_deps: bool,
     /// Opt-in: guard cache hits with a fingerprint of the workspace's external-dependency state.
     pub dependency_fingerprint: bool,
+    /// Opt-in: record hashing recipes in every entry and derive a revision from the request's
+    /// cached `from` entry, without a `bazel query`, when the diff between them cannot have
+    /// changed the graph (see [`crate::partial`]).
+    pub partial_graph: bool,
+    /// Paths whose change always forces a full generation in partial-graph mode.
+    pub partial_graph_rebuild_patterns: Vec<Glob>,
     pub no_initial_fetch: bool,
     pub warmup_revisions: Vec<String>,
     pub cache_max_age: Option<Duration>,
@@ -73,6 +80,10 @@ struct State {
     config: ServerConfig,
     ready: AtomicBool,
     workspace: Workspace,
+    /// Partial-graph mode: revisions hashed by derivation, and full generations the classifier
+    /// fell back to. `/metrics` reports both.
+    partial_derived: AtomicUsize,
+    partial_rebuilds: AtomicUsize,
     /// Queries accepted and not yet finished: waiting for the workspace, running, or abandoned by
     /// a timed-out client but still running. `/metrics` reports it as `activeQueries`.
     active_queries: AtomicUsize,
@@ -166,6 +177,8 @@ impl State {
             memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
             config,
             ready: AtomicBool::new(false),
+            partial_derived: AtomicUsize::new(0),
+            partial_rebuilds: AtomicUsize::new(0),
             workspace: Workspace::default(),
             active_queries: AtomicUsize::new(0),
             started: Instant::now(),
@@ -722,7 +735,30 @@ pub fn parse_byte_size(value: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("size overflow: {value}"))
 }
 
+/// Rejects configurations partial-graph mode cannot honour. The derivation evaluates recipes
+/// keyed by bare label from the revision's git tree alone, so it has no configured instances
+/// (cquery), no files outside the tree (fine-grained external repositories) and no
+/// per-invocation seeds (always-affected tags); each of those would make a derived entry differ
+/// from a full generation, which is the one property the mode rests on.
+pub fn validate_partial_graph(config: &ServerConfig) -> Result<()> {
+    if !config.partial_graph {
+        return Ok(());
+    }
+    let bazel = &config.hash_options.bazel;
+    if bazel.use_cquery {
+        bail!("--partialGraph does not support --useCquery");
+    }
+    if !bazel.fine_grained_external_repos.is_empty() {
+        bail!("--partialGraph does not support --fineGrainedHashExternalRepos");
+    }
+    if !config.hash_options.always_affected_tags.is_empty() {
+        bail!("--partialGraph does not support --alwaysAffectedTags");
+    }
+    Ok(())
+}
+
 pub fn serve(config: ServerConfig) -> Result<()> {
+    validate_partial_graph(&config)?;
     fs::create_dir_all(&config.cache_dir)?;
     let remote = RemoteCache::new(&config)?;
     let state = Arc::new(State::new(config, remote));
@@ -1016,16 +1052,22 @@ fn compute_query(
         // Same graph generate-hashes writes to --depEdgesFile: the end revision's
         // full (unscoped) dependency map. modifiedFilepaths must not shrink it —
         // PRI/CRI BFS-walk this file from the app target and need every edge.
-        let to = get_hashes_locked(state, &to_sha, &BTreeSet::new())?.data;
+        let to = get_hashes_locked(state, &to_sha, &BTreeSet::new(), None)?.data;
         prune_cache(state)?;
         return Ok(serde_json::to_value(&to.dep_edges)?);
     }
     let from_started = Instant::now();
-    let from = get_hashes_locked(state, &from_sha, &inputs.modified_filepaths)?;
+    let from = get_hashes_locked(state, &from_sha, &inputs.modified_filepaths, None)?;
     let from_profile = retrieval_profile(&from_sha, &from, from_started);
     let from = from.data;
     let to_started = Instant::now();
-    let to = get_hashes_locked(state, &to_sha, &inputs.modified_filepaths)?;
+    // The `from` entry is the base a partial-graph derivation of `to` starts from.
+    let to = get_hashes_locked(
+        state,
+        &to_sha,
+        &inputs.modified_filepaths,
+        Some((&from_sha, &from)),
+    )?;
     let to_profile = retrieval_profile(&to_sha, &to, to_started);
     let to = to.data;
     let diff_started = Instant::now();
@@ -1094,7 +1136,7 @@ fn compute_query(
 fn warm_revision(state: &Arc<State>, revision: &str) -> Result<()> {
     let _guard = state.workspace.acquire(&Arc::new(Cancellation::new()))?;
     let sha = resolve_sha(state, revision)?;
-    get_hashes_locked(state, &sha, &BTreeSet::new())?;
+    get_hashes_locked(state, &sha, &BTreeSet::new(), None)?;
     Ok(())
 }
 
@@ -1102,7 +1144,11 @@ fn warm_revision(state: &Arc<State>, revision: &str) -> Result<()> {
 /// checkout`, then the phases of [`generate_hashes_timed`], then serialising the result and
 /// writing it to the cache tiers. `targetCount` sizes the graph the phases operated on. Field
 /// names match the profile the Kotlin service emitted, which tools/serve_harness.py asserts on.
-#[derive(Clone, Copy, Debug, Serialize)]
+///
+/// In partial-graph mode the `partial` fields say how the entry was produced: `mode` is
+/// `derived` (no checkout, no query: the base's recipes were re-evaluated) or `full`, with
+/// `partialFallbackReason` naming what ruled a derivation out.
+#[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GenerationBreakdown {
     checkout_millis: u64,
@@ -1111,6 +1157,28 @@ struct GenerationBreakdown {
     module_graph_millis: u64,
     cache_write_millis: u64,
     target_count: usize,
+    #[serde(flatten)]
+    partial: PartialProfile,
+}
+
+/// How partial-graph mode handled one generation; empty outside the mode.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PartialProfile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    derived_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    partial_fallback_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changed_sources: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unmatched_paths: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classify_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    derive_millis: Option<u64>,
 }
 
 /// Outcome of one cache lookup: the data, whether it was served from a cache tier, and where the
@@ -1161,10 +1229,15 @@ fn retrieval_profile(sha: &str, retrieval: &Retrieval, started: Instant) -> Valu
     Value::Object(entry)
 }
 
+/// Retrieves the hashes of `sha` from the cache tiers, or generates them.
+///
+/// `base` is the request's other revision when it has already been retrieved: in partial-graph
+/// mode a full-content miss first tries to derive `sha` from it (see [`crate::partial`]).
 fn get_hashes_locked(
     state: &Arc<State>,
     sha: &str,
     modified: &BTreeSet<PathBuf>,
+    base: Option<(&str, &Arc<HashFileData>)>,
 ) -> Result<Retrieval> {
     // Keyed by the commit's tree, not the commit itself: a rebase, an amended message, or a merge
     // commit that changes no file all point at a tree that was already hashed.
@@ -1229,32 +1302,120 @@ fn get_hashes_locked(
     if state.config.dependency_fingerprint {
         eprintln!("[BD-DBG][cache-recompute] sha={sha} key={key}");
     }
-    let checkout_started = Instant::now();
-    checkout(state, sha)?;
-    let checkout_millis = elapsed_millis(checkout_started);
     let mut options = state.config.hash_options.clone();
     options.bazel.cancellation = state.workspace.holder();
     options.modified_filepaths = modified.clone();
     options.track_deps = state.config.track_deps;
+    let mut tree = None;
     if modified.is_empty() && options.content_hashes.is_none() {
         // Git already holds a content hash for every tracked file, so seed the source hasher from
         // one `ls-tree` instead of reading the whole working tree. The scoped `modifiedFilepaths`
         // path keeps its own disk-read semantics, and files absent from the tree (untracked, or in
         // a fine-grained external repository) still fall back to a disk read.
         let listed_started = Instant::now();
-        let content_hashes = git_content_hashes(state, sha)?;
+        let index = git_tree_index(state, sha)?;
         eprintln!(
             "[Info] listed {} tracked blobs for {sha} in {}ms",
-            content_hashes.len(),
+            index.len(),
             elapsed_millis(listed_started)
         );
-        options.content_hashes = Some(content_hashes);
+        options.content_hashes = Some(index.content_hashes());
+        tree = Some(Arc::new(index));
     }
-    let (mut data, timings) = generate_hashes_timed(&options)?;
+    let mut partial_profile = PartialProfile::default();
+    let mut derived = None;
+    if let (true, Some(tree)) = (state.config.partial_graph, &tree) {
+        let classify_started = Instant::now();
+        let outcome = match base {
+            Some((base_sha, base_data)) if base_data.partial.is_some() => {
+                classify_revisions(state, base_sha, sha, base_data, tree)
+                    .map(|classification| (classification, base_sha.to_owned()))
+            }
+            Some((base_sha, _)) => Ok((
+                Classification::Rebuild {
+                    reason: format!("base entry {base_sha} carries no partial-graph recipes"),
+                },
+                base_sha.to_owned(),
+            )),
+            None => Ok((
+                Classification::Rebuild {
+                    reason: "no base revision to derive from".to_owned(),
+                },
+                String::new(),
+            )),
+        };
+        partial_profile.classify_millis = Some(elapsed_millis(classify_started));
+        match outcome {
+            Ok((
+                Classification::Derivable {
+                    changed_sources,
+                    unmatched_paths,
+                },
+                base_sha,
+            )) => {
+                let derive_started = Instant::now();
+                let (_, base_data) = base.expect("a derivable classification has a base");
+                match partial::derive(base_data, tree) {
+                    Ok(data) => {
+                        eprintln!(
+                            "[Info] partial graph: derived {sha} from {base_sha}: {} changed source targets, {} changed paths outside the graph, {} targets",
+                            changed_sources.len(),
+                            unmatched_paths.len(),
+                            data.hashes.len()
+                        );
+                        partial_profile.mode = Some("derived");
+                        partial_profile.derived_from = Some(base_sha);
+                        partial_profile.changed_sources = Some(changed_sources.len());
+                        partial_profile.unmatched_paths = Some(unmatched_paths.len());
+                        partial_profile.derive_millis = Some(elapsed_millis(derive_started));
+                        derived = Some(data);
+                    }
+                    Err(error) => {
+                        partial_profile.partial_fallback_reason =
+                            Some(format!("derivation failed: {error:#}"));
+                    }
+                }
+            }
+            Ok((Classification::Rebuild { reason }, _)) => {
+                partial_profile.partial_fallback_reason = Some(reason);
+            }
+            Err(error) => {
+                partial_profile.partial_fallback_reason =
+                    Some(format!("classification failed: {error:#}"));
+            }
+        }
+        if derived.is_none() {
+            partial_profile.mode = Some("full");
+            eprintln!(
+                "[Info] partial graph: full generation for {sha}: {}",
+                partial_profile
+                    .partial_fallback_reason
+                    .as_deref()
+                    .unwrap_or("unknown reason")
+            );
+            state.partial_rebuilds.fetch_add(1, Ordering::SeqCst);
+        } else {
+            state.partial_derived.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (mut data, timings, checkout_millis) = match derived {
+        Some(data) => (data, Default::default(), 0),
+        None => {
+            let checkout_started = Instant::now();
+            checkout(state, sha)?;
+            let checkout_millis = elapsed_millis(checkout_started);
+            if state.config.partial_graph {
+                options.partial_tree = tree.clone();
+            }
+            let (data, timings) = generate_hashes_timed(&options)?;
+            (data, timings, checkout_millis)
+        }
+    };
     // A generation the client stopped waiting for is not cached: the subprocess kill above may
     // have left the working tree mid-checkout, and the caller may already be reusing it.
     state.workspace.check_cancelled()?;
-    if state.config.dependency_fingerprint {
+    // A derived entry already carries its base's fingerprint: the module files are unchanged.
+    if state.config.dependency_fingerprint && data.dependency_fingerprint.is_none() {
         data.dependency_fingerprint = current_dependency_fingerprint.take().or_else(|| {
             match dependency_fingerprint_for_workspace(state) {
                 Ok(value) => Some(value),
@@ -1289,17 +1450,23 @@ fn get_hashes_locked(
         module_graph_millis: timings.module_graph_millis,
         cache_write_millis: elapsed_millis(write_started),
         target_count: data.hashes.len(),
+        partial: partial_profile,
     };
     // Always logged, not just for profile=true requests, so a slow generation is attributable to
     // a phase straight from the server log.
     eprintln!(
-        "[Info] generated hashes for {sha}: checkout={}ms bazelQuery={}ms targetHash={}ms moduleGraph={}ms cacheWrite={}ms targets={}",
+        "[Info] generated hashes for {sha}: checkout={}ms bazelQuery={}ms targetHash={}ms moduleGraph={}ms cacheWrite={}ms targets={}{}",
         generation.checkout_millis,
         generation.bazel_query_millis,
         generation.target_hash_millis,
         generation.module_graph_millis,
         generation.cache_write_millis,
-        generation.target_count
+        generation.target_count,
+        generation
+            .partial
+            .mode
+            .map(|mode| format!(" partialGraph={mode}"))
+            .unwrap_or_default()
     );
     Ok(Retrieval {
         data,
@@ -1458,6 +1625,13 @@ fn configuration_fingerprint(config: &ServerConfig) -> String {
         hasher.update(value.as_bytes());
         hasher.update([0]);
     }
+    if config.partial_graph {
+        // Partial-graph entries hash under a different formula and carry recipes; they are never
+        // compared with, or served in place of, an entry of the default mode. Only folded in when
+        // enabled so existing keys do not move.
+        hasher.update(format!("partialGraph={}", partial::RECIPE_VERSION).as_bytes());
+        hasher.update([0]);
+    }
     hex::encode(hasher.finalize())[..12].to_owned()
 }
 
@@ -1557,16 +1731,66 @@ fn resolve_tree(state: &State, sha: &str) -> Result<String> {
     Ok(tree)
 }
 
-/// Maps every tracked path at `sha` to its git blob id, the same shape `--contentHashPath`
-/// accepts. Submodule entries are skipped: their id names a commit, not file content.
-fn git_content_hashes(state: &State, sha: &str) -> Result<BTreeMap<String, String>> {
-    let args = [
-        String::from("ls-tree"),
-        String::from("-r"),
-        String::from("-z"),
-        sha.to_owned(),
-    ];
-    let output = git_output(state, &args)?;
+/// Every tracked path at `sha` with its object id and mode, from one `git ls-tree`.
+/// [`TreeIndex::content_hashes`] is the `{path: blob}` map `--contentHashPath` accepts.
+fn git_tree_index(state: &State, sha: &str) -> Result<TreeIndex> {
+    let output = git_success(
+        state,
+        &[
+            String::from("ls-tree"),
+            String::from("-r"),
+            String::from("-z"),
+            sha.to_owned(),
+        ],
+    )?;
+    Ok(TreeIndex::parse_ls_tree(&output))
+}
+
+/// Decides whether `sha` can be derived from the cached `base_sha` entry: the raw diff between
+/// the two, the module and workspace files' label references at `sha`, and the server's
+/// rebuild patterns and seed files go through [`partial::classify`].
+fn classify_revisions(
+    state: &State,
+    base_sha: &str,
+    sha: &str,
+    base: &HashFileData,
+    tree: &TreeIndex,
+) -> Result<Classification> {
+    let diff = git_success(
+        state,
+        &[
+            String::from("diff"),
+            String::from("--raw"),
+            String::from("--no-renames"),
+            String::from("-z"),
+            base_sha.to_owned(),
+            sha.to_owned(),
+        ],
+    )?;
+    let diff = partial::parse_diff_raw(&diff)?;
+    let mut module_referenced = BTreeSet::new();
+    for file in MODULE_FILES {
+        if tree.get(file).is_none() {
+            continue;
+        }
+        let text = git_success(state, &[String::from("show"), format!("{sha}:{file}")])?;
+        module_referenced.extend(partial::referenced_main_repo_paths(
+            &String::from_utf8_lossy(&text),
+        ));
+    }
+    Ok(partial::classify(&ClassifyInputs {
+        diff: &diff,
+        tree,
+        base,
+        seed_filepaths: &state.config.hash_options.seed_filepaths,
+        rebuild_patterns: &state.config.partial_graph_rebuild_patterns,
+        module_referenced: &module_referenced,
+    }))
+}
+
+/// Runs git and returns its stdout, failing on a non-zero exit with the command and stderr.
+fn git_success(state: &State, args: &[String]) -> Result<Vec<u8>> {
+    let output = git_output(state, args)?;
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
@@ -1574,28 +1798,7 @@ fn git_content_hashes(state: &State, sha: &str) -> Result<BTreeMap<String, Strin
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    Ok(parse_ls_tree(&output.stdout))
-}
-
-/// Parses `git ls-tree -r -z` records: `<mode> <type> <object>\t<path>\0`.
-fn parse_ls_tree(output: &[u8]) -> BTreeMap<String, String> {
-    output
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty())
-        .filter_map(|record| {
-            let tab = record.iter().position(|byte| *byte == b'\t')?;
-            let metadata = String::from_utf8_lossy(&record[..tab]);
-            let mut fields = metadata.split(' ');
-            let _mode = fields.next()?;
-            let kind = fields.next()?;
-            let object = fields.next()?;
-            if kind != "blob" {
-                return None;
-            }
-            let path = String::from_utf8_lossy(&record[tab + 1..]).into_owned();
-            Some((path, object.to_owned()))
-        })
-        .collect()
+    Ok(output.stdout)
 }
 
 fn checkout(state: &State, sha: &str) -> Result<()> {
@@ -1672,6 +1875,11 @@ fn metrics(state: &State) -> Value {
         "gitEngine": "subprocess",
         "trackDeps": state.config.track_deps,
         "dependencyFingerprint": state.config.dependency_fingerprint,
+        "partialGraph": {
+            "enabled": state.config.partial_graph,
+            "derived": state.partial_derived.load(Ordering::SeqCst),
+            "fullGenerations": state.partial_rebuilds.load(Ordering::SeqCst),
+        },
         "cache": {
             "directory": state.config.cache_dir.to_string_lossy(),
             "remote": state.config.remote_cache,
@@ -1839,6 +2047,7 @@ mod tests {
                 modified_filepaths: BTreeSet::new(),
                 track_deps: false,
                 always_affected_tags: HashSet::new(),
+                partial_tree: None,
             },
             git_path: PathBuf::from("git"),
             port: 0,
@@ -1846,6 +2055,8 @@ mod tests {
             cache_dir: PathBuf::from("."),
             track_deps: false,
             dependency_fingerprint: false,
+            partial_graph: false,
+            partial_graph_rebuild_patterns: Vec::new(),
             no_initial_fetch: true,
             warmup_revisions: Vec::new(),
             cache_max_age: None,
@@ -1971,7 +2182,7 @@ mod tests {
         git_command(repo.path(), &["commit", "-q", "-m", "three"]);
         let third = git_command(repo.path(), &["rev-parse", "HEAD"]);
 
-        let hashes = git_content_hashes(&state, &third).unwrap();
+        let hashes = git_tree_index(&state, &third).unwrap().content_hashes();
         assert_eq!(hashes.len(), 2);
         assert_eq!(
             hashes["file.txt"],
@@ -1986,21 +2197,10 @@ mod tests {
         );
         // Same path, different content: the blob id moves with it.
         assert_ne!(
-            git_content_hashes(&state, &first).unwrap()["file.txt"],
-            git_content_hashes(&state, &second).unwrap()["file.txt"]
+            git_tree_index(&state, &first).unwrap().content_hashes()["file.txt"],
+            git_tree_index(&state, &second).unwrap().content_hashes()["file.txt"]
         );
-        assert!(git_content_hashes(&state, "not-a-revision").is_err());
-
-        let parsed = parse_ls_tree(
-            b"100644 blob aaaa\tREADME\x00160000 commit bbbb\tvendor/lib\x00120000 blob cccc\tlink\x00garbage\x00",
-        );
-        assert_eq!(
-            parsed,
-            BTreeMap::from([
-                ("README".to_owned(), "aaaa".to_owned()),
-                ("link".to_owned(), "cccc".to_owned()),
-            ])
-        );
+        assert!(git_tree_index(&state, "not-a-revision").is_err());
     }
 
     fn request(state: &Arc<State>, request: &str) -> String {
@@ -2120,6 +2320,335 @@ mod tests {
             configuration_fingerprint(&always_affected),
             base_fingerprint
         );
+
+        // Partial-graph entries hash under their own formula; the default mode's keys stay put.
+        let mut partial = test_config();
+        assert_eq!(configuration_fingerprint(&partial), base_fingerprint);
+        partial.partial_graph = true;
+        assert_ne!(configuration_fingerprint(&partial), base_fingerprint);
+        partial.partial_graph_rebuild_patterns = vec![Glob::new("*.lock").unwrap()];
+        assert_eq!(
+            configuration_fingerprint(&partial),
+            configuration_fingerprint(&ServerConfig {
+                partial_graph_rebuild_patterns: Vec::new(),
+                ..partial.clone()
+            }),
+            "rebuild patterns only steer the classifier, never the hashes"
+        );
+    }
+
+    #[test]
+    fn partial_graph_rejects_configurations_it_cannot_derive() {
+        let mut config = test_config();
+        assert!(validate_partial_graph(&config).is_ok());
+        config.partial_graph = true;
+        assert!(validate_partial_graph(&config).is_ok());
+
+        let mut cquery = config.clone();
+        cquery.hash_options.bazel.use_cquery = true;
+        assert!(validate_partial_graph(&cquery)
+            .unwrap_err()
+            .to_string()
+            .contains("--useCquery"));
+
+        let mut fine_grained = config.clone();
+        fine_grained
+            .hash_options
+            .bazel
+            .fine_grained_external_repos
+            .insert("@crates".into());
+        assert!(validate_partial_graph(&fine_grained)
+            .unwrap_err()
+            .to_string()
+            .contains("--fineGrainedHashExternalRepos"));
+
+        let mut always_affected = config;
+        always_affected
+            .hash_options
+            .always_affected_tags
+            .insert("flaky".into());
+        assert!(validate_partial_graph(&always_affected)
+            .unwrap_err()
+            .to_string()
+            .contains("--alwaysAffectedTags"));
+    }
+
+    /// A stand-in `bazel` whose query answers with the `targets.pb` checked out in the
+    /// workspace, so the graph a revision reports is whatever that revision committed.
+    #[cfg(unix)]
+    fn fake_bazel(directory: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = directory.join("fake-bazel.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+case "$1 $2" in
+  "mod dump_repo_mapping") printf '%s\n' '{"tool":"local_config_tool"}' ;;
+  "mod graph") printf '%s\n' '{"key":"<root>","name":"root","dependencies":[]}' ;;
+  "version ") printf '%s\n' 'Build label: 8.7.0' ;;
+  "info output_base") printf '%s\n' "$PWD" ;;
+  "query "*)
+    while [ "$1" != --output_file ]; do shift; done
+    cp "$PWD/targets.pb" "$2"
+    ;;
+  *) exit 80 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Two source files, a rule reading one, a rule reading the other plus the first rule, and
+    /// that rule's output: enough shape for a source edit to propagate direct and transitively.
+    fn encoded_targets() -> Vec<u8> {
+        use crate::proto::blaze_query::{target, GeneratedFile, Rule, SourceFile, Target};
+        use buffa::Message;
+        let source = |name: &str| {
+            let mut target = Target::default();
+            target.r#type = target::Discriminator::SourceFile;
+            target.source_file = buffa::MessageField::some(SourceFile {
+                name: name.to_owned(),
+                subinclude: vec!["//tools:defs.bzl".to_owned()],
+                ..Default::default()
+            });
+            target
+        };
+        let rule = |name: &str, inputs: &[&str]| {
+            let mut target = Target::default();
+            target.r#type = target::Discriminator::Rule;
+            target.rule = buffa::MessageField::some(Rule {
+                name: name.to_owned(),
+                rule_class: "genrule".to_owned(),
+                rule_input: inputs.iter().map(|input| (*input).to_owned()).collect(),
+                ..Default::default()
+            });
+            target
+        };
+        let generated = |name: &str, generating_rule: &str| {
+            let mut target = Target::default();
+            target.r#type = target::Discriminator::GeneratedFile;
+            target.generated_file = buffa::MessageField::some(GeneratedFile {
+                name: name.to_owned(),
+                generating_rule: generating_rule.to_owned(),
+                ..Default::default()
+            });
+            target
+        };
+        let mut encoded = Vec::new();
+        for target in [
+            source("//pkg:a.txt"),
+            source("//pkg:b.txt"),
+            rule("//pkg:lib", &["//pkg:a.txt"]),
+            rule("//pkg:bin", &["//pkg:lib", "//pkg:b.txt"]),
+            generated("//pkg:bin.out", "//pkg:bin"),
+        ] {
+            target.encode_length_delimited(&mut encoded);
+        }
+        encoded
+    }
+
+    /// A repository with the fixed graph above and four commits: `base`; a source and a README
+    /// edit; a `BUILD` edit on top of that; and, branching from the first edit, another source
+    /// edit.
+    #[cfg(unix)]
+    fn partial_graph_repo() -> (tempfile::TempDir, PathBuf, [String; 4]) {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(repo.join("pkg")).unwrap();
+        fs::create_dir_all(repo.join("tools")).unwrap();
+        let bazel = fake_bazel(root.path());
+        git_command(&repo, &["init", "-q"]);
+        git_command(&repo, &["config", "user.email", "test@example.com"]);
+        git_command(&repo, &["config", "user.name", "Test"]);
+        fs::write(repo.join("pkg/a.txt"), "one").unwrap();
+        fs::write(repo.join("pkg/b.txt"), "bee").unwrap();
+        fs::write(repo.join("pkg/BUILD.bazel"), "# build").unwrap();
+        fs::write(repo.join("tools/defs.bzl"), "def macro(): pass").unwrap();
+        fs::write(repo.join("README.md"), "readme").unwrap();
+        fs::write(repo.join("targets.pb"), encoded_targets()).unwrap();
+        let commit = |message: &str| {
+            git_command(&repo, &["add", "-A"]);
+            git_command(&repo, &["commit", "-q", "-m", message]);
+            git_command(&repo, &["rev-parse", "HEAD"])
+        };
+        let base = commit("base");
+        fs::write(repo.join("pkg/a.txt"), "two").unwrap();
+        fs::write(repo.join("README.md"), "readme two").unwrap();
+        let edited = commit("source edit");
+        fs::write(repo.join("pkg/a.txt"), "three").unwrap();
+        fs::write(repo.join("pkg/BUILD.bazel"), "# build two").unwrap();
+        let rebuilt = commit("build edit");
+        git_command(&repo, &["checkout", "-q", &edited]);
+        fs::write(repo.join("pkg/a.txt"), "four").unwrap();
+        let chained = commit("second source edit");
+        (root, bazel, [base, edited, rebuilt, chained])
+    }
+
+    fn partial_graph_state(repo: &Path, cache: &Path, bazel: &Path, partial: bool) -> Arc<State> {
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.to_path_buf();
+        config.hash_options.bazel.bazel = bazel.to_path_buf();
+        config.hash_options.bazel.no_bazelrc = false;
+        config.hash_options.track_deps = true;
+        config.track_deps = true;
+        config.cache_dir = cache.to_path_buf();
+        config.partial_graph = partial;
+        ready_state(config, None)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_graph_derives_source_edits_identically_to_a_full_generation() {
+        let (root, bazel, [base, edited, rebuilt, chained]) = partial_graph_repo();
+        let repo = root.path().join("repo");
+        let cache = root.path().join("cache");
+        let verify_cache = root.path().join("verify-cache");
+        let plain_cache = root.path().join("plain-cache");
+        for directory in [&cache, &verify_cache, &plain_cache] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let state = partial_graph_state(&repo, &cache, &bazel, true);
+
+        // The first revision has nothing to derive from: a full generation that records recipes.
+        let from = get_hashes_locked(&state, &base, &BTreeSet::new(), None).unwrap();
+        let generation = from.generation.as_ref().unwrap();
+        assert_eq!(generation.partial.mode, Some("full"));
+        assert!(generation
+            .partial
+            .partial_fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("no base revision"));
+        let recipes = from.data.partial.as_ref().unwrap();
+        assert_eq!(recipes.rules.len(), 2);
+        assert_eq!(recipes.generated["//pkg:bin.out"], "//pkg:bin");
+        assert_eq!(recipes.rules["//pkg:bin"].sources(), ["//pkg:b.txt"]);
+        assert_eq!(recipes.rules["//pkg:bin"].deps(), ["//pkg:lib"]);
+        assert_eq!(recipes.package_subincludes["//pkg"], ["//tools:defs.bzl"]);
+
+        // A source edit plus a README edit: derived, no checkout, no query.
+        let to = get_hashes_locked(&state, &edited, &BTreeSet::new(), Some((&base, &from.data)))
+            .unwrap();
+        let generation = to.generation.as_ref().unwrap();
+        assert_eq!(generation.partial.mode, Some("derived"));
+        assert_eq!(
+            generation.partial.derived_from.as_deref(),
+            Some(base.as_str())
+        );
+        assert_eq!(generation.partial.changed_sources, Some(1));
+        assert_eq!(generation.partial.unmatched_paths, Some(1));
+        assert_eq!(generation.bazel_query_millis, 0);
+        assert_eq!(generation.checkout_millis, 0);
+        assert!(generation.partial.derive_millis.is_some());
+        assert_eq!(
+            git_command(&repo, &["rev-parse", "HEAD"]),
+            base,
+            "a derivation leaves the working tree where it was"
+        );
+        let impacted = impacted_targets(&from.data.hashes, &to.data.hashes, None, false)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            impacted,
+            ["//pkg:a.txt", "//pkg:lib", "//pkg:bin", "//pkg:bin.out"]
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
+        );
+        assert!(
+            to.data.hashes["//pkg:lib"].direct_hash != from.data.hashes["//pkg:lib"].direct_hash
+        );
+        assert!(
+            to.data.hashes["//pkg:bin"].direct_hash == from.data.hashes["//pkg:bin"].direct_hash
+        );
+
+        // A full generation of the same revision, in a fresh cache, writes the identical entry.
+        let verify = partial_graph_state(&repo, &verify_cache, &bazel, true);
+        let full = get_hashes_locked(&verify, &edited, &BTreeSet::new(), None).unwrap();
+        assert_eq!(full.generation.as_ref().unwrap().partial.mode, Some("full"));
+        assert_eq!(full.data.hashes, to.data.hashes);
+        assert_eq!(full.data.dep_edges, to.data.dep_edges);
+        assert_eq!(full.data.partial, to.data.partial);
+        let key = cache_key_for_commit(&state, &edited);
+        assert_eq!(
+            fs::read(cache.join(format!("{key}.json"))).unwrap(),
+            fs::read(verify_cache.join(format!("{key}.json"))).unwrap(),
+            "derived and generated entries must be byte-identical"
+        );
+
+        // A BUILD edit forces a full generation.
+        let rebuilt_entry = get_hashes_locked(
+            &state,
+            &rebuilt,
+            &BTreeSet::new(),
+            Some((&edited, &to.data)),
+        )
+        .unwrap();
+        let generation = rebuilt_entry.generation.as_ref().unwrap();
+        assert_eq!(generation.partial.mode, Some("full"));
+        assert!(generation
+            .partial
+            .partial_fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("graph-defining file pkg/BUILD.bazel"));
+        assert!(generation.partial.classify_millis.is_some());
+
+        // A derived entry is itself a base for the next derivation.
+        let chained_entry = get_hashes_locked(
+            &state,
+            &chained,
+            &BTreeSet::new(),
+            Some((&edited, &to.data)),
+        )
+        .unwrap();
+        assert_eq!(
+            chained_entry.generation.as_ref().unwrap().partial.mode,
+            Some("derived")
+        );
+        let chained_full = get_hashes_locked(&verify, &chained, &BTreeSet::new(), None).unwrap();
+        assert_eq!(chained_full.data.hashes, chained_entry.data.hashes);
+
+        // A base without recipes (an entry the default mode wrote) cannot be derived from.
+        let plain = partial_graph_state(&repo, &plain_cache, &bazel, false);
+        let plain_entry = get_hashes_locked(&plain, &base, &BTreeSet::new(), None).unwrap();
+        assert!(plain_entry.data.partial.is_none());
+        assert!(plain_entry
+            .generation
+            .as_ref()
+            .unwrap()
+            .partial
+            .mode
+            .is_none());
+        assert_ne!(
+            plain_entry.data.hashes["//pkg:lib"].hash, from.data.hashes["//pkg:lib"].hash,
+            "the two modes hash under different formulas"
+        );
+        let unrecorded = get_hashes_locked(
+            &verify,
+            &base,
+            &BTreeSet::new(),
+            Some((&edited, &plain_entry.data)),
+        )
+        .unwrap();
+        assert!(unrecorded
+            .generation
+            .as_ref()
+            .unwrap()
+            .partial
+            .partial_fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("carries no partial-graph recipes"));
+
+        let snapshot = metrics(&state);
+        assert_eq!(snapshot["partialGraph"]["enabled"], true);
+        assert_eq!(snapshot["partialGraph"]["derived"], 2);
+        assert_eq!(snapshot["partialGraph"]["fullGenerations"], 2);
+        assert_eq!(metrics(&plain)["partialGraph"]["enabled"], false);
     }
 
     #[test]
@@ -2714,7 +3243,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         let path = cache.path().join(format!("{key}.json"));
         write_hashes(&path, &data, true);
         let before = fs::metadata(&path).unwrap().modified().unwrap();
-        let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
         assert!(retrieval.cache_hit);
         assert!(retrieval.cache_read_millis.is_some());
         assert!(retrieval.generation.is_none());
@@ -2789,7 +3318,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         write_hashes(&path, &data, false);
         assert_eq!(metrics(&state)["cache"]["memory"]["entries"], 0);
 
-        let first = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        let first = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
         assert!(first.cache_hit);
         let memory = metrics(&state)["cache"]["memory"].clone();
         assert_eq!(memory["entries"], 1);
@@ -2799,7 +3328,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         // The on-disk entry is gone (pruned, say); the parsed one still serves, and both
         // retrievals share the same allocation.
         fs::remove_file(&path).unwrap();
-        let second = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        let second = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
         assert!(second.cache_hit);
         assert!(Arc::ptr_eq(&first.data, &second.data));
         assert_eq!(second.data.hashes["//app:lib"].hash, "overall");
@@ -2828,13 +3357,13 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             remote_cache_with_responses("", vec![(200, gzip(&bytes).unwrap())]);
         let state = ready_state(config, Some(remote));
 
-        let first = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        let first = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
         assert!(first.cache_hit);
         assert!(first.cache_read_millis.is_some());
         assert_eq!(first.data.hashes["//app:lib"].hash, "overall");
         let key = cache_key_for_commit(&state, &sha);
         assert!(cache.path().join(format!("{key}.json")).is_file());
-        let second = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        let second = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
         assert!(second.cache_hit);
         assert_eq!(second.data.hashes["//app:lib"].hash, "overall");
 
@@ -2986,7 +3515,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             };
             let key = cache_key_for_commit(&state, &sha);
             write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
-            let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+            let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
             assert!(retrieval.cache_hit);
             assert_eq!(retrieval.data.hashes["//app:lib"].hash, "overall");
         }
@@ -3014,7 +3543,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             ],
         );
         let state = ready_state(config, Some(remote));
-        let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
         assert!(retrieval.cache_hit);
         assert_eq!(retrieval.data.hashes["//app:lib"].hash, "overall");
         requests.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -3037,7 +3566,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         };
         let key = cache_key_for_commit(&guarded, &sha);
         write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
-        assert!(get_hashes_locked(&guarded, &sha, &BTreeSet::new()).is_err());
+        assert!(get_hashes_locked(&guarded, &sha, &BTreeSet::new(), None).is_err());
     }
 
     #[test]
@@ -3053,6 +3582,12 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 module_graph_millis: 4,
                 cache_write_millis: 5,
                 target_count: 6,
+                partial: PartialProfile {
+                    mode: Some("derived"),
+                    derived_from: Some("base".into()),
+                    changed_sources: Some(2),
+                    ..Default::default()
+                },
             }),
         };
         let value = retrieval_profile("abc", &retrieval, Instant::now());
@@ -3068,7 +3603,10 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 "targetHashMillis": 3,
                 "moduleGraphMillis": 4,
                 "cacheWriteMillis": 5,
-                "targetCount": 6
+                "targetCount": 6,
+                "mode": "derived",
+                "derivedFrom": "base",
+                "changedSources": 2
             })
         );
     }

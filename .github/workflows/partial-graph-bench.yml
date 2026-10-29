@@ -1,0 +1,129 @@
+name: "Perf: serve --partialGraph vs default"
+
+# Nightly proof for the opt-in partial-graph mode of `bazel-diff serve`. The mode answers a
+# revision whose diff from the cached `from` entry only edits regular source files by
+# re-evaluating that entry's hashing recipes against the new revision's git tree -- no checkout,
+# no `bazel query` -- and falls back to a full generation for anything that can change the graph.
+# It stays opt-in until this cron shows, night after night, that it is
+#
+#   accurate   the impacted set and the distance-annotated set match the default mode on every
+#              revision pair, and every derived cache entry is byte-identical to the entry a full
+#              generation under the same mode writes for that revision (a fresh "verify" server);
+#   correct    the scenarios that must derive do, and the ones that must not (a BUILD or MODULE
+#              edit, an added or deleted path) fall back to a full generation;
+#   faster     the `to` retrieval and the whole request, derived versus the default mode's full
+#              generation, cold and warm.
+#
+# tools/perf/partial_graph_bench.py runs three serve instances in turn on each synthetic workload
+# (baseline, partial, verify) and commits the scenarios on top of the base revision, one commit per
+# iteration and leg. See tools/perf/README.md ("Partial-graph mode harness"). Any accuracy or
+# classifier failure fails the run. Note: scheduled + dispatched workflows run from the default
+# branch, so this must land on master before the cron fires.
+on:
+  workflow_dispatch:
+    inputs:
+      workloads:
+        description: "Comma-separated synthetic presets (tiny, small, medium, large, xlarge)"
+        type: string
+        default: "small,medium"
+      iterations:
+        description: "Warm iterations per scenario (plus one cold leg each)"
+        type: string
+        default: "2"
+      scenarios:
+        description: "Comma-separated scenarios to run (empty = all)"
+        type: string
+        default: ""
+      quick:
+        description: "Smoke profile: tiny workload, one iteration (overrides workloads/iterations)"
+        type: boolean
+        default: false
+  schedule:
+    # Nightly at 04:30 UTC, offset from the Tango perf cron (45 3), serve-consistency (30 3), the
+    # cache-probe bench (15 5), the serve crons (30 6, 30 8, 30 10, 30 14, 0 */12) and the
+    # format/badge crons (12:00-13:00) so the jobs never contend for runners.
+    - cron: "30 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  PartialGraphBench:
+    runs-on: ubuntu-latest
+    # Every scenario commit is generated in full twice (baseline and verify) plus the partial
+    # server's own work; the two default legs with two warm iterations fit well inside an hour on a
+    # 4-core runner. Generous timeout so a slow runner yields data, not a kill.
+    timeout-minutes: 180
+    steps:
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.25.0'
+          cache: false
+        id: go
+      - name: Setup Bazelisk
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
+      - uses: actions/checkout@v4
+      - name: Build bazel-diff
+        # Built here rather than by the harness so the Rust build has its own step and log. The
+        # .bazelrc lint aspects are skipped: this is a measurement binary, CI lints it elsewhere.
+        run: >
+          ~/go/bin/bazelisk build //src:bazel-diff -c opt
+          --output_groups=-clippy_checks,-rustfmt_checks
+          --enable_bzlmod=true --enable_workspace=false
+      - name: Run partial-graph harness
+        # Dispatch inputs reach the harness through the environment and a bash array, never by
+        # interpolating them into the command line. Scheduled runs see empty inputs and take the
+        # defaults.
+        env:
+          IN_WORKLOADS: ${{ inputs.workloads || 'small,medium' }}
+          IN_ITERATIONS: ${{ inputs.iterations || '2' }}
+          IN_SCENARIOS: ${{ inputs.scenarios }}
+          IN_QUICK: ${{ inputs.quick && 'true' || 'false' }}
+        run: |
+          args=()
+          if [ "$IN_QUICK" = "true" ]; then
+            args+=(--quick)
+          else
+            IFS=',' read -ra WLS <<< "$IN_WORKLOADS"
+            for w in "${WLS[@]}"; do
+              w="${w//[[:space:]]/}"
+              [ -n "$w" ] && args+=(--workload "$w")
+            done
+            args+=(--iterations "$IN_ITERATIONS")
+          fi
+          IFS=',' read -ra SCS <<< "$IN_SCENARIOS"
+          for s in "${SCS[@]}"; do
+            s="${s//[[:space:]]/}"
+            [ -n "$s" ] && args+=(--scenario "$s")
+          done
+          echo "harness args: ${args[*]}"
+          python3 tools/perf/partial_graph_bench.py \
+            --bazel "$HOME/go/bin/bazelisk" \
+            --bazel-diff bazel-bin/src/bazel-diff \
+            --skip-build \
+            --metrics-out partial-graph-metrics.json \
+            --summary-out partial-graph-summary.md \
+            "${args[@]}"
+      - name: Publish step summary
+        if: always()
+        run: |
+          if [ -f partial-graph-summary.md ]; then
+            cat partial-graph-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: partial-graph-${{ github.run_id }}
+          path: |
+            partial-graph-metrics.json
+            partial-graph-summary.md
+          if-no-files-found: warn
+          retention-days: 90

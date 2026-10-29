@@ -1,3 +1,4 @@
+use crate::partial::PartialRecipes;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeStruct};
@@ -215,7 +216,8 @@ impl Serialize for SerializedMetadata<'_> {
             "HashMetadata",
             usize::from(self.data.module_graph_json.is_some())
                 + usize::from(include_dep_edges)
-                + usize::from(self.data.dependency_fingerprint.is_some()),
+                + usize::from(self.data.dependency_fingerprint.is_some())
+                + usize::from(self.data.partial.is_some()),
         )?;
         if let Some(module_graph_json) = &self.data.module_graph_json {
             state.serialize_field("moduleGraphJson", module_graph_json)?;
@@ -225,6 +227,9 @@ impl Serialize for SerializedMetadata<'_> {
         }
         if include_dep_edges {
             state.serialize_field("depEdges", &self.data.dep_edges)?;
+        }
+        if let Some(partial) = &self.data.partial {
+            state.serialize_field("partialGraph", partial)?;
         }
         state.end()
     }
@@ -247,6 +252,7 @@ impl Serialize for SerializedHashFile<'_> {
         };
         if self.data.module_graph_json.is_none()
             && self.data.dependency_fingerprint.is_none()
+            && self.data.partial.is_none()
             && (!self.include_deps || self.data.dep_edges.is_empty())
         {
             return hashes.serialize(serializer);
@@ -270,6 +276,8 @@ pub struct HashFileData {
     pub module_graph_json: Option<String>,
     pub dependency_fingerprint: Option<String>,
     pub dep_edges: BTreeMap<String, Vec<String>>,
+    /// Partial-graph mode (`serve --partialGraph`): the recipes a derivation re-evaluates.
+    pub partial: Option<PartialRecipes>,
 }
 
 /// A JSON string borrowed from the input when it has no escapes, copied otherwise. Hash values
@@ -339,6 +347,8 @@ struct Metadata {
     dependency_fingerprint: Option<String>,
     #[serde(default)]
     dep_edges: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    partial_graph: Option<PartialRecipes>,
 }
 
 impl<'de> Deserialize<'de> for HashFileData {
@@ -364,6 +374,7 @@ impl<'de> Deserialize<'de> for HashFileData {
                             data.module_graph_json = metadata.module_graph_json;
                             data.dependency_fingerprint = metadata.dependency_fingerprint;
                             data.dep_edges = metadata.dep_edges;
+                            data.partial = metadata.partial_graph;
                         }
                         label => {
                             let value = map.next_value::<JsonStr<'de>>()?;
@@ -420,6 +431,7 @@ impl HashFileData {
             .collect::<Map<_, _>>();
         if self.module_graph_json.is_none()
             && self.dependency_fingerprint.is_none()
+            && self.partial.is_none()
             && (!include_deps || self.dep_edges.is_empty())
         {
             return Value::Object(hashes);
@@ -441,6 +453,12 @@ impl HashFileData {
             metadata.insert(
                 "depEdges".to_owned(),
                 serde_json::to_value(&self.dep_edges).expect("serializing string map cannot fail"),
+            );
+        }
+        if let Some(partial) = &self.partial {
+            metadata.insert(
+                "partialGraph".to_owned(),
+                serde_json::to_value(partial).expect("serializing recipes cannot fail"),
             );
         }
         serde_json::json!({"hashes": hashes, "metadata": metadata})
@@ -753,6 +771,24 @@ mod tests {
         let streamed = serde_json::to_value(data.serialized(true, false)).unwrap();
         assert_eq!(streamed, data.to_value(true, false));
         assert!(streamed.get("metadata").is_some());
+
+        data.dependency_fingerprint = None;
+        data.partial = Some(PartialRecipes {
+            version: 1,
+            seed_hash: "00".repeat(32),
+            package_seeds: true,
+            rules: BTreeMap::from([(
+                "//a:a".to_owned(),
+                crate::partial::RuleRecipe("11".repeat(32), vec!["//b:b".into()], vec![]),
+            )]),
+            ..Default::default()
+        });
+        let streamed = serde_json::to_value(data.serialized(true, false)).unwrap();
+        assert_eq!(streamed, data.to_value(true, false));
+        assert_eq!(streamed["metadata"]["partialGraph"]["version"], 1);
+        let parsed = HashFileData::from_slice(streamed.to_string().as_bytes()).unwrap();
+        assert_eq!(parsed.partial, data.partial);
+        assert_eq!(parsed.hashes, data.hashes);
     }
 
     #[test]

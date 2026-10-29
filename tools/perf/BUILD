@@ -37,3 +37,21 @@ py_test(
     python_version = "PY3",
     deps = [":cache_probe_bench_lib"],
 )
+
+# partial_graph_bench.py (the nightly proof behind partial-graph-bench.yml that `serve
+# --partialGraph` is faster and exactly as accurate as the default mode) is not a py_binary for the
+# same reason. It imports tango_compare for its shared helpers.
+py_library(
+    name = "partial_graph_bench_lib",
+    srcs = ["partial_graph_bench.py"],
+    imports = ["."],
+    visibility = ["//visibility:private"],
+    deps = [":tango_compare_lib"],
+)
+
+py_test(
+    name = "partial_graph_bench_test",
+    srcs = ["partial_graph_bench_test.py"],
+    python_version = "PY3",
+    deps = [":partial_graph_bench_lib"],
+)

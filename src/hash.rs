@@ -4,6 +4,7 @@ use crate::bazel::{
 };
 use crate::cancel::{self, Cancellation};
 use crate::model::{HashFileData, TargetHash};
+use crate::partial::{self, RecipeRecorder, RuleRecipe, TreeIndex};
 use crate::proto::blaze_query::{target, Rule, Target};
 use anyhow::{anyhow, bail, Context, Result};
 use buffa::{EncodeSink, Message, SizeCache};
@@ -25,7 +26,7 @@ type DigestBytes = [u8; 32];
 const DEFAULT_HASH_THREADS: usize = 4;
 const FILE_HASH_BUFFER_SIZE: usize = 64 * 1024;
 
-fn hash_pool() -> &'static rayon::ThreadPool {
+pub(crate) fn hash_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         let threads = std::env::var("RAYON_NUM_THREADS")
@@ -55,6 +56,12 @@ pub struct HashOptions {
     pub modified_filepaths: BTreeSet<PathBuf>,
     pub track_deps: bool,
     pub always_affected_tags: HashSet<String>,
+    /// Partial-graph mode (`serve --partialGraph`): the hashed revision's `git ls-tree`. When
+    /// set, main-repository sources are digested from the tree instead of the working tree, every
+    /// rule's hashing recipe is recorded, and the hashes are computed by evaluating those recipes
+    /// (see [`crate::partial`]), so that an entry derived from this one later is identical to
+    /// what a full generation would produce.
+    pub partial_tree: Option<Arc<TreeIndex>>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,37 +77,75 @@ struct TargetDigestBuilder {
     direct: Sha256,
     deps: Vec<String>,
     track_deps: bool,
+    /// Partial-graph mode: the recipe under construction. Every direct contribution that is not
+    /// a source digest also feeds `static`; source inputs and dependency keys are listed in
+    /// contribution order.
+    recipe: Option<RecipeBuilder>,
+}
+
+struct RecipeBuilder {
+    fixed: Sha256,
+    sources: Vec<String>,
+    deps: Vec<String>,
 }
 
 impl TargetDigestBuilder {
-    fn new(track_deps: bool) -> Self {
+    fn new(track_deps: bool, record_recipe: bool) -> Self {
         Self {
             overall: Sha256::new(),
             direct: Sha256::new(),
             deps: Vec::new(),
             track_deps,
+            recipe: record_recipe.then(|| RecipeBuilder {
+                fixed: Sha256::new(),
+                sources: Vec::new(),
+                deps: Vec::new(),
+            }),
         }
     }
 
+    /// A direct contribution that is not a source digest.
     fn direct(&mut self, bytes: impl AsRef<[u8]>) {
-        self.direct.update(bytes);
+        self.direct.update(&bytes);
+        if let Some(recipe) = &mut self.recipe {
+            recipe.fixed.update(bytes);
+        }
     }
 
-    fn transitive(&mut self, label: &str, bytes: impl AsRef<[u8]>) {
+    /// The digest of a source input.
+    fn source(&mut self, label: &str, digest: impl AsRef<[u8]>) {
+        self.direct.update(digest);
+        if let Some(recipe) = &mut self.recipe {
+            recipe.sources.push(label.to_owned());
+        }
+    }
+
+    /// The overall digest of a dependency: `label` is the key the edge names (for
+    /// `--trackDeps`), `canonical` the rule that was hashed (for the recipe).
+    fn transitive(&mut self, label: &str, canonical: &str, bytes: impl AsRef<[u8]>) {
         self.overall.update(bytes);
         if self.track_deps {
             self.deps.push(label.to_owned());
         }
+        if let Some(recipe) = &mut self.recipe {
+            recipe.deps.push(canonical.to_owned());
+        }
     }
 
-    fn finish(mut self) -> TargetDigest {
+    fn finish(mut self) -> (TargetDigest, Option<RuleRecipe>) {
         let direct = self.direct.finalize().into();
         self.overall.update(direct);
-        TargetDigest {
-            overall: self.overall.finalize().into(),
-            direct,
-            deps: (!self.deps.is_empty()).then(|| Rc::new(self.deps)),
-        }
+        let recipe = self.recipe.map(|recipe| {
+            RuleRecipe::new(recipe.fixed.finalize().into(), recipe.sources, recipe.deps)
+        });
+        (
+            TargetDigest {
+                overall: self.overall.finalize().into(),
+                direct,
+                deps: (!self.deps.is_empty()).then(|| Rc::new(self.deps)),
+            },
+            recipe,
+        )
     }
 }
 
@@ -229,8 +274,12 @@ fn hash_targets_with_environment(
     external_resolver: ExternalRepoResolver,
     module_graph_json: Option<String>,
 ) -> Result<HashFileData> {
+    if options.partial_tree.is_some() && options.bazel.use_cquery {
+        bail!("partial graph mode does not support --useCquery");
+    }
     let source_hasher = SourceHasher {
         workspace: &options.bazel.workspace,
+        tree: options.partial_tree.as_deref(),
         content_hashes: options.content_hashes.as_ref(),
         modified_filepaths: &options.modified_filepaths,
         fine_grained_external_repos: options
@@ -254,6 +303,10 @@ fn hash_targets_with_environment(
     } else {
         package_bzl_seeds(&targets, &source_hasher)?
     };
+    let mut recorder = options
+        .partial_tree
+        .is_some()
+        .then(|| RecipeRecorder::new(seed_hash, !has_instantiation_stacks));
 
     let mut rules = HashMap::<String, Rc<RuleNode>>::with_capacity(definition_digests.len());
     let mut decoded_rules = Vec::<(String, Rule)>::new();
@@ -285,6 +338,9 @@ fn hash_targets_with_environment(
             target::Discriminator::SourceFile => {
                 if let Some(source) = target.source_file.into_option() {
                     let name = source.name;
+                    if let Some(recorder) = &mut recorder {
+                        recorder.record_source(&name, &source.subinclude);
+                    }
                     hash_targets.push(HashTarget::Source(name.clone()));
                     source_targets.push(SourceTarget {
                         name,
@@ -351,6 +407,9 @@ fn hash_targets_with_environment(
             })
             .cloned()
             .ok_or_else(|| anyhow!("Unexpected generating rule {generating_rule}"))?;
+        if let Some(recorder) = &mut recorder {
+            recorder.record_generated(name, &rule.rule.name);
+        }
         rules.insert(name.clone(), rule);
         if let (Some(index), (label, Some(_))) = (&mut label_instances, split_configured(name)) {
             let instances = index.entry(label.to_owned()).or_default();
@@ -373,6 +432,7 @@ fn hash_targets_with_environment(
         bzl_digests: HashMap::new(),
         always_affected_seed: unique_invocation_seed(),
         cycle_warnings: HashSet::new(),
+        recorder,
     };
     // `--order_output=no` makes the query order arbitrary. Acyclic hashes do not care, but the
     // digest of a cycle depends on which member is entered first, so fix the traversal order.
@@ -415,13 +475,28 @@ fn hash_targets_with_environment(
         };
         digests.push((key, kind, digest));
     }
+    let recorder = context.recorder.take();
     drop(context);
-    let (hashes, dep_edges) = aggregate_by_label(digests, options.track_deps);
+    let (mut hashes, dep_edges) = aggregate_by_label(digests, options.track_deps);
+    let mut partial = None;
+    if let (Some(recorder), Some(tree)) = (recorder, &options.partial_tree) {
+        // The traversal above only recorded the recipes; the hashes an entry in this mode
+        // carries are what evaluating them yields, so a later derivation from this entry
+        // computes exactly the same values.
+        let recipes = recorder.finish();
+        let targets = hashes
+            .iter()
+            .map(|(label, hash)| (label.clone(), hash.kind.clone()))
+            .collect();
+        hashes = partial::evaluate(&recipes, &targets, tree)?;
+        partial = Some(recipes);
+    }
     Ok(HashFileData {
         hashes,
         module_graph_json,
         dependency_fingerprint: None,
         dep_edges,
+        partial,
     })
 }
 
@@ -564,6 +639,8 @@ struct HashContext<'a> {
     always_affected_seed: DigestBytes,
     /// Targets already reported as the entry of a cycle, so each is warned about once.
     cycle_warnings: HashSet<String>,
+    /// Partial-graph mode: collects every rule's recipe as it is hashed.
+    recorder: Option<RecipeRecorder>,
 }
 
 impl HashContext<'_> {
@@ -602,6 +679,10 @@ impl HashContext<'_> {
         builder.overall = transitive.clone();
         if builder.track_deps {
             builder.deps.clone_from(&inputs.labels);
+        }
+        if let Some(recipe) = &mut builder.recipe {
+            // Hub members are rule keys already hashed under their own names.
+            recipe.deps.clone_from(&inputs.labels);
         }
         true
     }
@@ -665,7 +746,8 @@ impl HashContext<'_> {
         }
         path.push(canonical_key.clone());
 
-        let mut builder = TargetDigestBuilder::new(self.options.track_deps);
+        let mut builder =
+            TargetDigestBuilder::new(self.options.track_deps, self.recorder.is_some());
         builder.direct(rule.prepared.definition_digest);
         builder.direct(self.seed_hash);
         if let Some(seed) = self.rule_bzl_seed(&rule.rule)? {
@@ -746,16 +828,17 @@ impl HashContext<'_> {
             builder.direct(encoded_input.as_bytes());
             let input_label = target_label(&encoded_input);
             if let Some(source_digest) = self.source_digests.get(input_label) {
-                builder.direct(source_digest);
+                builder.source(input_label, source_digest);
             } else if let Some(dependency) = self
                 .resolve_dependency(&encoded_input, input_label, path)
                 .filter(|dependency| dependency.as_ref() != canonical_key)
             {
                 let digest = self.rule_overall_digest(&dependency, path)?;
-                builder.transitive(&dependency, digest);
+                let canonical = self.canonical_key(&dependency);
+                builder.transitive(&dependency, &canonical, digest);
             } else if let Some(digest) = self.source_hasher.soft_digest(input_label, &[])? {
                 self.source_digests.insert(input_label.to_owned(), digest);
-                builder.direct(digest);
+                builder.source(input_label, digest);
             } else if self.options.bazel.verbose {
                 eprintln!(
                     "[Warn] Unable to calculate digest for input {input_label} for rule {}",
@@ -777,14 +860,25 @@ impl HashContext<'_> {
                 }
                 builder.direct(package_group.as_bytes());
                 let digest = self.rule_overall_digest(package_group, path)?;
-                builder.transitive(package_group, digest);
+                builder.transitive(package_group, package_group, digest);
             }
         }
 
         let canonical_key = path.pop().expect("rule path contains the current rule");
-        let digest = builder.finish();
+        let (digest, recipe) = builder.finish();
+        if let (Some(recorder), Some(recipe)) = (&mut self.recorder, recipe) {
+            recorder.record_rule(&canonical_key, recipe);
+        }
         self.cache.insert(canonical_key, digest.clone());
         Ok(digest)
+    }
+
+    /// The name a dependency key is hashed under: a generated file's key maps to its
+    /// generating rule, every other key to itself.
+    fn canonical_key(&self, key: &str) -> String {
+        self.rules
+            .get(key)
+            .map_or_else(|| key.to_owned(), |rule| rule.rule.name.clone())
     }
 
     /// The key of the rule a rule input resolves to.
@@ -1315,6 +1409,8 @@ pub fn label_package(label: &str) -> &str {
 
 struct SourceHasher<'a> {
     workspace: &'a Path,
+    /// Partial-graph mode: main-repository labels are digested from this tree.
+    tree: Option<&'a TreeIndex>,
     content_hashes: Option<&'a BTreeMap<String, String>>,
     modified_filepaths: &'a BTreeSet<PathBuf>,
     fine_grained_external_repos: BTreeSet<String>,
@@ -1323,6 +1419,11 @@ struct SourceHasher<'a> {
 
 impl SourceHasher<'_> {
     fn digest(&self, label: &str, seed: &[u8]) -> Result<DigestBytes> {
+        if let Some(tree) = self.tree {
+            if is_main_repo(label) {
+                return Ok(partial::source_digest(tree, label, seed));
+            }
+        }
         let Some((path, content_key)) = self.resolve(label)? else {
             return Ok(Sha256::digest([]).into());
         };
@@ -1383,6 +1484,10 @@ impl SourceHasher<'_> {
         if !is_main_repo(label) {
             return Ok(None);
         }
+        if let Some(tree) = self.tree {
+            debug_assert!(seed.is_empty());
+            return Ok(partial::soft_digest(tree, label));
+        }
         let Some((path, _)) = self.resolve(label)? else {
             return Ok(None);
         };
@@ -1431,7 +1536,7 @@ impl SourceHasher<'_> {
     }
 }
 
-fn is_main_repo(label: &str) -> bool {
+pub(crate) fn is_main_repo(label: &str) -> bool {
     label.starts_with("//") || label.starts_with("@//") || label.starts_with("@@//")
 }
 
@@ -1720,6 +1825,7 @@ mod tests {
             modified_filepaths: BTreeSet::new(),
             track_deps: true,
             always_affected_tags: HashSet::new(),
+            partial_tree: None,
         }
     }
 
@@ -2178,6 +2284,7 @@ esac
         };
         let modified = BTreeSet::new();
         let hasher = |fine_grained: &[&str]| SourceHasher {
+            tree: None,
             workspace: workspace.path(),
             content_hashes: None,
             modified_filepaths: &modified,
@@ -2372,17 +2479,27 @@ esac
 
     #[test]
     fn digest_builder_tracks_direct_transitive_and_dependencies() {
-        let mut tracked = TargetDigestBuilder::new(true);
+        let mut tracked = TargetDigestBuilder::new(true, false);
         tracked.direct(b"direct");
-        tracked.transitive("//dep:a", b"dependency");
-        let tracked = tracked.finish();
+        tracked.transitive("//dep:a", "//dep:a", b"dependency");
+        let (tracked, recipe) = tracked.finish();
         assert_eq!(tracked.deps.unwrap().as_slice(), ["//dep:a"]);
         assert_ne!(tracked.direct, tracked.overall);
+        assert!(recipe.is_none());
 
-        let mut untracked = TargetDigestBuilder::new(false);
+        let mut untracked = TargetDigestBuilder::new(false, true);
         untracked.direct(b"direct");
-        untracked.transitive("//dep:a", b"dependency");
-        assert!(untracked.finish().deps.is_none());
+        untracked.source("//pkg:src", b"source");
+        untracked.transitive("//dep:a.out", "//dep:a", b"dependency");
+        let (untracked, recipe) = untracked.finish();
+        assert!(untracked.deps.is_none());
+        let recipe = recipe.unwrap();
+        assert_eq!(recipe.sources(), ["//pkg:src"]);
+        assert_eq!(recipe.deps(), ["//dep:a"]);
+        assert_eq!(
+            recipe.static_digest().unwrap(),
+            <[u8; 32]>::from(Sha256::digest(b"direct"))
+        );
         assert_eq!(crate::model::Digest::from([0; 32]).to_string().len(), 64);
     }
 
@@ -3063,6 +3180,7 @@ esac
         };
         let modified = BTreeSet::new();
         let hasher = SourceHasher {
+            tree: None,
             workspace: workspace.path(),
             content_hashes: None,
             modified_filepaths: &modified,
@@ -3103,6 +3221,7 @@ esac
         };
         let modified = BTreeSet::new();
         let hasher = SourceHasher {
+            tree: None,
             workspace: workspace.path(),
             content_hashes: None,
             modified_filepaths: &modified,
@@ -3160,6 +3279,7 @@ esac
         };
         let modified = BTreeSet::new();
         let hasher = SourceHasher {
+            tree: None,
             workspace: workspace.path(),
             content_hashes: Some(&content_hashes),
             modified_filepaths: &modified,
@@ -3185,6 +3305,7 @@ esac
         );
 
         let not_fine_grained = SourceHasher {
+            tree: None,
             workspace: workspace.path(),
             content_hashes: Some(&content_hashes),
             modified_filepaths: &modified,
@@ -3214,6 +3335,7 @@ esac
         };
         let modified = BTreeSet::new();
         let hasher = SourceHasher {
+            tree: None,
             workspace: workspace.path(),
             content_hashes: None,
             modified_filepaths: &modified,
@@ -3259,6 +3381,7 @@ esac
         fs::write(directory.join("a.txt"), "a").unwrap();
         let unrelated = BTreeSet::from([PathBuf::from("other/file.txt")]);
         let scoped_out = SourceHasher {
+            tree: None,
             workspace: workspace.path(),
             content_hashes: None,
             modified_filepaths: &unrelated,
@@ -3273,6 +3396,7 @@ esac
         );
         let inside = BTreeSet::from([PathBuf::from("pkg/testdata/a.txt")]);
         let scoped_in = SourceHasher {
+            tree: None,
             workspace: workspace.path(),
             content_hashes: None,
             modified_filepaths: &inside,
@@ -3514,6 +3638,7 @@ esac
         };
         let modified = BTreeSet::new();
         let hasher = SourceHasher {
+            tree: None,
             workspace: workspace.path(),
             content_hashes: None,
             modified_filepaths: &modified,

@@ -205,3 +205,104 @@ bazel test //tools/perf:cache_probe_bench_test
 - The probe answers "is this result cached", not "did this change touch it". With a fully seeded
   cache the two coincide; the `partial_*` scenarios measure how far they drift apart when they do
   not, and whether bounding the probe by bazel-diff's candidates (hybrid) keeps the drift in check.
+
+## Partial-graph mode harness
+
+[`partial_graph_bench.py`](partial_graph_bench.py) is the nightly proof behind the opt-in
+`bazel-diff serve --partialGraph` mode (see the top-level README, "Query Service"). The mode answers
+a revision whose diff from the cached `from` entry only edits regular source content by
+re-evaluating that entry's recorded hashing recipes against the new revision's `git ls-tree` -- no
+checkout, no `bazel query` -- and falls back to a full generation for anything that can change the
+graph. The [`partial-graph-bench` workflow](../../.github/workflows/partial-graph-bench.yml) runs
+this harness nightly; the mode stays opt-in until the trend shows it is **exactly as accurate** and
+**faster**.
+
+### What is checked
+
+Three `serve` instances run one after another on the same workspace (so they share one Bazel
+server and compare like for like):
+
+| Instance | Flags | Role |
+|---|---|---|
+| `baseline` | `--trackDeps` | ground truth and today's cost: a full generation of every `to` revision |
+| `partial` | `--partialGraph --trackDeps` | the derivation under test |
+| `verify` | `--partialGraph --trackDeps`, fresh cache | a full generation of every `to` revision under the mode, whose cache entry the partial server's must equal |
+
+Per revision pair the harness asserts, and fails the run on (unless `--no-require-match`):
+
+- **accuracy** -- `/impacted_targets` and `/impacted_targets_with_distances` agree label for label
+  with the baseline, and the partial server's cache entry for `to` is byte-identical to the
+  verify server's (hashes, dependency edges, module graph, recipes);
+- **classifier correctness** -- the scenarios that must derive report `generation.mode = derived`,
+  and the ones that must not report `full` with a `partialFallbackReason`;
+- **speed** -- the `to` retrieval and the whole request, derived versus the baseline's full
+  generation, cold (Bazel server restarted before the query) and warm; the verify server's
+  numbers show what recording recipes costs a full generation.
+
+### Scenarios
+
+Synthetic workloads are the Tango-comparison presets from
+[`gen_project.py`](../firecracker/bench/gen_project.py), plus one tracked file no target reads
+(`docs/NOTES.md`). Every scenario is committed on top of the base revision, once per warm iteration
+and once more for the cold leg, with iteration-specific content so no two commits share a tree
+(the serve cache is keyed by tree):
+
+| Scenario | Edit | Expected |
+|---|---|---|
+| `leaf_edit` | one source file ~75% deep in the graph | derived |
+| `wide_edit` | the layer-0 source with the most dependents | derived |
+| `multi_edit` | ten sources spread across the packages | derived |
+| `exec_bit` | flip a source's executable bit (and edit it) | derived |
+| `unmatched_edit` | edit the tracked file no target reads | derived, empty impacted set |
+| `chain` | a second leaf edit on top of the `leaf_edit` commit | derived from a derived entry |
+| `build_edit` | touch a `BUILD.bazel` (plus a leaf edit) | full generation |
+| `module_edit` | touch `MODULE.bazel` | full generation |
+| `add_file` | add an unreferenced file | full generation |
+| `delete_file` | delete the unreferenced tracked file (plus a leaf edit) | full generation |
+
+A real repository (`--repo-url URL --repo-to REV --repo-commits N`) is replayed instead along its
+first-parent history, `N` consecutive pairs ending at `REV`. There is no expected mode for a real
+commit, so the report shows how often real changes derive (the fallback rate the classifier's
+conservatism costs) while every pair is still held to the accuracy checks.
+
+### Running locally
+
+```bash
+# Build bazel-diff, then the two nightly presets (small, medium) x 2 warm iterations + 1 cold leg.
+python3 tools/perf/partial_graph_bench.py --bazel ~/go/bin/bazelisk
+
+# Smoke profile: tiny workload, one warm iteration, reusing an existing binary.
+python3 tools/perf/partial_graph_bench.py --quick --skip-build --bazel-diff bazel-bin/src/bazel-diff
+
+# Only some scenarios, keep the scratch directory, write the report files the workflow publishes.
+python3 tools/perf/partial_graph_bench.py --workload medium --scenario leaf_edit --scenario build_edit \
+    --workdir /tmp/pgb --keep-workdir --metrics-out metrics.json --summary-out summary.md
+
+# Replay ten commits of a real repository.
+python3 tools/perf/partial_graph_bench.py --repo-url https://github.com/bazelbuild/bazel-skylib.git \
+    --repo-to HEAD --repo-commits 10 --workload skylib
+```
+
+`--serve-arg=<flag>` adds a flag to every serve instance (a `--bazelStartupOptions`, a
+`--partialGraphRebuildPattern`). Requirements: `git`, a `bazel`/`bazelisk` binary, Python 3.9+,
+stdlib only.
+
+### Output
+
+`--summary-out` is GitHub-flavored markdown (the workflow appends it to `$GITHUB_STEP_SUMMARY`): per
+workload the derived-pair count and a per-scenario table of expected and observed modes, baseline
+cold and warm, the partial `to` retrieval and whole request, the verify full generation, the
+speedup (baseline warm / partial `to`; the request column is warm legs only), and the two agreement columns; then every failure.
+`--metrics-out` is JSON with the environment and, per pair, the three instances' timings and
+profile fields (`mode`, `partialFallbackReason`, `classifyMillis`, `deriveMillis`,
+`changedSources`, `unmatchedPaths`), the impacted-set and distance comparisons with the first
+differing labels, and the entry comparison with the first differing hashes.
+
+### Unit tests
+
+```bash
+bazel test //tools/perf:partial_graph_bench_test
+```
+
+They cover the pure helpers: the scenario edit plans, reading the profile, set comparison, the
+per-pair checks, the medians and the rendering.

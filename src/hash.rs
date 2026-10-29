@@ -201,11 +201,14 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
     } = options.bazel.query_all_targets_with(|batch, inputs| {
         let prehash = |target: &mut Target, shared_inputs| {
             let rule = target.rule.as_option_mut()?;
+            // Read before `prehash_rule` drops the attributes they come from.
+            let loading_inputs = partial_loading_inputs(options, rule);
             Some((
                 rule.name.clone(),
                 PreparedRule {
                     definition_digest: prehash_rule(rule, &options.ignored_attributes),
                     shared_inputs,
+                    loading_inputs,
                 },
             ))
         };
@@ -370,6 +373,7 @@ fn hash_targets_with_environment(
             .into_par_iter()
             .map(|(name, rule)| {
                 let definition_digest = rule_definition_digest(&rule, &options.ignored_attributes);
+                let loading_inputs = partial_loading_inputs(options, &rule);
                 (
                     name,
                     RuleNode {
@@ -377,6 +381,7 @@ fn hash_targets_with_environment(
                         prepared: PreparedRule {
                             definition_digest,
                             shared_inputs: None,
+                            loading_inputs,
                         },
                     },
                 )
@@ -419,6 +424,17 @@ fn hash_targets_with_environment(
         }
     }
 
+    if let Some(recorder) = &mut recorder {
+        // What repository rules read from the workspace while the graph loads: named by their
+        // attributes, and recorded by Bazel in the repository marker files of everything it
+        // fetched. A change to any of it forces a full generation.
+        for node in rules.values() {
+            recorder.record_loading_inputs(node.prepared.loading_inputs.iter().cloned());
+        }
+        recorder.record_loading_inputs(partial::marker_loading_inputs(
+            &source_hasher.external_resolver.output_base,
+        ));
+    }
     let mut context = HashContext {
         options,
         source_hasher: &source_hasher,
@@ -974,6 +990,17 @@ struct RuleNode {
 struct PreparedRule {
     definition_digest: DigestBytes,
     shared_inputs: Option<RepositoryInputs>,
+    /// Partial-graph mode: the workspace paths a repository rule's definition digest folds in
+    /// (see [`partial::rule_loading_inputs`]); empty for every other rule.
+    loading_inputs: Vec<String>,
+}
+
+/// The loading inputs of a repository rule, in partial-graph mode only.
+fn partial_loading_inputs(options: &HashOptions, rule: &Rule) -> Vec<String> {
+    if options.partial_tree.is_none() {
+        return Vec::new();
+    }
+    partial::rule_loading_inputs(rule, &options.bazel.workspace)
 }
 
 fn source_seed(source: &SourceTarget) -> DigestBytes {
@@ -2824,6 +2851,7 @@ esac
                     PreparedRule {
                         definition_digest: prehash_rule(rule, &options.ignored_attributes),
                         shared_inputs: Some(Arc::clone(&group)),
+                        loading_inputs: Vec::new(),
                     },
                 );
             }

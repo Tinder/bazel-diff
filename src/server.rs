@@ -1782,6 +1782,7 @@ fn classify_revisions(
         diff: &diff,
         tree,
         base,
+        workspace: &state.config.hash_options.bazel.workspace,
         seed_filepaths: &state.config.hash_options.seed_filepaths,
         rebuild_patterns: &state.config.partial_graph_rebuild_patterns,
         module_referenced: &module_referenced,

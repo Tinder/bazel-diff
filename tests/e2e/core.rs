@@ -354,6 +354,42 @@ fn serve_partial_graph_derives_source_edits() {
     );
 }
 
+/// `--partialGraph` must not derive across an edit to a file a repository rule reads while
+/// loading: `dep_repo/hello` is a regular source file to git, but its content sits in the
+/// `//external:dep_repo` node's definition, so the entry records the local repository's root
+/// and a change under it forces a full generation, which still reports `//:consume`.
+#[test]
+fn serve_partial_graph_rebuilds_for_local_repository_edits() {
+    let workspace = copy_workspace("bzlmod_local_repo");
+    let from = init_git(workspace.path());
+    fs::write(workspace.path().join("dep_repo/hello"), "changed\n").unwrap();
+    let to = commit(workspace.path(), "local repository edit");
+    let cache = tempfile::tempdir().unwrap();
+    let server = ServerProcess::start(workspace.path(), cache.path(), &["--partialGraph"]);
+    let (status, body) = server
+        .get(&format!(
+            "/impacted_targets?from={from}&to={to}&profile=true"
+        ))
+        .unwrap();
+    assert_eq!(status, 200, "{body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    let generation = &body["profile"]["hashRetrievals"][1]["generation"];
+    assert_eq!(generation["mode"], "full", "{body}");
+    let reason = generation["partialFallbackReason"].as_str().unwrap();
+    assert!(
+        reason.contains("read while loading") && reason.contains("dep_repo"),
+        "{reason}"
+    );
+    assert!(
+        body["impactedTargets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|label| label == "//:consume"),
+        "{body}"
+    );
+}
+
 #[test]
 fn serve_macro_digest_is_revision_scoped() {
     let workspace = copy_workspace("serve_bzl_cache");

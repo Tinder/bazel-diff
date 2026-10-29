@@ -434,7 +434,10 @@ Notes and operational guidance:
   `*.bzl`, `*.scl`, `MODULE.bazel`, `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`,
   `VENDOR.bazel`, `*bazelrc`, `.bazelversion`, `.bazelignore`, `.bazeliskrc`, `tools/bazel`,
   `*.BUILD`, `BUILD.*`, `*.patch`, `*.diff`); a file `MODULE.bazel` or a `WORKSPACE` file names
-  by label (a requirements or lock file a module extension reads); a `--seed-filepaths` file; or
+  by label (a requirements or lock file a module extension reads); anything a repository rule
+  read from the workspace while the graph was generated (the root of a `local_repository` or
+  `local_path_override`, the files its attributes name, and the files Bazel's repository marker
+  files record as read), which every entry records; a `--seed-filepaths` file; or
   a path matching `--partialGraphRebuildPattern` (a glob: `*` within a path segment, `**` across,
   a pattern without `/` matches the file name; repeatable). A fallback costs speed, never
   correctness. A modified file no target reads impacts nothing, as it would in a full generation.

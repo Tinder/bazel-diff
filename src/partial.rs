@@ -27,15 +27,17 @@
 //! path matching a user-supplied `--partialGraphRebuildPattern` falls back to a full generation.
 //! A fallback costs speed, never correctness.
 
-use crate::bazel::target_label;
+use crate::bazel::{attribute_main_repo_labels, target_label};
 use crate::hash::{hash_pool, is_main_repo, label_package, main_repo_path};
 use crate::model::{HashFileData, TargetHash};
+use crate::proto::blaze_query::Rule;
 use anyhow::{anyhow, bail, Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 type DigestBytes = [u8; 32];
 
@@ -279,6 +281,12 @@ pub struct PartialRecipes {
     /// Generated file label to the key of the rule that generates it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub generated: BTreeMap<String, String>,
+    /// Workspace-relative files and directories read while the graph loads whose content is
+    /// folded into a recipe's static digest rather than tracked as a source target: local
+    /// repository roots, the files repository rules name by label, and the files Bazel's
+    /// repository marker files list. A change under any of them forces a full generation.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub load_inputs: BTreeSet<String>,
 }
 
 impl PartialRecipes {
@@ -293,9 +301,10 @@ impl PartialRecipes {
 /// Collects recipes while the default traversal hashes a query result.
 pub(crate) struct RecipeRecorder {
     recipes: PartialRecipes,
-    /// Packages whose first source file has been seen, including those with no subincludes
-    /// (which `package_subincludes` does not store).
-    seen_packages: BTreeSet<String>,
+    /// Every source's subinclude list, grouped by package and then by list, until `finish`
+    /// picks each package's default: `--order_output=no` makes the query order arbitrary, so
+    /// the default must not depend on which source was seen first.
+    subincludes: BTreeMap<String, BTreeMap<Vec<String>, Vec<String>>>,
 }
 
 impl RecipeRecorder {
@@ -307,30 +316,21 @@ impl RecipeRecorder {
                 package_seeds,
                 ..Default::default()
             },
-            seen_packages: BTreeSet::new(),
+            subincludes: BTreeMap::new(),
         }
     }
 
     pub(crate) fn record_source(&mut self, label: &str, subincludes: &[String]) {
-        let package = label_package(label);
-        if self.seen_packages.insert(package.to_owned()) {
-            if !subincludes.is_empty() {
-                self.recipes
-                    .package_subincludes
-                    .insert(package.to_owned(), subincludes.to_vec());
-            }
-            return;
-        }
-        let package_default = self
-            .recipes
-            .package_subincludes
-            .get(package)
-            .map_or(&[][..], Vec::as_slice);
-        if package_default != subincludes {
-            self.recipes
-                .source_subincludes
-                .insert(label.to_owned(), subincludes.to_vec());
-        }
+        self.subincludes
+            .entry(label_package(label).to_owned())
+            .or_default()
+            .entry(subincludes.to_vec())
+            .or_default()
+            .push(label.to_owned());
+    }
+
+    pub(crate) fn record_loading_inputs(&mut self, paths: impl IntoIterator<Item = String>) {
+        self.recipes.load_inputs.extend(paths);
     }
 
     pub(crate) fn record_generated(&mut self, label: &str, generating_rule: &str) {
@@ -343,9 +343,123 @@ impl RecipeRecorder {
         self.recipes.rules.insert(key.to_owned(), recipe);
     }
 
-    pub(crate) fn finish(self) -> PartialRecipes {
+    pub(crate) fn finish(mut self) -> PartialRecipes {
+        for (package, lists) in std::mem::take(&mut self.subincludes) {
+            // The package default is the list of its lexicographically first source, so the
+            // serialized recipes do not depend on query order; every other list is an override.
+            let default = lists
+                .iter()
+                .min_by_key(|(_, labels)| labels.iter().min().cloned())
+                .map(|(list, _)| list.clone())
+                .unwrap_or_default();
+            for (list, labels) in lists {
+                if list == default {
+                    continue;
+                }
+                for label in labels {
+                    self.recipes.source_subincludes.insert(label, list.clone());
+                }
+            }
+            if !default.is_empty() {
+                self.recipes.package_subincludes.insert(package, default);
+            }
+        }
         self.recipes
     }
+}
+
+/// The workspace paths a repository rule's definition digest folds in: the root of a
+/// `local_repository` (its whole tree is hashed) and every main-repository label among its
+/// attributes (a `build_file`, `patches`, a requirements file). Paths outside the workspace are
+/// not in git and are left out.
+pub(crate) fn rule_loading_inputs(rule: &Rule, workspace: &Path) -> Vec<String> {
+    if !rule.name.starts_with("//external:") {
+        return Vec::new();
+    }
+    let mut inputs = Vec::new();
+    if rule.rule_class == "local_repository" {
+        if let Some(path) = rule
+            .attribute
+            .iter()
+            .find(|attribute| attribute.name == "path")
+            .and_then(|attribute| attribute.string_value.as_deref())
+        {
+            inputs.extend(normalize_workspace_path(workspace, path));
+        }
+    }
+    inputs.extend(
+        attribute_main_repo_labels(&rule.attribute)
+            .filter_map(label_path)
+            .filter(|path| !path.is_empty()),
+    );
+    inputs
+}
+
+/// The main-repository files Bazel's repository marker files (`<output base>/external/*.marker`)
+/// record as read by a fetched repository rule: `FILE:@@//path <hash>` lines. Nothing when the
+/// directory cannot be read.
+pub(crate) fn marker_loading_inputs(output_base: &Path) -> BTreeSet<String> {
+    let mut inputs = BTreeSet::new();
+    let Ok(entries) = fs::read_dir(output_base.join("external")) else {
+        return inputs;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "marker")
+        {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        inputs.extend(marker_file_inputs(&text));
+    }
+    inputs
+}
+
+/// The main-repository paths one marker file's `FILE:` lines name.
+pub fn marker_file_inputs(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("FILE:"))
+        .filter_map(|rest| rest.split(' ').next())
+        .filter(|label| is_main_repo(label))
+        .filter_map(label_path)
+        .filter(|path| !path.is_empty())
+}
+
+/// A workspace path as git names it: `%workspace%/x`, `./x`, `a/../x` and an absolute path
+/// inside the workspace all become `x`. `None` for a path that leaves the workspace.
+pub fn normalize_workspace_path(workspace: &Path, value: &str) -> Option<String> {
+    let value = value
+        .strip_prefix("%workspace%/")
+        .or_else(|| value.strip_prefix("%workspace%"))
+        .unwrap_or(value);
+    let path = Path::new(value);
+    let relative = if path.is_absolute() {
+        match path.strip_prefix(workspace) {
+            Ok(stripped) => stripped.to_path_buf(),
+            Err(_) => {
+                let canonical = fs::canonicalize(workspace).ok()?;
+                path.strip_prefix(&canonical).ok()?.to_path_buf()
+            }
+        }
+    } else {
+        path.to_path_buf()
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(parts.join("/"))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -648,19 +762,38 @@ pub const MODULE_FILES: [&str; 4] = [
     "WORKSPACE.bzlmod",
 ];
 
-/// Main-repository paths named by label literals (`"//pkg:file"`, `"@//:file"`) in `text`.
+/// Main-repository paths named by label literals in `text`, in either quote style:
+/// `"//pkg:file"`, `'@//:file'`, the root-relative `":file"` a module file may use, and the
+/// shorthand `"//pkg"` for `//pkg:pkg`.
 pub fn referenced_main_repo_paths(text: &str) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
-    for (index, _) in text.match_indices('"') {
-        let rest = &text[index + 1..];
-        let Some(end) = rest.find('"') else { break };
-        let literal = &rest[..end];
-        if literal.contains('\n') || !is_main_repo(literal) {
-            continue;
-        }
-        if let Some(path) = main_repo_path(literal) {
-            let path = path.to_string_lossy().into_owned();
-            if !path.is_empty() {
+    for quote in ['"', '\''] {
+        for (index, _) in text.match_indices(quote) {
+            let rest = &text[index + 1..];
+            let Some(end) = rest.find(quote) else { break };
+            let literal = &rest[..end];
+            if literal.contains('\n') {
+                continue;
+            }
+            let path = if let Some(name) = literal.strip_prefix(':') {
+                Some(name.replace(':', "/"))
+            } else if is_main_repo(literal) {
+                main_repo_path(literal).map(|path| {
+                    let path = path.to_string_lossy().into_owned();
+                    if literal.contains(':') {
+                        path
+                    } else {
+                        // `//pkg/sub` names `//pkg/sub:sub`.
+                        match path.rsplit('/').next() {
+                            Some(last) if !path.is_empty() => format!("{path}/{last}"),
+                            _ => path,
+                        }
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(path) = path.filter(|path| !path.is_empty()) {
                 paths.insert(path);
             }
         }
@@ -738,6 +871,8 @@ pub struct ClassifyInputs<'a> {
     /// The revision being hashed.
     pub tree: &'a TreeIndex,
     pub base: &'a HashFileData,
+    /// The workspace root, against which seed paths are normalized.
+    pub workspace: &'a Path,
     pub seed_filepaths: &'a BTreeSet<PathBuf>,
     pub rebuild_patterns: &'a [Glob],
     /// Paths named by label in the module and workspace files (see
@@ -747,9 +882,9 @@ pub struct ClassifyInputs<'a> {
 
 pub fn classify(inputs: &ClassifyInputs<'_>) -> Classification {
     let rebuild = |reason: String| Classification::Rebuild { reason };
-    if inputs.base.partial.is_none() {
+    let Some(recipes) = inputs.base.partial.as_ref() else {
         return rebuild("base entry carries no partial-graph recipes".to_owned());
-    }
+    };
     for path in inputs.tree.symlinks() {
         if is_graph_defining_path(path) {
             return rebuild(format!("symlinked graph-defining file {path}"));
@@ -758,7 +893,7 @@ pub fn classify(inputs: &ClassifyInputs<'_>) -> Classification {
     let seeds = inputs
         .seed_filepaths
         .iter()
-        .map(|path| path.to_string_lossy().into_owned())
+        .filter_map(|path| normalize_workspace_path(inputs.workspace, &path.to_string_lossy()))
         .collect::<BTreeSet<_>>();
     let mut changed_sources = Vec::new();
     let mut unmatched_paths = Vec::new();
@@ -794,6 +929,15 @@ pub fn classify(inputs: &ClassifyInputs<'_>) -> Classification {
         }
         if seeds.contains(path) {
             return rebuild(format!("seed file {path} changed"));
+        }
+        if let Some(input) = recipes
+            .load_inputs
+            .iter()
+            .find(|input| path == input.as_str() || path.starts_with(&format!("{input}/")))
+        {
+            return rebuild(format!(
+                "{path} is read while loading the graph (under {input}) and changed"
+            ));
         }
         if let Some(glob) = inputs
             .rebuild_patterns
@@ -1043,6 +1187,18 @@ mod tests {
     #[test]
     fn recorder_stores_package_subincludes_with_per_source_overrides() {
         let recipes = recipes();
+        // The same sources recorded in another order yield the same recipes.
+        let mut reversed = RecipeRecorder::new([7; 32], true);
+        reversed.record_source("//other:d.txt", &["//tools:late.bzl".into()]);
+        reversed.record_source("//other:c.txt", &[]);
+        reversed.record_source("//pkg:odd.txt", &[]);
+        reversed.record_source("//pkg:b.txt", &["//tools:defs.bzl".into()]);
+        reversed.record_source("//pkg:a.txt", &["//tools:defs.bzl".into()]);
+        for (key, recipe) in &recipes.rules {
+            reversed.record_rule(key, recipe.clone());
+        }
+        reversed.record_generated("//pkg:bin.out", "//pkg:bin");
+        assert_eq!(reversed.finish(), recipes);
         assert_eq!(recipes.version, RECIPE_VERSION);
         assert_eq!(recipes.seed_hash, hex::encode([7; 32]));
         assert_eq!(
@@ -1291,6 +1447,9 @@ mod tests {
             not_a_label = "@rules_cc//cc:defs.bzl"
             multi = "//a
             b"
+            single = '//tools:versions.json'
+            relative = ":go.mod"
+            shorthand = "//third_party/boringssl"
         "#;
         assert_eq!(
             referenced_main_repo_paths(text),
@@ -1299,6 +1458,9 @@ mod tests {
                 "third_party/Cargo.lock".to_owned(),
                 "Cargo.toml".to_owned(),
                 "patches/fix.patch".to_owned(),
+                "tools/versions.json".to_owned(),
+                "go.mod".to_owned(),
+                "third_party/boringssl/boringssl".to_owned(),
             ])
         );
         assert!(referenced_main_repo_paths("no labels here").is_empty());
@@ -1392,7 +1554,12 @@ mod tests {
             diff,
             tree,
             base,
-            seed_filepaths: &BTreeSet::from([PathBuf::from("seed.txt")]),
+            workspace: Path::new("/ws"),
+            seed_filepaths: &BTreeSet::from([
+                PathBuf::from("./seed.txt"),
+                PathBuf::from("/ws/config/../other.seed"),
+                PathBuf::from("/elsewhere/ignored.seed"),
+            ]),
             rebuild_patterns: &[Glob::new("*.lock").unwrap()],
             module_referenced: &BTreeSet::from(["requirements.txt".to_owned()]),
         })
@@ -1492,6 +1659,20 @@ mod tests {
         assert!(reason(&[modified("requirements.txt")], tree_ref, base)
             .contains("named by a module or workspace file"));
         assert!(reason(&[modified("seed.txt")], tree_ref, base).contains("seed file"));
+        assert!(reason(&[modified("other.seed")], tree_ref, base).contains("seed file"));
+        let mut with_inputs = base_data.clone();
+        with_inputs.partial.as_mut().unwrap().load_inputs =
+            BTreeSet::from(["dep_repo".to_owned(), "versions.json".to_owned()]);
+        assert!(
+            reason(&[modified("dep_repo/hello")], tree_ref, &with_inputs)
+                .contains("read while loading the graph (under dep_repo)")
+        );
+        assert!(reason(&[modified("versions.json")], tree_ref, &with_inputs)
+            .contains("read while loading"));
+        assert!(matches!(
+            classify_with(&[modified("dep_repository/x")], tree_ref, &with_inputs),
+            Classification::Derivable { .. }
+        ));
         assert!(
             reason(&[modified("deps/foo.lock")], tree_ref, base).contains("rebuild pattern *.lock")
         );
@@ -1504,5 +1685,121 @@ mod tests {
             classify_with(&[modified("pkg/a.txt")], &harmless_link, base),
             Classification::Derivable { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod loading_input_tests {
+    use super::*;
+    use crate::proto::blaze_query::{attribute, Attribute};
+
+    fn string_attribute(name: &str, value: &str) -> Attribute {
+        Attribute {
+            name: name.to_owned(),
+            r#type: attribute::Discriminator::String,
+            string_value: Some(value.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn normalizes_workspace_paths_like_git_names_them() {
+        let workspace = Path::new("/ws");
+        for (value, expected) in [
+            ("seed.txt", Some("seed.txt")),
+            ("./seed.txt", Some("seed.txt")),
+            ("config/../seed.txt", Some("seed.txt")),
+            ("a/./b//c", Some("a/b/c")),
+            ("%workspace%/dep_repo", Some("dep_repo")),
+            ("%workspace%", Some("")),
+            ("/ws/dep_repo/sub", Some("dep_repo/sub")),
+            ("/elsewhere/file", None),
+            ("../outside", None),
+        ] {
+            assert_eq!(
+                normalize_workspace_path(workspace, value).as_deref(),
+                expected,
+                "{value}"
+            );
+        }
+        let real = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(real.path()).unwrap();
+        assert_eq!(
+            normalize_workspace_path(real.path(), &format!("{}/x/y", canonical.display()))
+                .as_deref(),
+            Some("x/y"),
+            "the canonical spelling of the workspace is accepted too"
+        );
+    }
+
+    #[test]
+    fn repository_rules_name_their_loading_inputs() {
+        let workspace = Path::new("/ws");
+        let local = Rule {
+            name: "//external:dep_repo".into(),
+            rule_class: "local_repository".into(),
+            attribute: vec![
+                string_attribute("path", "%workspace%/dep_repo"),
+                string_attribute("build_file", "//third_party:dep.BUILD"),
+                string_attribute("name", "dep_repo"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            rule_loading_inputs(&local, workspace),
+            ["dep_repo", "third_party/dep.BUILD"]
+        );
+        let outside = Rule {
+            name: "//external:elsewhere".into(),
+            rule_class: "local_repository".into(),
+            attribute: vec![string_attribute("path", "/opt/elsewhere")],
+            ..Default::default()
+        };
+        assert!(rule_loading_inputs(&outside, workspace).is_empty());
+        let archive = Rule {
+            name: "//external:archive".into(),
+            rule_class: "http_archive".into(),
+            attribute: vec![
+                string_attribute("path", "ignored/for/non-local"),
+                string_attribute("patches", "//patches:fix.patch"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            rule_loading_inputs(&archive, workspace),
+            ["patches/fix.patch"]
+        );
+        let ordinary = Rule {
+            name: "//pkg:lib".into(),
+            rule_class: "local_repository".into(),
+            attribute: vec![string_attribute("path", "pkg")],
+            ..Default::default()
+        };
+        assert!(rule_loading_inputs(&ordinary, workspace).is_empty());
+    }
+
+    #[test]
+    fn marker_files_list_the_main_repo_files_a_fetch_read() {
+        let text = "abc123\nFILE:@@//requirements.txt 0000\nFILE:@@rules_python+//python/x.bzl 1111\nFILE:@//:versions.json 2222\nENV:HOME x\nFILE://pkg:data 3333\n";
+        assert_eq!(
+            marker_file_inputs(text).collect::<Vec<_>>(),
+            ["requirements.txt", "versions.json", "pkg/data"]
+        );
+        let output_base = tempfile::tempdir().unwrap();
+        assert!(marker_loading_inputs(output_base.path()).is_empty());
+        let external = output_base.path().join("external");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("@pip+.marker"), text).unwrap();
+        fs::write(external.join("@other+.marker"), "FILE:@@//go.mod 4444\n").unwrap();
+        fs::write(external.join("not-a-marker.txt"), "FILE:@@//ignored 5555\n").unwrap();
+        assert_eq!(
+            marker_loading_inputs(output_base.path()),
+            BTreeSet::from([
+                "requirements.txt".to_owned(),
+                "versions.json".to_owned(),
+                "pkg/data".to_owned(),
+                "go.mod".to_owned(),
+            ])
+        );
     }
 }

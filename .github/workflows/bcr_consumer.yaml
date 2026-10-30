@@ -1,6 +1,6 @@
 name: BCR consumer
 
-# Mirror the Bazel Central Registry presubmit for bazel-diff on a PR, so a
+# Mirror the Bazel Central Registry presubmit for bazel-diff on master, so a
 # release that the registry would reject fails here first:
 #
 # 1. Build bazel-diff as a non-root module from the release source archive,
@@ -8,11 +8,13 @@ name: BCR consumer
 # 2. Rebuild once per incompatible flag the registry tests for that Bazel
 #    version (bazel-central-registry/incompatible_flags.yml), as BCR does
 #    before it lets a registry PR merge.
+#
+# The per-flag rebuilds make this the longest workflow in the repo, so it runs
+# on master (where releases are cut from) and on demand rather than on every
+# pull request.
 
 on:
   push:
-    branches: [ master ]
-  pull_request:
     branches: [ master ]
   workflow_dispatch:
 

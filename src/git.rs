@@ -196,6 +196,24 @@ impl Git {
                     repository_index.display()
                 )
             })?;
+            // Git trusts an entry's cached stat data unless the file's mtime is at or after the
+            // index file's own ("racy git"), in which case it re-reads the content. The copy
+            // must carry the original's mtime: with a fresh one every entry looks trustworthy
+            // and an edit made in the second the index was last written, keeping the file's
+            // size, would go unseen.
+            let modified = fs::metadata(&repository_index)
+                .and_then(|metadata| metadata.modified())
+                .with_context(|| {
+                    format!(
+                        "failed to read the modification time of {}",
+                        repository_index.display()
+                    )
+                })?;
+            fs::File::options()
+                .write(true)
+                .open(&index)
+                .and_then(|file| file.set_modified(modified))
+                .context("failed to set the temporary index's modification time")?;
         }
         let env = [("GIT_INDEX_FILE", index.as_os_str())];
         self.stdout_with_env(["add", "--all"], &env)?;
@@ -321,6 +339,7 @@ pub fn classify_revisions(
 mod tests {
     use super::*;
     use crate::partial::TreeKind;
+    use std::time::{Duration, SystemTime};
 
     fn git_command(repo: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
@@ -447,6 +466,53 @@ mod tests {
             .unwrap()
             .get("file.txt")
             .is_none());
+    }
+
+    #[test]
+    fn working_tree_snapshot_rereads_edits_made_in_the_index_write_second() {
+        let (repo, git) = repository();
+        // Only whole-second mtimes and sizes decide whether an entry is trusted, so the edit
+        // below is stat-identical to the committed content without a same-second race.
+        git_command(repo.path(), &["config", "core.trustctime", "false"]);
+        git_command(repo.path(), &["config", "core.checkStat", "minimal"]);
+        let file = repo.path().join("file.txt");
+        let index = repo.path().join(".git/index");
+        let set_modified = |path: &Path, time: SystemTime| {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        };
+        let written = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        set_modified(&file, written);
+        git_command(repo.path(), &["add", "-A"]);
+        git_command(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "stat"],
+        );
+        let head_tree = git_command(repo.path(), &["rev-parse", "HEAD^{tree}"]);
+        assert_eq!(
+            git.snapshot_working_tree(&[]).unwrap().id(),
+            Some(head_tree.as_str())
+        );
+
+        // A same-size edit made in the second the index was written.
+        fs::write(&file, "two").unwrap();
+        set_modified(&file, written);
+        set_modified(&index, written);
+        let snapshot = git.snapshot_working_tree(&[]).unwrap();
+        assert_ne!(snapshot.id(), Some(head_tree.as_str()));
+        assert_eq!(
+            snapshot.content_hashes()["file.txt"],
+            git_command(repo.path(), &["hash-object", "file.txt"])
+        );
+        // Git itself re-reads it too (and, run last, rewrites the index with that knowledge).
+        assert_eq!(
+            git_command(repo.path(), &["status", "--porcelain"]),
+            "M file.txt"
+        );
     }
 
     #[test]

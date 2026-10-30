@@ -370,6 +370,132 @@ fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
     );
 }
 
+const ISOLATED_ROOT: &[&str] = &["--isolatedDependencyRoot", "@hub"];
+
+fn assert_product(workspace: &std::path::Path, target: &str, file: &str, expected: &str) {
+    let build = std::process::Command::new(bazel())
+        .current_dir(workspace)
+        .args(["build", target])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("bazel-bin").join(file))
+            .unwrap()
+            .trim(),
+        expected
+    );
+}
+
+#[test]
+fn isolated_dependency_root_reaches_alias_direct_and_build_load_readers() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let base = copy_workspace("isolated_dependency_root");
+    let head = copy_workspace("isolated_dependency_root");
+    edit(&head.path().join("settings.json"), |s| {
+        s.replace("before", "after")
+    });
+    assert!(diff_local(base.path(), head.path(), &[]).contains("//outside:uses_owner"));
+    let changed = diff_local(base.path(), head.path(), ISOLATED_ROOT);
+    for reader in ["//:alias", "//:direct", "//:loaded"] {
+        assert!(changed.contains(reader), "missing {reader}: {changed:?}");
+    }
+    assert!(!changed.contains("//outside:uses_owner"), "{changed:?}");
+    assert_product(base.path(), "//:direct", "direct.txt", "before");
+    assert_product(head.path(), "//:direct", "direct.txt", "after");
+
+    let comment = copy_workspace("isolated_dependency_root");
+    edit(&comment.path().join("settings.json"), |s| {
+        s.replace("before", "before-comment")
+    });
+    let maps = tempfile::tempdir().unwrap();
+    let direct = |ws: &std::path::Path, name: &str| {
+        let map = maps.path().join(name);
+        assert!(generate(ws, &map, ISOLATED_ROOT).status.success());
+        let data = hashes(&map);
+        (
+            data["@hub//:defs.bzl"].clone(),
+            data["//external:hub"].split_once('~').unwrap().1.to_owned(),
+        )
+    };
+    let before = direct(base.path(), "base.json");
+    let after = direct(comment.path(), "comment.json");
+    assert_ne!(before.0, after.0);
+    assert_ne!(before.1, after.1);
+    assert_product(comment.path(), "//:direct", "direct.txt", "before");
+}
+
+#[test]
+fn isolated_dependency_root_tracks_repository_read_bytes() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let base = copy_workspace("isolated_dependency_root");
+    for (input, contents, target, product, initial, expected) in [
+        (
+            "registry.txt",
+            "changed",
+            "//:reads_registry",
+            "registry-output.txt",
+            "original",
+            "changed",
+        ),
+        (
+            "alias.txt",
+            "changed",
+            "//:reads_alias",
+            "alias-output.txt",
+            "absent",
+            "changed",
+        ),
+        // No queried output changes. Only the typed repository input changes
+        // from absent to present at the alias's path.
+        (
+            "alias.txt",
+            "absent\nnew file",
+            "//:reads_alias",
+            "alias-output.txt",
+            "absent",
+            "absent",
+        ),
+    ] {
+        let head = copy_workspace("isolated_dependency_root");
+        fs::write(head.path().join(input), contents).unwrap();
+        let changed = diff_local(base.path(), head.path(), ISOLATED_ROOT);
+        assert!(changed.contains(target), "{input}: {changed:?}");
+        assert!(
+            !changed.contains("//outside:uses_owner"),
+            "{input}: {changed:?}"
+        );
+        assert_product(base.path(), target, product, initial);
+        assert_product(head.path(), target, product, expected);
+    }
+}
+
+#[test]
+fn isolated_dependency_root_keeps_hidden_spoke_changes() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let base = copy_workspace("isolated_dependency_root");
+    let head = copy_workspace("isolated_dependency_root");
+    edit(&head.path().join("settings.json"), |s| {
+        s.replace("\"1\"", "\"2\"")
+    });
+    let changed = diff_local(base.path(), head.path(), ISOLATED_ROOT);
+    assert!(
+        changed.contains("//:alias") && changed.contains("//:direct"),
+        "{changed:?}"
+    );
+    assert!(!changed.contains("//outside:uses_owner"), "{changed:?}");
+}
+
 // Module `ext`'s extension generates `@app`, whose rule resolves a toolchain, and the repositories
 // that toolchain can come from. A query never shows a resolved toolchain as an input, so with
 // `@app` fine-grained the change has to reach `//:uses_app` through `ext`, however `ext` registers
@@ -411,6 +537,54 @@ fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
                 .any(|label| label == "//:uses_app" || label == "@@//:uses_app"),
             "{registration}: {impacted:?}"
         );
+        if registration.starts_with("register_toolchains") {
+            // The assertion is specifically about consumers of @app. The distinct @tc_impl
+            // repository selected via a registered toolchain must still invalidate its user.
+            // This other usage of the same extension is isolated and root-imported.
+            for workspace in [&first, &bumped] {
+                edit(&workspace.path().join("MODULE.bazel"), |module| {
+                    format!("{module}\npeer = use_extension(\"@ext//:tools.bzl\", \"tools\", isolate = True)\nuse_repo(peer, peer_tc = \"tc\")\n")
+                });
+                fs::write(
+                    workspace.path().join(".bazelrc"),
+                    "common --experimental_isolated_extension_usages\n",
+                )
+                .unwrap();
+            }
+            let out = tempfile::tempdir().unwrap();
+            let edges = out.path().join("edges.json");
+            let opted_in = diff_local(
+                first.path(),
+                bumped.path(),
+                &[
+                    "--fineGrainedHashExternalRepos",
+                    "@app",
+                    "--isolatedDependencyRoot",
+                    "@peer_tc",
+                    "--depEdgesFile",
+                    edges.to_str().unwrap(),
+                ],
+            );
+            let deps: std::collections::BTreeMap<String, Vec<String>> =
+                serde_json::from_slice(&fs::read(edges).unwrap()).unwrap();
+            let owner = &deps["//external:ext"];
+            assert!(
+                !owner.iter().any(|label| label == "//external:peer_tc"),
+                "{owner:?}"
+            );
+            assert!(
+                owner
+                    .iter()
+                    .any(|label| label == "//external:ext++tools+tc"),
+                "{owner:?}"
+            );
+            assert!(
+                opted_in
+                    .iter()
+                    .any(|label| label.trim_start_matches("@@") == "//:uses_app"),
+                "{opted_in:?}"
+            );
+        }
     }
 }
 

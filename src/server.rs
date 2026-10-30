@@ -751,6 +751,9 @@ pub fn validate_partial_graph(config: &ServerConfig) -> Result<()> {
     if !bazel.fine_grained_external_repos.is_empty() {
         bail!("--partialGraph does not support --fineGrainedHashExternalRepos");
     }
+    if bazel.isolated_dependency_root.is_some() {
+        bail!("--partialGraph does not support --isolatedDependencyRoot");
+    }
     if !config.hash_options.always_affected_tags.is_empty() {
         bail!("--partialGraph does not support --alwaysAffectedTags");
     }
@@ -1625,6 +1628,11 @@ fn configuration_fingerprint(config: &ServerConfig) -> String {
         hasher.update(value.as_bytes());
         hasher.update([0]);
     }
+    if let Some(root) = &options.bazel.isolated_dependency_root {
+        hasher.update(b"isolatedDependencyRoot=");
+        hasher.update(root.as_bytes());
+        hasher.update([0]);
+    }
     if config.partial_graph {
         // Partial-graph entries hash under a different formula and carry recipes; they are never
         // compared with, or served in place of, an entry of the default mode. Only folded in when
@@ -2036,6 +2044,7 @@ mod tests {
                     keep_going: false,
                     fine_grained_external_repos: BTreeSet::new(),
                     label_only_module_extensions: BTreeSet::new(),
+                    isolated_dependency_root: None,
                     exclude_external_targets: false,
                     exclude_targets_query: None,
                     no_bazelrc: false,

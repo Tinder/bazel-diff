@@ -37,6 +37,9 @@ pub struct BazelOptions {
     /// extension's repository reaches the module that owns the extension without the extension's
     /// other repositories (see `extension_view_node`).
     pub label_only_module_extensions: BTreeSet<String>,
+    /// A root-isolated extension import whose external consumers are discoverable through
+    /// ordinary target inputs and BUILD loads.
+    pub isolated_dependency_root: Option<String>,
     pub exclude_external_targets: bool,
     pub exclude_targets_query: Option<String>,
     pub no_bazelrc: bool,
@@ -277,12 +280,17 @@ impl BazelOptions {
     }
 
     pub fn query_all_targets(&self) -> Result<Vec<Target>> {
-        let QueriedTargets {
-            targets,
-            module_graph_json: _module_graph_json,
-            root_mapping: _root_mapping,
-        } = self.query_all_targets_with(materialize_repository_inputs_for_batch)?;
-        Ok(targets)
+        self.check_raw_targets_supported()?;
+        Ok(self
+            .query_all_targets_with(materialize_repository_inputs_for_batch)?
+            .targets)
+    }
+
+    pub(crate) fn check_raw_targets_supported(&self) -> Result<()> {
+        if self.isolated_dependency_root.is_some() {
+            bail!("--isolatedDependencyRoot requires generate_hashes to retain repository inputs");
+        }
+        Ok(())
     }
 
     pub(crate) fn query_all_targets_with(
@@ -316,7 +324,7 @@ impl BazelOptions {
                 transform(std::slice::from_mut(target), inputs);
             }) {
                 Ok(repos) => bzlmod = repos,
-                Err(error) if self.keep_going => {
+                Err(error) if self.keep_going && self.isolated_dependency_root.is_none() => {
                     eprintln!("[Warn] failed to hash Bzlmod repositories: {error:#}");
                 }
                 Err(error) => return Err(error),
@@ -328,12 +336,75 @@ impl BazelOptions {
             canonical_to_apparent,
             module_graph_json,
             root_mapping,
+            scope,
         } = bzlmod;
-        let targets = self.collect_all_targets(bzlmod_repos, |expression, use_cquery| {
-            self.query_with(expression, use_cquery, version, &mut |batch| {
-                transform(batch, None)
-            })
+        let strict = (!scope.members.is_empty()).then(|| Self {
+            keep_going: false,
+            ..self.clone()
+        });
+        let mut loads = BTreeMap::new();
+        let mut targets = self.collect_all_targets(bzlmod_repos, |expression, use_cquery| {
+            if let Some(strict) = &strict {
+                strict.query_with(
+                    &self.with_exclude_filter(scope.expression(expression)),
+                    false,
+                    version,
+                    &mut |batch| {
+                        scope.record_build_loads(batch, &mut loads);
+                        transform(batch, None);
+                    },
+                )
+            } else {
+                self.query_with(expression, use_cquery, version, &mut |batch| {
+                    transform(batch, None)
+                })
+            }
         })?;
+        if let Some(strict) = &strict {
+            // Direct users may name a target the hub doesn't export. Ask only about
+            // edges actually seen in the ordinary graph, and keep the primary's rows.
+            let missing = scope.missing_inputs(&targets);
+            let mut additions = Vec::new();
+            if !missing.is_empty() {
+                let roots = query_labels(missing.iter())?;
+                additions.push(format!(
+                    "(let direct = deps({roots}) in $direct + buildfiles($direct))"
+                ));
+            }
+            let files = scope.returned_source_files(&targets);
+            let readers: BTreeSet<_> = loads
+                .iter()
+                .filter(|(_, names)| {
+                    names
+                        .iter()
+                        .filter_map(|name| scope.canonical(name))
+                        .any(|name| !files.contains(&name))
+                })
+                .map(|(build, _)| build)
+                .collect();
+            if !readers.is_empty() {
+                additions.push(format!(
+                    "buildfiles({})",
+                    query_labels(readers.into_iter())?
+                ));
+            }
+            if !additions.is_empty() {
+                let query = self.with_exclude_filter(additions.join(" + "));
+                let mut extra = strict.query_with(&query, false, version, &mut |batch| {
+                    scope.record_build_loads(batch, &mut loads);
+                })?;
+                let present: HashSet<_> = targets.iter().filter_map(target_name).collect();
+                extra.retain(|target| {
+                    target_name(target).is_some_and(|name| !present.contains(name))
+                });
+                transform(&mut extra, None);
+                targets.extend(extra);
+                if let Some(missing) = scope.missing_inputs(&targets).first() {
+                    bail!("--isolatedDependencyRoot: scoped input {missing} was not returned");
+                }
+            }
+            scope.connect_external_readers(&loads, &mut targets)?;
+        }
         self.check_failed_extension_references(
             &targets,
             &mut failed_extensions,
@@ -343,6 +414,17 @@ impl BazelOptions {
             targets,
             module_graph_json,
             root_mapping,
+            scoped_sources: ScopedSources {
+                repositories: scope
+                    .aliases
+                    .into_iter()
+                    .filter_map(|(alias, canonical)| {
+                        scope.members.contains(&canonical).then_some(alias)
+                    })
+                    .chain(scope.members.iter().cloned())
+                    .collect(),
+                repository_inputs: scope.repository_inputs,
+            },
         })
     }
 
@@ -493,6 +575,31 @@ impl BazelOptions {
                 },
             )?
         };
+        let mut scope = IsolatedRepoScope::default();
+        let label_only = LabelOnlyRepositories {
+            sibling_extensions: self
+                .label_only_extension_prefixes(&canonical_to_apparent, &extension_repos.generated),
+            owner_exemptions: if self.use_cquery || self.isolated_dependency_root.is_none() {
+                BTreeSet::new()
+            } else if retain_root_mapping
+                && complete_graph
+                && failed.is_empty()
+                && extension_repos.complete_mappings
+            {
+                resolve_isolated_root(
+                    self.isolated_dependency_root
+                        .as_deref()
+                        .expect("requested root"),
+                    &root_mapping,
+                    &extension_repos,
+                    &repositories,
+                    &mut scope,
+                )
+            } else {
+                eprintln!("[Warn] --isolatedDependencyRoot: incomplete Bzlmod repository survey; retaining owner dependencies");
+                BTreeSet::new()
+            },
+        };
         let targets = lower_repositories(
             repositories,
             &canonical_to_apparent,
@@ -503,7 +610,7 @@ impl BazelOptions {
             // input, so there the nodes alone carry the change and the stand-in edges would only
             // widen the impacted set.
             (!self.use_cquery).then_some(&extension_repos.imported),
-            &self.label_only_extension_prefixes(&canonical_to_apparent, &extension_repos.generated),
+            &label_only,
             &self.workspace,
             transform,
         );
@@ -513,6 +620,7 @@ impl BazelOptions {
             canonical_to_apparent,
             module_graph_json: module_graph,
             root_mapping: retain_root_mapping.then_some(root_mapping),
+            scope,
         })
     }
 
@@ -778,8 +886,7 @@ impl BazelOptions {
         let mut module_repos = visible_module_repos.clone();
         module_repos.extend(hidden_module_repos.iter().cloned());
         let mut module_mappings = BTreeMap::new();
-        let mut complete_mappings =
-            complete_inputs && !hidden_module_repos.is_empty() && failed.is_empty();
+        let mut complete_mappings = complete_inputs && failed.is_empty();
         if !module_repos.is_empty() {
             // The hidden modules' repository names are derived, not reported, so a derivation
             // Bazel disagrees with falls back to the root-visible modules alone.
@@ -804,9 +911,9 @@ impl BazelOptions {
                     .filter(|canonical| is_extension_repo(canonical))
                     .cloned(),
             );
-            if complete_mappings {
+            complete_mappings &= mappings.len() == module_repos.len();
+            if complete_mappings && !hidden_module_repos.is_empty() {
                 module_mappings.extend(module_repos.iter().cloned().zip(mappings));
-                complete_mappings = module_mappings.len() == module_repos.len();
             }
         }
         imported.retain(|canonical| !has_unavailable_mapping(canonical, failed));
@@ -819,33 +926,35 @@ impl BazelOptions {
             }
         }
         let mut generated = imported.clone();
+        let mut complete_spoke_mappings = true;
         if !representatives.is_empty() {
             let names = representatives.values().cloned().collect::<Vec<_>>();
-            let mappings = match self.dump_repo_mappings(&names, failed, &mut complete_mappings) {
-                Ok(mappings) => mappings,
-                Err(_) => {
-                    complete_mappings = false;
-                    // One extension that fails to evaluate should not hide the rest; retry
-                    // one at a time and report the ones Bazel cannot describe.
-                    let mut mappings = Vec::new();
-                    for name in &names {
-                        match self.dump_repo_mappings(
-                            std::slice::from_ref(name),
-                            failed,
-                            &mut complete_mappings,
-                        ) {
-                            Ok(mapping) => mappings.extend(mapping),
-                            Err(error) if self.keep_going => {
-                                eprintln!(
+            let mappings =
+                match self.dump_repo_mappings(&names, failed, &mut complete_spoke_mappings) {
+                    Ok(mappings) => mappings,
+                    Err(_) => {
+                        complete_spoke_mappings = false;
+                        // One extension that fails to evaluate should not hide the rest; retry
+                        // one at a time and report the ones Bazel cannot describe.
+                        let mut mappings = Vec::new();
+                        for name in &names {
+                            match self.dump_repo_mappings(
+                                std::slice::from_ref(name),
+                                failed,
+                                &mut complete_mappings,
+                            ) {
+                                Ok(mapping) => mappings.extend(mapping),
+                                Err(error) if self.keep_going => {
+                                    eprintln!(
                                     "[Warn] skipping the module extension behind {name}: {error:#}"
                                 );
+                                }
+                                Err(error) => return Err(error),
                             }
-                            Err(error) => return Err(error),
                         }
+                        mappings
                     }
-                    mappings
-                }
-            };
+                };
             generated.extend(
                 mappings
                     .into_iter()
@@ -859,12 +968,13 @@ impl BazelOptions {
         }
         imported.retain(|canonical| !has_unavailable_mapping(canonical, failed));
         generated.retain(|canonical| !has_unavailable_mapping(canonical, failed));
-        if !complete_mappings {
+        if !complete_mappings || !complete_spoke_mappings {
             module_mappings.clear();
         }
         Ok(ExtensionRepositories {
             imported,
             generated,
+            complete_mappings: complete_mappings && complete_spoke_mappings,
             module_mappings,
         })
     }
@@ -1452,15 +1562,334 @@ struct ModuleSurvey {
 }
 
 /// Canonical names of the repositories module extensions generate.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ExtensionRepositories {
     /// The ones some module (the root included) imports with `use_repo`: the hubs, toolchain
     /// registries and rule repos that targets name.
     imported: BTreeSet<String>,
     /// Every repository of every extension in `imported`, the imported ones included.
     generated: BTreeSet<String>,
+    /// All modules and extension representatives supplied their requested mapping.
+    complete_mappings: bool,
     /// Complete module mappings from the ordinary module read, keyed by their requested canonical names.
     module_mappings: BTreeMap<String, RepoMapping>,
+}
+
+#[derive(Default)]
+struct IsolatedRepoScope {
+    anchor: String,
+    members: BTreeSet<String>,
+    aliases: RepoMapping,
+    // Typed labels addressed by the usage's repository rules, including non-source targets.
+    repository_inputs: BTreeSet<String>,
+}
+
+fn query_labels<'a>(labels: impl Iterator<Item = &'a String>) -> Result<String> {
+    labels
+        .map(|label| {
+            if !label.contains('\'') {
+                Ok(format!("'{label}'"))
+            } else if !label.contains('"') {
+                Ok(format!("\"{label}\""))
+            } else {
+                bail!("cannot quote Bazel query label {label}")
+            }
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|labels| labels.join(" + "))
+}
+
+impl IsolatedRepoScope {
+    fn expression(&self, ordinary: &str) -> String {
+        format!("let members = deps('@{}//...:all-targets') in ({ordinary}) + $members + buildfiles($members)", self.anchor)
+    }
+
+    fn canonical(&self, label: &str) -> Option<String> {
+        let (repo, rest) = label.strip_prefix('@')?.split_once("//")?;
+        let canonical = if let Some(name) = repo.strip_prefix('@') {
+            self.members.get(name)?
+        } else {
+            self.members.get(self.aliases.get(repo)?)?
+        };
+        Some(format!("@@{canonical}//{rest}"))
+    }
+
+    fn package(&self, label: &str) -> String {
+        let package = label.rsplit_once(':').map_or(label, |(package, _)| package);
+        if let Some((repo, path)) = package
+            .strip_prefix('@')
+            .and_then(|label| label.split_once("//"))
+        {
+            let canonical = repo
+                .strip_prefix('@')
+                .or_else(|| self.aliases.get(repo).map(String::as_str));
+            if let Some(repo) = canonical {
+                return if repo.is_empty() {
+                    format!("//{path}")
+                } else {
+                    format!("@@{repo}//{path}")
+                };
+            }
+        }
+        package.to_owned()
+    }
+
+    fn missing_inputs(&self, targets: &[Target]) -> BTreeSet<String> {
+        let present: HashSet<_> = targets
+            .iter()
+            .filter_map(target_name)
+            .filter_map(|name| self.canonical(name))
+            .collect();
+        targets
+            .iter()
+            .filter_map(|target| target.rule.as_option())
+            .flat_map(|rule| &rule.rule_input)
+            .filter_map(|label| self.canonical(label))
+            .filter(|label| !present.contains(label))
+            .collect()
+    }
+
+    // Ordinary query can emit two source records for a BUILD, even within one stream.
+    // Keep the union of observed load edges before normal first-record deduplication.
+    fn record_build_loads(
+        &self,
+        batch: &[Target],
+        loads_by_package: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        for source in batch
+            .iter()
+            .filter_map(|target| target.source_file.as_option())
+        {
+            let Some((_, "BUILD" | "BUILD.bazel")) = source.name.rsplit_once(':') else {
+                continue;
+            };
+            if self.canonical(&source.name).is_some() {
+                loads_by_package
+                    .entry(source.name.clone())
+                    .or_default()
+                    .extend(source.subinclude.iter().cloned());
+            } else {
+                for load in source
+                    .subinclude
+                    .iter()
+                    .filter_map(|load| self.canonical(load))
+                {
+                    loads_by_package
+                        .entry(source.name.clone())
+                        .or_default()
+                        .insert(load);
+                }
+            }
+        }
+    }
+
+    fn returned_source_files(&self, targets: &[Target]) -> HashSet<String> {
+        targets
+            .iter()
+            .filter_map(|target| target.source_file.as_option())
+            .filter_map(|source| self.canonical(&source.name))
+            .collect()
+    }
+
+    fn connect_external_readers(
+        &self,
+        loads_by_package: &BTreeMap<String, BTreeSet<String>>,
+        targets: &mut [Target],
+    ) -> Result<()> {
+        let files = self.returned_source_files(targets);
+        let mut readers = BTreeSet::new();
+        for (build, loads) in loads_by_package {
+            for load in loads.iter().filter_map(|label| self.canonical(label)) {
+                if !files.contains(&load) {
+                    bail!("--isolatedDependencyRoot: buildfiles did not return scoped load {load}");
+                }
+                readers.insert(self.package(build));
+            }
+        }
+        let root = format!("//external:{}", self.anchor);
+        for target in targets {
+            if let Some(source) = target.source_file.as_option_mut() {
+                if self.canonical(&source.name).is_some() {
+                    if let Some(loads) = loads_by_package.get(&source.name) {
+                        source.subinclude = loads.iter().cloned().collect();
+                    }
+                }
+            }
+            if let Some(rule) = target.rule.as_option_mut() {
+                if !rule.name.starts_with("//external:")
+                    && self.canonical(&rule.name).is_none()
+                    && (readers.contains(&self.package(&rule.name))
+                        || rule
+                            .rule_input
+                            .iter()
+                            .any(|input| self.canonical(input).is_some()))
+                    && !rule.rule_input.contains(&root)
+                {
+                    rule.rule_input.push(root.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct LabelOnlyRepositories {
+    sibling_extensions: BTreeSet<String>,
+    owner_exemptions: BTreeSet<String>,
+}
+
+/// Bind the effective root import to one returned extension usage. Its one imported
+/// hub already depends on every hidden member; use that same aggregate at its readers.
+fn resolve_isolated_root(
+    root: &str,
+    root_mapping: &[u8],
+    survey: &ExtensionRepositories,
+    repositories: &[Repository],
+    scope: &mut IsolatedRepoScope,
+) -> BTreeSet<String> {
+    fn resolve(
+        root: &str,
+        mapping: RepoMapping,
+        survey: &ExtensionRepositories,
+        repositories: &[Repository],
+    ) -> Option<IsolatedRepoScope> {
+        let name = root.strip_prefix('@')?;
+        if name.is_empty() || name.contains(['@', '/', '%', '+', ':']) {
+            return None;
+        }
+        let hub = mapping.get(name)?;
+        let group = effective_root_group(hub, survey, repositories)?;
+        if survey
+            .imported
+            .iter()
+            .any(|other| other != hub && extension_usage_prefix(other) == Some(group))
+        {
+            return None;
+        }
+        let members: BTreeSet<_> = survey
+            .generated
+            .iter()
+            .filter(|repo| extension_usage_prefix(repo) == Some(group))
+            .cloned()
+            .collect();
+        let mut inputs = BTreeSet::new();
+        for repo in repositories {
+            for attr in &repo.attribute {
+                use crate::proto::blaze_query::attribute::Discriminator as Kind;
+                if !attr.__buffa_unknown_fields.is_empty()
+                    || matches!(
+                        attr.r#type,
+                        Kind::Unknown
+                            | Kind::SelectorList
+                            | Kind::FilesetEntryList
+                            | Kind::License
+                            | Kind::Output
+                            | Kind::OutputList
+                    )
+                {
+                    return None;
+                }
+                if !matches!(
+                    attr.r#type,
+                    Kind::Label
+                        | Kind::LabelList
+                        | Kind::LabelListDict
+                        | Kind::LabelDictUnary
+                        | Kind::LabelKeyedStringDict
+                ) {
+                    continue;
+                }
+                for value in attribute_label_values(attr) {
+                    // A repository generator outside the usage may consume a file
+                    // without producing any ordinary target edge. Keep the old owner.
+                    let reader = repo.canonical_name.as_ref()?;
+                    let canonical = if value.starts_with("@@") {
+                        value.to_owned()
+                    } else if value.starts_with("//") {
+                        format!("@@{value}")
+                    } else if value.starts_with('@') {
+                        return None;
+                    } else {
+                        continue;
+                    };
+                    let (target, _) = canonical[2..].split_once("//")?;
+                    if members.contains(reader) {
+                        inputs.insert(canonical);
+                    } else if members.contains(target) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(IsolatedRepoScope {
+            anchor: name.to_owned(),
+            aliases: mapping,
+            members,
+            repository_inputs: inputs,
+        })
+    }
+    let result = serde_json::from_slice(root_mapping)
+        .ok()
+        .and_then(|mapping| resolve(root, mapping, survey, repositories));
+    if let Some(found) = result {
+        *scope = found;
+        scope.members.clone()
+    } else {
+        eprintln!("[Warn] --isolatedDependencyRoot: unresolved or incomplete root-isolated usage, multiple imports, or outside repository reader; retaining owner dependencies");
+        BTreeSet::new()
+    }
+}
+
+/// Bazel assigns each root-isolated usage its own canonical prefix. Its module and
+/// version slots are both empty, followed by the exported usage name. Repository names
+/// themselves cannot contain '+'. Verify that every returned original name agrees with
+/// that prefix, and that no other root import identifies a different group of that name.
+fn effective_root_group<'a>(
+    hub: &'a str,
+    survey: &ExtensionRepositories,
+    repositories: &[Repository],
+) -> Option<&'a str> {
+    fn root_export(prefix: &str) -> Option<&str> {
+        let (owner_and_symbol, name) = prefix.rsplit_once("+++")?;
+        let (_owner, symbol) = owner_and_symbol.rsplit_once("+_")?;
+        (!symbol.is_empty() && !symbol.contains('+') && !name.is_empty() && !name.contains('+'))
+            .then_some(name)
+    }
+    let group = extension_usage_prefix(hub)?;
+    let usage = root_export(group)?;
+    if !survey.imported.contains(hub) {
+        return None;
+    }
+    if survey
+        .imported
+        .iter()
+        .filter_map(|repo| extension_usage_prefix(repo))
+        .any(|candidate| candidate != group && root_export(candidate) == Some(usage))
+    {
+        return None;
+    }
+    let mut seen = BTreeSet::new();
+    for row in repositories {
+        let Some(name) = row.canonical_name.as_deref() else {
+            continue;
+        };
+        let Some((prefix, original)) = name.rsplit_once('+') else {
+            continue;
+        };
+        if prefix == group
+            && (original.is_empty()
+                || row.original_name.as_deref() != Some(original)
+                || !seen.insert(name))
+        {
+            return None;
+        }
+    }
+    let expected = survey
+        .generated
+        .iter()
+        .filter(|repo| extension_usage_prefix(repo) == Some(group));
+    (seen.contains(hub) && expected.map(String::as_str).eq(seen)).then_some(group)
 }
 
 type RepoMapping = BTreeMap<String, String>;
@@ -1594,11 +2023,18 @@ fn mod_argument_byte_budget_from(setting: Option<&str>) -> usize {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct ScopedSources {
+    pub(crate) repositories: BTreeSet<String>,
+    pub(crate) repository_inputs: BTreeSet<String>,
+}
+
 /// Targets with the accepted module graph and successful unfiltered root mapping from discovery.
 pub(crate) struct QueriedTargets {
     pub(crate) targets: Vec<Target>,
     pub(crate) module_graph_json: Option<String>,
     pub(crate) root_mapping: Option<Vec<u8>>,
+    pub(crate) scoped_sources: ScopedSources,
 }
 
 /// The repositories `bazel mod` describes for a Bzlmod workspace, lowered to `//external:`
@@ -1606,6 +2042,7 @@ pub(crate) struct QueriedTargets {
 #[derive(Default)]
 struct BzlmodRepos {
     targets: Vec<Target>,
+    scope: IsolatedRepoScope,
     /// Extension diagnostics and canonical repositories whose mappings failed.
     failed_extensions: FailedExtensions,
     /// The root module's repository mapping, canonical name -> apparent names.
@@ -1717,7 +2154,7 @@ fn lower_repositories(
     canonical_to_apparent: &BTreeMap<String, Vec<String>>,
     module_edges: &BTreeMap<String, BTreeSet<String>>,
     extension_edges: Option<&BTreeSet<String>>,
-    label_only_extensions: &BTreeSet<String>,
+    label_only: &LabelOnlyRepositories,
     workspace: &Path,
     transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>),
 ) -> Vec<Target> {
@@ -1772,6 +2209,8 @@ fn lower_repositories(
     // through labels, which the query reports. Otherwise every fine-grained spoke would change
     // whenever any other spoke does. The view is opt-in because a toolchain resolved from a
     // sibling is invisible to a query, however it is registered.
+    // An explicitly label-only imported repository needs no owner fallback. Its own node,
+    // the hub-to-spoke inputs and the owner's edges to other generators remain.
     let mut module_extension_repos = BTreeMap::<String, BTreeMap<String, BTreeSet<String>>>::new();
     let mut extension_spokes = BTreeMap::<String, BTreeSet<String>>::new();
     if let Some(imported) = extension_edges {
@@ -1781,8 +2220,11 @@ fn lower_repositories(
                 continue;
             };
             if let Some((module_repo, _definition_hash)) =
-                extension_repo_owner(extension, &module_definitions)
-                    .filter(|(module_repo, _definition_hash)| !module_repo.is_empty())
+                extension_repo_owner(extension, &module_definitions).filter(
+                    |(module_repo, _definition_hash)| {
+                        !module_repo.is_empty() && !label_only.owner_exemptions.contains(canonical)
+                    },
+                )
             {
                 module_extension_repos
                     .entry(module_repo.clone())
@@ -1864,7 +2306,7 @@ fn lower_repositories(
             for (extension, repos) in extensions
                 .into_iter()
                 .flatten()
-                .filter(|(extension, _)| label_only_extensions.contains(*extension))
+                .filter(|(extension, _)| label_only.sibling_extensions.contains(*extension))
             {
                 let mut view = repository_target(
                     &repository,
@@ -2358,41 +2800,56 @@ fn repository_local_input_labels(repository: &Repository) -> BTreeSet<&str> {
 /// Every main-repository label among the attributes' values: the files and directories a
 /// repository rule reads from the workspace (`build_file`, `patches`, a requirements file).
 pub(crate) fn attribute_main_repo_labels(attributes: &[Attribute]) -> impl Iterator<Item = &str> {
-    attributes
+    attributes.iter().flat_map(|attr| {
+        attribute_label_values(attr)
+            .chain(
+                attr.string_dict_value
+                    .iter()
+                    .map(|entry| entry.value.as_str()),
+            )
+            .chain(
+                attr.label_dict_unary_value
+                    .iter()
+                    .map(|entry| entry.key.as_str()),
+            )
+            .filter(|value| crate::hash::main_repo_path(value).is_some())
+    })
+}
+
+/// The slots that can name targets after the caller checks the attribute discriminator.
+/// LABEL_DICT_UNARY is string -> label and LABEL_KEYED_STRING_DICT is label -> string.
+fn attribute_label_values(attribute: &Attribute) -> impl Iterator<Item = &str> {
+    attribute
+        .string_value
         .iter()
-        .flat_map(|attribute| {
+        .chain(&attribute.string_list_value)
+        .chain(
             attribute
-                .string_value
+                .label_dict_unary_value
                 .iter()
-                .chain(&attribute.string_list_value)
-                .chain(attribute.string_dict_value.iter().map(|entry| &entry.value))
-                .chain(
-                    attribute
-                        .label_dict_unary_value
-                        .iter()
-                        .flat_map(|entry| [&entry.key, &entry.value]),
-                )
-                .chain(
-                    attribute
-                        .label_keyed_string_dict_value
-                        .iter()
-                        .map(|entry| &entry.key),
-                )
-                .chain(
-                    attribute
-                        .label_list_dict_value
-                        .iter()
-                        .flat_map(|entry| &entry.value),
-                )
-                .chain(
-                    attribute
-                        .string_list_dict_value
-                        .iter()
-                        .flat_map(|entry| &entry.value),
-                )
-        })
+                .map(|entry| &entry.value),
+        )
+        .chain(
+            attribute
+                .label_keyed_string_dict_value
+                .iter()
+                .map(|entry| &entry.key),
+        )
+        .chain(
+            attribute
+                .label_list_dict_value
+                .iter()
+                .flat_map(|entry| &entry.value),
+        )
+        // Bazel's AttributeFormatter emits LABEL_LIST_DICT in the same field as
+        // STRING_LIST_DICT. Only the former is a typed repository input.
+        .chain(
+            attribute
+                .string_list_dict_value
+                .iter()
+                .flat_map(|entry| &entry.value),
+        )
         .map(String::as_str)
-        .filter(|value| crate::hash::main_repo_path(value).is_some())
 }
 
 /// Digest of a repository's own definition: its rule, its attributes, and the local tree and
@@ -3398,6 +3855,7 @@ mod tests {
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
             exclude_external_targets: false,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -3426,6 +3884,7 @@ mod tests {
             keep_going: false,
             fine_grained_external_repos: BTreeSet::from(["@repo".to_owned()]),
             label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
             exclude_external_targets: false,
             exclude_targets_query: Some("attr(tags, manual, //...)".into()),
             no_bazelrc: false,
@@ -3470,6 +3929,7 @@ mod tests {
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
             exclude_external_targets: false,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -3527,7 +3987,7 @@ mod tests {
             &mapping,
             &edges,
             None,
-            &BTreeSet::new(),
+            &LabelOnlyRepositories::default(),
             Path::new("."),
             &mut |target, _| transformed.push(target_name(target).unwrap().to_owned()),
         );
@@ -3586,7 +4046,7 @@ mod tests {
                 &mapping,
                 &BTreeMap::new(),
                 None,
-                &BTreeSet::new(),
+                &LabelOnlyRepositories::default(),
                 workspace.path(),
                 &mut materialize_repository_inputs,
             );
@@ -3641,7 +4101,7 @@ mod tests {
             &mapping,
             &parse_module_dependency_edges(graph),
             None,
-            &BTreeSet::new(),
+            &LabelOnlyRepositories::default(),
             Path::new("."),
             &mut materialize_repository_inputs,
         );
@@ -3838,6 +4298,7 @@ exit 1
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -4044,6 +4505,7 @@ exit 1
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -4093,6 +4555,7 @@ exit 1
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -4197,7 +4660,13 @@ exit 1
             &mapping,
             &edges,
             Some(&imported),
-            &BTreeSet::from(["rules_go++go_sdk".to_owned(), "rules_rs++crate".to_owned()]),
+            &LabelOnlyRepositories {
+                sibling_extensions: BTreeSet::from([
+                    "rules_go++go_sdk".to_owned(),
+                    "rules_rs++crate".to_owned(),
+                ]),
+                ..Default::default()
+            },
             Path::new("."),
             &mut materialize_repository_inputs,
         );
@@ -4252,7 +4721,7 @@ exit 1
             &mapping,
             &edges,
             None,
-            &BTreeSet::new(),
+            &LabelOnlyRepositories::default(),
             Path::new("."),
             &mut materialize_repository_inputs,
         );
@@ -4297,6 +4766,226 @@ exit 1
             options.label_only_extension_prefixes(&mapping, &generated),
             BTreeSet::from(["rules_go++go_sdk".to_owned(), "rules_rs++crate".to_owned()])
         );
+    }
+
+    #[test]
+    fn scoped_build_loads_union_duplicate_observations_before_deduplication() {
+        let repo = "owner++_ext+++usage+hub";
+        let scope = IsolatedRepoScope {
+            anchor: "hub".into(),
+            members: BTreeSet::from([repo.to_owned()]),
+            aliases: RepoMapping::from([("hub".to_owned(), repo.to_owned())]),
+            ..Default::default()
+        };
+        let canonical = format!("@@{repo}//:defs.bzl");
+        let source = |name: &str, loads: &[&str]| Target {
+            r#type: target::Discriminator::SourceFile,
+            source_file: buffa::MessageField::some(SourceFile {
+                name: name.to_owned(),
+                subinclude: loads.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut records = [
+            source("@hub//:BUILD.bazel", &[&canonical]),
+            source("@hub//:BUILD.bazel", &[]),
+        ];
+        for _ in 0..2 {
+            let mut loads = BTreeMap::new();
+            scope.record_build_loads(&records[..1], &mut loads);
+            scope.record_build_loads(&records[1..], &mut loads);
+            scope.record_build_loads(&[source("//pkg:BUILD", &[&canonical])], &mut loads);
+            let mut targets = vec![
+                rule_target("//pkg:consumer"),
+                source("@hub//:BUILD.bazel", &[]),
+            ];
+            assert!(scope
+                .connect_external_readers(&loads, &mut targets)
+                .is_err());
+            targets.push(source("@hub//:defs.bzl", &[]));
+            scope
+                .connect_external_readers(&loads, &mut targets)
+                .unwrap();
+            assert_eq!(
+                targets[0].rule.as_option().unwrap().rule_input,
+                ["//external:hub"]
+            );
+            assert_eq!(
+                targets[1].source_file.as_option().unwrap().subinclude,
+                std::slice::from_ref(&canonical)
+            );
+            records.reverse();
+        }
+    }
+
+    #[test]
+    fn typed_repository_inputs_exclude_string_dictionary_keys() {
+        use crate::proto::blaze_query::attribute::Discriminator as Kind;
+        let mut attr = Attribute {
+            r#type: Kind::LabelDictUnary,
+            ..Default::default()
+        };
+        attr.label_dict_unary_value.push(Default::default());
+        let entry = &mut attr.label_dict_unary_value[0];
+        entry.key = "//:string".into();
+        entry.value = "//:label".into();
+        assert_eq!(
+            attribute_label_values(&attr).collect::<Vec<_>>(),
+            ["//:label"]
+        );
+        // The stock main-repository scan still sees both strings.
+        assert_eq!(
+            attribute_main_repo_labels(&[attr]).collect::<BTreeSet<_>>(),
+            ["//:string", "//:label"].into()
+        );
+    }
+
+    #[test]
+    fn label_list_dictionary_reads_both_wire_encodings() {
+        // LABEL_LIST_DICT in mod show_repo uses StringListDictEntry (field 11).
+        // The schema also has LabelListDictEntry (field 10), with the same shape.
+        for field in [0x5a, 0x52] {
+            let mut wire = b"\x0a\x04deps\x10\x0c".to_vec();
+            wire.push(field);
+            wire.extend_from_slice(b"\x12\x0a\x07//:text\x12\x07//:file\x68\x01");
+            let attribute = Attribute::decode_from_slice(&wire).unwrap();
+            assert_eq!(
+                attribute_label_values(&attribute).collect::<Vec<_>>(),
+                ["//:file"]
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_usage_requires_a_complete_unique_root_identity() {
+        let hub = "owner++_ext+++usage+hub";
+        let spoke = "owner++_ext+++usage+spoke";
+        let config = "owner++_ext+++usage+registry";
+        let path = "owner++_ext+++usage+path";
+        let peer = "owner++ext+neighbor";
+        let other = "owner++_ext+++second+tool";
+        let survey = ExtensionRepositories {
+            imported: [hub.to_owned(), peer.to_owned(), other.to_owned()].into(),
+            generated: [hub, spoke, config, path, peer, other]
+                .map(str::to_owned)
+                .into(),
+            ..Default::default()
+        };
+        let mut rows: Vec<_> = [hub, spoke, config, path, peer, other]
+            .map(|canonical| Repository {
+                canonical_name: Some(canonical.to_owned()),
+                original_name: Some(canonical.rsplit_once('+').unwrap().1.to_owned()),
+                repo_rule_bzl_label: Some("@@owner+//:rules.bzl".into()),
+                repo_rule_name: Some(
+                    if canonical == path {
+                        "new_unknown_class"
+                    } else {
+                        "archive"
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            })
+            .into();
+        rows[1].attribute.push(Attribute {
+            name: "registry_config".into(),
+            r#type: attribute::Discriminator::Label,
+            string_value: Some(format!("@@{config}//:dl")),
+            ..Default::default()
+        });
+        let mapping =
+            serde_json::to_vec(&serde_json::json!({"renamed":hub,"peer":peer,"mod":"owner+"}))
+                .unwrap();
+        let requested = "@renamed";
+        let resolve = |rows: &[Repository], survey: &ExtensionRepositories| {
+            resolve_isolated_root(
+                requested,
+                &mapping,
+                survey,
+                rows,
+                &mut IsolatedRepoScope::default(),
+            )
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                resolve(&rows, &survey),
+                [hub, spoke, config, path].map(str::to_owned).into()
+            );
+            rows.reverse();
+        }
+        // A substituted anchor cannot qualify a different isolated or unisolated group.
+        for substituted in [peer, "foreign++_ext+dep+1+usage+hub"] {
+            let diverted =
+                serde_json::to_vec(&serde_json::json!({"renamed":substituted,"mod":"owner+"}))
+                    .unwrap();
+            assert!(resolve_isolated_root(
+                requested,
+                &diverted,
+                &survey,
+                &rows,
+                &mut IsolatedRepoScope::default()
+            )
+            .is_empty());
+        }
+        // Separate imported members prevent the hub from covering the whole usage.
+        let mut split = survey.clone();
+        split.imported.insert(spoke.into());
+        assert!(resolve(&rows, &split).is_empty());
+        // A known outside repository-time read has no guaranteed ordinary target edge.
+        let mut outside = rows.clone();
+        outside[4].attribute = outside[1].attribute.clone();
+        assert!(resolve(&outside, &survey).is_empty());
+        // Same wire slot, different meaning. String list dictionaries do not
+        // declare a repository input; lists of labels can read this usage.
+        let mut dict = Attribute {
+            name: "settings".into(),
+            r#type: attribute::Discriminator::StringListDict,
+            ..Default::default()
+        };
+        dict.string_list_dict_value.push(Default::default());
+        dict.string_list_dict_value[0].key = "//:text".into();
+        dict.string_list_dict_value[0].value = vec![format!("@@{config}//:dl")];
+        outside[4].attribute = vec![dict];
+        assert!(!resolve(&outside, &survey).is_empty());
+        outside[4].attribute[0].r#type = attribute::Discriminator::LabelListDict;
+        assert!(resolve(&outside, &survey).is_empty());
+        // A repository with an output label is outside the supported read contract.
+        for kind in [
+            attribute::Discriminator::Output,
+            attribute::Discriminator::OutputList,
+        ] {
+            outside[4].attribute[0].r#type = kind;
+            assert!(resolve(&outside, &survey).is_empty());
+        }
+        let mut ambiguous = survey;
+        ambiguous
+            .imported
+            .insert("foreign++_ext+++usage+hub".into());
+        assert!(resolve(&rows, &ambiguous).is_empty());
+        ambiguous.imported.remove("foreign++_ext+++usage+hub");
+        let mut missing = rows.clone();
+        missing.retain(|row| row.canonical_name.as_deref() != Some(spoke));
+        assert!(resolve(&missing, &ambiguous).is_empty());
+        let mut replaced = rows.clone();
+        replaced[1].original_name = Some("different".into());
+        assert!(resolve(&replaced, &ambiguous).is_empty());
+        let malformed = "owner++_ext+++usage+";
+        ambiguous.generated.insert(malformed.into());
+        let mut empty_name = rows.clone();
+        empty_name.push(Repository {
+            canonical_name: Some(malformed.into()),
+            original_name: Some(String::new()),
+            repo_rule_bzl_label: Some("@@owner+//:rules.bzl".into()),
+            repo_rule_name: Some("archive".into()),
+            ..Default::default()
+        });
+        assert!(resolve(&empty_name, &ambiguous).is_empty());
+        ambiguous.generated.remove(malformed);
+        rows[1].attribute[0].string_value = Some("@ambiguous".into());
+        assert!(resolve(&rows, &ambiguous).is_empty());
+        rows[1].attribute[0].r#type = attribute::Discriminator::Unknown;
+        assert!(resolve(&rows, &ambiguous).is_empty());
     }
 
     #[test]
@@ -4359,7 +5048,7 @@ exit 1
                 &mapping,
                 &BTreeMap::new(),
                 None,
-                &BTreeSet::new(),
+                &LabelOnlyRepositories::default(),
                 workspace.path(),
                 &mut materialize_repository_inputs,
             )
@@ -4493,6 +5182,7 @@ if [ "$2" = "dump_repo_mapping" ]; then
     if [ -f unavailable-survey ]; then exit 2; fi
   fi
   for repo in "$@"; do
+    if [ "$repo" = "unknown_hidden+" ]; then echo "Unknown module repository" >&2; exit 2; fi
     if [ "$repo" = "{fail}" ]; then
       echo "ERROR: extension evaluation failed for $repo" >&2
       exit 2
@@ -4559,6 +5249,7 @@ exit 1
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -4777,6 +5468,7 @@ exit 1
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -4806,6 +5498,20 @@ exit 1
             "{show_repo}"
         );
         assert!(!show_repo.contains("go_default_sdk"), "{show_repo}");
+
+        // Recovery can lose a hidden module without a failed extension. Keep the
+        // global owner on that survey, even if the visible module read succeeded.
+        let visible = BTreeMap::from([("rules_python+".into(), vec!["rules_python".into()])]);
+        let mut failed = FailedExtensions::default();
+        let resolved = |hidden, failed: &mut FailedExtensions| {
+            options
+                .extension_repositories(&visible, hidden, BTreeMap::new(), true, failed)
+                .unwrap()
+        };
+        assert!(resolved(Vec::new(), &mut failed).complete_mappings);
+        let recovered = resolved(vec!["unknown_hidden+".into()], &mut failed);
+        assert!(!recovered.complete_mappings);
+        assert!(failed.is_empty());
     }
 
     #[test]
@@ -4863,6 +5569,7 @@ exit 1
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
             exclude_external_targets: false,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -4932,6 +5639,7 @@ exit 1
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,
@@ -4988,6 +5696,7 @@ exit 1
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
             exclude_external_targets: true,
             exclude_targets_query: None,
             no_bazelrc: false,

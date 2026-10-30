@@ -19,6 +19,18 @@ jobs:
       matrix:
         # Keep in sync with the bazel matrix in .bcr/presubmit.yml.
         bazel: ['8.x', '9.x']
+        include:
+          # BCR presubmit also builds every verify_targets task once per flag in
+          # https://github.com/bazelbuild/bazel-central-registry/blob/main/incompatible_flags.yml
+          # for the Bazel versions listed there, and the registry PR cannot
+          # merge until each passes. Keep this list in sync with that file.
+          - bazel: '8.x'
+            incompatible_flags: >-
+              --incompatible_config_setting_private_default_visibility
+              --incompatible_disable_starlark_host_transitions
+              --incompatible_disable_native_repo_rules
+              --incompatible_autoload_externally=
+              --incompatible_strict_action_env
     steps:
       - name: Setup Go environment
         uses: actions/setup-go@v5
@@ -51,3 +63,9 @@ jobs:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
         # Keep in sync with the build_targets in .bcr/presubmit.yml.
         run: ~/go/bin/bazelisk build @bazel-diff//:bazel-diff @bazel-diff//:bazel-diff-rust
+      - name: Build BCR verify_targets with BCR's incompatible flags
+        if: matrix.incompatible_flags
+        working-directory: ${{ runner.temp }}/consumer
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+        run: ~/go/bin/bazelisk build ${{ matrix.incompatible_flags }} @bazel-diff//:bazel-diff @bazel-diff//:bazel-diff-rust

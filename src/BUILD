@@ -39,9 +39,13 @@ rust_library(
     deps = normal_crate_deps() + [":build_script"],
 )
 
+# Public: BCR presubmit builds this module as a dependency with
+# --incompatible_config_setting_private_default_visibility, under which a
+# config_setting without a visibility is private even to the select() below.
 config_setting(
     name = "without_mimalloc",
     values = {"features": "-mimalloc"},
+    visibility = ["//visibility:public"],
 )
 
 rust_binary(

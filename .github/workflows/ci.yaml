@@ -241,7 +241,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            bazel: '8.5.0'
+            bazel: '8.7.0'
             disable_workspace: 'true'
             extra_flags: ''
           - os: ubuntu-latest

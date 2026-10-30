@@ -43,17 +43,26 @@ jobs:
           go install github.com/bazelbuild/bazelisk@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
+      - name: Resolve the temp directory for bash
+        # On Windows RUNNER_TEMP is "D:\a\_temp"; GNU tar reads the drive
+        # colon as a remote host and bash needs forward slashes.
+        run: |
+          tmp="$RUNNER_TEMP"
+          if [ "$RUNNER_OS" = Windows ]; then
+            tmp=$(cygpath -u "$RUNNER_TEMP")
+          fi
+          echo "TMP=$tmp" >> "$GITHUB_ENV"
       - name: Pack release archive
-        run: .github/workflows/pack_release_archive.sh "$RUNNER_TEMP/release.tar.gz"
+        run: .github/workflows/pack_release_archive.sh "$TMP/release.tar.gz"
       - name: Set up consumer module
         run: |
           if [ "$RUNNER_OS" = Windows ]; then
-            url="file:///$(cygpath -m "$RUNNER_TEMP")/release.tar.gz"
+            url="file:///$(cygpath -m "$TMP")/release.tar.gz"
           else
-            url="file://$RUNNER_TEMP/release.tar.gz"
+            url="file://$TMP/release.tar.gz"
           fi
-          mkdir -p "$RUNNER_TEMP/consumer"
-          cd "$RUNNER_TEMP/consumer"
+          mkdir -p "$TMP/consumer"
+          cd "$TMP/consumer"
           cat > MODULE.bazel <<EOF
           module(name = "bcr-consumer-check")
 
@@ -82,12 +91,12 @@ jobs:
         run: |
           curl -fsSL --retry 5 --retry-delay 2 \
             https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main/incompatible_flags.yml \
-            -o "$RUNNER_TEMP/incompatible_flags.yml"
+            -o "$TMP/incompatible_flags.yml"
           py=$(command -v python3 || command -v python)
-          "$py" tools/bcr_incompatible_flags.py --file "$RUNNER_TEMP/incompatible_flags.yml" \
-            "${{ matrix.bazel }}" > "$RUNNER_TEMP/incompatible_flags.txt"
+          "$py" tools/bcr_incompatible_flags.py --file "$TMP/incompatible_flags.yml" \
+            "${{ matrix.bazel }}" > "$TMP/incompatible_flags.txt"
           echo "BCR tests these flags on Bazel ${{ matrix.bazel }}:"
-          cat "$RUNNER_TEMP/incompatible_flags.txt"
+          cat "$TMP/incompatible_flags.txt"
       - name: Build BCR verify_targets as a consumer
         working-directory: ${{ runner.temp }}/consumer
         # Keep in sync with the build_targets in .bcr/presubmit.yml.
@@ -105,7 +114,7 @@ jobs:
               failed+=("$flag")
             fi
             echo "::endgroup::"
-          done < "$RUNNER_TEMP/incompatible_flags.txt"
+          done < "$TMP/incompatible_flags.txt"
           if [ "${#failed[@]}" -gt 0 ]; then
             echo "::error::BCR presubmit would fail: migration is needed for ${failed[*]}"
             exit 1

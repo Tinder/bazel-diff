@@ -1,11 +1,13 @@
 use crate::bazel::BazelOptions;
-use crate::cancel::{self, Cancellation, CANCELLED};
+use crate::cache;
+use crate::cancel::{Cancellation, CANCELLED};
+use crate::git::{self, DerivationPolicy, Git};
 use crate::hash::{generate_hashes_timed, HashOptions};
 use crate::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
 };
 use crate::module_graph::impacted_with_module_changes;
-use crate::partial::{self, Classification, ClassifyInputs, Glob, TreeIndex, MODULE_FILES};
+use crate::partial::{self, Classification, Glob, TreeIndex};
 use anyhow::{anyhow, bail, Context, Result};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -17,13 +19,11 @@ use s3::request::ResponseData;
 use s3::{Bucket, Region};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -185,6 +185,16 @@ impl State {
             fingerprint,
             remote,
         }
+    }
+
+    /// Git bound to the query currently holding the workspace, so the subprocesses it spawns die
+    /// with that query; outside the lock (startup fetch) they run plainly.
+    fn git(&self) -> Git {
+        Git::new(
+            &self.config.git_path,
+            &self.config.hash_options.bazel.workspace,
+        )
+        .with_cancellation(self.workspace.holder())
     }
 
     /// The server's Bazel options bound to the query currently holding the workspace, so the
@@ -735,26 +745,13 @@ pub fn parse_byte_size(value: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("size overflow: {value}"))
 }
 
-/// Rejects configurations partial-graph mode cannot honour. The derivation evaluates recipes
-/// keyed by bare label from the revision's git tree alone, so it has no configured instances
-/// (cquery), no files outside the tree (fine-grained external repositories) and no
-/// per-invocation seeds (always-affected tags); each of those would make a derived entry differ
-/// from a full generation, which is the one property the mode rests on.
+/// Rejects configurations partial-graph mode cannot honour (see
+/// [`partial::validate_hash_options`]).
 pub fn validate_partial_graph(config: &ServerConfig) -> Result<()> {
     if !config.partial_graph {
         return Ok(());
     }
-    let bazel = &config.hash_options.bazel;
-    if bazel.use_cquery {
-        bail!("--partialGraph does not support --useCquery");
-    }
-    if !bazel.fine_grained_external_repos.is_empty() {
-        bail!("--partialGraph does not support --fineGrainedHashExternalRepos");
-    }
-    if !config.hash_options.always_affected_tags.is_empty() {
-        bail!("--partialGraph does not support --alwaysAffectedTags");
-    }
-    Ok(())
+    partial::validate_hash_options(&config.hash_options)
 }
 
 pub fn serve(config: ServerConfig) -> Result<()> {
@@ -1563,89 +1560,18 @@ fn dependency_fingerprint_for_workspace(state: &State) -> Result<String> {
         })
 }
 
+/// The hash-affecting configuration's digest, as [`cache::configuration_fingerprint`]
+/// computes it for every producer of cache entries.
 fn configuration_fingerprint(config: &ServerConfig) -> String {
-    let options = &config.hash_options;
-    let mut hasher = Sha256::new();
-    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
-    hasher.update([0]);
-    for value in [
-        options.bazel.startup_options.join("\0"),
-        options.bazel.command_options.join("\0"),
-        options.bazel.cquery_options.join("\0"),
-        options.bazel.use_cquery.to_string(),
-        options.bazel.cquery_expression.clone().unwrap_or_default(),
-        options.bazel.keep_going.to_string(),
-        options.bazel.exclude_external_targets.to_string(),
-        options
-            .bazel
-            .exclude_targets_query
-            .clone()
-            .unwrap_or_default(),
-        options
-            .bazel
-            .fine_grained_external_repos
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(","),
-        options
-            .bazel
-            .label_only_module_extensions
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(","),
-        options
-            .ignored_attributes
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join(","),
-        options
-            .seed_filepaths
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("\0"),
-        options
-            .always_affected_tags
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join(","),
-        config.track_deps.to_string(),
-        // Full-content entries hash git blob ids rather than file bytes; keep them apart from
-        // entries a build without this seeding wrote under the same package version.
-        String::from("sourceContent=git-blob"),
-    ] {
-        hasher.update(value.as_bytes());
-        hasher.update([0]);
-    }
-    if config.partial_graph {
-        // Partial-graph entries hash under a different formula and carry recipes; they are never
-        // compared with, or served in place of, an entry of the default mode. Only folded in when
-        // enabled so existing keys do not move.
-        hasher.update(format!("partialGraph={}", partial::RECIPE_VERSION).as_bytes());
-        hasher.update([0]);
-    }
-    hex::encode(hasher.finalize())[..12].to_owned()
+    cache::configuration_fingerprint(
+        &config.hash_options,
+        config.track_deps,
+        config.partial_graph,
+    )
 }
 
 fn cache_key(state: &State, sha: &str, modified: &BTreeSet<PathBuf>) -> String {
-    let base = format!("{sha}.{}", state.fingerprint);
-    if modified.is_empty() {
-        return base;
-    }
-    let mut hasher = Sha256::new();
-    for path in modified {
-        hasher.update(path.to_string_lossy().as_bytes());
-        hasher.update(b"\n");
-    }
-    format!("{base}.{}", &hex::encode(hasher.finalize())[..12])
+    cache::cache_key(sha, &state.fingerprint, modified)
 }
 
 fn resolve_both(state: &State, from: &str, to: &str) -> Result<(String, String)> {
@@ -1692,63 +1618,22 @@ fn fetch_revision(state: &State, revision: &str) -> bool {
         })
 }
 
+/// Thin wrappers over [`Git`] bound to the query holding the workspace, so the subprocesses
+/// die with it (see [`State::git`]).
 fn resolve_sha(state: &State, revision: &str) -> Result<String> {
-    let output = git_output(
-        state,
-        &[
-            String::from("rev-parse"),
-            String::from("--verify"),
-            format!("{revision}^{{commit}}"),
-        ],
-    )?;
-    if !output.status.success() {
-        bail!("revision '{revision}' is missing from the local clone");
-    }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if sha.len() != 40 {
-        bail!("revision '{revision}' resolved to invalid SHA '{sha}'");
-    }
-    Ok(sha)
+    state.git().resolve_sha(revision)
 }
 
-/// Resolves the tree object a commit points at; distinct commits with identical content share it.
 fn resolve_tree(state: &State, sha: &str) -> Result<String> {
-    let output = git_output(
-        state,
-        &[
-            String::from("rev-parse"),
-            String::from("--verify"),
-            format!("{sha}^{{tree}}"),
-        ],
-    )?;
-    if !output.status.success() {
-        bail!("tree for revision '{sha}' is missing from the local clone");
-    }
-    let tree = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if tree.len() != 40 {
-        bail!("revision '{sha}' resolved to invalid tree '{tree}'");
-    }
-    Ok(tree)
+    state.git().resolve_tree(sha)
 }
 
-/// Every tracked path at `sha` with its object id and mode, from one `git ls-tree`.
-/// [`TreeIndex::content_hashes`] is the `{path: blob}` map `--contentHashPath` accepts.
 fn git_tree_index(state: &State, sha: &str) -> Result<TreeIndex> {
-    let output = git_success(
-        state,
-        &[
-            String::from("ls-tree"),
-            String::from("-r"),
-            String::from("-z"),
-            sha.to_owned(),
-        ],
-    )?;
-    Ok(TreeIndex::parse_ls_tree(&output))
+    state.git().tree_index(sha)
 }
 
-/// Decides whether `sha` can be derived from the cached `base_sha` entry: the raw diff between
-/// the two, the module and workspace files' label references at `sha`, and the server's
-/// rebuild patterns and seed files go through [`partial::classify`].
+/// Decides whether `sha` can be derived from the cached `base_sha` entry under the server's
+/// rebuild patterns and seed files (see [`git::classify_revisions`]).
 fn classify_revisions(
     state: &State,
     base_sha: &str,
@@ -1756,107 +1641,29 @@ fn classify_revisions(
     base: &HashFileData,
     tree: &TreeIndex,
 ) -> Result<Classification> {
-    let diff = git_success(
-        state,
-        &[
-            String::from("diff"),
-            String::from("--raw"),
-            String::from("--no-renames"),
-            String::from("-z"),
-            base_sha.to_owned(),
-            sha.to_owned(),
-        ],
-    )?;
-    let diff = partial::parse_diff_raw(&diff)?;
-    let mut module_referenced = BTreeSet::new();
-    for file in MODULE_FILES {
-        if tree.get(file).is_none() {
-            continue;
-        }
-        let text = git_success(state, &[String::from("show"), format!("{sha}:{file}")])?;
-        module_referenced.extend(partial::referenced_main_repo_paths(
-            &String::from_utf8_lossy(&text),
-        ));
-    }
-    Ok(partial::classify(&ClassifyInputs {
-        diff: &diff,
-        tree,
+    git::classify_revisions(
+        &state.git(),
+        base_sha,
+        sha,
         base,
-        workspace: &state.config.hash_options.bazel.workspace,
-        seed_filepaths: &state.config.hash_options.seed_filepaths,
-        rebuild_patterns: &state.config.partial_graph_rebuild_patterns,
-        module_referenced: &module_referenced,
-    }))
-}
-
-/// Runs git and returns its stdout, failing on a non-zero exit with the command and stderr.
-fn git_success(state: &State, args: &[String]) -> Result<Vec<u8>> {
-    let output = git_output(state, args)?;
-    if !output.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(output.stdout)
+        tree,
+        &DerivationPolicy {
+            seed_filepaths: &state.config.hash_options.seed_filepaths,
+            rebuild_patterns: &state.config.partial_graph_rebuild_patterns,
+        },
+    )
 }
 
 fn checkout(state: &State, sha: &str) -> Result<()> {
-    if let Ok(output) = git_output(state, &[String::from("rev-parse"), String::from("HEAD")]) {
-        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == sha {
-            return Ok(());
-        }
-    }
-    let args = [
-        String::from("-c"),
-        String::from("advice.detachedHead=false"),
-        String::from("checkout"),
-        String::from("--force"),
-        sha.to_owned(),
-    ];
-    if git(state, &args).is_ok() {
-        return Ok(());
-    }
-    let index_lock = state
-        .config
-        .hash_options
-        .bazel
-        .workspace
-        .join(".git/index.lock");
-    if !index_lock.is_file() {
-        bail!("git checkout failed for revision {sha}");
-    }
-    fs::remove_file(&index_lock).context("failed to remove stale .git/index.lock")?;
-    eprintln!(
-        "[Warn] cleared stale git index.lock in {}; retrying checkout of {sha}",
-        state.config.hash_options.bazel.workspace.display()
-    );
-    git(state, &args)
+    state.git().checkout(sha)
 }
 
 fn git(state: &State, args: &[String]) -> Result<()> {
-    let output = git_output(state, args)?;
-    if !output.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(())
+    state.git().run(args)
 }
 
-/// Runs git in the workspace. While a query holds the workspace the subprocess belongs to it and
-/// is killed if that query is cancelled; outside the lock (startup fetch) it runs plainly.
 fn git_output(state: &State, args: &[String]) -> Result<std::process::Output> {
-    let mut command = Command::new(&state.config.git_path);
-    command
-        .current_dir(&state.config.hash_options.bazel.workspace)
-        .args(args)
-        .stdin(Stdio::null());
-    cancel::output(state.workspace.holder().as_deref(), &mut command)
-        .with_context(|| format!("failed to execute {}", state.config.git_path.display()))
+    state.git().output(args)
 }
 
 fn metrics(state: &State) -> Value {
@@ -2019,6 +1826,7 @@ mod tests {
     use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::TcpStream;
+    use std::process::Command;
     use std::sync::mpsc as std_mpsc;
     use std::thread;
 

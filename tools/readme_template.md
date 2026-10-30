@@ -68,6 +68,59 @@ See https://github.com/aspect-extensions/impacted
 
 * We run `bazel-diff` on the starting and final JSON hash filepaths to get our impacted set of targets. This impacted set of targets is written to a file.
 
+## Partial Graph Updates
+
+A full `generate-hashes` pays for a `bazel query` over the whole graph even when the change
+cannot have altered that graph: editing the body of a source file changes what Bazel builds,
+never which targets exist or how they depend on each other. `generate-hashes --partialGraph`
+skips that query when it can:
+
+* The hashes describe the workspace's *git tree* rather than the files on disk: the working tree
+  as it stands, committed or not, is written as a tree object (an untracked file `.gitignore`
+  does not exclude is part of it, an ignored one is not, and neither are the hash files the run
+  itself reads and writes: the output, `--baseHashes` and `--depEdgesFile`), and source content
+  is read from that tree. A clean working tree yields the commit's own tree. The file records
+  the tree's id under `metadata.tree`, and every rule's hashing *recipe* (the digest of
+  everything that feeds its hash except source content, plus its ordered source inputs and
+  dependencies) under `metadata.partialGraph`. The file always includes every target's type, as
+  `--includeTargetType` would.
+* With `--baseHashes <file>` naming a file written this way, the recipes it carries are
+  re-evaluated against the workspace's tree when `git diff` between the two trees only modifies
+  the content of regular files -- no `bazel query`, no Bazel at all. Anything else falls back to a
+  full generation: an added, deleted, renamed or type-changed path; a symlink or submodule on
+  either side; a change to a file Bazel reads while loading (`BUILD`, `BUILD.bazel`, `*.bzl`,
+  `*.scl`, `MODULE.bazel`, `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`, `VENDOR.bazel`,
+  `*bazelrc`, `.bazelversion`, `.bazelignore`, `.bazeliskrc`, `tools/bazel`, `*.BUILD`,
+  `BUILD.*`, `*.patch`, `*.diff`); a file `MODULE.bazel` or a `WORKSPACE` file names by label;
+  anything a repository rule read from the workspace while the graph was generated; a
+  `--seed-filepaths` file; a path matching `--partialGraphRebuildPattern` (a glob: `*` within a
+  path segment, `**` across, a pattern without `/` matches the file name; repeatable); or a base
+  whose tree the local clone does not have. A fallback costs speed, never correctness, and the
+  log says which path each run took. A modified file no target reads impacts nothing, as it
+  would in a full generation.
+* The file a derivation writes is byte-identical to the one a full generation under the flag
+  writes for the same tree, so derived files are themselves bases for later runs. A base that
+  already describes the workspace's tree is written back as is. With `--depEdgesFile` the hash
+  file also carries the dependency edges, so a derivation can write them; a base without them
+  cannot feed `--depEdgesFile` and forces a full generation.
+* Hashes under the flag follow a slightly different formula from the default mode's, so
+  `get-impacted-targets` and `explain` refuse a pair of files of which only one carries recipes.
+  Not supported together with `--useCquery`, `--fineGrainedHashExternalRepos`,
+  `--alwaysAffectedTags`, `--contentHashPath`, `--modified-filepaths` or `--targetType` (a file
+  missing targets cannot be derived from; filter in `get-impacted-targets` instead): a derivation
+  reads only the git tree and keys recipes by bare label. The workspace must be the repository
+  root, and `--gitPath` names the git binary (default `git`).
+
+A typical CI job hashes the merge base once on the main branch and keeps the file; a pull
+request run then needs no Bazel for the common case of a source-only change:
+
+```terminal
+bazel-diff generate-hashes -w . -b bazel --partialGraph --baseHashes main_hashes.json pr_hashes.json
+bazel-diff get-impacted-targets --startingHashes main_hashes.json --finalHashes pr_hashes.json -o impacted.txt
+```
+
+The [query service](#query-service) runs the same derivation server-side behind a cache.
+
 ## Build Graph Distance Metrics
 
 `bazel-diff` can optionally compute build graph distance metrics between two revisions. This is
@@ -452,7 +505,9 @@ Notes and operational guidance:
   with `--useCquery`, `--fineGrainedHashExternalRepos` or `--alwaysAffectedTags` (the server
   refuses to start): a derivation reads only the git tree and keys recipes by bare label. The
   nightly [`partial-graph-bench`](.github/workflows/partial-graph-bench.yml) workflow checks the
-  mode's speed and its exact agreement with the default mode (see `tools/perf/README.md`).
+  mode's speed and its exact agreement with the default mode (see `tools/perf/README.md`). The
+  one-shot `generate-hashes --partialGraph` writes the same entries (see [Partial Graph
+  Updates](#partial-graph-updates)).
 
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,

@@ -24,6 +24,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "core::generate_hashes_partial_graph_derives_from_base_hashes",
+                "timeout": "moderate",
+            },
+            {
                 "name": "core::integration_golden",
                 "timeout": "moderate",
             },

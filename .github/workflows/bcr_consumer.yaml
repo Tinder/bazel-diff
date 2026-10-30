@@ -1,7 +1,13 @@
 name: BCR consumer
 
-# Build bazel-diff as a non-root module from the release source archive,
-# using the same targets as .bcr/presubmit.yml.
+# Mirror the Bazel Central Registry presubmit for bazel-diff on a PR, so a
+# release that the registry would reject fails here first:
+#
+# 1. Build bazel-diff as a non-root module from the release source archive,
+#    using the same platforms, flags and targets as .bcr/presubmit.yml.
+# 2. Rebuild once per incompatible flag the registry tests for that Bazel
+#    version (bazel-central-registry/incompatible_flags.yml), as BCR does
+#    before it lets a registry PR merge.
 
 on:
   push:
@@ -12,37 +18,40 @@ on:
 
 jobs:
   verify-targets:
-    name: Consume as dependency (Bazel ${{ matrix.bazel }})
-    runs-on: ubuntu-latest
+    name: Consume as dependency (${{ matrix.os }}, Bazel ${{ matrix.bazel }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Keep in sync with the bazel matrix in .bcr/presubmit.yml.
+        # Keep in sync with the platforms and bazel matrix in .bcr/presubmit.yml.
+        os: [ubuntu-latest, windows-latest]
         bazel: ['8.x', '9.x']
-        include:
-          # BCR presubmit also builds every verify_targets task once per flag in
-          # https://github.com/bazelbuild/bazel-central-registry/blob/main/incompatible_flags.yml
-          # for the Bazel versions listed there, and the registry PR cannot
-          # merge until each passes. Keep this list in sync with that file.
-          - bazel: '8.x'
-            incompatible_flags: >-
-              --incompatible_config_setting_private_default_visibility
-              --incompatible_disable_starlark_host_transitions
-              --incompatible_disable_native_repo_rules
-              --incompatible_autoload_externally=
-              --incompatible_strict_action_env
+    defaults:
+      run:
+        shell: bash
+    env:
+      USE_BAZEL_VERSION: ${{ matrix.bazel }}
+      # Prevent Git Bash from rewriting Bazel target labels as Windows paths.
+      MSYS2_ARG_CONV_EXCL: '//'
     steps:
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
           go-version: ^1.17
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest
+        run: |
+          go install github.com/bazelbuild/bazelisk@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
       - name: Pack release archive
         run: .github/workflows/pack_release_archive.sh "$RUNNER_TEMP/release.tar.gz"
       - name: Set up consumer module
         run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            url="file:///$(cygpath -m "$RUNNER_TEMP")/release.tar.gz"
+          else
+            url="file://$RUNNER_TEMP/release.tar.gz"
+          fi
           mkdir -p "$RUNNER_TEMP/consumer"
           cd "$RUNNER_TEMP/consumer"
           cat > MODULE.bazel <<EOF
@@ -53,19 +62,51 @@ jobs:
 
           archive_override(
               module_name = "bazel-diff",
-              urls = ["file://$RUNNER_TEMP/release.tar.gz"],
+              urls = ["$url"],
           )
           EOF
           touch BUILD.bazel
+      - name: Set Bazel flags
+        # Keep in sync with the build_flags of the matching task in
+        # .bcr/presubmit.yml. The startup flag keeps Windows output paths short
+        # on GitHub runners, as the other Windows jobs do.
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            echo "BAZEL_STARTUP_FLAGS=--output_base=C:/b" >> "$GITHUB_ENV"
+            echo "BAZEL_FLAGS=--legacy_external_runfiles --host_platform=@bazel-diff//platforms:windows_msvc --experimental_platform_in_output_dir --experimental_override_name_platform_in_output_dir=@bazel-diff//platforms:windows_msvc=w" >> "$GITHUB_ENV"
+          else
+            echo "BAZEL_STARTUP_FLAGS=" >> "$GITHUB_ENV"
+            echo "BAZEL_FLAGS=" >> "$GITHUB_ENV"
+          fi
+      - name: Fetch the incompatible flags BCR tests for Bazel ${{ matrix.bazel }}
+        run: |
+          curl -fsSL --retry 5 --retry-delay 2 \
+            https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main/incompatible_flags.yml \
+            -o "$RUNNER_TEMP/incompatible_flags.yml"
+          py=$(command -v python3 || command -v python)
+          "$py" tools/bcr_incompatible_flags.py --file "$RUNNER_TEMP/incompatible_flags.yml" \
+            "${{ matrix.bazel }}" > "$RUNNER_TEMP/incompatible_flags.txt"
+          echo "BCR tests these flags on Bazel ${{ matrix.bazel }}:"
+          cat "$RUNNER_TEMP/incompatible_flags.txt"
       - name: Build BCR verify_targets as a consumer
         working-directory: ${{ runner.temp }}/consumer
-        env:
-          USE_BAZEL_VERSION: ${{ matrix.bazel }}
         # Keep in sync with the build_targets in .bcr/presubmit.yml.
-        run: ~/go/bin/bazelisk build @bazel-diff//:bazel-diff @bazel-diff//:bazel-diff-rust
-      - name: Build BCR verify_targets with BCR's incompatible flags
-        if: matrix.incompatible_flags
+        run: bazelisk $BAZEL_STARTUP_FLAGS build $BAZEL_FLAGS @bazel-diff//:bazel-diff @bazel-diff//:bazel-diff-rust
+      - name: Build once per incompatible flag, as BCR presubmit does
         working-directory: ${{ runner.temp }}/consumer
-        env:
-          USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        run: ~/go/bin/bazelisk build ${{ matrix.incompatible_flags }} @bazel-diff//:bazel-diff @bazel-diff//:bazel-diff-rust
+        run: |
+          failed=()
+          while IFS= read -r flag; do
+            [ -z "$flag" ] && continue
+            echo "::group::bazel build $flag"
+            if bazelisk $BAZEL_STARTUP_FLAGS build $BAZEL_FLAGS "$flag" @bazel-diff//:bazel-diff @bazel-diff//:bazel-diff-rust; then
+              echo "passed with $flag"
+            else
+              failed+=("$flag")
+            fi
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/incompatible_flags.txt"
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::BCR presubmit would fail: migration is needed for ${failed[*]}"
+            exit 1
+          fi

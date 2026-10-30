@@ -1844,6 +1844,7 @@ mod tests {
                     keep_going: false,
                     fine_grained_external_repos: BTreeSet::new(),
                     label_only_module_extensions: BTreeSet::new(),
+                    isolated_dependency_root: None,
                     exclude_external_targets: false,
                     exclude_targets_query: None,
                     no_bazelrc: false,

@@ -126,6 +126,10 @@ struct HashingArgs {
     )]
     label_only_module_extensions: Vec<String>,
 
+    /// Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer.
+    #[arg(long = "isolatedDependencyRoot")]
+    isolated_dependency_root: Option<String>,
+
     #[arg(
         long = "useCquery",
         action = ArgAction::Set,
@@ -578,6 +582,7 @@ fn bazel_options(args: &HashingArgs, verbose: bool) -> Result<BazelOptions> {
         keep_going: args.keep_going,
         fine_grained_external_repos: repos,
         label_only_module_extensions: args.label_only_module_extensions.iter().cloned().collect(),
+        isolated_dependency_root: args.isolated_dependency_root.clone(),
         exclude_external_targets: args.exclude_external_targets,
         exclude_targets_query: args.exclude_targets_query.clone(),
         no_bazelrc: false,
@@ -621,7 +626,7 @@ fn fingerprint_flags(
     include_type: bool,
     types: &[String],
 ) -> BTreeMap<String, String> {
-    BTreeMap::from([
+    let mut flags = BTreeMap::from([
         (
             "bazelStartupOptions".into(),
             flatten_options(&args.bazel_startup_options).join(" "),
@@ -685,7 +690,11 @@ fn fingerprint_flags(
             args.exclude_external_targets.to_string(),
         ),
         ("keepGoing".into(), args.keep_going.to_string()),
-    ])
+    ]);
+    if let Some(root) = &args.isolated_dependency_root {
+        flags.insert("isolatedDependencyRoot".into(), root.clone());
+    }
+    flags
 }
 
 fn write_json_file(file: File, value: &impl Serialize) -> Result<()> {
@@ -881,6 +890,7 @@ fn get_bazel_options(args: &GetImpactedTargetsArgs, verbose: bool) -> BazelOptio
         keep_going: false,
         fine_grained_external_repos: BTreeSet::new(),
         label_only_module_extensions: BTreeSet::new(),
+        isolated_dependency_root: None,
         exclude_external_targets: false,
         exclude_targets_query: None,
         no_bazelrc: args.no_bazelrc,
@@ -1183,6 +1193,7 @@ mod tests {
             fine_grained_hash_external_repos: Vec::new(),
             fine_grained_hash_external_repos_file: None,
             label_only_module_extensions: Vec::new(),
+            isolated_dependency_root: None,
             use_cquery: false,
             cquery_expression: None,
             keep_going: false,
@@ -1441,6 +1452,7 @@ mod tests {
         first.fine_grained_hash_external_repos = vec!["maven".into(), "abc".into()];
         first.ignored_rule_hashing_attributes = vec!["z".into(), "a".into()];
         first.label_only_module_extensions = vec!["@b//:e.bzl%b".into(), "@a//:e.bzl%a".into()];
+        first.isolated_dependency_root = Some("@a".into());
         let mut second = first.clone();
         second.fine_grained_hash_external_repos.reverse();
         second.label_only_module_extensions.reverse();
@@ -1453,6 +1465,7 @@ mod tests {
         assert_eq!(first_flags["bazelStartupOptions"], "--a --b");
         assert_eq!(first_flags["targetType"], "GeneratedFile,Rule");
         assert_eq!(first_flags["fineGrainedHashExternalRepos"], "abc,maven");
+        assert_eq!(first_flags["isolatedDependencyRoot"], "@a");
         assert_eq!(
             first_flags["labelOnlyModuleExtensions"],
             "@a//:e.bzl%a,@b//:e.bzl%b"

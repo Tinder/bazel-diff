@@ -120,6 +120,18 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::isolated_dependency_root_keeps_hidden_spoke_changes",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::isolated_dependency_root_reaches_alias_direct_and_build_load_readers",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::isolated_dependency_root_tracks_repository_read_bytes",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::remote_proto_bump_impacts_consumer",
                 "timeout": "moderate",
             },

@@ -81,6 +81,11 @@ pub fn configuration_fingerprint(
         hasher.update(value.as_bytes());
         hasher.update([0]);
     }
+    if let Some(root) = &options.bazel.isolated_dependency_root {
+        hasher.update(b"isolatedDependencyRoot=");
+        hasher.update(root.as_bytes());
+        hasher.update([0]);
+    }
     if partial_graph {
         hasher.update(format!("partialGraph={}", partial::RECIPE_VERSION).as_bytes());
         hasher.update([0]);
@@ -122,6 +127,7 @@ mod tests {
                 keep_going: false,
                 fine_grained_external_repos: BTreeSet::new(),
                 label_only_module_extensions: BTreeSet::new(),
+                isolated_dependency_root: None,
                 exclude_external_targets: false,
                 exclude_targets_query: None,
                 no_bazelrc: false,

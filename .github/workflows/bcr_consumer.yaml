@@ -106,6 +106,9 @@ jobs:
         run: |
           failed=()
           while IFS= read -r flag; do
+            # Python writes CRLF on Windows; a trailing CR makes Bazel reject
+            # the flag as unrecognized against its own name.
+            flag=${flag%$'\r'}
             [ -z "$flag" ] && continue
             echo "::group::bazel build $flag"
             if bazelisk $BAZEL_STARTUP_FLAGS build $BAZEL_FLAGS "$flag" @bazel-diff//:bazel-diff @bazel-diff//:bazel-diff-rust; then

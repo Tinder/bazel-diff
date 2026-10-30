@@ -20,7 +20,11 @@ go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk", dev_dependency 
 go_sdk.download(version = "1.23.1")
 
 # llvm 0.8.20-0.8.25 hermetic Windows MSVC toolchains hit an analysis cycle on a
-# Windows exec host (hermetic-llvm#809, rules_rs#271); 0.8.26 fixed it.
+# Windows exec host (hermetic-llvm#809, rules_rs#271); 0.8.26 fixed it, but the
+# toolchain downloads the MSVC runtime and Windows SDK, which need Microsoft
+# license acceptance from every Windows builder. register_toolchains below
+# therefore lists only the Linux and macOS toolchains, so Windows keeps using
+# the locally installed Visual Studio toolchain.
 bazel_dep(name = "llvm", version = "0.8.26")
 
 # rules_rs 0.2.0 requires Bazel 8.7+, hence bazel_compatibility above.
@@ -46,9 +50,26 @@ rust.toolchain(
 )
 use_repo(rust, "bd_rust")
 
+# Every Linux/macOS exec-to-target pair llvm declares; release-linux configs
+# cross-compile musl Linux binaries from macOS and Linux.
 register_toolchains(
     "@bd_rust//...",
-    "@llvm//toolchain:all",
+    "@llvm//toolchain:linux_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:linux_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:linux_aarch64_to_macos_aarch64",
+    "@llvm//toolchain:linux_aarch64_to_macos_x86_64",
+    "@llvm//toolchain:linux_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:linux_x86_64_to_macos_aarch64",
+    "@llvm//toolchain:linux_x86_64_to_macos_x86_64",
+    "@llvm//toolchain:macos_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:macos_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:macos_aarch64_to_macos_aarch64",
+    "@llvm//toolchain:macos_aarch64_to_macos_x86_64",
+    "@llvm//toolchain:macos_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:macos_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:macos_x86_64_to_macos_aarch64",
+    "@llvm//toolchain:macos_x86_64_to_macos_x86_64",
 )
 
 # CI selects this toolchain explicitly to check Cargo.toml's rust-version.

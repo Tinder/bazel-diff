@@ -138,3 +138,21 @@ py_test(
     python_version = "PY3",
     deps = [":report_bazel_failures_lib"],
 )
+
+# bcr_incompatible_flags.py selects the flags BCR presubmit tests for a Bazel
+# version from the registry's incompatible_flags.yml. bcr_consumer.yaml runs the
+# file with the runner's python3 before Bazel is set up, so it stays a plain
+# script (no py_binary) and the test imports the same source.
+py_library(
+    name = "bcr_incompatible_flags_lib",
+    srcs = ["bcr_incompatible_flags.py"],
+    imports = ["."],
+    visibility = ["//visibility:private"],
+)
+
+py_test(
+    name = "bcr_incompatible_flags_test",
+    srcs = ["bcr_incompatible_flags_test.py"],
+    python_version = "PY3",
+    deps = [":bcr_incompatible_flags_lib"],
+)

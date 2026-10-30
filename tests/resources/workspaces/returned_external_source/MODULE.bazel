@@ -1,0 +1,5 @@
+module(name = "returned_external_source")
+
+mirror = use_repo_rule("//:mirror.bzl", "mirror")
+
+mirror(name = "bridge")

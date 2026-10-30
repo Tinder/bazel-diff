@@ -428,3 +428,44 @@ fn diff_local(
     assert!(impacted(second, &from, &to, &result, &[]).status.success());
     read_lines(&result)
 }
+
+#[test]
+fn returned_external_source_reaches_consumer() {
+    let workspace = copy_workspace("returned_external_source");
+    let output = tempfile::tempdir().unwrap();
+    let before = output.path().join("before.json");
+    let after = output.path().join("after.json");
+    let result = output.path().join("impacted.txt");
+    let args = [
+        "--useCquery",
+        "--cqueryExpression",
+        "deps(set(//:consumer //:unrelated))",
+    ];
+    for (contents, snapshot) in [("before\n", &before), ("after\n", &after)] {
+        fs::write(workspace.path().join("value.txt"), contents).unwrap();
+        assert!(generate(workspace.path(), snapshot, &args).status.success());
+        assert!(std::process::Command::new(bazel())
+            .current_dir(workspace.path())
+            .args(["build", "//:consumer"])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("bazel-bin/copied.txt")).unwrap(),
+            contents
+        );
+    }
+    assert!(impacted(workspace.path(), &before, &after, &result, &[])
+        .status
+        .success());
+    let targets = read_lines(&result);
+    assert!(
+        targets.iter().any(|t| t.ends_with("//:mirror.txt")),
+        "{targets:?}"
+    );
+    assert!(
+        targets.contains("@@//:consumer") || targets.contains("//:consumer"),
+        "{targets:?}"
+    );
+    assert!(!targets.contains("@@//:unrelated") && !targets.contains("//:unrelated"));
+}

@@ -361,7 +361,7 @@ fn hash_targets_with_environment(
                 .map(|source| {
                     let seed = source_seed(&source);
                     source_hasher
-                        .digest(&source.name, &seed)
+                        .digest_source(&source.name, &seed, options.bazel.use_cquery)
                         .map(|digest| (source.name, digest))
                 })
                 .collect::<Result<Vec<_>>>()
@@ -1446,12 +1446,22 @@ struct SourceHasher<'a> {
 
 impl SourceHasher<'_> {
     fn digest(&self, label: &str, seed: &[u8]) -> Result<DigestBytes> {
+        self.digest_source(label, seed, false)
+    }
+
+    fn digest_source(
+        &self,
+        label: &str,
+        seed: &[u8],
+        configured_source: bool,
+    ) -> Result<DigestBytes> {
         if let Some(tree) = self.tree {
             if is_main_repo(label) {
                 return Ok(partial::source_digest(tree, label, seed));
             }
         }
-        let Some((path, content_key)) = self.resolve(label)? else {
+        let Some((path, content_key, materialized)) = self.resolve(label, configured_source)?
+        else {
             return Ok(Sha256::digest([]).into());
         };
         let absolute = if path.is_absolute() {
@@ -1467,7 +1477,7 @@ impl SourceHasher<'_> {
             hasher.update(content_hash.as_bytes());
             hasher.update([1]);
             hasher.update([u8::from(owner_executable(&absolute))]);
-        } else if absolute.is_file() {
+        } else if materialized || absolute.is_file() {
             let should_hash = self.modified_filepaths.is_empty()
                 || self.modified_filepaths.iter().any(|modified| {
                     self.workspace
@@ -1476,8 +1486,9 @@ impl SourceHasher<'_> {
                         .eq(absolute.components())
                 });
             if should_hash {
-                hash_file_into(&mut hasher, &absolute)
-                    .with_context(|| format!("failed to read source {}", absolute.display()))?;
+                hash_file_into(&mut hasher, &absolute).with_context(|| {
+                    format!("failed to read source {} ({label})", absolute.display())
+                })?;
             }
             hasher.update([1]);
             hasher.update([u8::from(owner_executable(&absolute))]);
@@ -1515,7 +1526,7 @@ impl SourceHasher<'_> {
             debug_assert!(seed.is_empty());
             return Ok(partial::soft_digest(tree, label));
         }
-        let Some((path, _)) = self.resolve(label)? else {
+        let Some((path, _, _)) = self.resolve(label, false)? else {
             return Ok(None);
         };
         let absolute = self.workspace.join(path);
@@ -1525,9 +1536,17 @@ impl SourceHasher<'_> {
         self.digest(label, seed).map(Some)
     }
 
-    fn resolve(&self, label: &str) -> Result<Option<(PathBuf, String)>> {
+    fn resolve(
+        &self,
+        label: &str,
+        configured_source: bool,
+    ) -> Result<Option<(PathBuf, String, bool)>> {
         if let Some(path) = main_repo_path(label) {
-            return Ok(Some((path.clone(), path.to_string_lossy().into_owned())));
+            return Ok(Some((
+                path.clone(),
+                path.to_string_lossy().into_owned(),
+                false,
+            )));
         }
         if let Some(rest) = label.strip_prefix('@') {
             let canonical = rest.starts_with('@');
@@ -1535,6 +1554,39 @@ impl SourceHasher<'_> {
             let Some((repo, target)) = rest.split_once("//") else {
                 return Ok(None);
             };
+            let paths = || {
+                let relative = PathBuf::from(target.trim_start_matches(':').replace(':', "/"));
+                let key = PathBuf::from("external").join(repo).join(&relative);
+                (relative, key)
+            };
+            // A canonical source returned by cquery can be read directly, even when the
+            // repository was not queried as a fine-grained root.
+            if configured_source
+                && canonical
+                && !repo.is_empty()
+                && self.tree.is_none()
+                && self.content_hashes.is_none()
+                && self.modified_filepaths.is_empty()
+            {
+                let (_, key) = paths();
+                let path = self.external_resolver.output_base.join(&key);
+                match fs::metadata(&path) {
+                    Ok(metadata) if metadata.is_file() => {
+                        return Ok(Some((path, key.to_string_lossy().into_owned(), true)));
+                    }
+                    Ok(_) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) => {}
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("failed to inspect source {} ({label})", path.display())
+                        })
+                    }
+                }
+            }
             // The same matching `transform_external_input` applies to the rule's inputs: a label
             // printed under either name (`@crates//...` by `query`, `@@rules_rs++crate+crates//...`
             // by `cquery`) is fine-grained when the user named the repository either way.
@@ -1551,12 +1603,12 @@ impl SourceHasher<'_> {
             if !fine_grained {
                 return Ok(None);
             }
-            let relative = PathBuf::from(target.trim_start_matches(':').replace(':', "/"));
+            let (relative, key) = paths();
             let root = self.external_resolver.resolve(repo)?;
-            let key = PathBuf::from("external").join(repo).join(&relative);
             return Ok(Some((
                 root.join(relative),
                 key.to_string_lossy().into_owned(),
+                false,
             )));
         }
         Ok(None)
@@ -2320,7 +2372,7 @@ esac
         };
         let label = "@@rules_jvm_external++maven+maven//:guava.jar";
         for fine_grained in [&["maven"][..], &["rules_jvm_external++maven+maven"][..]] {
-            let (path, key) = hasher(fine_grained).resolve(label).unwrap().unwrap();
+            let (path, key, _) = hasher(fine_grained).resolve(label, false).unwrap().unwrap();
             assert_eq!(path, repo_root.join("guava.jar"), "{fine_grained:?}");
             assert_eq!(
                 key, "external/rules_jvm_external++maven+maven/guava.jar",
@@ -2328,18 +2380,27 @@ esac
             );
         }
         // Neither name listed: the label is opaque, as before.
-        assert!(hasher(&["other"]).resolve(label).unwrap().is_none());
-        assert!(hasher(&[]).resolve(label).unwrap().is_none());
+        assert!(hasher(&["other"]).resolve(label, false).unwrap().is_none());
+        assert!(hasher(&[]).resolve(label, false).unwrap().is_none());
         // An apparent label, as `query` prints it, resolves under the canonical name too.
-        let (path, _) = hasher(&["rules_jvm_external++maven+maven"])
-            .resolve("@maven//:guava.jar")
+        let (path, _, _) = hasher(&["rules_jvm_external++maven+maven"])
+            .resolve("@maven//:guava.jar", false)
             .unwrap()
             .unwrap();
         assert_eq!(path, repo_root.join("guava.jar"));
         assert!(hasher(&["other"])
-            .resolve("@maven//:guava.jar")
+            .resolve("@maven//:guava.jar", false)
             .unwrap()
             .is_none());
+        #[cfg(unix)]
+        {
+            let loop_path = repo_root.join("loop");
+            std::os::unix::fs::symlink("loop", &loop_path).unwrap();
+            let label = "@@rules_jvm_external++maven+maven//:loop";
+            let error = hasher(&[]).digest_source(label, b"", true).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains(label) && message.contains(loop_path.to_str().unwrap()));
+        }
     }
 
     #[test]

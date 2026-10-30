@@ -120,6 +120,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::returned_external_source_reaches_consumer",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::transitive_external_repo_change_reaches_consumer",
                 "timeout": "moderate",
             },

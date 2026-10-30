@@ -241,7 +241,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            bazel: '8.5.0'
+            bazel: '8.7.0'
             disable_workspace: 'true'
             extra_flags: ''
           - os: ubuntu-latest
@@ -333,13 +333,29 @@ jobs:
         #
         # Keep Windows output paths short for the build and nested queries.
         # A startup option cannot live in a --config.
+        #
+        # Build bazel-diff once at HEAD and hand the script that binary
+        # (BAZEL_DIFF_BINARY) instead of letting it `bazel run` at each
+        # revision: rebuilding the previous revision in the output base the
+        # HEAD build populated fails MSVC's include validation when the two
+        # revisions resolve different rules_cc versions (undeclared inclusion
+        # of a _virtual_includes header). Linux's clang checking is unaffected.
         run: |
           New-Item -ItemType Directory -Force -Path "$env:ProgramData" | Out-Null
           Add-Content -Path "$env:ProgramData\bazel.bazelrc" -Value "startup --output_base=C:/b"
           $prevRev = git rev-parse HEAD~1
           $currRev = git rev-parse HEAD
+          $bazel = "$env:USERPROFILE\go\bin\bazelisk.exe"
           for ($i = 1; $i -le 3; $i++) {
-            .\bazel-diff-example.ps1 -WorkspacePath "$env:GITHUB_WORKSPACE" -BazelPath "$env:USERPROFILE\go\bin\bazelisk.exe" -PreviousRevision $prevRev -FinalRevision $currRev
+            # -c opt matches the `run -c opt` the script's own `bazel run` would use.
+            & $bazel build -c opt //:bazel-diff
+            if ($LASTEXITCODE -eq 0) {
+              $execRoot = & $bazel info execution_root
+              $built = (& $bazel cquery -c opt --output=files //:bazel-diff) | Where-Object { $_ -match 'bazel-diff\.exe$' } | Select-Object -First 1
+              Copy-Item "$execRoot/$built" "$env:RUNNER_TEMP\bazel-diff.exe" -Force
+              $env:BAZEL_DIFF_BINARY = "$env:RUNNER_TEMP\bazel-diff.exe"
+              .\bazel-diff-example.ps1 -WorkspacePath "$env:GITHUB_WORKSPACE" -BazelPath $bazel -PreviousRevision $prevRev -FinalRevision $currRev
+            }
             if ($LASTEXITCODE -eq 0) { break }
             if ($i -eq 3) { exit 1 }
             Write-Host "example script failed (attempt $i); retrying in 15s..."

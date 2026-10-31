@@ -426,9 +426,48 @@ fn isolated_dependency_root_reaches_alias_direct_and_build_load_readers() {
     };
     let before = direct(base.path(), "base.json");
     let after = direct(comment.path(), "comment.json");
+    let captured: serde_json::Value =
+        serde_json::from_slice(&fs::read(maps.path().join("base.json")).unwrap()).unwrap();
+    let graph: serde_json::Value =
+        serde_json::from_str(captured["metadata"]["moduleGraphJson"].as_str().unwrap()).unwrap();
+    assert_eq!(graph["key"], "<root>");
+    assert!(
+        graph["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|module| module["dependencies"].as_array().is_some_and(Vec::is_empty)),
+        "{graph}"
+    );
     assert_ne!(before.0, after.0);
     assert_ne!(before.1, after.1);
     assert_product(comment.path(), "//:direct", "direct.txt", "before");
+
+    edit(&base.path().join("MODULE.bazel"), |module| {
+        module.replace(
+            "use_repo(family, \"hub\")",
+            "use_repo(family, \"hub\", \"app\")",
+        )
+    });
+    let refused = maps.path().join("refused.json");
+    let output = generate(base.path(), &refused, ISOLATED_ROOT);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("--isolatedDependencyRoot=@hub")
+            && stderr.contains("extra imported repository")
+            && stderr.contains("+app"),
+        "{stderr}"
+    );
+    assert!(!refused.exists(), "failed admission wrote a hash file");
+    let unflagged = maps.path().join("unflagged.json");
+    let output = generate(base.path(), &unflagged, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(hashes(&unflagged).contains_key("//:direct"));
 }
 
 #[test]

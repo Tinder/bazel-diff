@@ -382,6 +382,26 @@ fn generate_hashes_partial_graph_derives_from_base_hashes() {
     assert!(log.contains("no --baseHashes"), "{log}");
     let base_partial_arg = base_partial.display().to_string();
 
+    // Even a valid recipe for the current tree cannot supply physical repository inputs.
+    let rejected = path("isolated.json");
+    let result = generate(
+        workspace.path(),
+        &rejected,
+        &[
+            "--partialGraph",
+            "--baseHashes",
+            &base_partial_arg,
+            "--isolatedDependencyRoot=@crates",
+        ],
+    );
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        error.contains("--partialGraph does not support --isolatedDependencyRoot"),
+        "{error}"
+    );
+    assert!(!rejected.exists());
+
     // An uncommitted source edit: derived from the base, no query.
     fs::write(workspace.path().join("lib.sh"), "echo changed\n").unwrap();
     let to_default = path("to_default.json");

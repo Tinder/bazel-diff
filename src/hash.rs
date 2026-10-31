@@ -56,7 +56,7 @@ pub struct HashOptions {
     pub modified_filepaths: BTreeSet<PathBuf>,
     pub track_deps: bool,
     pub always_affected_tags: HashSet<String>,
-    /// Partial-graph mode (`serve --partialGraph`): the hashed revision's `git ls-tree`. When
+    /// Partial-graph mode (`--partialGraph`): the hashed revision's `git ls-tree`. When
     /// set, main-repository sources are digested from the tree instead of the working tree, every
     /// rule's hashing recipe is recorded, and the hashes are computed by evaluating those recipes
     /// (see [`crate::partial`]), so that an entry derived from this one later is identical to
@@ -513,6 +513,10 @@ fn hash_targets_with_environment(
         dependency_fingerprint: None,
         dep_edges,
         partial,
+        tree: options
+            .partial_tree
+            .as_ref()
+            .and_then(|tree| tree.id().map(str::to_owned)),
     })
 }
 

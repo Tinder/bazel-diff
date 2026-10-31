@@ -1,4 +1,4 @@
-//! Opt-in partial graph updates for `bazel-diff serve` (`--partialGraph`).
+//! Opt-in partial graph updates (`--partialGraph`, for `generate-hashes` and `serve`).
 //!
 //! A full hash generation pays for a `bazel query` over the whole graph even when the change
 //! between two revisions cannot have altered that graph: editing the body of a source file
@@ -28,7 +28,7 @@
 //! A fallback costs speed, never correctness.
 
 use crate::bazel::{attribute_main_repo_labels, target_label};
-use crate::hash::{hash_pool, is_main_repo, label_package, main_repo_path};
+use crate::hash::{hash_pool, is_main_repo, label_package, main_repo_path, HashOptions};
 use crate::model::{HashFileData, TargetHash};
 use crate::proto::blaze_query::Rule;
 use anyhow::{anyhow, bail, Context, Result};
@@ -73,6 +73,9 @@ pub struct TreeEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TreeIndex {
     entries: BTreeMap<String, TreeEntry>,
+    /// The tree object's id, when the index was listed from one; a hash file records it so a
+    /// later derivation knows which tree its hashes describe.
+    id: Option<String>,
 }
 
 impl TreeIndex {
@@ -100,7 +103,18 @@ impl TreeIndex {
                 Some((path, TreeEntry { object, kind }))
             })
             .collect();
-        Self { entries }
+        Self { entries, id: None }
+    }
+
+    /// Tags the index with the id of the tree it was listed from.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// The id of the tree the index was listed from, if known.
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
     }
 
     pub fn get(&self, path: &str) -> Option<&TreeEntry> {
@@ -655,9 +669,9 @@ impl Evaluator<'_> {
     }
 }
 
-/// Re-hashes a cached entry against another revision's tree. Everything but the hashes is
-/// carried over: the graph did not change, so neither did the dependency edges, the module
-/// graph, the dependency fingerprint, or the recipes themselves.
+/// Re-hashes a cached entry against another revision's tree. Everything but the hashes and the
+/// tree id is carried over: the graph did not change, so neither did the dependency edges, the
+/// module graph, the dependency fingerprint, or the recipes themselves.
 pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
     let recipes = base
         .partial
@@ -675,7 +689,26 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
         dependency_fingerprint: base.dependency_fingerprint.clone(),
         dep_edges: base.dep_edges.clone(),
         partial: base.partial.clone(),
+        tree: tree.id().map(str::to_owned),
     })
+}
+
+/// Rejects hashing options partial-graph mode cannot honour. The derivation evaluates recipes
+/// keyed by bare label from the revision's git tree alone, so it has no configured instances
+/// (cquery), no files outside the tree (fine-grained external repositories) and no
+/// per-invocation seeds (always-affected tags); each of those would make a derived entry differ
+/// from a full generation, which is the one property the mode rests on.
+pub fn validate_hash_options(options: &HashOptions) -> Result<()> {
+    if options.bazel.use_cquery {
+        bail!("--partialGraph does not support --useCquery");
+    }
+    if !options.bazel.fine_grained_external_repos.is_empty() {
+        bail!("--partialGraph does not support --fineGrainedHashExternalRepos");
+    }
+    if !options.always_affected_tags.is_empty() {
+        bail!("--partialGraph does not support --alwaysAffectedTags");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1027,6 +1060,7 @@ mod tests {
                 .map(|(label, kind)| ((*label).to_owned(), hash(kind)))
                 .collect(),
             partial: recipes.then(PartialRecipes::default),
+            tree: None,
             ..Default::default()
         }
     }
@@ -1341,14 +1375,16 @@ mod tests {
             dependency_fingerprint: Some("fp".into()),
             dep_edges: BTreeMap::from([("//pkg:bin".to_owned(), vec!["//pkg:lib".to_owned()])]),
             partial: Some(recipes),
+            tree: None,
         };
-        let mut edited = fixture_tree();
+        let mut edited = fixture_tree().with_id("edited-tree");
         edited.entries.get_mut("other/c.txt").unwrap().object = "c2".into();
         let derived = derive(&base, &edited).unwrap();
         assert_eq!(derived.module_graph_json.as_deref(), Some("{}"));
         assert_eq!(derived.dependency_fingerprint.as_deref(), Some("fp"));
         assert_eq!(derived.dep_edges, base.dep_edges);
         assert_eq!(derived.partial, base.partial);
+        assert_eq!(derived.tree.as_deref(), Some("edited-tree"));
         assert_ne!(
             derived.hashes["//other:c.txt"].hash,
             base.hashes["//other:c.txt"].hash
@@ -1357,7 +1393,9 @@ mod tests {
             derived.hashes["//pkg:bin"].hash,
             base.hashes["//pkg:bin"].hash
         );
-        assert_eq!(derive(&base, &fixture_tree()).unwrap().hashes, base.hashes);
+        let same = derive(&base, &fixture_tree()).unwrap();
+        assert_eq!(same.hashes, base.hashes);
+        assert_eq!(same.tree, None);
         base.partial = None;
         assert!(derive(&base, &edited).is_err());
     }

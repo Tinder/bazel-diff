@@ -217,7 +217,8 @@ impl Serialize for SerializedMetadata<'_> {
             usize::from(self.data.module_graph_json.is_some())
                 + usize::from(include_dep_edges)
                 + usize::from(self.data.dependency_fingerprint.is_some())
-                + usize::from(self.data.partial.is_some()),
+                + usize::from(self.data.partial.is_some())
+                + usize::from(self.data.tree.is_some()),
         )?;
         if let Some(module_graph_json) = &self.data.module_graph_json {
             state.serialize_field("moduleGraphJson", module_graph_json)?;
@@ -230,6 +231,9 @@ impl Serialize for SerializedMetadata<'_> {
         }
         if let Some(partial) = &self.data.partial {
             state.serialize_field("partialGraph", partial)?;
+        }
+        if let Some(tree) = &self.data.tree {
+            state.serialize_field("tree", tree)?;
         }
         state.end()
     }
@@ -253,6 +257,7 @@ impl Serialize for SerializedHashFile<'_> {
         if self.data.module_graph_json.is_none()
             && self.data.dependency_fingerprint.is_none()
             && self.data.partial.is_none()
+            && self.data.tree.is_none()
             && (!self.include_deps || self.data.dep_edges.is_empty())
         {
             return hashes.serialize(serializer);
@@ -276,8 +281,11 @@ pub struct HashFileData {
     pub module_graph_json: Option<String>,
     pub dependency_fingerprint: Option<String>,
     pub dep_edges: BTreeMap<String, Vec<String>>,
-    /// Partial-graph mode (`serve --partialGraph`): the recipes a derivation re-evaluates.
+    /// Partial-graph mode (`--partialGraph`): the recipes a derivation re-evaluates.
     pub partial: Option<PartialRecipes>,
+    /// Partial-graph mode: the id of the git tree the hashes describe, the base of a later
+    /// derivation's `git diff`.
+    pub tree: Option<String>,
 }
 
 /// A JSON string borrowed from the input when it has no escapes, copied otherwise. Hash values
@@ -349,6 +357,8 @@ struct Metadata {
     dep_edges: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     partial_graph: Option<PartialRecipes>,
+    #[serde(default)]
+    tree: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for HashFileData {
@@ -375,6 +385,7 @@ impl<'de> Deserialize<'de> for HashFileData {
                             data.dependency_fingerprint = metadata.dependency_fingerprint;
                             data.dep_edges = metadata.dep_edges;
                             data.partial = metadata.partial_graph;
+                            data.tree = metadata.tree;
                         }
                         label => {
                             let value = map.next_value::<JsonStr<'de>>()?;
@@ -432,6 +443,7 @@ impl HashFileData {
         if self.module_graph_json.is_none()
             && self.dependency_fingerprint.is_none()
             && self.partial.is_none()
+            && self.tree.is_none()
             && (!include_deps || self.dep_edges.is_empty())
         {
             return Value::Object(hashes);
@@ -460,6 +472,9 @@ impl HashFileData {
                 "partialGraph".to_owned(),
                 serde_json::to_value(partial).expect("serializing recipes cannot fail"),
             );
+        }
+        if let Some(tree) = &self.tree {
+            metadata.insert("tree".to_owned(), Value::String(tree.clone()));
         }
         serde_json::json!({"hashes": hashes, "metadata": metadata})
     }
@@ -789,6 +804,19 @@ mod tests {
         let parsed = HashFileData::from_slice(streamed.to_string().as_bytes()).unwrap();
         assert_eq!(parsed.partial, data.partial);
         assert_eq!(parsed.hashes, data.hashes);
+        assert!(parsed.tree.is_none());
+
+        data.tree = Some("f".repeat(40));
+        let streamed = serde_json::to_value(data.serialized(true, false)).unwrap();
+        assert_eq!(streamed, data.to_value(true, false));
+        assert_eq!(streamed["metadata"]["tree"], "f".repeat(40));
+        let parsed = HashFileData::from_slice(streamed.to_string().as_bytes()).unwrap();
+        assert_eq!(parsed.tree, data.tree);
+        // The tree alone is metadata enough to leave the legacy bare shape.
+        data.partial = None;
+        let streamed = serde_json::to_value(data.serialized(false, false)).unwrap();
+        assert_eq!(streamed["metadata"]["tree"], "f".repeat(40));
+        assert_eq!(streamed, data.to_value(false, false));
     }
 
     #[test]

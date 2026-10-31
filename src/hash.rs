@@ -1469,6 +1469,8 @@ impl SourceHasher<'_> {
         } else {
             self.workspace.join(path)
         };
+        let metadata = fs::metadata(&absolute).ok();
+        let executable = metadata.as_ref().is_some_and(metadata_owner_executable);
         let mut hasher = Sha256::new();
         if let Some(content_hash) = self
             .content_hashes
@@ -1476,8 +1478,8 @@ impl SourceHasher<'_> {
         {
             hasher.update(content_hash.as_bytes());
             hasher.update([1]);
-            hasher.update([u8::from(owner_executable(&absolute))]);
-        } else if materialized || absolute.is_file() {
+            hasher.update([u8::from(executable)]);
+        } else if materialized || metadata.as_ref().is_some_and(fs::Metadata::is_file) {
             let should_hash = self.modified_filepaths.is_empty()
                 || self.modified_filepaths.iter().any(|modified| {
                     self.workspace
@@ -1491,8 +1493,8 @@ impl SourceHasher<'_> {
                 })?;
             }
             hasher.update([1]);
-            hasher.update([u8::from(owner_executable(&absolute))]);
-        } else if absolute.is_dir() {
+            hasher.update([u8::from(executable)]);
+        } else if metadata.as_ref().is_some_and(fs::Metadata::is_dir) {
             // A label can point at a directory (`srcs = ["testdata"]`). Bazel only tracks the
             // directory itself, but its contents are what the consuming action reads, so hash the
             // tree: otherwise an edit inside it never impacts anything.
@@ -1630,16 +1632,20 @@ pub(crate) fn main_repo_path(label: &str) -> Option<PathBuf> {
 }
 
 fn owner_executable(path: &Path) -> bool {
+    fs::metadata(path)
+        .as_ref()
+        .is_ok_and(metadata_owner_executable)
+}
+
+fn metadata_owner_executable(metadata: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
-        fs::metadata(path)
-            .map(|metadata| metadata.permissions().mode() & 0o100 != 0)
-            .unwrap_or(false)
+        metadata.permissions().mode() & 0o100 != 0
     }
     #[cfg(not(unix))]
-    fs::metadata(path)
-        .map(|metadata| !metadata.permissions().readonly())
-        .unwrap_or(false)
+    {
+        !metadata.permissions().readonly()
+    }
 }
 
 #[derive(Clone, Default)]

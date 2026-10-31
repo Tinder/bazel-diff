@@ -1183,3 +1183,79 @@ fn serve_deleted_package_labels_are_not_impacted() {
     assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), to);
     assert_labels_resolve_at(workspace.path(), &expected_after_deletion());
 }
+
+/// The mechanism that can put a deleted package's labels into a consumer's hands: `serve`
+/// switches revisions with `git checkout --force`, which leaves untracked and ignored files in
+/// place, so a `BUILD` file left behind in the working tree (a generator's leftovers) is loaded
+/// by `bazel query` at every revision. The generation must fail and name the package instead
+/// of caching it under a revision that does not contain it; `--allowUntrackedPackages` restores
+/// the old behaviour, and shows the stale labels that behaviour reports.
+#[test]
+fn serve_rejects_packages_the_revision_does_not_track() {
+    let workspace = copy_workspace("deleted_package");
+    let from = init_git(workspace.path());
+    delete_library_tests_package(workspace.path());
+    let to = commit(
+        workspace.path(),
+        "delete keep/LibraryTests and edit keep.sh",
+    );
+    // Present in the working tree, tracked by neither revision.
+    let stale = workspace.path().join("keep/StaleTests");
+    fs::create_dir_all(&stale).unwrap();
+    fs::write(
+        stale.join("BUILD"),
+        "load(\"@rules_shell//shell:sh_test.bzl\", \"sh_test\")\n\
+         sh_test(name = \"stale_tests\", srcs = [\"stale_tests.sh\"], deps = [\"//keep\"])\n",
+    )
+    .unwrap();
+    fs::write(stale.join("stale_tests.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+
+    {
+        let cache = tempfile::tempdir().unwrap();
+        let server = ServerProcess::start(workspace.path(), cache.path(), &[]);
+        let (status, body) = server
+            .get(&format!("/impacted_targets?from={from}&to={to}"))
+            .unwrap();
+        assert_ne!(status, 200, "{body}");
+        assert!(
+            body.contains("//keep/StaleTests") && body.contains("--allowUntrackedPackages"),
+            "{body}"
+        );
+        assert!(
+            fs::read_dir(cache.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| entry.path().extension().is_none_or(|ext| ext != "json")),
+            "a rejected generation must not be cached"
+        );
+        let (status, body) = server.get("/metrics").unwrap();
+        assert_eq!(status, 200);
+        let metrics: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(metrics["untrackedPackages"]["rejections"], 1, "{body}");
+    }
+    {
+        let cache = tempfile::tempdir().unwrap();
+        let server = ServerProcess::start(
+            workspace.path(),
+            cache.path(),
+            &["--allowUntrackedPackages"],
+        );
+        let (status, body) = server
+            .get(&format!("/impacted_targets?from={from}&to={to}"))
+            .unwrap();
+        assert_eq!(status, 200, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let labels = body["impactedTargets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|label| label.as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>();
+        // The report's symptom: a label from a package no checkout of `to` has.
+        assert!(
+            labels.contains("//keep/StaleTests:stale_tests"),
+            "{labels:?}"
+        );
+        assert!(labels.is_superset(&expected_after_deletion()), "{labels:?}");
+    }
+}

@@ -558,7 +558,7 @@ Options:
       --labelOnlyModuleExtensions <LABEL_ONLY_MODULE_EXTENSIONS>
           Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories use each other only through labels, never by resolving a toolchain from one another. A fine-grained target in one of their repositories then does not change whenever any other repository of the extension does
       --isolatedDependencyRoot <ISOLATED_DEPENDENCY_ROOT>
-          Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer.
+          Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
       --cqueryExpression <CQUERY_EXPRESSION>
@@ -708,7 +708,7 @@ Options:
       --labelOnlyModuleExtensions <LABEL_ONLY_MODULE_EXTENSIONS>
           Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories use each other only through labels, never by resolving a toolchain from one another. A fine-grained target in one of their repositories then does not change whenever any other repository of the extension does
       --isolatedDependencyRoot <ISOLATED_DEPENDENCY_ROOT>
-          Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer.
+          Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
       --cqueryExpression <CQUERY_EXPRESSION>
@@ -817,14 +817,16 @@ A few inputs are normalized or extended on the way in:
   that constructs another filename relative to a label is not covered by that label alone.
   The named effective root import must be the only imported member. The query includes its
   dependency closure and build files. Each observed outside consumer retains the whole usage, including hidden siblings.
-  Other usages keep their existing owner dependencies. An unrecognized mapping, an incomplete
-  inventory, or a known outside repository-file reader retains the old owner dependencies.
+  Other usages keep their existing owner dependencies. Generation requires ordinary query with
+  supported Bzlmod discovery and fails on an unrecognized mapping, an incomplete inventory, or a
+  known outside repository-file reader.
   Typed labels hash their contents, mode, and absence at their filesystem location, regardless
   of target kind. A reader that relies on the location of a symlink rather than its contents
   does not satisfy this contract.
   Unavailable repositories, unreadable inputs, or unsupported directory entries fail generation.
   Use `generate_hashes` when using this mode through the library. The raw target API cannot retain
-  the repository inputs. Review the assertion if the root import is rebound.
+  the repository inputs, and `serve` does not support this mode. Review the assertion
+  if the root import is rebound.
   Bzlmod repositories are read from `bazel mod show_repo`, asked for by name in as many
   invocations as the platform's command-line limit allows, or in one `--all_repos` invocation
   when that would take several. The limit is 8191 characters wherever `cmd.exe` is involved --

@@ -122,13 +122,18 @@ impl TargetDigestBuilder {
 
     /// The overall digest of a dependency: `label` is the key the edge names (for
     /// `--trackDeps`), `canonical` the rule that was hashed (for the recipe).
-    fn transitive(&mut self, label: &str, canonical: &str, bytes: impl AsRef<[u8]>) {
+    fn transitive(
+        &mut self,
+        label: &str,
+        canonical: impl FnOnce() -> String,
+        bytes: impl AsRef<[u8]>,
+    ) {
         self.overall.update(bytes);
         if self.track_deps {
             self.deps.push(label.to_owned());
         }
         if let Some(recipe) = &mut self.recipe {
-            recipe.deps.push(canonical.to_owned());
+            recipe.deps.push(canonical());
         }
     }
 
@@ -850,8 +855,7 @@ impl HashContext<'_> {
                 .filter(|dependency| dependency.as_ref() != canonical_key)
             {
                 let digest = self.rule_overall_digest(&dependency, path)?;
-                let canonical = self.canonical_key(&dependency);
-                builder.transitive(&dependency, &canonical, digest);
+                builder.transitive(&dependency, || self.canonical_key(&dependency), digest);
             } else if let Some(digest) = self.source_hasher.soft_digest(input_label, &[])? {
                 self.source_digests.insert(input_label.to_owned(), digest);
                 builder.source(input_label, digest);
@@ -876,7 +880,7 @@ impl HashContext<'_> {
                 }
                 builder.direct(package_group.as_bytes());
                 let digest = self.rule_overall_digest(package_group, path)?;
-                builder.transitive(package_group, package_group, digest);
+                builder.transitive(package_group, || package_group.to_owned(), digest);
             }
         }
 
@@ -2569,7 +2573,7 @@ esac
     fn digest_builder_tracks_direct_transitive_and_dependencies() {
         let mut tracked = TargetDigestBuilder::new(true, false);
         tracked.direct(b"direct");
-        tracked.transitive("//dep:a", "//dep:a", b"dependency");
+        tracked.transitive("//dep:a", || panic!("no recipe to record"), b"dependency");
         let (tracked, recipe) = tracked.finish();
         assert_eq!(tracked.deps.unwrap().as_slice(), ["//dep:a"]);
         assert_ne!(tracked.direct, tracked.overall);
@@ -2578,7 +2582,7 @@ esac
         let mut untracked = TargetDigestBuilder::new(false, true);
         untracked.direct(b"direct");
         untracked.source("//pkg:src", b"source");
-        untracked.transitive("//dep:a.out", "//dep:a", b"dependency");
+        untracked.transitive("//dep:a.out", || "//dep:a".to_owned(), b"dependency");
         let (untracked, recipe) = untracked.finish();
         assert!(untracked.deps.is_none());
         let recipe = recipe.unwrap();
@@ -2718,6 +2722,44 @@ esac
         .unwrap();
         assert_eq!(data.dep_edges["//:a"], ["//:dep"]);
         assert_eq!(data.dep_edges["//:b"], ["//:dep", "//:a"]);
+    }
+
+    #[test]
+    fn partial_recipe_records_producer_of_generated_input() {
+        let workspace = tempfile::tempdir().unwrap();
+        let rule = |name: &str, input: &str| {
+            rule_target(Rule {
+                name: name.into(),
+                rule_class: "genrule".into(),
+                rule_input: vec![input.into()],
+                ..Default::default()
+            })
+        };
+        let targets = vec![
+            source_target("//:src", &[]),
+            rule("//:producer", "//:src"),
+            generated_target("//:out", "//:producer"),
+            rule("//:consumer", "//:out"),
+        ];
+        let full = |tree: &TreeIndex| {
+            let mut options = hash_options(workspace.path());
+            options.partial_tree = Some(Arc::new(tree.clone()));
+            hash_targets_for_test(&options, targets.clone(), workspace.path()).unwrap()
+        };
+        let before = full(&TreeIndex::parse_ls_tree(b"100644 blob a\tsrc\0"));
+        assert_eq!(before.dep_edges["//:consumer"], ["//:out"]);
+        let recipes = before.partial.as_ref().unwrap();
+        assert_eq!(recipes.rules["//:consumer"].deps(), ["//:producer"]);
+
+        let edited_tree = TreeIndex::parse_ls_tree(b"100644 blob b\tsrc\0");
+        let derived = partial::derive(&before, &edited_tree).unwrap();
+        let rebuilt = full(&edited_tree);
+        assert_ne!(
+            before.hashes["//:consumer"].hash,
+            derived.hashes["//:consumer"].hash
+        );
+        assert_eq!(derived.hashes, rebuilt.hashes);
+        assert_eq!(derived.dep_edges, rebuilt.dep_edges);
     }
 
     #[cfg(unix)]

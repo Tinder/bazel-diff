@@ -1,0 +1,35 @@
+load("@hub//:defs.bzl", "VALUE")
+
+exports_files(["settings.json", "registry.txt", "alias.txt"])
+
+genrule(
+    name = "loaded",
+    outs = ["loaded.txt"],
+    cmd = "echo " + VALUE + " > $@",
+)
+
+filegroup(
+    name = "alias",
+    srcs = ["@hub//:app"],
+)
+
+genrule(
+    name = "direct",
+    srcs = ["@@ext++_family+++family+app//:shared"],
+    outs = ["direct.txt"],
+    cmd = "cat $< > $@",
+)
+
+genrule(
+    name = "reads_registry",
+    srcs = ["@@ext++_family+++family+app//:registry_copy"],
+    outs = ["registry-output.txt"],
+    cmd = "cat $< > $@",
+)
+
+genrule(
+    name = "reads_alias",
+    srcs = ["@@ext++_family+++family+app//:alias_copy"],
+    outs = ["alias-output.txt"],
+    cmd = "cat $< > $@",
+)

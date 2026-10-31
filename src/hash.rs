@@ -1,6 +1,6 @@
 use crate::bazel::{
     encode_configured_input, split_configured, target_label, BazelOptions, QueriedTargets,
-    RepositoryInputGroup, RepositoryInputs,
+    RepositoryInputGroup, RepositoryInputs, ScopedSources,
 };
 use crate::cancel::{self, Cancellation};
 use crate::model::{HashFileData, TargetHash};
@@ -191,6 +191,13 @@ pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
 }
 
 pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, GenerationTimings)> {
+    if options.bazel.isolated_dependency_root.is_some()
+        && (options.content_hashes.is_some()
+            || !options.modified_filepaths.is_empty()
+            || options.partial_tree.is_some())
+    {
+        anyhow::bail!("--isolatedDependencyRoot requires full physical source hashing");
+    }
     let mut definition_digests = HashMap::new();
     let mut digests = Vec::new();
     let query_started = Instant::now();
@@ -198,6 +205,7 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
         targets,
         module_graph_json,
         root_mapping,
+        scoped_sources,
     } = options.bazel.query_all_targets_with(|batch, inputs| {
         let prehash = |target: &mut Target, shared_inputs| {
             let rule = target.rule.as_option_mut()?;
@@ -233,13 +241,23 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
         definition_digests,
         module_graph_json,
         root_mapping,
+        scoped_sources,
     )?;
     timings.bazel_query_millis = bazel_query_millis;
     Ok((data, timings))
 }
 
 pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashFileData> {
-    hash_targets_with_digests(options, targets, HashMap::new(), None, None).map(|(data, _)| data)
+    options.bazel.check_raw_targets_supported()?;
+    hash_targets_with_digests(
+        options,
+        targets,
+        HashMap::new(),
+        None,
+        None,
+        ScopedSources::default(),
+    )
+    .map(|(data, _)| data)
 }
 
 fn hash_targets_with_digests(
@@ -248,9 +266,11 @@ fn hash_targets_with_digests(
     definition_digests: HashMap<String, PreparedRule>,
     module_graph_json: Option<String>,
     root_mapping: Option<Vec<u8>>,
+    scoped_sources: ScopedSources,
 ) -> Result<(HashFileData, GenerationTimings)> {
     let hash_started = Instant::now();
-    let external_resolver = ExternalRepoResolver::new(&options.bazel, root_mapping)?;
+    let mut external_resolver = ExternalRepoResolver::new(&options.bazel, root_mapping)?;
+    external_resolver.scoped_sources = scoped_sources;
     let module_graph_started = Instant::now();
     let module_graph_json = module_graph_json.or_else(|| options.bazel.module_graph_json());
     options.bazel.check_cancelled()?;
@@ -290,6 +310,13 @@ fn hash_targets_with_environment(
             .fine_grained_external_repos
             .iter()
             .map(|name| name.trim_start_matches('@').to_owned())
+            .chain(
+                external_resolver
+                    .scoped_sources
+                    .repositories
+                    .iter()
+                    .cloned(),
+            )
             .collect(),
         external_resolver,
     };
@@ -391,6 +418,63 @@ fn hash_targets_with_environment(
     rules.reserve(processed_rules.len());
     for (name, node) in processed_rules {
         rules.insert(name, Rc::new(node));
+    }
+    // Fold each returned source into the existing hub once. Using the source
+    // digests directly avoids cycles from a member's BUILD back to the hub.
+    if !source_hasher
+        .external_resolver
+        .scoped_sources
+        .repositories
+        .is_empty()
+    {
+        let root = options
+            .bazel
+            .isolated_dependency_root
+            .as_deref()
+            .expect("bound root");
+        let name = format!("//external:{}", root.trim_start_matches('@'));
+        let hub = rules
+            .get_mut(&name)
+            .and_then(Rc::get_mut)
+            .with_context(|| format!("--isolatedDependencyRoot: missing synthetic root {name}"))?;
+        let files: BTreeMap<_, _> = source_digests
+            .iter()
+            .filter(|(label, _)| {
+                label
+                    .trim_start_matches('@')
+                    .split_once("//")
+                    .is_some_and(|(repo, _)| {
+                        !repo.is_empty()
+                            && source_hasher
+                                .external_resolver
+                                .scoped_sources
+                                .repositories
+                                .contains(repo)
+                    })
+            })
+            .collect();
+        let mut digest = Sha256::new();
+        digest.update(hub.prepared.definition_digest);
+        for (label, bytes) in files {
+            digest.update((label.len() as u64).to_le_bytes());
+            digest.update(label.as_bytes());
+            digest.update(bytes);
+        }
+        digest.update(b"repository inputs");
+        for label in &source_hasher
+            .external_resolver
+            .scoped_sources
+            .repository_inputs
+        {
+            digest.update((label.len() as u64).to_le_bytes());
+            digest.update(label.as_bytes());
+            digest.update(repository_input_digest(
+                options.bazel.workspace.as_path(),
+                &source_hasher.external_resolver.output_base,
+                label,
+            )?);
+        }
+        hub.prepared.definition_digest = digest.finalize().into();
     }
     let mut label_instances = None;
     for target in &hash_targets {
@@ -1042,23 +1126,56 @@ fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<()> {
 /// and kind, plus regular-file contents and executable bits and symlink targets. Entries are
 /// visited in sorted order so the digest does not depend on readdir order.
 pub(crate) fn hash_directory_into(hasher: &mut Sha256, root: &Path) -> Result<()> {
+    hash_directory_tree(hasher, root, false)
+}
+
+fn hash_directory_entry_path(hasher: &mut Sha256, path: &Path, strict: bool) -> Result<()> {
+    for (index, component) in path.components().enumerate() {
+        if index != 0 {
+            hasher.update(b"/");
+        }
+        let name = component.as_os_str();
+        if strict {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                hasher.update(name.as_bytes());
+            }
+            #[cfg(not(unix))]
+            hasher.update(
+                name.to_str()
+                    .with_context(|| {
+                        format!("cannot fingerprint non-UTF-8 directory entry {path:?}")
+                    })?
+                    .as_bytes(),
+            );
+        } else {
+            hasher.update(name.to_string_lossy().as_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn hash_directory_tree(hasher: &mut Sha256, root: &Path, strict: bool) -> Result<()> {
     for entry in walkdir::WalkDir::new(root)
         .min_depth(1)
         .follow_links(false)
         .sort_by_file_name()
     {
         let entry = entry?;
-        let relative = entry
-            .path()
-            .strip_prefix(root)?
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        hasher.update(relative.as_bytes());
+        hash_directory_entry_path(hasher, entry.path().strip_prefix(root)?, strict)?;
         hasher.update([0]);
         let file_type = entry.file_type();
+        if strict && !file_type.is_symlink() {
+            hash_permissions(hasher, &entry.metadata()?);
+        }
         if file_type.is_symlink() {
+            if strict {
+                bail!(
+                    "cannot fingerprint symlink inside repository input directory {}",
+                    entry.path().display()
+                );
+            }
             let target = fs::read_link(entry.path())?;
             hasher.update(b"symlink");
             hasher.update(target.to_string_lossy().as_bytes());
@@ -1070,12 +1187,105 @@ pub(crate) fn hash_directory_into(hasher: &mut Sha256, root: &Path) -> Result<()
             hasher.update(b"file");
             hasher.update(content.finalize());
             hasher.update([u8::from(owner_executable(entry.path()))]);
+        } else if strict {
+            bail!(
+                "unsupported entry in repository input directory {}",
+                entry.path().display()
+            );
         } else {
             hasher.update(b"other");
         }
         hasher.update([0]);
     }
     Ok(())
+}
+
+/// Repository rules address the label's physical path, even when query calls it an alias.
+fn repository_input_digest(
+    workspace: &Path,
+    output_base: &Path,
+    label: &str,
+) -> Result<DigestBytes> {
+    let (repo, target) = label
+        .strip_prefix("@@")
+        .and_then(|s| s.split_once("//"))
+        .with_context(|| format!("invalid repository input {label}"))?;
+    let (package, name) = target
+        .split_once(':')
+        .with_context(|| format!("incomplete repository input {label}"))?;
+    if repo.contains(['/', '\\'])
+        || matches!(repo, "." | "..")
+        || name.is_empty()
+        || name.contains(':')
+        || [package, name]
+            .iter()
+            .filter(|value| !value.is_empty())
+            .any(|value| {
+                value.contains('\\') || value.split('/').any(|part| matches!(part, "" | "." | ".."))
+            })
+    {
+        bail!("invalid repository input path {label}");
+    }
+    let root = if repo.is_empty() {
+        workspace.to_owned()
+    } else {
+        output_base.join("external").join(repo)
+    };
+    let metadata = fs::metadata(&root).with_context(|| {
+        format!(
+            "repository for {label} is not materialized at {}",
+            root.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        bail!(
+            "repository for {label} is not a directory: {}",
+            root.display()
+        );
+    }
+    let path = root.join(external_label_path(target));
+    let mut digest = Sha256::new();
+    match fs::metadata(&path) {
+        Ok(metadata) => {
+            hash_permissions(&mut digest, &metadata);
+            if metadata.is_file() {
+                digest.update(b"file");
+                hash_file_into(&mut digest, &path).with_context(|| {
+                    format!("reading repository input {label} at {}", path.display())
+                })?;
+            } else if metadata.is_dir() {
+                digest.update(b"directory");
+                hash_directory_tree(&mut digest, &path, true)?;
+            } else {
+                bail!("unsupported repository input {label} at {}", path.display());
+            }
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            digest.update(b"absent");
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspecting repository input {label} at {}", path.display())
+            })
+        }
+    }
+    Ok(digest.finalize().into())
+}
+
+fn hash_permissions(digest: &mut Sha256, metadata: &fs::Metadata) {
+    #[cfg(unix)]
+    digest.update((metadata.permissions().mode() & 0o777).to_le_bytes());
+    #[cfg(not(unix))]
+    digest.update([u8::from(metadata.permissions().readonly())]);
+}
+
+fn external_label_path(target: &str) -> PathBuf {
+    PathBuf::from(target.trim_start_matches(':').replace(':', "/"))
 }
 
 fn unique_invocation_seed() -> DigestBytes {
@@ -1502,7 +1712,17 @@ impl SourceHasher<'_> {
                     .iter()
                     .any(|modified| self.workspace.join(modified).starts_with(&absolute));
             if should_hash {
-                hash_directory_into(&mut hasher, &absolute).with_context(|| {
+                let scoped =
+                    label
+                        .trim_start_matches('@')
+                        .split_once("//")
+                        .is_some_and(|(repo, _)| {
+                            self.external_resolver
+                                .scoped_sources
+                                .repositories
+                                .contains(repo)
+                        });
+                hash_directory_tree(&mut hasher, &absolute, scoped).with_context(|| {
                     format!("failed to read source directory {}", absolute.display())
                 })?;
             }
@@ -1555,7 +1775,7 @@ impl SourceHasher<'_> {
                 return Ok(None);
             };
             let paths = || {
-                let relative = PathBuf::from(target.trim_start_matches(':').replace(':', "/"));
+                let relative = external_label_path(target);
                 let key = PathBuf::from("external").join(repo).join(&relative);
                 (relative, key)
             };
@@ -1605,11 +1825,30 @@ impl SourceHasher<'_> {
             }
             let (relative, key) = paths();
             let root = self.external_resolver.resolve(repo)?;
-            return Ok(Some((
-                root.join(relative),
-                key.to_string_lossy().into_owned(),
-                false,
-            )));
+            let path = root.join(relative);
+            let file = if self
+                .external_resolver
+                .scoped_sources
+                .repositories
+                .contains(repo)
+            {
+                let metadata = fs::metadata(&path).with_context(|| {
+                    format!(
+                        "failed to inspect scoped source {} ({label})",
+                        path.display()
+                    )
+                })?;
+                if !metadata.is_file() && !metadata.is_dir() {
+                    bail!(
+                        "scoped source {} ({label}) is neither a regular file nor a directory",
+                        path.display()
+                    );
+                }
+                metadata.is_file()
+            } else {
+                false
+            };
+            return Ok(Some((path, key.to_string_lossy().into_owned(), file)));
         }
         Ok(None)
     }
@@ -1644,6 +1883,7 @@ fn owner_executable(path: &Path) -> bool {
 
 #[derive(Clone, Default)]
 struct ExternalRepoResolver {
+    scoped_sources: ScopedSources,
     workspace: PathBuf,
     bazel: PathBuf,
     output_base: PathBuf,
@@ -1875,6 +2115,43 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
+    #[test]
+    fn scoped_directory_paths_preserve_distinct_non_utf8_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let hash_path = |path: &[u8], strict| {
+            let mut digest = Sha256::new();
+            hash_directory_entry_path(&mut digest, Path::new(OsStr::from_bytes(path)), strict)
+                .unwrap();
+            digest.finalize()
+        };
+        let first = b"sub/foo\x80";
+        let second = b"sub/foo\x81";
+        assert_eq!(hash_path(first, false), hash_path(second, false));
+        assert_ne!(hash_path(first, true), hash_path(second, true));
+        assert_eq!(hash_path(first, true), Sha256::digest(first));
+        let unicode = "sub/café.txt".as_bytes();
+        assert_eq!(hash_path(unicode, true), Sha256::digest(unicode));
+        assert_eq!(hash_path(unicode, true), hash_path(unicode, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_directory_keeps_existing_valid_tree_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("foo.txt");
+        fs::write(&file, b"hello").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut digest = Sha256::new();
+        hash_directory_tree(&mut digest, directory.path(), true).unwrap();
+        assert_eq!(
+            hex::encode(digest.finalize()),
+            "ffa8d48b9be2ef65bb03ce061dd4a8cc09854be31f029ccc991f1e4af6efb4ac"
+        );
+    }
+
     fn bazel_options(workspace: &Path) -> BazelOptions {
         BazelOptions {
             workspace: workspace.to_path_buf(),
@@ -1887,12 +2164,70 @@ mod tests {
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
             exclude_external_targets: false,
             exclude_targets_query: None,
             no_bazelrc: true,
             verbose: false,
             cancellation: None,
         }
+    }
+
+    #[test]
+    fn raw_target_apis_cannot_drop_isolated_repository_inputs() {
+        let mut options = hash_options(Path::new("."));
+        options.bazel.isolated_dependency_root = Some("@hub".into());
+        assert!(options
+            .bazel
+            .query_all_targets()
+            .unwrap_err()
+            .to_string()
+            .contains("generate_hashes"));
+        assert!(hash_targets(&options, vec![])
+            .unwrap_err()
+            .to_string()
+            .contains("generate_hashes"));
+    }
+
+    #[test]
+    fn repository_inputs_are_portable_and_distinguish_absent_files_and_directories() {
+        let file = "@@source//:data";
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let outer = tempfile::tempdir().unwrap();
+            let root = outer.path();
+            let get = || repository_input_digest(root, root, file);
+            assert!(get().is_err());
+            let repo = root.join("external/source");
+            fs::create_dir_all(&repo).unwrap();
+            for invalid in ["@@source//:../escape", "@@source//pkg", "@@../other//:data"] {
+                assert!(repository_input_digest(root, root, invalid).is_err());
+            }
+            let absent = get().unwrap();
+            let path = repo.join("data");
+            fs::write(&path, "").unwrap();
+            let empty = get().unwrap();
+            fs::write(&path, "changed").unwrap();
+            let changed = get().unwrap();
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            let dir = get().unwrap();
+            fs::write(path.join("child"), "content").unwrap();
+            let tree = get().unwrap();
+            #[cfg(unix)]
+            {
+                let child = path.join("child");
+                let mode = fs::metadata(&child).unwrap().permissions().mode();
+                fs::set_permissions(&child, fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+                assert_ne!(get().unwrap(), tree);
+                std::os::unix::fs::symlink(root, path.join("link")).unwrap();
+                assert!(get().is_err());
+            }
+            let values = [absent, empty, changed, dir, tree];
+            assert_eq!(values.iter().collect::<HashSet<_>>().len(), values.len());
+            seen.push(values);
+        }
+        assert_eq!(seen[0], seen[1]);
     }
 
     fn hash_options(workspace: &Path) -> HashOptions {

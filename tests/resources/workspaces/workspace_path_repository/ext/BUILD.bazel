@@ -1,0 +1,1 @@
+filegroup(name = "tool", srcs = ["tool.txt"], visibility = ["//visibility:public"])

@@ -1,0 +1,11 @@
+module(
+    name = "transitive_dep",
+    version = "1.0",
+)
+
+# Mirrors envoy_api importing `com_google_googleapis_imports` from googleapis'
+# `switched_rules` extension after a googleapis upgrade stopped generating it:
+# the extension evaluates, but the imported repository is not among the ones it
+# creates, which Bazel reports as an error the moment the extension is evaluated.
+broken = use_extension("//:extensions.bzl", "broken")
+use_repo(broken, "missing_repo")

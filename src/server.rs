@@ -1,9 +1,17 @@
+use crate::bazel::BazelOptions;
+use crate::cache;
+use crate::cancel::{Cancellation, CANCELLED};
+use crate::git::{self, DerivationPolicy, Git};
 use crate::hash::{generate_hashes_timed, HashOptions};
 use crate::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
 };
 use crate::module_graph::impacted_with_module_changes;
+use crate::partial::{self, Classification, Glob, TreeIndex};
 use anyhow::{anyhow, bail, Context, Result};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
 use s3::creds::Credentials;
@@ -11,14 +19,13 @@ use s3::request::ResponseData;
 use s3::{Bucket, Region};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use url::{form_urlencoded, Url};
@@ -33,12 +40,21 @@ pub struct ServerConfig {
     pub track_deps: bool,
     /// Opt-in: guard cache hits with a fingerprint of the workspace's external-dependency state.
     pub dependency_fingerprint: bool,
+    /// Opt-in: record hashing recipes in every entry and derive a revision from the request's
+    /// cached `from` entry, without a `bazel query`, when the diff between them cannot have
+    /// changed the graph (see [`crate::partial`]).
+    pub partial_graph: bool,
+    /// Paths whose change always forces a full generation in partial-graph mode.
+    pub partial_graph_rebuild_patterns: Vec<Glob>,
     pub no_initial_fetch: bool,
     pub warmup_revisions: Vec<String>,
     pub cache_max_age: Option<Duration>,
     pub cache_max_entries: Option<usize>,
     pub cache_max_size: Option<u64>,
     pub cache_prune_interval: Duration,
+    /// Byte budget for parsed entries kept in memory, measured by each entry's serialized size.
+    /// `0` disables the in-memory tier.
+    pub cache_memory_max: u64,
     pub remote_cache: Option<String>,
     pub s3_bucket: Option<String>,
     pub s3_prefix: String,
@@ -54,13 +70,223 @@ pub struct ServerConfig {
     pub nexus_ca_cert: Option<PathBuf>,
 }
 
+/// How long a timed-out request waits for its cancelled query to stop before answering anyway.
+/// Killing the subprocesses is immediate; this bounds the CPU-only phases (target hashing) a
+/// cancel can only interrupt at their boundaries.
+const CANCEL_GRACE: Duration = Duration::from_secs(60);
+
+/// How often a query waiting for the workspace re-checks whether it has been cancelled.
+const WORKSPACE_WAIT_POLL: Duration = Duration::from_millis(50);
+
 struct State {
     config: ServerConfig,
     ready: AtomicBool,
-    workspace_lock: Mutex<()>,
+    workspace: Workspace,
+    /// Partial-graph mode: revisions hashed by derivation, and full generations the classifier
+    /// fell back to. `/metrics` reports both.
+    partial_derived: AtomicUsize,
+    partial_rebuilds: AtomicUsize,
+    /// Queries accepted and not yet finished: waiting for the workspace, running, or abandoned by
+    /// a timed-out client but still running. `/metrics` reports it as `activeQueries`.
+    active_queries: AtomicUsize,
     started: Instant,
     fingerprint: String,
     remote: Option<RemoteCache>,
+    /// Parsed entries, in front of the local-disk tier. Guarded by its own lock rather than the
+    /// workspace's so `/metrics` can read its size while a query holds the workspace.
+    memory: Mutex<MemoryCache>,
+}
+
+/// The in-memory tier: entries already parsed, most recently used last.
+///
+/// Nearly every request shares its `from` revision (the main branch) with the previous one, and
+/// reading and parsing a large entry costs seconds, so a hit here is the difference between a
+/// query bounded by the compare and one bounded by JSON parsing. Entries are sized by their
+/// serialized length, the one cheap proxy for their heap footprint, and the least recently used
+/// entry goes first when the budget is exceeded.
+struct MemoryCache {
+    budget: u64,
+    used: u64,
+    entries: VecDeque<MemoryEntry>,
+}
+
+struct MemoryEntry {
+    key: String,
+    bytes: u64,
+    data: Arc<HashFileData>,
+}
+
+impl MemoryCache {
+    fn new(budget: u64) -> Self {
+        Self {
+            budget,
+            used: 0,
+            entries: VecDeque::new(),
+        }
+    }
+
+    /// Returns the entry for `key`, marking it most recently used.
+    fn get(&mut self, key: &str) -> Option<Arc<HashFileData>> {
+        let index = self.entries.iter().position(|entry| entry.key == key)?;
+        let entry = self.entries.remove(index)?;
+        let data = Arc::clone(&entry.data);
+        self.entries.push_back(entry);
+        Some(data)
+    }
+
+    /// Remembers `data` for `key`, evicting least recently used entries to stay within budget. An
+    /// entry larger than the whole budget is not kept.
+    fn insert(&mut self, key: &str, bytes: u64, data: &Arc<HashFileData>) {
+        if bytes > self.budget {
+            return;
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let previous = self.entries.remove(index).expect("index from position");
+            self.used -= previous.bytes;
+        }
+        while self.used + bytes > self.budget {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.used -= evicted.bytes;
+        }
+        self.used += bytes;
+        self.entries.push_back(MemoryEntry {
+            key: key.to_owned(),
+            bytes,
+            data: Arc::clone(data),
+        });
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Locks the in-memory tier. A panic while holding it cannot leave the cache inconsistent in a
+/// way that matters (it is only a cache), so a poisoned lock is recovered rather than propagated.
+fn memory_cache(state: &State) -> std::sync::MutexGuard<'_, MemoryCache> {
+    state
+        .memory
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl State {
+    fn new(config: ServerConfig, remote: Option<RemoteCache>) -> Self {
+        let fingerprint = configuration_fingerprint(&config);
+        Self {
+            memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
+            config,
+            ready: AtomicBool::new(false),
+            partial_derived: AtomicUsize::new(0),
+            partial_rebuilds: AtomicUsize::new(0),
+            workspace: Workspace::default(),
+            active_queries: AtomicUsize::new(0),
+            started: Instant::now(),
+            fingerprint,
+            remote,
+        }
+    }
+
+    /// Git bound to the query currently holding the workspace, so the subprocesses it spawns die
+    /// with that query; outside the lock (startup fetch) they run plainly.
+    fn git(&self) -> Git {
+        Git::new(
+            &self.config.git_path,
+            &self.config.hash_options.bazel.workspace,
+        )
+        .with_cancellation(self.workspace.holder())
+    }
+
+    /// The server's Bazel options bound to the query currently holding the workspace, so the
+    /// Bazel subprocesses it spawns die with that query.
+    fn bazel_options(&self) -> BazelOptions {
+        let mut options = self.config.hash_options.bazel.clone();
+        options.cancellation = self.workspace.holder();
+        options
+    }
+}
+
+/// Serialises everything that mutates `--workspacePath` (git checkout, `bazel query`) and
+/// remembers which operation holds it. That lets `/metrics` report `workspaceBusy`, lets the
+/// subprocesses the holder spawns be killed when its query is cancelled, and lets a query that is
+/// cancelled while queued give up instead of taking the workspace for nothing.
+#[derive(Default)]
+struct Workspace {
+    holder: Mutex<Option<Arc<Cancellation>>>,
+    released: Condvar,
+}
+
+impl Workspace {
+    fn acquire(&self, token: &Arc<Cancellation>) -> Result<WorkspaceGuard<'_>> {
+        let mut holder = self.holder.lock().map_err(|_| poisoned())?;
+        while holder.is_some() {
+            if token.is_cancelled() {
+                bail!(CANCELLED);
+            }
+            holder = self
+                .released
+                .wait_timeout(holder, WORKSPACE_WAIT_POLL)
+                .map_err(|_| poisoned())?
+                .0;
+        }
+        *holder = Some(Arc::clone(token));
+        Ok(WorkspaceGuard { workspace: self })
+    }
+
+    fn holder(&self) -> Option<Arc<Cancellation>> {
+        self.holder.lock().ok().and_then(|holder| holder.clone())
+    }
+
+    fn is_busy(&self) -> bool {
+        self.holder
+            .lock()
+            .map(|holder| holder.is_some())
+            .unwrap_or(true)
+    }
+
+    /// Fails once the operation holding the workspace has been cancelled: the caller is about to
+    /// do something (write a cache entry) that only a finished query should do.
+    fn check_cancelled(&self) -> Result<()> {
+        if let Some(token) = self.holder() {
+            token.check()?;
+        }
+        Ok(())
+    }
+}
+
+fn poisoned() -> anyhow::Error {
+    anyhow!("workspace lock poisoned")
+}
+
+struct WorkspaceGuard<'a> {
+    workspace: &'a Workspace,
+}
+
+impl Drop for WorkspaceGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut holder) = self.workspace.holder.lock() {
+            *holder = None;
+        }
+        self.workspace.released.notify_all();
+    }
+}
+
+/// Keeps `activeQueries` accurate even when the worker panics.
+struct ActiveQuery(Arc<State>);
+
+impl ActiveQuery {
+    fn start(state: &Arc<State>) -> Self {
+        state.active_queries.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(state))
+    }
+}
+
+impl Drop for ActiveQuery {
+    fn drop(&mut self) {
+        self.0.active_queries.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The shared cache tier behind local disk. Every backend degrades the same way: a failed read is
@@ -93,21 +319,87 @@ impl RemoteCache {
         Ok(None)
     }
 
+    /// Reads the entry for `key`: the compressed object first, then the plain one an older
+    /// replica (or this one, before compression) may have written. A read failure is a miss and
+    /// does not fall through, so an outage costs one request per lookup, not two.
     fn get(&self, key: &str) -> Option<Vec<u8>> {
-        match self {
-            Self::S3(cache) => cache.get(key),
-            Self::Gcs(cache) => cache.get(key),
-            Self::Nexus(cache) => cache.get(key),
+        let compressed = format!("{key}{COMPRESSED_SUFFIX}");
+        match self.fetch(&compressed) {
+            Fetched::Found(bytes) => match gunzip(&bytes) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    eprintln!(
+                        "[Warn] shared cache entry {compressed} is not valid gzip (treating as a miss): {error}"
+                    );
+                    None
+                }
+            },
+            Fetched::Missing => match self.fetch(&format!("{key}{PLAIN_SUFFIX}")) {
+                Fetched::Found(bytes) => Some(bytes),
+                Fetched::Missing | Fetched::Failed => None,
+            },
+            Fetched::Failed => None,
         }
     }
 
+    /// Publishes `data` for `key` as a gzip-compressed object. Hash entries are repetitive label
+    /// text and hex, so this is a 2-3x smaller upload and backfill for every replica.
     fn put(&self, key: &str, data: &[u8]) {
-        match self {
-            Self::S3(cache) => cache.put(key, data),
-            Self::Gcs(cache) => cache.put(key, data),
-            Self::Nexus(cache) => cache.put(key, data),
+        match gzip(data) {
+            Ok(compressed) => self.store(
+                &format!("{key}{COMPRESSED_SUFFIX}"),
+                &compressed,
+                "application/gzip",
+            ),
+            Err(error) => eprintln!(
+                "[Warn] failed to compress shared cache entry {key} (entry not shared): {error}"
+            ),
         }
     }
+
+    fn fetch(&self, name: &str) -> Fetched {
+        match self {
+            Self::S3(cache) => cache.get(name),
+            Self::Gcs(cache) => cache.get(name),
+            Self::Nexus(cache) => cache.get(name),
+        }
+    }
+
+    fn store(&self, name: &str, data: &[u8], content_type: &str) {
+        match self {
+            Self::S3(cache) => cache.put(name, data),
+            Self::Gcs(cache) => cache.put(name, data, content_type),
+            Self::Nexus(cache) => cache.put(name, data, content_type),
+        }
+    }
+}
+
+/// Object name suffixes on the shared tier. New entries are written compressed; the plain suffix
+/// is read for entries written before compression existed.
+const COMPRESSED_SUFFIX: &str = ".json.gz";
+const PLAIN_SUFFIX: &str = ".json";
+
+/// Outcome of one object read on the shared tier. A clean miss and a failure are told apart so a
+/// miss on the compressed name can fall back to the plain one while a failure stays a failure.
+enum Fetched {
+    Found(Vec<u8>),
+    Missing,
+    Failed,
+}
+
+/// Fast-level gzip: the compressed size is within a few percent of the default level on hash
+/// entries and the encode is several times quicker, which matters on a cache write that already
+/// sits on the critical path of a cold query.
+fn gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 2), Compression::fast());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(data.len() * 3);
+    GzDecoder::new(data).read_to_end(&mut decoded)?;
+    Ok(decoded)
 }
 
 struct S3Cache {
@@ -142,8 +434,8 @@ impl S3Cache {
         })
     }
 
-    fn object_key(&self, key: &str) -> String {
-        format!("{}{key}.json", self.prefix)
+    fn object_key(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
     }
 
     /// Reads an entry, degrading to a miss on any failure.
@@ -153,29 +445,31 @@ impl S3Cache {
     /// miss with `404`, `Transfer-Encoding: chunked` and no body, and every HTTP client on this
     /// stack fails reading that absent body -- `attohttpc: Io Error: unexpected end of file`. A GET
     /// miss carries a real `NoSuchKey` body, so it reads back cleanly.
-    fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let failure = match self.bucket.get_object(self.object_key(key)) {
-            Ok(response) if response.status_code() == 200 => return Some(response.to_vec()),
-            Ok(response) if response.status_code() == 404 => return None,
+    fn get(&self, name: &str) -> Fetched {
+        let failure = match self.bucket.get_object(self.object_key(name)) {
+            Ok(response) if response.status_code() == 200 => {
+                return Fetched::Found(response.to_vec())
+            }
+            Ok(response) if response.status_code() == 404 => return Fetched::Missing,
             Ok(response) => http_failure(&response),
             Err(error) => error.to_string(),
         };
         eprintln!(
             "[Warn] S3 cache read of {} failed (treating as a miss): {failure}",
-            self.object_key(key)
+            self.object_key(name)
         );
-        None
+        Fetched::Failed
     }
 
-    fn put(&self, key: &str, data: &[u8]) {
-        let failure = match self.bucket.put_object(self.object_key(key), data) {
+    fn put(&self, name: &str, data: &[u8]) {
+        let failure = match self.bucket.put_object(self.object_key(name), data) {
             Ok(response) if (200..300).contains(&response.status_code()) => return,
             Ok(response) => http_failure(&response),
             Err(error) => error.to_string(),
         };
         eprintln!(
             "[Warn] S3 cache write of {} failed (entry not shared): {failure}",
-            self.object_key(key)
+            self.object_key(name)
         );
     }
 }
@@ -204,8 +498,14 @@ fn normalize_s3_prefix(prefix: &str) -> String {
     }
 }
 
+/// Produces a bearer token for `storage.googleapis.com`; abstracted so tests can run the backend
+/// against a local server without Google credentials.
 type GcsTokenSource = Box<dyn Fn() -> Result<String> + Send + Sync>;
 
+/// Cache entries stored as objects in a Google Cloud Storage bucket, addressed through the JSON
+/// API with a bearer token from Application Default Credentials: a media download
+/// `GET /storage/v1/b/<bucket>/o/<prefix><key>.json.gz?alt=media` and a media upload
+/// `POST /upload/storage/v1/b/<bucket>/o?uploadType=media&name=<prefix><key>.json.gz`.
 struct GcsCache {
     session: attohttpc::Session,
     endpoint: Url,
@@ -214,47 +514,53 @@ struct GcsCache {
     token_source: GcsTokenSource,
 }
 
+const GCS_ENDPOINT: &str = "https://storage.googleapis.com";
+const GCS_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
+
 impl GcsCache {
     fn new(bucket: &str, prefix: &str) -> Result<Self> {
-        if bucket.is_empty() || bucket.contains('/') {
-            bail!("invalid GCS bucket name");
-        }
+        // `gcp_auth` is async-only. A single-threaded runtime owned by the token source drives
+        // credential discovery here and every later token refresh; the provider caches tokens, so
+        // a refresh is rare and `block_on` from a request thread is cheap.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .context("failed to create GCS credential runtime")?;
+            .context("failed to create the GCS credential runtime")?;
         let provider = runtime
             .block_on(gcp_auth::provider())
-            .context("failed to resolve GCS credentials")?;
-        Self::new_with_token_source(
+            .context("failed to resolve Google Cloud credentials")?;
+        Self::with_token_source(
             bucket,
             prefix,
-            "https://storage.googleapis.com",
+            GCS_ENDPOINT,
             Box::new(move || {
-                let token = runtime.block_on(
-                    provider.token(&["https://www.googleapis.com/auth/devstorage.read_write"]),
-                )?;
+                let token = runtime
+                    .block_on(provider.token(&[GCS_SCOPE]))
+                    .context("failed to obtain a Google Cloud access token")?;
                 Ok(token.as_str().to_owned())
             }),
         )
     }
 
-    fn new_with_token_source(
+    fn with_token_source(
         bucket: &str,
         prefix: &str,
         endpoint: &str,
         token_source: GcsTokenSource,
     ) -> Result<Self> {
-        let endpoint = Url::parse(endpoint).context("invalid GCS endpoint")?;
-        if !matches!(endpoint.scheme(), "http" | "https")
-            || bucket.is_empty()
-            || bucket.contains('/')
-        {
-            bail!("invalid GCS endpoint or bucket");
+        let endpoint =
+            Url::parse(endpoint).with_context(|| format!("invalid GCS endpoint {endpoint:?}"))?;
+        if !matches!(endpoint.scheme(), "http" | "https") {
+            bail!("GCS endpoint must be http or https: {endpoint}");
+        }
+        if bucket.is_empty() || bucket.contains('/') {
+            bail!("GCS bucket must be a single non-empty name: {bucket:?}");
         }
         let mut session = attohttpc::Session::new();
-        session.connect_timeout(Duration::from_secs(10));
-        session.read_timeout(Duration::from_secs(60));
+        session.connect_timeout(HTTP_CONNECT_TIMEOUT);
+        session.read_timeout(HTTP_READ_TIMEOUT);
+        // A redirect is reported, never followed: following one would replay the bearer token
+        // against whatever host the `Location` names.
         session.follow_redirects(false);
         Ok(Self {
             session,
@@ -265,76 +571,82 @@ impl GcsCache {
         })
     }
 
-    fn object_name(&self, key: &str) -> String {
-        format!("{}{key}.json", self.prefix)
+    fn object_name(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
     }
 
-    fn object_url(&self, key: &str) -> Url {
+    /// The media-download URL: the object name is a single percent-encoded path segment, so a
+    /// prefix's `/` travels as `%2F`.
+    fn object_url(&self, name: &str) -> Url {
         let mut url = self.endpoint.clone();
         url.path_segments_mut()
-            .expect("validated GCS endpoint")
+            .expect("validated by with_token_source")
             .pop_if_empty()
             .extend(["storage", "v1", "b", &self.bucket, "o"])
-            .push(&self.object_name(key));
+            .push(&self.object_name(name));
         url.query_pairs_mut().append_pair("alt", "media");
         url
     }
 
-    fn upload_url(&self, key: &str) -> Url {
+    fn upload_url(&self, name: &str) -> Url {
         let mut url = self.endpoint.clone();
         url.path_segments_mut()
-            .expect("validated GCS endpoint")
+            .expect("validated by with_token_source")
             .pop_if_empty()
             .extend(["upload", "storage", "v1", "b", &self.bucket, "o"]);
         url.query_pairs_mut()
             .append_pair("uploadType", "media")
-            .append_pair("name", &self.object_name(key));
+            .append_pair("name", &self.object_name(name));
         url
     }
 
-    fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let url = self.object_url(key);
-        let result = (|| -> Result<Option<Vec<u8>>> {
-            let token = (self.token_source)()?;
-            let response = self
-                .session
-                .get(url.as_str())
-                .header(attohttpc::header::AUTHORIZATION, format!("Bearer {token}"))
-                .send()?;
-            match response.status() {
-                attohttpc::StatusCode::OK => Ok(Some(response.bytes()?)),
-                attohttpc::StatusCode::NOT_FOUND => Ok(None),
-                status => bail!("HTTP {status}"),
-            }
-        })();
-        match result {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                eprintln!("[Warn] GCS cache read of {url} failed (treating as a miss): {error}");
-                None
-            }
-        }
+    fn authorized<B>(
+        &self,
+        request: attohttpc::RequestBuilder<B>,
+    ) -> Result<attohttpc::RequestBuilder<B>> {
+        Ok(request.bearer_auth((self.token_source)()?))
     }
 
-    fn put(&self, key: &str, data: &[u8]) {
-        let url = self.upload_url(key);
-        let result = (|| -> Result<()> {
-            let token = (self.token_source)()?;
-            let response = self
-                .session
-                .post(url.as_str())
-                .header(attohttpc::header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(attohttpc::header::CONTENT_TYPE, "application/json")
-                .bytes(data)
-                .send()?;
-            if !response.is_success() {
-                bail!("HTTP {}", response.status());
+    /// Reads an entry, degrading to a miss on any failure. GCS answers a missing object (or a
+    /// missing bucket) with a plain `404`.
+    fn get(&self, name: &str) -> Fetched {
+        let url = self.object_url(name);
+        let failure = match self
+            .authorized(self.session.get(url.as_str()))
+            .and_then(|request| request.send().map_err(Into::into))
+        {
+            Ok(response) if response.status() == attohttpc::StatusCode::OK => {
+                match response.bytes() {
+                    Ok(bytes) => return Fetched::Found(bytes),
+                    Err(error) => error.to_string(),
+                }
             }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            eprintln!("[Warn] GCS cache write of {url} failed (entry not shared): {error}");
-        }
+            Ok(response) if response.status() == attohttpc::StatusCode::NOT_FOUND => {
+                return Fetched::Missing
+            }
+            Ok(response) => http_response_failure(response),
+            Err(error) => format!("{error:#}"),
+        };
+        eprintln!("[Warn] GCS cache read of {url} failed (treating as a miss): {failure}");
+        Fetched::Failed
+    }
+
+    fn put(&self, name: &str, data: &[u8], content_type: &str) {
+        let url = self.upload_url(name);
+        let failure = match self
+            .authorized(self.session.post(url.as_str()))
+            .and_then(|request| {
+                request
+                    .header(attohttpc::header::CONTENT_TYPE, content_type)
+                    .bytes(data)
+                    .send()
+                    .map_err(Into::into)
+            }) {
+            Ok(response) if response.is_success() => return,
+            Ok(response) => http_response_failure(response),
+            Err(error) => format!("{error:#}"),
+        };
+        eprintln!("[Warn] GCS cache write of {url} failed (entry not shared): {failure}");
     }
 }
 
@@ -357,18 +669,19 @@ impl fmt::Debug for NexusCredentials {
 
 /// Cache entries stored as components of a Sonatype Nexus Repository *raw* hosted repository,
 /// addressed through Nexus's plain HTTP content API: `GET`/`PUT` on
-/// `<nexusUrl>/repository/<repository>/<prefix>/<key>.json`.
+/// `<nexusUrl>/repository/<repository>/<prefix>/<key>.json.gz`.
 struct NexusCache {
     session: attohttpc::Session,
     base: Url,
     credentials: Option<NexusCredentials>,
 }
 
-const NEXUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const NEXUS_READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Timeouts shared by the plain-HTTP backends (Nexus, GCS).
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bounds how much of an error body (Nexus answers many failures with a full HTML page) is
 /// echoed into a warning.
-const NEXUS_ERROR_BODY_LIMIT: usize = 200;
+const HTTP_ERROR_BODY_LIMIT: usize = 200;
 
 impl NexusCache {
     fn new(
@@ -377,8 +690,8 @@ impl NexusCache {
         ca_cert: Option<&Path>,
     ) -> Result<Self> {
         let mut session = attohttpc::Session::new();
-        session.connect_timeout(NEXUS_CONNECT_TIMEOUT);
-        session.read_timeout(NEXUS_READ_TIMEOUT);
+        session.connect_timeout(HTTP_CONNECT_TIMEOUT);
+        session.read_timeout(HTTP_READ_TIMEOUT);
         // A redirect is reported, never followed: following one would replay the basic-auth
         // header against whatever host the `Location` names.
         session.follow_redirects(false);
@@ -394,12 +707,12 @@ impl NexusCache {
         })
     }
 
-    fn object_url(&self, key: &str) -> Url {
+    fn object_url(&self, name: &str) -> Url {
         let mut url = self.base.clone();
         url.path_segments_mut()
             .expect("validated by nexus_base_url")
             .pop_if_empty()
-            .push(&format!("{key}.json"));
+            .push(name);
         url
     }
 
@@ -414,28 +727,30 @@ impl NexusCache {
 
     /// Reads an entry, degrading to a miss on any failure. Nexus answers a missing component with
     /// a plain `404`.
-    fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let url = self.object_url(key);
+    fn get(&self, name: &str) -> Fetched {
+        let url = self.object_url(name);
         let failure = match self.authorized(self.session.get(url.as_str())).send() {
             Ok(response) if response.status() == attohttpc::StatusCode::OK => {
                 match response.bytes() {
-                    Ok(bytes) => return Some(bytes),
+                    Ok(bytes) => return Fetched::Found(bytes),
                     Err(error) => error.to_string(),
                 }
             }
-            Ok(response) if response.status() == attohttpc::StatusCode::NOT_FOUND => return None,
-            Ok(response) => nexus_http_failure(response),
+            Ok(response) if response.status() == attohttpc::StatusCode::NOT_FOUND => {
+                return Fetched::Missing
+            }
+            Ok(response) => http_response_failure(response),
             Err(error) => error.to_string(),
         };
         eprintln!("[Warn] Nexus cache read of {url} failed (treating as a miss): {failure}");
-        None
+        Fetched::Failed
     }
 
-    fn put(&self, key: &str, data: &[u8]) {
-        let url = self.object_url(key);
+    fn put(&self, name: &str, data: &[u8], content_type: &str) {
+        let url = self.object_url(name);
         let failure = match self
             .authorized(self.session.put(url.as_str()))
-            .header(attohttpc::header::CONTENT_TYPE, "application/json")
+            .header(attohttpc::header::CONTENT_TYPE, content_type)
             .bytes(data)
             .send()
         {
@@ -443,20 +758,21 @@ impl NexusCache {
             Ok(response) if response.status() == attohttpc::StatusCode::BAD_REQUEST => format!(
                 "{} (a raw hosted repository answers 400 when its deployment policy forbids \
                  redeploying an existing component; set it to \"Allow redeploy\")",
-                nexus_http_failure(response)
+                http_response_failure(response)
             ),
-            Ok(response) => nexus_http_failure(response),
+            Ok(response) => http_response_failure(response),
             Err(error) => error.to_string(),
         };
         eprintln!("[Warn] Nexus cache write of {url} failed (entry not shared): {failure}");
     }
 }
 
-fn nexus_http_failure(response: attohttpc::Response) -> String {
+/// Renders a non-2xx `attohttpc` response for a warning, in the same shape as `http_failure`.
+fn http_response_failure(response: attohttpc::Response) -> String {
     let status = response.status().as_u16();
     let body = response.text().unwrap_or_default();
     let body = body.trim();
-    let shown = match body.char_indices().nth(NEXUS_ERROR_BODY_LIMIT) {
+    let shown = match body.char_indices().nth(HTTP_ERROR_BODY_LIMIT) {
         Some((cut, _)) => format!("{}...", &body[..cut]),
         None => body.to_owned(),
     };
@@ -594,18 +910,20 @@ pub fn parse_byte_size(value: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("size overflow: {value}"))
 }
 
+/// Rejects configurations partial-graph mode cannot honour (see
+/// [`partial::validate_hash_options`]).
+pub fn validate_partial_graph(config: &ServerConfig) -> Result<()> {
+    if !config.partial_graph {
+        return Ok(());
+    }
+    partial::validate_hash_options(&config.hash_options)
+}
+
 pub fn serve(config: ServerConfig) -> Result<()> {
+    validate_partial_graph(&config)?;
     fs::create_dir_all(&config.cache_dir)?;
-    let fingerprint = configuration_fingerprint(&config);
     let remote = RemoteCache::new(&config)?;
-    let state = Arc::new(State {
-        config,
-        ready: AtomicBool::new(false),
-        workspace_lock: Mutex::new(()),
-        started: Instant::now(),
-        fingerprint,
-        remote,
-    });
+    let state = Arc::new(State::new(config, remote));
     prune_cache(&state)?;
     start_cache_pruner(&state)?;
     perform_initial_fetch(&state);
@@ -736,10 +1054,17 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
                 );
             }
             let timeout = state.config.request_timeout;
+            let token = Arc::new(Cancellation::new());
+            let active = ActiveQuery::start(state);
             let state_for_compute = Arc::clone(state);
+            let worker_token = Arc::clone(&token);
             let (sender, receiver) = mpsc::sync_channel(1);
             std::thread::spawn(move || {
-                let _ = sender.send(compute_query(&state_for_compute, inputs, kind));
+                let result = compute_query(&state_for_compute, inputs, kind, &worker_token);
+                // Decrement before answering so a client that polls /metrics right after its
+                // response never sees its own finished query still counted.
+                drop(active);
+                let _ = sender.send(result);
             });
             let computed = if timeout.is_zero() {
                 receiver
@@ -749,11 +1074,16 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
                 match receiver.recv_timeout(timeout) {
                     Ok(result) => result,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let stopped = cancel_query(&token, &receiver, timeout);
                         return respond_json(
                             request,
                             504,
-                            &json!({"error": format!("request timed out after {}s", timeout.as_secs())}),
-                        )
+                            &json!({
+                                "error": format!("request timed out after {}s", timeout.as_secs()),
+                                "cancelled": stopped,
+                                "workspaceBusy": state.workspace.is_busy(),
+                            }),
+                        );
                     }
                     Err(_) => Err(anyhow!("query worker stopped")),
                 }
@@ -764,6 +1094,39 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
             }
         }
         _ => respond_json(request, 404, &json!({"error": "not found"})),
+    }
+}
+
+/// Cancels the query a timed-out request abandoned and waits for its worker to stop, so the 504
+/// is sent only once the query has released the workspace and will write no cache entry. Returns
+/// whether the worker stopped within [`CANCEL_GRACE`]; when it did not, `/metrics` reports the
+/// moment it does through `activeQueries` and `workspaceBusy`.
+fn cancel_query(
+    token: &Cancellation,
+    receiver: &mpsc::Receiver<Result<Value>>,
+    timeout: Duration,
+) -> bool {
+    let killed = token.cancel();
+    eprintln!(
+        "[Warn] request timed out after {}s; cancelled its query and killed {killed} subprocess(es)",
+        timeout.as_secs()
+    );
+    let cancelled = Instant::now();
+    match receiver.recv_timeout(CANCEL_GRACE) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "[Warn] cancelled query is still running {}s later; /metrics reports when it stops",
+                CANCEL_GRACE.as_secs()
+            );
+            false
+        }
+        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!(
+                "[Info] cancelled query stopped and released the workspace after {}ms",
+                elapsed_millis(cancelled)
+            );
+            true
+        }
     }
 }
 
@@ -836,12 +1199,14 @@ fn normalized_types(types: Option<Vec<String>>) -> Option<HashSet<String>> {
         .filter(|types| !types.is_empty())
 }
 
-fn compute_query(state: &Arc<State>, inputs: QueryInputs, kind: QueryKind) -> Result<Value> {
+fn compute_query(
+    state: &Arc<State>,
+    inputs: QueryInputs,
+    kind: QueryKind,
+    token: &Arc<Cancellation>,
+) -> Result<Value> {
     let started = Instant::now();
-    let _guard = state
-        .workspace_lock
-        .lock()
-        .map_err(|_| anyhow!("workspace lock poisoned"))?;
+    let _guard = state.workspace.acquire(token)?;
     let resolve_started = Instant::now();
     let (from_sha, to_sha) = resolve_both(state, &inputs.from, &inputs.to)?;
     let resolve_millis = resolve_started.elapsed().as_millis() as u64;
@@ -849,23 +1214,29 @@ fn compute_query(state: &Arc<State>, inputs: QueryInputs, kind: QueryKind) -> Re
         // Same graph generate-hashes writes to --depEdgesFile: the end revision's
         // full (unscoped) dependency map. modifiedFilepaths must not shrink it —
         // PRI/CRI BFS-walk this file from the app target and need every edge.
-        let to = get_hashes_locked(state, &to_sha, &BTreeSet::new())?.data;
+        let to = get_hashes_locked(state, &to_sha, &BTreeSet::new(), None)?.data;
         prune_cache(state)?;
         return Ok(serde_json::to_value(&to.dep_edges)?);
     }
     let from_started = Instant::now();
-    let from = get_hashes_locked(state, &from_sha, &inputs.modified_filepaths)?;
+    let from = get_hashes_locked(state, &from_sha, &inputs.modified_filepaths, None)?;
     let from_profile = retrieval_profile(&from_sha, &from, from_started);
     let from = from.data;
     let to_started = Instant::now();
-    let to = get_hashes_locked(state, &to_sha, &inputs.modified_filepaths)?;
+    // The `from` entry is the base a partial-graph derivation of `to` starts from.
+    let to = get_hashes_locked(
+        state,
+        &to_sha,
+        &inputs.modified_filepaths,
+        Some((&from_sha, &from)),
+    )?;
     let to_profile = retrieval_profile(&to_sha, &to, to_started);
     let to = to.data;
     let diff_started = Instant::now();
     checkout(state, &to_sha)?;
-    let exclude_external = state.config.hash_options.bazel.is_bzlmod_enabled();
-    let impacted =
-        impacted_with_module_changes(&from, &to, Some(&state.config.hash_options.bazel))?;
+    let bazel = state.bazel_options();
+    let exclude_external = bazel.is_bzlmod_enabled();
+    let impacted = impacted_with_module_changes(&from, &to, Some(&bazel))?;
     let impacted_value = if matches!(kind, QueryKind::Distances) {
         let hash_impacted = impacted_targets(&from.hashes, &to.hashes, None, false)?
             .into_iter()
@@ -925,12 +1296,9 @@ fn compute_query(state: &Arc<State>, inputs: QueryInputs, kind: QueryKind) -> Re
 }
 
 fn warm_revision(state: &Arc<State>, revision: &str) -> Result<()> {
-    let _guard = state
-        .workspace_lock
-        .lock()
-        .map_err(|_| anyhow!("workspace lock poisoned"))?;
+    let _guard = state.workspace.acquire(&Arc::new(Cancellation::new()))?;
     let sha = resolve_sha(state, revision)?;
-    get_hashes_locked(state, &sha, &BTreeSet::new())?;
+    get_hashes_locked(state, &sha, &BTreeSet::new(), None)?;
     Ok(())
 }
 
@@ -938,7 +1306,11 @@ fn warm_revision(state: &Arc<State>, revision: &str) -> Result<()> {
 /// checkout`, then the phases of [`generate_hashes_timed`], then serialising the result and
 /// writing it to the cache tiers. `targetCount` sizes the graph the phases operated on. Field
 /// names match the profile the Kotlin service emitted, which tools/serve_harness.py asserts on.
-#[derive(Clone, Copy, Debug, Serialize)]
+///
+/// In partial-graph mode the `partial` fields say how the entry was produced: `mode` is
+/// `derived` (no checkout, no query: the base's recipes were re-evaluated) or `full`, with
+/// `partialFallbackReason` naming what ruled a derivation out.
+#[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GenerationBreakdown {
     checkout_millis: u64,
@@ -947,20 +1319,42 @@ struct GenerationBreakdown {
     module_graph_millis: u64,
     cache_write_millis: u64,
     target_count: usize,
+    #[serde(flatten)]
+    partial: PartialProfile,
+}
+
+/// How partial-graph mode handled one generation; empty outside the mode.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PartialProfile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    derived_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    partial_fallback_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changed_sources: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unmatched_paths: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classify_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    derive_millis: Option<u64>,
 }
 
 /// Outcome of one cache lookup: the data, whether it was served from a cache tier, and where the
 /// time went. A hit carries only `cache_read_millis` (reading and deserialising the entry is the
 /// whole cost of a hit); a miss carries only `generation`.
 struct Retrieval {
-    data: HashFileData,
+    data: Arc<HashFileData>,
     cache_hit: bool,
     cache_read_millis: Option<u64>,
     generation: Option<GenerationBreakdown>,
 }
 
 impl Retrieval {
-    fn hit(data: HashFileData, read_started: Instant) -> Self {
+    fn hit(data: Arc<HashFileData>, read_started: Instant) -> Self {
         Self {
             data,
             cache_hit: true,
@@ -997,17 +1391,45 @@ fn retrieval_profile(sha: &str, retrieval: &Retrieval, started: Instant) -> Valu
     Value::Object(entry)
 }
 
+/// Retrieves the hashes of `sha` from the cache tiers, or generates them.
+///
+/// `base` is the request's other revision when it has already been retrieved: in partial-graph
+/// mode a full-content miss first tries to derive `sha` from it (see [`crate::partial`]).
 fn get_hashes_locked(
     state: &Arc<State>,
     sha: &str,
     modified: &BTreeSet<PathBuf>,
+    base: Option<(&str, &Arc<HashFileData>)>,
 ) -> Result<Retrieval> {
-    let key = cache_key(state, sha, modified);
+    // Keyed by the commit's tree, not the commit itself: a rebase, an amended message, or a merge
+    // commit that changes no file all point at a tree that was already hashed.
+    let tree = resolve_tree(state, sha)?;
+    let key = cache_key(state, &tree, modified);
     let path = state.config.cache_dir.join(format!("{key}.json"));
     let mut current_dependency_fingerprint = None;
+    // Bound first so the tier's lock is released before the (possibly slow) servability check.
+    let remembered = memory_cache(state).get(&key);
+    if let Some(data) = remembered {
+        let read_started = Instant::now();
+        if cache_entry_is_servable(
+            state,
+            sha,
+            "memory",
+            &key,
+            &data,
+            &mut current_dependency_fingerprint,
+        )? {
+            // Still counts as a use of the on-disk entry, so the pruner does not expire it out
+            // from under an entry that is hot in memory.
+            touch(&path);
+            return Ok(Retrieval::hit(data, read_started));
+        }
+    }
     if path.is_file() {
         let read_started = Instant::now();
-        let data = HashFileData::read(&path)?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read hash file {}", path.display()))?;
+        let data = Arc::new(HashFileData::from_slice(&bytes)?);
         if cache_entry_is_servable(
             state,
             sha,
@@ -1017,13 +1439,14 @@ fn get_hashes_locked(
             &mut current_dependency_fingerprint,
         )? {
             touch(&path);
+            memory_cache(state).insert(&key, bytes.len() as u64, &data);
             return Ok(Retrieval::hit(data, read_started));
         }
     }
     if let Some(remote) = &state.remote {
         let read_started = Instant::now();
         if let Some(bytes) = remote.get(&key) {
-            let data = HashFileData::from_slice(&bytes)?;
+            let data = Arc::new(HashFileData::from_slice(&bytes)?);
             if cache_entry_is_servable(
                 state,
                 sha,
@@ -1033,6 +1456,7 @@ fn get_hashes_locked(
                 &mut current_dependency_fingerprint,
             )? {
                 fs::write(&path, &bytes)?;
+                memory_cache(state).insert(&key, bytes.len() as u64, &data);
                 return Ok(Retrieval::hit(data, read_started));
             }
         }
@@ -1040,14 +1464,120 @@ fn get_hashes_locked(
     if state.config.dependency_fingerprint {
         eprintln!("[BD-DBG][cache-recompute] sha={sha} key={key}");
     }
-    let checkout_started = Instant::now();
-    checkout(state, sha)?;
-    let checkout_millis = elapsed_millis(checkout_started);
     let mut options = state.config.hash_options.clone();
+    options.bazel.cancellation = state.workspace.holder();
     options.modified_filepaths = modified.clone();
     options.track_deps = state.config.track_deps;
-    let (mut data, timings) = generate_hashes_timed(&options)?;
-    if state.config.dependency_fingerprint {
+    let mut tree = None;
+    if modified.is_empty() && options.content_hashes.is_none() {
+        // Git already holds a content hash for every tracked file, so seed the source hasher from
+        // one `ls-tree` instead of reading the whole working tree. The scoped `modifiedFilepaths`
+        // path keeps its own disk-read semantics, and files absent from the tree (untracked, or in
+        // a fine-grained external repository) still fall back to a disk read.
+        let listed_started = Instant::now();
+        let index = git_tree_index(state, sha)?;
+        eprintln!(
+            "[Info] listed {} tracked blobs for {sha} in {}ms",
+            index.len(),
+            elapsed_millis(listed_started)
+        );
+        options.content_hashes = Some(index.content_hashes());
+        tree = Some(Arc::new(index));
+    }
+    let mut partial_profile = PartialProfile::default();
+    let mut derived = None;
+    if let (true, Some(tree)) = (state.config.partial_graph, &tree) {
+        let classify_started = Instant::now();
+        let outcome = match base {
+            Some((base_sha, base_data)) if base_data.partial.is_some() => {
+                classify_revisions(state, base_sha, sha, base_data, tree)
+                    .map(|classification| (classification, base_sha.to_owned()))
+            }
+            Some((base_sha, _)) => Ok((
+                Classification::Rebuild {
+                    reason: format!("base entry {base_sha} carries no partial-graph recipes"),
+                },
+                base_sha.to_owned(),
+            )),
+            None => Ok((
+                Classification::Rebuild {
+                    reason: "no base revision to derive from".to_owned(),
+                },
+                String::new(),
+            )),
+        };
+        partial_profile.classify_millis = Some(elapsed_millis(classify_started));
+        match outcome {
+            Ok((
+                Classification::Derivable {
+                    changed_sources,
+                    unmatched_paths,
+                },
+                base_sha,
+            )) => {
+                let derive_started = Instant::now();
+                let (_, base_data) = base.expect("a derivable classification has a base");
+                match partial::derive(base_data, tree) {
+                    Ok(data) => {
+                        eprintln!(
+                            "[Info] partial graph: derived {sha} from {base_sha}: {} changed source targets, {} changed paths outside the graph, {} targets",
+                            changed_sources.len(),
+                            unmatched_paths.len(),
+                            data.hashes.len()
+                        );
+                        partial_profile.mode = Some("derived");
+                        partial_profile.derived_from = Some(base_sha);
+                        partial_profile.changed_sources = Some(changed_sources.len());
+                        partial_profile.unmatched_paths = Some(unmatched_paths.len());
+                        partial_profile.derive_millis = Some(elapsed_millis(derive_started));
+                        derived = Some(data);
+                    }
+                    Err(error) => {
+                        partial_profile.partial_fallback_reason =
+                            Some(format!("derivation failed: {error:#}"));
+                    }
+                }
+            }
+            Ok((Classification::Rebuild { reason }, _)) => {
+                partial_profile.partial_fallback_reason = Some(reason);
+            }
+            Err(error) => {
+                partial_profile.partial_fallback_reason =
+                    Some(format!("classification failed: {error:#}"));
+            }
+        }
+        if derived.is_none() {
+            partial_profile.mode = Some("full");
+            eprintln!(
+                "[Info] partial graph: full generation for {sha}: {}",
+                partial_profile
+                    .partial_fallback_reason
+                    .as_deref()
+                    .unwrap_or("unknown reason")
+            );
+            state.partial_rebuilds.fetch_add(1, Ordering::SeqCst);
+        } else {
+            state.partial_derived.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (mut data, timings, checkout_millis) = match derived {
+        Some(data) => (data, Default::default(), 0),
+        None => {
+            let checkout_started = Instant::now();
+            checkout(state, sha)?;
+            let checkout_millis = elapsed_millis(checkout_started);
+            if state.config.partial_graph {
+                options.partial_tree = tree.clone();
+            }
+            let (data, timings) = generate_hashes_timed(&options)?;
+            (data, timings, checkout_millis)
+        }
+    };
+    // A generation the client stopped waiting for is not cached: the subprocess kill above may
+    // have left the working tree mid-checkout, and the caller may already be reusing it.
+    state.workspace.check_cancelled()?;
+    // A derived entry already carries its base's fingerprint: the module files are unchanged.
+    if state.config.dependency_fingerprint && data.dependency_fingerprint.is_none() {
         data.dependency_fingerprint = current_dependency_fingerprint.take().or_else(|| {
             match dependency_fingerprint_for_workspace(state) {
                 Ok(value) => Some(value),
@@ -1068,12 +1598,13 @@ fn get_hashes_locked(
     let write_started = Instant::now();
     let bytes = serde_json::to_vec(&data.serialized(true, state.config.track_deps))?;
     let temporary = state.config.cache_dir.join(format!("{key}.tmp"));
-    fs::write(&temporary, bytes)?;
+    fs::write(&temporary, &bytes)?;
     fs::rename(temporary, path)?;
     if let Some(remote) = &state.remote {
-        let bytes = fs::read(state.config.cache_dir.join(format!("{key}.json")))?;
         remote.put(&key, &bytes);
     }
+    let data = Arc::new(data);
+    memory_cache(state).insert(&key, bytes.len() as u64, &data);
     let generation = GenerationBreakdown {
         checkout_millis,
         bazel_query_millis: timings.bazel_query_millis,
@@ -1081,17 +1612,23 @@ fn get_hashes_locked(
         module_graph_millis: timings.module_graph_millis,
         cache_write_millis: elapsed_millis(write_started),
         target_count: data.hashes.len(),
+        partial: partial_profile,
     };
     // Always logged, not just for profile=true requests, so a slow generation is attributable to
     // a phase straight from the server log.
     eprintln!(
-        "[Info] generated hashes for {sha}: checkout={}ms bazelQuery={}ms targetHash={}ms moduleGraph={}ms cacheWrite={}ms targets={}",
+        "[Info] generated hashes for {sha}: checkout={}ms bazelQuery={}ms targetHash={}ms moduleGraph={}ms cacheWrite={}ms targets={}{}",
         generation.checkout_millis,
         generation.bazel_query_millis,
         generation.target_hash_millis,
         generation.module_graph_millis,
         generation.cache_write_millis,
-        generation.target_count
+        generation.target_count,
+        generation
+            .partial
+            .mode
+            .map(|mode| format!(" partialGraph={mode}"))
+            .unwrap_or_default()
     );
     Ok(Retrieval {
         data,
@@ -1181,81 +1718,25 @@ fn short_fingerprint(value: &str) -> &str {
 
 fn dependency_fingerprint_for_workspace(state: &State) -> Result<String> {
     state
-        .config
-        .hash_options
-        .bazel
+        .bazel_options()
         .dependency_fingerprint()
         .map_err(|error| {
             anyhow!("failed to compute dependency fingerprint for cache guard: {error:#}")
         })
 }
 
+/// The hash-affecting configuration's digest, as [`cache::configuration_fingerprint`]
+/// computes it for every producer of cache entries.
 fn configuration_fingerprint(config: &ServerConfig) -> String {
-    let options = &config.hash_options;
-    let mut hasher = Sha256::new();
-    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
-    hasher.update([0]);
-    for value in [
-        options.bazel.startup_options.join("\0"),
-        options.bazel.command_options.join("\0"),
-        options.bazel.cquery_options.join("\0"),
-        options.bazel.use_cquery.to_string(),
-        options.bazel.cquery_expression.clone().unwrap_or_default(),
-        options.bazel.keep_going.to_string(),
-        options.bazel.exclude_external_targets.to_string(),
-        options
-            .bazel
-            .exclude_targets_query
-            .clone()
-            .unwrap_or_default(),
-        options
-            .bazel
-            .fine_grained_external_repos
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(","),
-        options
-            .ignored_attributes
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join(","),
-        options
-            .seed_filepaths
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("\0"),
-        options
-            .always_affected_tags
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join(","),
-        config.track_deps.to_string(),
-    ] {
-        hasher.update(value.as_bytes());
-        hasher.update([0]);
-    }
-    hex::encode(hasher.finalize())[..12].to_owned()
+    cache::configuration_fingerprint(
+        &config.hash_options,
+        config.track_deps,
+        config.partial_graph,
+    )
 }
 
 fn cache_key(state: &State, sha: &str, modified: &BTreeSet<PathBuf>) -> String {
-    let base = format!("{sha}.{}", state.fingerprint);
-    if modified.is_empty() {
-        return base;
-    }
-    let mut hasher = Sha256::new();
-    for path in modified {
-        hasher.update(path.to_string_lossy().as_bytes());
-        hasher.update(b"\n");
-    }
-    format!("{base}.{}", &hex::encode(hasher.finalize())[..12])
+    cache::cache_key(sha, &state.fingerprint, modified)
 }
 
 fn resolve_both(state: &State, from: &str, to: &str) -> Result<(String, String)> {
@@ -1302,96 +1783,87 @@ fn fetch_revision(state: &State, revision: &str) -> bool {
         })
 }
 
+/// Thin wrappers over [`Git`] bound to the query holding the workspace, so the subprocesses
+/// die with it (see [`State::git`]).
 fn resolve_sha(state: &State, revision: &str) -> Result<String> {
-    let output = git_output(
-        state,
-        &[
-            String::from("rev-parse"),
-            String::from("--verify"),
-            format!("{revision}^{{commit}}"),
-        ],
-    )?;
-    if !output.status.success() {
-        bail!("revision '{revision}' is missing from the local clone");
-    }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if sha.len() != 40 {
-        bail!("revision '{revision}' resolved to invalid SHA '{sha}'");
-    }
-    Ok(sha)
+    state.git().resolve_sha(revision)
+}
+
+fn resolve_tree(state: &State, sha: &str) -> Result<String> {
+    state.git().resolve_tree(sha)
+}
+
+fn git_tree_index(state: &State, sha: &str) -> Result<TreeIndex> {
+    state.git().tree_index(sha)
+}
+
+/// Decides whether `sha` can be derived from the cached `base_sha` entry under the server's
+/// rebuild patterns and seed files (see [`git::classify_revisions`]).
+fn classify_revisions(
+    state: &State,
+    base_sha: &str,
+    sha: &str,
+    base: &HashFileData,
+    tree: &TreeIndex,
+) -> Result<Classification> {
+    git::classify_revisions(
+        &state.git(),
+        base_sha,
+        sha,
+        base,
+        tree,
+        &DerivationPolicy {
+            seed_filepaths: &state.config.hash_options.seed_filepaths,
+            rebuild_patterns: &state.config.partial_graph_rebuild_patterns,
+        },
+    )
 }
 
 fn checkout(state: &State, sha: &str) -> Result<()> {
-    if let Ok(output) = git_output(state, &[String::from("rev-parse"), String::from("HEAD")]) {
-        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == sha {
-            return Ok(());
-        }
-    }
-    let args = [
-        String::from("-c"),
-        String::from("advice.detachedHead=false"),
-        String::from("checkout"),
-        String::from("--force"),
-        sha.to_owned(),
-    ];
-    if git(state, &args).is_ok() {
-        return Ok(());
-    }
-    let index_lock = state
-        .config
-        .hash_options
-        .bazel
-        .workspace
-        .join(".git/index.lock");
-    if !index_lock.is_file() {
-        bail!("git checkout failed for revision {sha}");
-    }
-    fs::remove_file(&index_lock).context("failed to remove stale .git/index.lock")?;
-    eprintln!(
-        "[Warn] cleared stale git index.lock in {}; retrying checkout of {sha}",
-        state.config.hash_options.bazel.workspace.display()
-    );
-    git(state, &args)
+    state.git().checkout(sha)
 }
 
 fn git(state: &State, args: &[String]) -> Result<()> {
-    let output = git_output(state, args)?;
-    if !output.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(())
+    state.git().run(args)
 }
 
 fn git_output(state: &State, args: &[String]) -> Result<std::process::Output> {
-    Command::new(&state.config.git_path)
-        .current_dir(&state.config.hash_options.bazel.workspace)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("failed to execute {}", state.config.git_path.display()))
+    state.git().output(args)
 }
 
 fn metrics(state: &State) -> Value {
     let entries = cache_entries(&state.config.cache_dir);
     let total = entries.iter().map(|entry| entry.size).sum::<u64>();
     let (used, max) = memory_usage();
+    let (memory_entries, memory_used, memory_max) = {
+        let memory = memory_cache(state);
+        (memory.len(), memory.used, memory.budget)
+    };
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptimeSeconds": state.started.elapsed().as_secs(),
         "ready": state.ready.load(Ordering::Acquire),
+        "activeQueries": state.active_queries.load(Ordering::SeqCst),
+        "workspaceBusy": state.workspace.is_busy(),
         "gitEngine": "subprocess",
         "trackDeps": state.config.track_deps,
         "dependencyFingerprint": state.config.dependency_fingerprint,
+        "partialGraph": {
+            "enabled": state.config.partial_graph,
+            "derived": state.partial_derived.load(Ordering::SeqCst),
+            "fullGenerations": state.partial_rebuilds.load(Ordering::SeqCst),
+        },
         "cache": {
             "directory": state.config.cache_dir.to_string_lossy(),
             "remote": state.config.remote_cache,
             "entries": entries.len(),
             "sizeBytes": total,
             "sizeHuman": human_bytes(total),
+            "memory": {
+                "entries": memory_entries,
+                "sizeBytes": memory_used,
+                "maxBytes": memory_max,
+            },
         },
         "jvm": {"usedBytes": used, "maxBytes": max}
     })
@@ -1455,10 +1927,10 @@ fn prune_cache(state: &State) -> Result<()> {
 }
 
 fn touch(path: &Path) {
-    // Rewriting the same bytes is portable and gives pruning a genuine
-    // last-use timestamp without another platform-specific dependency.
-    if let Ok(bytes) = fs::read(path) {
-        let _ = fs::write(path, bytes);
+    // Refreshes the modification time pruning reads as last use. Opening for write without
+    // truncating leaves the bytes alone; rewriting them cost a full copy of the entry per hit.
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
     }
 }
 
@@ -1519,6 +1991,7 @@ mod tests {
     use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::TcpStream;
+    use std::process::Command;
     use std::sync::mpsc as std_mpsc;
     use std::thread;
 
@@ -1535,10 +2008,12 @@ mod tests {
                     cquery_expression: None,
                     keep_going: false,
                     fine_grained_external_repos: BTreeSet::new(),
+                    label_only_module_extensions: BTreeSet::new(),
                     exclude_external_targets: false,
                     exclude_targets_query: None,
                     no_bazelrc: false,
                     verbose: false,
+                    cancellation: None,
                 },
                 content_hashes: None,
                 ignored_attributes: HashSet::new(),
@@ -1546,6 +2021,7 @@ mod tests {
                 modified_filepaths: BTreeSet::new(),
                 track_deps: false,
                 always_affected_tags: HashSet::new(),
+                partial_tree: None,
             },
             git_path: PathBuf::from("git"),
             port: 0,
@@ -1553,12 +2029,15 @@ mod tests {
             cache_dir: PathBuf::from("."),
             track_deps: false,
             dependency_fingerprint: false,
+            partial_graph: false,
+            partial_graph_rebuild_patterns: Vec::new(),
             no_initial_fetch: true,
             warmup_revisions: Vec::new(),
             cache_max_age: None,
             cache_max_entries: None,
             cache_max_size: None,
             cache_prune_interval: Duration::from_secs(60),
+            cache_memory_max: 64 * 1024 * 1024,
             remote_cache: None,
             s3_bucket: None,
             s3_prefix: String::new(),
@@ -1578,9 +2057,8 @@ mod tests {
     fn hash(kind: &str, value: &str, direct: &str) -> TargetHash {
         TargetHash {
             kind: kind.to_owned(),
-            hash: value.to_owned(),
-            direct_hash: direct.to_owned(),
-            deps: Vec::new(),
+            hash: value.into(),
+            direct_hash: direct.into(),
         }
     }
 
@@ -1631,15 +2109,74 @@ mod tests {
         config.track_deps = track_deps;
         config.hash_options.track_deps = track_deps;
         config.dependency_fingerprint = true;
-        let fingerprint = configuration_fingerprint(&config);
-        Arc::new(State {
-            config,
-            ready: AtomicBool::new(true),
-            workspace_lock: Mutex::new(()),
-            started: Instant::now(),
-            fingerprint,
-            remote: None,
-        })
+        ready_state(config, None)
+    }
+
+    fn ready_state(config: ServerConfig, remote: Option<RemoteCache>) -> Arc<State> {
+        let state = State::new(config, remote);
+        state.ready.store(true, Ordering::Release);
+        Arc::new(state)
+    }
+
+    /// The full-content cache key `get_hashes_locked` uses for a commit: its tree, not its SHA.
+    fn cache_key_for_commit(state: &State, sha: &str) -> String {
+        cache_key(state, &resolve_tree(state, sha).unwrap(), &BTreeSet::new())
+    }
+
+    #[test]
+    fn cache_key_is_shared_by_commits_with_identical_trees() {
+        let (repo, first, second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        git_command(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "no file changes"],
+        );
+        let third = git_command(repo.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(second, third);
+        assert_eq!(
+            cache_key_for_commit(&state, &second),
+            cache_key_for_commit(&state, &third)
+        );
+        assert_ne!(
+            cache_key_for_commit(&state, &first),
+            cache_key_for_commit(&state, &second)
+        );
+        assert!(cache_key_for_commit(&state, &second)
+            .starts_with(&git_command(repo.path(), &["rev-parse", "HEAD^{tree}"])));
+        assert!(resolve_tree(&state, "0000000000000000000000000000000000000000").is_err());
+    }
+
+    #[test]
+    fn git_content_hashes_list_tracked_blobs_and_skip_submodules() {
+        let (repo, first, second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        fs::create_dir_all(repo.path().join("nested dir")).unwrap();
+        fs::write(repo.path().join("nested dir/with space.txt"), "three").unwrap();
+        git_command(repo.path(), &["add", "."]);
+        git_command(repo.path(), &["commit", "-q", "-m", "three"]);
+        let third = git_command(repo.path(), &["rev-parse", "HEAD"]);
+
+        let hashes = git_tree_index(&state, &third).unwrap().content_hashes();
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(
+            hashes["file.txt"],
+            git_command(repo.path(), &["rev-parse", &format!("{third}:file.txt")])
+        );
+        assert_eq!(
+            hashes["nested dir/with space.txt"],
+            git_command(
+                repo.path(),
+                &["rev-parse", &format!("{third}:nested dir/with space.txt")]
+            )
+        );
+        // Same path, different content: the blob id moves with it.
+        assert_ne!(
+            git_tree_index(&state, &first).unwrap().content_hashes()["file.txt"],
+            git_tree_index(&state, &second).unwrap().content_hashes()["file.txt"]
+        );
+        assert!(git_tree_index(&state, "not-a-revision").is_err());
     }
 
     fn request(state: &Arc<State>, request: &str) -> String {
@@ -1742,6 +2279,14 @@ mod tests {
             .insert(PathBuf::from("seed.txt"));
         assert_ne!(configuration_fingerprint(&seeded), base_fingerprint);
 
+        let mut label_only = base.clone();
+        label_only
+            .hash_options
+            .bazel
+            .label_only_module_extensions
+            .insert("@rules_rs//rs:extensions.bzl%crate".to_owned());
+        assert_ne!(configuration_fingerprint(&label_only), base_fingerprint);
+
         let mut always_affected = base;
         always_affected
             .hash_options
@@ -1751,6 +2296,335 @@ mod tests {
             configuration_fingerprint(&always_affected),
             base_fingerprint
         );
+
+        // Partial-graph entries hash under their own formula; the default mode's keys stay put.
+        let mut partial = test_config();
+        assert_eq!(configuration_fingerprint(&partial), base_fingerprint);
+        partial.partial_graph = true;
+        assert_ne!(configuration_fingerprint(&partial), base_fingerprint);
+        partial.partial_graph_rebuild_patterns = vec![Glob::new("*.lock").unwrap()];
+        assert_eq!(
+            configuration_fingerprint(&partial),
+            configuration_fingerprint(&ServerConfig {
+                partial_graph_rebuild_patterns: Vec::new(),
+                ..partial.clone()
+            }),
+            "rebuild patterns only steer the classifier, never the hashes"
+        );
+    }
+
+    #[test]
+    fn partial_graph_rejects_configurations_it_cannot_derive() {
+        let mut config = test_config();
+        assert!(validate_partial_graph(&config).is_ok());
+        config.partial_graph = true;
+        assert!(validate_partial_graph(&config).is_ok());
+
+        let mut cquery = config.clone();
+        cquery.hash_options.bazel.use_cquery = true;
+        assert!(validate_partial_graph(&cquery)
+            .unwrap_err()
+            .to_string()
+            .contains("--useCquery"));
+
+        let mut fine_grained = config.clone();
+        fine_grained
+            .hash_options
+            .bazel
+            .fine_grained_external_repos
+            .insert("@crates".into());
+        assert!(validate_partial_graph(&fine_grained)
+            .unwrap_err()
+            .to_string()
+            .contains("--fineGrainedHashExternalRepos"));
+
+        let mut always_affected = config;
+        always_affected
+            .hash_options
+            .always_affected_tags
+            .insert("flaky".into());
+        assert!(validate_partial_graph(&always_affected)
+            .unwrap_err()
+            .to_string()
+            .contains("--alwaysAffectedTags"));
+    }
+
+    /// A stand-in `bazel` whose query answers with the `targets.pb` checked out in the
+    /// workspace, so the graph a revision reports is whatever that revision committed.
+    #[cfg(unix)]
+    fn fake_bazel(directory: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = directory.join("fake-bazel.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+case "$1 $2" in
+  "mod dump_repo_mapping") printf '%s\n' '{"tool":"local_config_tool"}' ;;
+  "mod graph") printf '%s\n' '{"key":"<root>","name":"root","dependencies":[]}' ;;
+  "version ") printf '%s\n' 'Build label: 8.7.0' ;;
+  "info output_base") printf '%s\n' "$PWD" ;;
+  "query "*)
+    while [ "$1" != --output_file ]; do shift; done
+    cp "$PWD/targets.pb" "$2"
+    ;;
+  *) exit 80 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Two source files, a rule reading one, a rule reading the other plus the first rule, and
+    /// that rule's output: enough shape for a source edit to propagate direct and transitively.
+    fn encoded_targets() -> Vec<u8> {
+        use crate::proto::blaze_query::{target, GeneratedFile, Rule, SourceFile, Target};
+        use buffa::Message;
+        let source = |name: &str| {
+            let mut target = Target::default();
+            target.r#type = target::Discriminator::SourceFile;
+            target.source_file = buffa::MessageField::some(SourceFile {
+                name: name.to_owned(),
+                subinclude: vec!["//tools:defs.bzl".to_owned()],
+                ..Default::default()
+            });
+            target
+        };
+        let rule = |name: &str, inputs: &[&str]| {
+            let mut target = Target::default();
+            target.r#type = target::Discriminator::Rule;
+            target.rule = buffa::MessageField::some(Rule {
+                name: name.to_owned(),
+                rule_class: "genrule".to_owned(),
+                rule_input: inputs.iter().map(|input| (*input).to_owned()).collect(),
+                ..Default::default()
+            });
+            target
+        };
+        let generated = |name: &str, generating_rule: &str| {
+            let mut target = Target::default();
+            target.r#type = target::Discriminator::GeneratedFile;
+            target.generated_file = buffa::MessageField::some(GeneratedFile {
+                name: name.to_owned(),
+                generating_rule: generating_rule.to_owned(),
+                ..Default::default()
+            });
+            target
+        };
+        let mut encoded = Vec::new();
+        for target in [
+            source("//pkg:a.txt"),
+            source("//pkg:b.txt"),
+            rule("//pkg:lib", &["//pkg:a.txt"]),
+            rule("//pkg:bin", &["//pkg:lib", "//pkg:b.txt"]),
+            generated("//pkg:bin.out", "//pkg:bin"),
+        ] {
+            target.encode_length_delimited(&mut encoded);
+        }
+        encoded
+    }
+
+    /// A repository with the fixed graph above and four commits: `base`; a source and a README
+    /// edit; a `BUILD` edit on top of that; and, branching from the first edit, another source
+    /// edit.
+    #[cfg(unix)]
+    fn partial_graph_repo() -> (tempfile::TempDir, PathBuf, [String; 4]) {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(repo.join("pkg")).unwrap();
+        fs::create_dir_all(repo.join("tools")).unwrap();
+        let bazel = fake_bazel(root.path());
+        git_command(&repo, &["init", "-q"]);
+        git_command(&repo, &["config", "user.email", "test@example.com"]);
+        git_command(&repo, &["config", "user.name", "Test"]);
+        fs::write(repo.join("pkg/a.txt"), "one").unwrap();
+        fs::write(repo.join("pkg/b.txt"), "bee").unwrap();
+        fs::write(repo.join("pkg/BUILD.bazel"), "# build").unwrap();
+        fs::write(repo.join("tools/defs.bzl"), "def macro(): pass").unwrap();
+        fs::write(repo.join("README.md"), "readme").unwrap();
+        fs::write(repo.join("targets.pb"), encoded_targets()).unwrap();
+        let commit = |message: &str| {
+            git_command(&repo, &["add", "-A"]);
+            git_command(&repo, &["commit", "-q", "-m", message]);
+            git_command(&repo, &["rev-parse", "HEAD"])
+        };
+        let base = commit("base");
+        fs::write(repo.join("pkg/a.txt"), "two").unwrap();
+        fs::write(repo.join("README.md"), "readme two").unwrap();
+        let edited = commit("source edit");
+        fs::write(repo.join("pkg/a.txt"), "three").unwrap();
+        fs::write(repo.join("pkg/BUILD.bazel"), "# build two").unwrap();
+        let rebuilt = commit("build edit");
+        git_command(&repo, &["checkout", "-q", &edited]);
+        fs::write(repo.join("pkg/a.txt"), "four").unwrap();
+        let chained = commit("second source edit");
+        (root, bazel, [base, edited, rebuilt, chained])
+    }
+
+    fn partial_graph_state(repo: &Path, cache: &Path, bazel: &Path, partial: bool) -> Arc<State> {
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.to_path_buf();
+        config.hash_options.bazel.bazel = bazel.to_path_buf();
+        config.hash_options.bazel.no_bazelrc = false;
+        config.hash_options.track_deps = true;
+        config.track_deps = true;
+        config.cache_dir = cache.to_path_buf();
+        config.partial_graph = partial;
+        ready_state(config, None)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_graph_derives_source_edits_identically_to_a_full_generation() {
+        let (root, bazel, [base, edited, rebuilt, chained]) = partial_graph_repo();
+        let repo = root.path().join("repo");
+        let cache = root.path().join("cache");
+        let verify_cache = root.path().join("verify-cache");
+        let plain_cache = root.path().join("plain-cache");
+        for directory in [&cache, &verify_cache, &plain_cache] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let state = partial_graph_state(&repo, &cache, &bazel, true);
+
+        // The first revision has nothing to derive from: a full generation that records recipes.
+        let from = get_hashes_locked(&state, &base, &BTreeSet::new(), None).unwrap();
+        let generation = from.generation.as_ref().unwrap();
+        assert_eq!(generation.partial.mode, Some("full"));
+        assert!(generation
+            .partial
+            .partial_fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("no base revision"));
+        let recipes = from.data.partial.as_ref().unwrap();
+        assert_eq!(recipes.rules.len(), 2);
+        assert_eq!(recipes.generated["//pkg:bin.out"], "//pkg:bin");
+        assert_eq!(recipes.rules["//pkg:bin"].sources(), ["//pkg:b.txt"]);
+        assert_eq!(recipes.rules["//pkg:bin"].deps(), ["//pkg:lib"]);
+        assert_eq!(recipes.package_subincludes["//pkg"], ["//tools:defs.bzl"]);
+
+        // A source edit plus a README edit: derived, no checkout, no query.
+        let to = get_hashes_locked(&state, &edited, &BTreeSet::new(), Some((&base, &from.data)))
+            .unwrap();
+        let generation = to.generation.as_ref().unwrap();
+        assert_eq!(generation.partial.mode, Some("derived"));
+        assert_eq!(
+            generation.partial.derived_from.as_deref(),
+            Some(base.as_str())
+        );
+        assert_eq!(generation.partial.changed_sources, Some(1));
+        assert_eq!(generation.partial.unmatched_paths, Some(1));
+        assert_eq!(generation.bazel_query_millis, 0);
+        assert_eq!(generation.checkout_millis, 0);
+        assert!(generation.partial.derive_millis.is_some());
+        assert_eq!(
+            git_command(&repo, &["rev-parse", "HEAD"]),
+            base,
+            "a derivation leaves the working tree where it was"
+        );
+        let impacted = impacted_targets(&from.data.hashes, &to.data.hashes, None, false)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            impacted,
+            ["//pkg:a.txt", "//pkg:lib", "//pkg:bin", "//pkg:bin.out"]
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
+        );
+        assert!(
+            to.data.hashes["//pkg:lib"].direct_hash != from.data.hashes["//pkg:lib"].direct_hash
+        );
+        assert!(
+            to.data.hashes["//pkg:bin"].direct_hash == from.data.hashes["//pkg:bin"].direct_hash
+        );
+
+        // A full generation of the same revision, in a fresh cache, writes the identical entry.
+        let verify = partial_graph_state(&repo, &verify_cache, &bazel, true);
+        let full = get_hashes_locked(&verify, &edited, &BTreeSet::new(), None).unwrap();
+        assert_eq!(full.generation.as_ref().unwrap().partial.mode, Some("full"));
+        assert_eq!(full.data.hashes, to.data.hashes);
+        assert_eq!(full.data.dep_edges, to.data.dep_edges);
+        assert_eq!(full.data.partial, to.data.partial);
+        let key = cache_key_for_commit(&state, &edited);
+        assert_eq!(
+            fs::read(cache.join(format!("{key}.json"))).unwrap(),
+            fs::read(verify_cache.join(format!("{key}.json"))).unwrap(),
+            "derived and generated entries must be byte-identical"
+        );
+
+        // A BUILD edit forces a full generation.
+        let rebuilt_entry = get_hashes_locked(
+            &state,
+            &rebuilt,
+            &BTreeSet::new(),
+            Some((&edited, &to.data)),
+        )
+        .unwrap();
+        let generation = rebuilt_entry.generation.as_ref().unwrap();
+        assert_eq!(generation.partial.mode, Some("full"));
+        assert!(generation
+            .partial
+            .partial_fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("graph-defining file pkg/BUILD.bazel"));
+        assert!(generation.partial.classify_millis.is_some());
+
+        // A derived entry is itself a base for the next derivation.
+        let chained_entry = get_hashes_locked(
+            &state,
+            &chained,
+            &BTreeSet::new(),
+            Some((&edited, &to.data)),
+        )
+        .unwrap();
+        assert_eq!(
+            chained_entry.generation.as_ref().unwrap().partial.mode,
+            Some("derived")
+        );
+        let chained_full = get_hashes_locked(&verify, &chained, &BTreeSet::new(), None).unwrap();
+        assert_eq!(chained_full.data.hashes, chained_entry.data.hashes);
+
+        // A base without recipes (an entry the default mode wrote) cannot be derived from.
+        let plain = partial_graph_state(&repo, &plain_cache, &bazel, false);
+        let plain_entry = get_hashes_locked(&plain, &base, &BTreeSet::new(), None).unwrap();
+        assert!(plain_entry.data.partial.is_none());
+        assert!(plain_entry
+            .generation
+            .as_ref()
+            .unwrap()
+            .partial
+            .mode
+            .is_none());
+        assert_ne!(
+            plain_entry.data.hashes["//pkg:lib"].hash, from.data.hashes["//pkg:lib"].hash,
+            "the two modes hash under different formulas"
+        );
+        let unrecorded = get_hashes_locked(
+            &verify,
+            &base,
+            &BTreeSet::new(),
+            Some((&edited, &plain_entry.data)),
+        )
+        .unwrap();
+        assert!(unrecorded
+            .generation
+            .as_ref()
+            .unwrap()
+            .partial
+            .partial_fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("carries no partial-graph recipes"));
+
+        let snapshot = metrics(&state);
+        assert_eq!(snapshot["partialGraph"]["enabled"], true);
+        assert_eq!(snapshot["partialGraph"]["derived"], 2);
+        assert_eq!(snapshot["partialGraph"]["fullGenerations"], 2);
+        assert_eq!(metrics(&plain)["partialGraph"]["enabled"], false);
     }
 
     #[test]
@@ -1765,12 +2639,12 @@ mod tests {
     fn remote_cache_operations_use_normalized_key_and_succeed() {
         let (remote, requests, handle) = remote_cache_with_responses(
             "/team/repo/",
-            vec![(200, b"hello".to_vec()), (200, Vec::new())],
+            vec![(200, gzip(b"hello").unwrap()), (200, Vec::new())],
         );
         let RemoteCache::S3(s3) = &remote else {
             panic!("expected the S3 backend");
         };
-        assert_eq!(s3.object_key("sha.fp"), "team/repo/sha.fp.json");
+        assert_eq!(s3.object_key("sha.fp.json.gz"), "team/repo/sha.fp.json.gz");
         assert_eq!(remote.get("sha.fp"), Some(b"hello".to_vec()));
         remote.put("sha.fp", b"data");
         let captured = (0..2)
@@ -1779,7 +2653,52 @@ mod tests {
         handle.join().unwrap();
         assert!(captured
             .iter()
-            .all(|request| request.url.contains("/bucket/team/repo/sha.fp.json")));
+            .all(|request| request.url.contains("/bucket/team/repo/sha.fp.json.gz")));
+    }
+
+    #[test]
+    fn remote_cache_falls_back_to_plain_entries_and_rejects_corrupt_compressed_ones() {
+        // A replica that predates compression wrote `<key>.json`: the compressed name misses
+        // cleanly and the plain one is read. A compressed object that does not decode is a miss,
+        // with no fallback (the plain name would be a stale duplicate at best).
+        let (remote, requests, handle) = remote_cache_with_responses(
+            "",
+            vec![
+                (404, b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
+                (200, b"plain".to_vec()),
+                (200, b"not gzip".to_vec()),
+            ],
+        );
+        assert_eq!(remote.get("legacy"), Some(b"plain".to_vec()));
+        assert_eq!(remote.get("corrupt"), None);
+        let captured = (0..3)
+            .map(|_| requests.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect::<Vec<_>>();
+        handle.join().unwrap();
+        assert!(captured[0].url.ends_with("/legacy.json.gz"));
+        assert!(captured[1].url.ends_with("/legacy.json"));
+        assert!(captured[2].url.ends_with("/corrupt.json.gz"));
+        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn gzip_round_trips_and_shrinks_hash_entries() {
+        let entry = (0..2000)
+            .map(|index| {
+                format!(
+                    "\"//pkg/{}:target_{index}\":\"Rule#{:064x}~{:064x}\"",
+                    index / 8,
+                    index,
+                    index * 7
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let entry = format!("{{{entry}}}").into_bytes();
+        let compressed = gzip(&entry).unwrap();
+        assert!(compressed.len() * 2 < entry.len());
+        assert_eq!(gunzip(&compressed).unwrap(), entry);
+        assert!(gunzip(b"not gzip").is_err());
     }
 
     #[test]
@@ -1788,6 +2707,7 @@ mod tests {
             "",
             vec![
                 (404, b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
+                (404, b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
                 (500, b"failure".to_vec()),
                 (500, Vec::new()),
             ],
@@ -1795,10 +2715,11 @@ mod tests {
         assert_eq!(remote.get("missing"), None);
         assert_eq!(remote.get("failure"), None);
         remote.put("failure", b"data");
-        // Exactly one request per call. `rust-s3`'s `fail-on-err` feature is off precisely so a
-        // non-2xx stays a response: as an error it would enter the crate's `retry!`, and every
-        // miss would cost a second request and a one-second backoff sleep.
-        for _ in 0..3 {
+        // A clean miss probes the compressed and then the plain name; a failure is one request
+        // and no fallback. `rust-s3`'s `fail-on-err` feature is off precisely so a non-2xx stays
+        // a response: as an error it would enter the crate's `retry!`, and every miss would cost
+        // a second request and a one-second backoff sleep.
+        for _ in 0..4 {
             requests.recv_timeout(Duration::from_secs(5)).unwrap();
         }
         assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
@@ -1814,7 +2735,10 @@ mod tests {
         );
     }
 
-    struct CapturedGcsRequest {
+    /// A canned HTTP reply for a mocked shared tier: status, extra headers, body.
+    type HttpReply = (u16, Vec<(&'static str, &'static str)>, Vec<u8>);
+
+    struct CapturedHttpRequest {
         method: Method,
         url: String,
         authorization: Option<String>,
@@ -1822,152 +2746,16 @@ mod tests {
         body: Vec<u8>,
     }
 
-    fn gcs_cache_with_responses(
-        prefix: &str,
-        responses: Vec<(u16, Vec<u8>)>,
+    /// Serves `responses` in order from a local HTTP server, capturing every request it answers.
+    fn mock_http_server(
+        responses: Vec<HttpReply>,
     ) -> (
-        GcsCache,
-        std_mpsc::Receiver<CapturedGcsRequest>,
+        String,
+        std_mpsc::Receiver<CapturedHttpRequest>,
         thread::JoinHandle<()>,
     ) {
         let server = Server::http("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", server.server_addr().to_ip().unwrap());
-        let (sender, receiver) = std_mpsc::channel();
-        let handle = thread::spawn(move || {
-            for (status, body) in responses {
-                let mut request = server
-                    .recv_timeout(Duration::from_secs(5))
-                    .unwrap()
-                    .expect("expected a GCS request");
-                let header = |name: &'static str| {
-                    request
-                        .headers()
-                        .iter()
-                        .find(|header| header.field.equiv(name))
-                        .map(|header| header.value.as_str().to_owned())
-                };
-                let authorization = header("Authorization");
-                let content_type = header("Content-Type");
-                let mut received = Vec::new();
-                request.as_reader().read_to_end(&mut received).unwrap();
-                sender
-                    .send(CapturedGcsRequest {
-                        method: request.method().clone(),
-                        url: request.url().to_owned(),
-                        authorization,
-                        content_type,
-                        body: received,
-                    })
-                    .unwrap();
-                request
-                    .respond(Response::from_data(body).with_status_code(StatusCode(status)))
-                    .unwrap();
-            }
-        });
-        let cache = GcsCache::new_with_token_source(
-            "cache-bucket",
-            prefix,
-            &endpoint,
-            Box::new(|| Ok("test-token".to_owned())),
-        )
-        .unwrap();
-        (cache, receiver, handle)
-    }
-
-    #[test]
-    fn gcs_cache_reads_and_writes_objects_with_bearer_auth() {
-        let (cache, requests, handle) = gcs_cache_with_responses(
-            "/team/repo/",
-            vec![(200, b"cached hashes".to_vec()), (200, Vec::new())],
-        );
-        assert_eq!(cache.get("sha.fp"), Some(b"cached hashes".to_vec()));
-        cache.put("sha.fp", b"generated hashes");
-        let read = requests.recv_timeout(Duration::from_secs(5)).unwrap();
-        let write = requests.recv_timeout(Duration::from_secs(5)).unwrap();
-        handle.join().unwrap();
-
-        assert_eq!(read.method, Method::Get);
-        assert_eq!(
-            read.url,
-            "/storage/v1/b/cache-bucket/o/team%2Frepo%2Fsha.fp.json?alt=media"
-        );
-        assert_eq!(read.authorization.as_deref(), Some("Bearer test-token"));
-        assert_eq!(write.method, Method::Post);
-        let url = Url::parse(&format!("http://localhost{}", write.url)).unwrap();
-        assert_eq!(url.path(), "/upload/storage/v1/b/cache-bucket/o");
-        let query = url
-            .query_pairs()
-            .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(
-            query.get("uploadType").map(|value| value.as_ref()),
-            Some("media")
-        );
-        assert_eq!(
-            query.get("name").map(|value| value.as_ref()),
-            Some("team/repo/sha.fp.json")
-        );
-        assert_eq!(write.authorization.as_deref(), Some("Bearer test-token"));
-        assert_eq!(write.content_type.as_deref(), Some("application/json"));
-        assert_eq!(write.body, b"generated hashes");
-    }
-
-    #[test]
-    fn gcs_cache_misses_and_failures_degrade_without_failing() {
-        let (cache, requests, handle) = gcs_cache_with_responses(
-            "",
-            vec![
-                (404, b"not found".to_vec()),
-                (403, b"permission denied".to_vec()),
-                (500, b"unavailable".to_vec()),
-                (500, b"unavailable".to_vec()),
-            ],
-        );
-        assert_eq!(cache.get("missing"), None);
-        assert_eq!(cache.get("denied"), None);
-        assert_eq!(cache.get("failure"), None);
-        cache.put("failure", b"generated hashes");
-        for _ in 0..4 {
-            assert!(requests.recv_timeout(Duration::from_secs(5)).is_ok());
-        }
-        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
-        handle.join().unwrap();
-    }
-
-    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIBkTCCATegAwIBAgIUaqMU9czNCvWG1R457FBnv8BzZfQwCgYIKoZIzj0EAwIw
-HTEbMBkGA1UEAwwSYmF6ZWwtZGlmZi10ZXN0LWNhMCAXDTI2MTAwNTE0NTUwOVoY
-DzIxMjYwOTExMTQ1NTA5WjAdMRswGQYDVQQDDBJiYXplbC1kaWZmLXRlc3QtY2Ew
-WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASRkDRNQ1MfFy+8eM1z9tY6FseE+Bqs
-p3hQcwR/2L3wzZKwFWhaDmfn5WFKAINVfcGxOAKWKcXrhK+xWOz9KmYoo1MwUTAd
-BgNVHQ4EFgQUzsQ/MEApeEP6b/jW5ecBMceQbJcwHwYDVR0jBBgwFoAUzsQ/MEAp
-eEP6b/jW5ecBMceQbJcwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBF
-AiEAixF88BBeQUzoM0fYxa/ivGx5U4kHdLW82V9LIFiOV14CIG/00V8ZKfomL0v0
-nQBeQ4AIl47nDOrFeVnvse8R9IHJ
------END CERTIFICATE-----
-";
-
-    /// A canned Nexus reply: status, extra headers, body.
-    type NexusReply = (u16, Vec<(&'static str, &'static str)>, Vec<u8>);
-
-    struct CapturedNexusRequest {
-        method: Method,
-        url: String,
-        authorization: Option<String>,
-        content_type: Option<String>,
-        body: Vec<u8>,
-    }
-
-    fn nexus_cache_with_responses(
-        prefix: &str,
-        credentials: Option<NexusCredentials>,
-        responses: Vec<NexusReply>,
-    ) -> (
-        RemoteCache,
-        std_mpsc::Receiver<CapturedNexusRequest>,
-        thread::JoinHandle<()>,
-    ) {
-        let server = Server::http("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}/nexus", server.server_addr().to_ip().unwrap());
         let (sender, receiver) = std_mpsc::channel();
         let handle = thread::spawn(move || {
             for (status, headers, body) in responses {
@@ -1984,7 +2772,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 let mut received = Vec::new();
                 request.as_reader().read_to_end(&mut received).unwrap();
                 sender
-                    .send(CapturedNexusRequest {
+                    .send(CapturedHttpRequest {
                         method: request.method().clone(),
                         url: request.url().to_owned(),
                         authorization,
@@ -1999,7 +2787,196 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 request.respond(response).unwrap();
             }
         });
-        let base = nexus_base_url(&endpoint, "bazel-diff", prefix).unwrap();
+        (endpoint, receiver, handle)
+    }
+
+    fn gcs_cache_with_responses(
+        prefix: &str,
+        responses: Vec<HttpReply>,
+    ) -> (
+        RemoteCache,
+        std_mpsc::Receiver<CapturedHttpRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let (endpoint, receiver, handle) = mock_http_server(responses);
+        let cache = GcsCache::with_token_source(
+            "cache-bucket",
+            prefix,
+            &endpoint,
+            Box::new(|| Ok("test-token".to_owned())),
+        )
+        .unwrap();
+        (RemoteCache::Gcs(Box::new(cache)), receiver, handle)
+    }
+
+    #[test]
+    fn gcs_cache_addresses_objects_through_the_json_api() {
+        let cache = GcsCache::with_token_source(
+            "cache-bucket",
+            "/team/repo/",
+            GCS_ENDPOINT,
+            Box::new(|| Ok(String::new())),
+        )
+        .unwrap();
+        assert_eq!(
+            cache.object_url("sha.fp.json.gz").as_str(),
+            "https://storage.googleapis.com/storage/v1/b/cache-bucket/o/team%2Frepo%2Fsha.fp.json.gz?alt=media"
+        );
+        assert_eq!(
+            cache.upload_url("sha.fp.json.gz").as_str(),
+            "https://storage.googleapis.com/upload/storage/v1/b/cache-bucket/o?uploadType=media&name=team%2Frepo%2Fsha.fp.json.gz"
+        );
+        for (bucket, endpoint) in [
+            ("", GCS_ENDPOINT),
+            ("a/b", GCS_ENDPOINT),
+            ("cache-bucket", "not a url"),
+            ("cache-bucket", "ftp://storage.googleapis.com"),
+            ("cache-bucket", "mailto:ops@example.com"),
+        ] {
+            assert!(
+                GcsCache::with_token_source(bucket, "", endpoint, Box::new(|| Ok(String::new())))
+                    .is_err(),
+                "{bucket} {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn gcs_cache_reads_and_writes_with_bearer_auth() {
+        let (remote, requests, handle) = gcs_cache_with_responses(
+            "/team/repo/",
+            vec![
+                (200, Vec::new(), gzip(b"hello").unwrap()),
+                (404, Vec::new(), b"No such object".to_vec()),
+                (404, Vec::new(), b"No such object".to_vec()),
+                (200, Vec::new(), b"{\"kind\":\"storage#object\"}".to_vec()),
+            ],
+        );
+        assert_eq!(remote.get("sha.fp"), Some(b"hello".to_vec()));
+        assert_eq!(remote.get("missing"), None);
+        remote.put("sha.fp", b"data");
+        handle.join().unwrap();
+        let captured = requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(captured.len(), 4);
+        let methods = captured
+            .iter()
+            .map(|r| r.method.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            [Method::Get, Method::Get, Method::Get, Method::Post]
+        );
+        assert_eq!(
+            captured[0].url,
+            "/storage/v1/b/cache-bucket/o/team%2Frepo%2Fsha.fp.json.gz?alt=media"
+        );
+        assert_eq!(
+            captured[1].url,
+            "/storage/v1/b/cache-bucket/o/team%2Frepo%2Fmissing.json.gz?alt=media"
+        );
+        assert_eq!(
+            captured[2].url,
+            "/storage/v1/b/cache-bucket/o/team%2Frepo%2Fmissing.json?alt=media"
+        );
+        assert_eq!(
+            captured[3].url,
+            "/upload/storage/v1/b/cache-bucket/o?uploadType=media&name=team%2Frepo%2Fsha.fp.json.gz"
+        );
+        for request in &captured {
+            assert_eq!(request.authorization.as_deref(), Some("Bearer test-token"));
+        }
+        assert_eq!(
+            captured[3].content_type.as_deref(),
+            Some("application/gzip")
+        );
+        assert_eq!(gunzip(&captured[3].body).unwrap(), b"data");
+    }
+
+    #[test]
+    fn gcs_cache_failures_degrade_without_following_redirects() {
+        let (remote, requests, handle) = gcs_cache_with_responses(
+            "",
+            vec![
+                (500, Vec::new(), b"backend error".to_vec()),
+                (403, Vec::new(), b"permission denied".to_vec()),
+                (
+                    302,
+                    vec![("Location", "http://127.0.0.1:9/elsewhere")],
+                    Vec::new(),
+                ),
+                (401, Vec::new(), b"invalid token".to_vec()),
+            ],
+        );
+        assert_eq!(remote.get("failure"), None);
+        assert_eq!(remote.get("denied"), None);
+        assert_eq!(remote.get("moved"), None);
+        remote.put("denied", b"data");
+        handle.join().unwrap();
+        // Exactly one request per call: nothing is retried and the redirect is not followed.
+        assert_eq!(requests.try_iter().count(), 4);
+    }
+
+    #[test]
+    fn gcs_cache_token_and_transport_errors_degrade_without_failing() {
+        // No token, no request: the failure is reported as a miss before anything is sent. The
+        // server's one canned reply is consumed by hand afterwards so its thread exits.
+        let (endpoint, requests, handle) = mock_http_server(vec![(200, Vec::new(), Vec::new())]);
+        let remote = RemoteCache::Gcs(Box::new(
+            GcsCache::with_token_source(
+                "cache-bucket",
+                "",
+                &endpoint,
+                Box::new(|| bail!("metadata server unreachable")),
+            )
+            .unwrap(),
+        ));
+        assert_eq!(remote.get("no-token"), None);
+        remote.put("no-token", b"data");
+        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
+        attohttpc::get(&endpoint).send().unwrap();
+        handle.join().unwrap();
+        assert_eq!(requests.try_iter().count(), 1);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let remote = RemoteCache::Gcs(Box::new(
+            GcsCache::with_token_source(
+                "cache-bucket",
+                "",
+                &endpoint,
+                Box::new(|| Ok("test-token".to_owned())),
+            )
+            .unwrap(),
+        ));
+        assert_eq!(remote.get("unreachable"), None);
+        remote.put("unreachable", b"data");
+    }
+
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBkTCCATegAwIBAgIUaqMU9czNCvWG1R457FBnv8BzZfQwCgYIKoZIzj0EAwIw
+HTEbMBkGA1UEAwwSYmF6ZWwtZGlmZi10ZXN0LWNhMCAXDTI2MTAwNTE0NTUwOVoY
+DzIxMjYwOTExMTQ1NTA5WjAdMRswGQYDVQQDDBJiYXplbC1kaWZmLXRlc3QtY2Ew
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASRkDRNQ1MfFy+8eM1z9tY6FseE+Bqs
+p3hQcwR/2L3wzZKwFWhaDmfn5WFKAINVfcGxOAKWKcXrhK+xWOz9KmYoo1MwUTAd
+BgNVHQ4EFgQUzsQ/MEApeEP6b/jW5ecBMceQbJcwHwYDVR0jBBgwFoAUzsQ/MEAp
+eEP6b/jW5ecBMceQbJcwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBF
+AiEAixF88BBeQUzoM0fYxa/ivGx5U4kHdLW82V9LIFiOV14CIG/00V8ZKfomL0v0
+nQBeQ4AIl47nDOrFeVnvse8R9IHJ
+-----END CERTIFICATE-----
+";
+
+    fn nexus_cache_with_responses(
+        prefix: &str,
+        credentials: Option<NexusCredentials>,
+        responses: Vec<HttpReply>,
+    ) -> (
+        RemoteCache,
+        std_mpsc::Receiver<CapturedHttpRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let (endpoint, receiver, handle) = mock_http_server(responses);
+        let base = nexus_base_url(&format!("{endpoint}/nexus"), "bazel-diff", prefix).unwrap();
         (
             RemoteCache::Nexus(Box::new(NexusCache::new(base, credentials, None).unwrap())),
             receiver,
@@ -2052,8 +3029,8 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             panic!("expected the Nexus backend");
         };
         assert_eq!(
-            cache.object_url("sha.fp").as_str(),
-            "https://nexus.example.com/repository/cache/team/sha.fp.json"
+            cache.object_url("sha.fp.json.gz").as_str(),
+            "https://nexus.example.com/repository/cache/team/sha.fp.json.gz"
         );
         config.nexus_repository = Some("a/b".to_owned());
         assert!(RemoteCache::new(&config).is_err());
@@ -2068,7 +3045,8 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 password: "s3cret".to_owned(),
             }),
             vec![
-                (200, Vec::new(), b"hello".to_vec()),
+                (200, Vec::new(), gzip(b"hello").unwrap()),
+                (404, Vec::new(), Vec::new()),
                 (404, Vec::new(), Vec::new()),
                 (201, Vec::new(), Vec::new()),
             ],
@@ -2078,21 +3056,28 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         remote.put("sha.fp", b"data");
         handle.join().unwrap();
         let captured = requests.try_iter().collect::<Vec<_>>();
-        assert_eq!(captured.len(), 3);
+        assert_eq!(captured.len(), 4);
         let methods = captured
             .iter()
             .map(|r| r.method.clone())
             .collect::<Vec<_>>();
-        assert_eq!(methods, [Method::Get, Method::Get, Method::Put]);
+        assert_eq!(
+            methods,
+            [Method::Get, Method::Get, Method::Get, Method::Put]
+        );
         assert_eq!(
             captured[0].url,
-            "/nexus/repository/bazel-diff/team/repo/sha.fp.json"
+            "/nexus/repository/bazel-diff/team/repo/sha.fp.json.gz"
         );
         assert_eq!(
             captured[1].url,
+            "/nexus/repository/bazel-diff/team/repo/missing.json.gz"
+        );
+        assert_eq!(
+            captured[2].url,
             "/nexus/repository/bazel-diff/team/repo/missing.json"
         );
-        assert_eq!(captured[2].url, captured[0].url);
+        assert_eq!(captured[3].url, captured[0].url);
         for request in &captured {
             // base64("svc:s3cret")
             assert_eq!(
@@ -2101,10 +3086,10 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             );
         }
         assert_eq!(
-            captured[2].content_type.as_deref(),
-            Some("application/json")
+            captured[3].content_type.as_deref(),
+            Some("application/gzip")
         );
-        assert_eq!(captured[2].body, b"data");
+        assert_eq!(gunzip(&captured[3].body).unwrap(), b"data");
     }
 
     #[test]
@@ -2152,7 +3137,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
     }
 
     #[test]
-    fn nexus_http_failure_truncates_long_bodies() {
+    fn http_response_failure_truncates_long_bodies() {
         let server = Server::http("127.0.0.1:0").unwrap();
         let address = server.server_addr().to_ip().unwrap();
         let handle = thread::spawn(move || {
@@ -2165,7 +3150,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 .unwrap();
         });
         let response = attohttpc::get(format!("http://{address}/")).send().unwrap();
-        let failure = nexus_http_failure(response);
+        let failure = http_response_failure(response);
         handle.join().unwrap();
         assert_eq!(
             failure,
@@ -2262,15 +3247,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             config.hash_options.bazel.workspace = repo.path().to_path_buf();
             config.git_path = PathBuf::from("git");
             config.cache_dir = cache.path().to_path_buf();
-            let fingerprint = configuration_fingerprint(&config);
-            Arc::new(State {
-                config,
-                ready: AtomicBool::new(false),
-                workspace_lock: Mutex::new(()),
-                started: Instant::now(),
-                fingerprint,
-                remote: None,
-            })
+            Arc::new(State::new(config, None))
         };
 
         let lame_duck = unready_state(false);
@@ -2331,14 +3308,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
 
         let mut bad_config = state.config.clone();
         bad_config.git_path = PathBuf::from("/definitely/missing/git");
-        let bad = State {
-            config: bad_config,
-            ready: AtomicBool::new(true),
-            workspace_lock: Mutex::new(()),
-            started: Instant::now(),
-            fingerprint: state.fingerprint.clone(),
-            remote: None,
-        };
+        let bad = State::new(bad_config, None);
         assert!(git_output(&bad, &[]).is_err());
     }
 
@@ -2393,14 +3363,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
 
         let mut bad_config = state.config.clone();
         bad_config.git_path = PathBuf::from("/missing/git");
-        let bad_state = State {
-            config: bad_config,
-            ready: AtomicBool::new(true),
-            workspace_lock: Mutex::new(()),
-            started: Instant::now(),
-            fingerprint: state.fingerprint.clone(),
-            remote: None,
-        };
+        let bad_state = State::new(bad_config, None);
         assert!(!fetch_revision(&bad_state, "HEAD"));
     }
 
@@ -2427,11 +3390,11 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
-        let key = cache_key(&state, &sha, &BTreeSet::new());
+        let key = cache_key_for_commit(&state, &sha);
         let path = cache.path().join(format!("{key}.json"));
         write_hashes(&path, &data, true);
         let before = fs::metadata(&path).unwrap().modified().unwrap();
-        let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
         assert!(retrieval.cache_hit);
         assert!(retrieval.cache_read_millis.is_some());
         assert!(retrieval.generation.is_none());
@@ -2439,6 +3402,87 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         assert_eq!(loaded.hashes["//app:lib"].hash, "overall");
         assert_eq!(loaded.dep_edges["//app:lib"], ["//dep:lib"]);
         assert!(fs::metadata(path).unwrap().modified().unwrap() >= before);
+    }
+
+    #[test]
+    fn memory_cache_evicts_least_recently_used_within_budget() {
+        let entry = |label: &str| {
+            Arc::new(HashFileData {
+                hashes: std::collections::BTreeMap::from([(
+                    label.to_owned(),
+                    hash("Rule", "a", "b"),
+                )]),
+                ..Default::default()
+            })
+        };
+        let mut cache = MemoryCache::new(100);
+        cache.insert("a", 40, &entry("//a"));
+        cache.insert("b", 40, &entry("//b"));
+        assert_eq!(cache.len(), 2);
+        // Reading `a` makes `b` the least recently used, so `c` evicts `b`.
+        assert!(cache.get("a").unwrap().hashes.contains_key("//a"));
+        cache.insert("c", 40, &entry("//c"));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get("b").is_none());
+        assert!(cache.get("a").is_some());
+        assert!(cache.get("c").is_some());
+        assert_eq!(cache.used, 80);
+        // Re-inserting a key replaces it instead of double counting.
+        cache.insert("c", 50, &entry("//c2"));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.used, 90);
+        assert!(cache.get("c").unwrap().hashes.contains_key("//c2"));
+        // An entry over the whole budget is never kept; one that needs the whole budget evicts
+        // everything else.
+        cache.insert("huge", 101, &entry("//huge"));
+        assert!(cache.get("huge").is_none());
+        cache.insert("whole", 100, &entry("//whole"));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.used, 100);
+        // A zero budget disables the tier.
+        let mut disabled = MemoryCache::new(0);
+        disabled.insert("a", 1, &entry("//a"));
+        assert_eq!(disabled.len(), 0);
+        assert!(disabled.get("a").is_none());
+    }
+
+    #[test]
+    fn parsed_entries_are_served_from_memory_after_the_first_read() {
+        let (repo, _, sha) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        let data = HashFileData {
+            hashes: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                hash("Rule", "overall", "direct"),
+            )]),
+            dependency_fingerprint: state
+                .config
+                .hash_options
+                .bazel
+                .dependency_fingerprint()
+                .ok(),
+            ..Default::default()
+        };
+        let key = cache_key_for_commit(&state, &sha);
+        let path = cache.path().join(format!("{key}.json"));
+        write_hashes(&path, &data, false);
+        assert_eq!(metrics(&state)["cache"]["memory"]["entries"], 0);
+
+        let first = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
+        assert!(first.cache_hit);
+        let memory = metrics(&state)["cache"]["memory"].clone();
+        assert_eq!(memory["entries"], 1);
+        assert_eq!(memory["sizeBytes"], fs::metadata(&path).unwrap().len());
+        assert_eq!(memory["maxBytes"], state.config.cache_memory_max);
+
+        // The on-disk entry is gone (pruned, say); the parsed one still serves, and both
+        // retrievals share the same allocation.
+        fs::remove_file(&path).unwrap();
+        let second = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
+        assert!(second.cache_hit);
+        assert!(Arc::ptr_eq(&first.data, &second.data));
+        assert_eq!(second.data.hashes["//app:lib"].hash, "overall");
     }
 
     #[test]
@@ -2460,24 +3504,17 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
-        let (remote, requests, handle) = remote_cache_with_responses("", vec![(200, bytes)]);
-        let fingerprint = configuration_fingerprint(&config);
-        let state = Arc::new(State {
-            config,
-            ready: AtomicBool::new(true),
-            workspace_lock: Mutex::new(()),
-            started: Instant::now(),
-            fingerprint,
-            remote: Some(remote),
-        });
+        let (remote, requests, handle) =
+            remote_cache_with_responses("", vec![(200, gzip(&bytes).unwrap())]);
+        let state = ready_state(config, Some(remote));
 
-        let first = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        let first = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
         assert!(first.cache_hit);
         assert!(first.cache_read_millis.is_some());
         assert_eq!(first.data.hashes["//app:lib"].hash, "overall");
-        let key = cache_key(&state, &sha, &BTreeSet::new());
+        let key = cache_key_for_commit(&state, &sha);
         assert!(cache.path().join(format!("{key}.json")).is_file());
-        let second = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        let second = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
         assert!(second.cache_hit);
         assert_eq!(second.data.hashes["//app:lib"].hash, "overall");
 
@@ -2517,7 +3554,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             ..Default::default()
         };
         for (sha, data) in [(&first, &from), (&second, &to)] {
-            let key = cache_key(&state, sha, &BTreeSet::new());
+            let key = cache_key_for_commit(&state, sha);
             write_hashes(
                 &cache.path().join(format!("{key}.json")),
                 data,
@@ -2531,7 +3568,13 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             modified_filepaths: BTreeSet::new(),
             profile: true,
         };
-        let result = compute_query(&state, inputs, QueryKind::Distances).unwrap();
+        let result = compute_query(
+            &state,
+            inputs,
+            QueryKind::Distances,
+            &Arc::new(Cancellation::new()),
+        )
+        .unwrap();
         assert_eq!(result["to"], second);
         assert_eq!(result["impactedTargets"].as_array().unwrap().len(), 2);
         let retrievals = result["profile"]["hashRetrievals"].as_array().unwrap();
@@ -2621,9 +3664,9 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 dependency_fingerprint: cached_fingerprint,
                 ..Default::default()
             };
-            let key = cache_key(&state, &sha, &BTreeSet::new());
+            let key = cache_key_for_commit(&state, &sha);
             write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
-            let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+            let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
             assert!(retrieval.cache_hit);
             assert_eq!(retrieval.data.hashes["//app:lib"].hash, "overall");
         }
@@ -2642,19 +3685,19 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
-        let (remote, requests, handle) = remote_cache_with_responses("", vec![(200, bytes)]);
-        let fingerprint = configuration_fingerprint(&config);
-        let state = Arc::new(State {
-            config,
-            ready: AtomicBool::new(true),
-            workspace_lock: Mutex::new(()),
-            started: Instant::now(),
-            fingerprint,
-            remote: Some(remote),
-        });
-        let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        // Written by a replica from before compression: only the plain object exists.
+        let (remote, requests, handle) = remote_cache_with_responses(
+            "",
+            vec![
+                (404, b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
+                (200, bytes),
+            ],
+        );
+        let state = ready_state(config, Some(remote));
+        let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
         assert!(retrieval.cache_hit);
         assert_eq!(retrieval.data.hashes["//app:lib"].hash, "overall");
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
         requests.recv_timeout(Duration::from_secs(5)).unwrap();
         handle.join().unwrap();
 
@@ -2672,15 +3715,15 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             )]),
             ..Default::default()
         };
-        let key = cache_key(&guarded, &sha, &BTreeSet::new());
+        let key = cache_key_for_commit(&guarded, &sha);
         write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
-        assert!(get_hashes_locked(&guarded, &sha, &BTreeSet::new()).is_err());
+        assert!(get_hashes_locked(&guarded, &sha, &BTreeSet::new(), None).is_err());
     }
 
     #[test]
     fn miss_retrievals_serialize_the_generation_breakdown() {
         let retrieval = Retrieval {
-            data: HashFileData::default(),
+            data: Arc::new(HashFileData::default()),
             cache_hit: false,
             cache_read_millis: None,
             generation: Some(GenerationBreakdown {
@@ -2690,6 +3733,12 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 module_graph_millis: 4,
                 cache_write_millis: 5,
                 target_count: 6,
+                partial: PartialProfile {
+                    mode: Some("derived"),
+                    derived_from: Some("base".into()),
+                    changed_sources: Some(2),
+                    ..Default::default()
+                },
             }),
         };
         let value = retrieval_profile("abc", &retrieval, Instant::now());
@@ -2705,7 +3754,10 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 "targetHashMillis": 3,
                 "moduleGraphMillis": 4,
                 "cacheWriteMillis": 5,
-                "targetCount": 6
+                "targetCount": 6,
+                "mode": "derived",
+                "derivedFrom": "base",
+                "changedSources": 2
             })
         );
     }
@@ -2769,6 +3821,26 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         );
         assert!(response.starts_with("HTTP/1.1 404"));
 
+        // The query endpoints take GET and POST only, and the method is checked before the
+        // parameters are, so a well-formed query under the wrong method is still refused.
+        for path in [
+            "/impacted_targets",
+            "/impacted_targets_with_distances",
+            "/dependency_edges",
+        ] {
+            let response = request(
+                &state,
+                &format!(
+                    "PUT {path}?from=a&to=b HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            assert!(response.starts_with("HTTP/1.1 405"), "{path}: {response}");
+            assert!(
+                response.contains("method not allowed, use GET or POST"),
+                "{path}: {response}"
+            );
+        }
+
         let response = request(
             &state,
             "GET /impacted_targets HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -2823,7 +3895,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             ..Default::default()
         };
         for (sha, data) in [(&first, &from), (&second, &to)] {
-            let key = cache_key(&state, sha, &BTreeSet::new());
+            let key = cache_key_for_commit(&state, sha);
             write_hashes(
                 &cache.path().join(format!("{key}.json")),
                 data,
@@ -2876,13 +3948,147 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         let cache = tempfile::tempdir().unwrap();
         let mut state = state_for_repo(repo.path(), cache.path(), false);
         Arc::get_mut(&mut state).unwrap().config.request_timeout = Duration::from_millis(20);
-        let _guard = state.workspace_lock.lock().unwrap();
+        // Another operation holds the workspace for the whole test, so the query never gets it.
+        let _guard = state
+            .workspace
+            .acquire(&Arc::new(Cancellation::new()))
+            .unwrap();
         let response = request(
             &state,
             "GET /impacted_targets?from=a&to=b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
         assert!(response.starts_with("HTTP/1.1 504"), "{response}");
         assert!(response.contains("request timed out"));
+        // The abandoned query stopped waiting (so it is no longer counted) and the workspace is
+        // reported busy because of the other holder, not because of it.
+        assert!(response.contains("\"cancelled\":true"), "{response}");
+        assert!(response.contains("\"workspaceBusy\":true"), "{response}");
+        assert_eq!(state.active_queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn metrics_report_active_queries_and_workspace_busy() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        let idle = metrics(&state);
+        assert_eq!(idle["activeQueries"], 0);
+        assert_eq!(idle["workspaceBusy"], false);
+        assert!(state.workspace.holder().is_none());
+        assert!(state.bazel_options().cancellation.is_none());
+        state.workspace.check_cancelled().unwrap();
+
+        let token = Arc::new(Cancellation::new());
+        let guard = state.workspace.acquire(&token).unwrap();
+        assert_eq!(metrics(&state)["workspaceBusy"], true);
+        assert!(Arc::ptr_eq(&state.workspace.holder().unwrap(), &token));
+        // Bazel options handed out while the query holds the workspace carry its token, so the
+        // subprocesses they spawn are killed with it.
+        let bazel = state.bazel_options();
+        assert!(Arc::ptr_eq(bazel.cancellation.as_ref().unwrap(), &token));
+        state.workspace.check_cancelled().unwrap();
+        token.cancel();
+        assert_eq!(
+            state.workspace.check_cancelled().unwrap_err().to_string(),
+            CANCELLED
+        );
+        assert_eq!(bazel.check_cancelled().unwrap_err().to_string(), CANCELLED);
+        drop(guard);
+        assert_eq!(metrics(&state)["workspaceBusy"], false);
+        assert!(state.workspace.holder().is_none());
+
+        let counted = ActiveQuery::start(&state);
+        assert_eq!(metrics(&state)["activeQueries"], 1);
+        drop(counted);
+        assert_eq!(metrics(&state)["activeQueries"], 0);
+    }
+
+    #[test]
+    fn queued_query_gives_up_once_cancelled() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        let _held = state
+            .workspace
+            .acquire(&Arc::new(Cancellation::new()))
+            .unwrap();
+
+        // Cancelled before it ever waits: fails on the first check.
+        let cancelled = Arc::new(Cancellation::new());
+        cancelled.cancel();
+        assert_eq!(
+            state
+                .workspace
+                .acquire(&cancelled)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            CANCELLED
+        );
+
+        // Cancelled while waiting: notices within one poll interval instead of blocking until
+        // the holder is done.
+        let waiting = Arc::new(Cancellation::new());
+        let waiter_state = Arc::clone(&state);
+        let waiter_token = Arc::clone(&waiting);
+        let waiter = thread::spawn(move || {
+            waiter_state
+                .workspace
+                .acquire(&waiter_token)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string()
+        });
+        thread::sleep(WORKSPACE_WAIT_POLL);
+        waiting.cancel();
+        assert_eq!(waiter.join().unwrap(), CANCELLED);
+        assert!(state.workspace.is_busy());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_query_kills_its_subprocess_and_releases_the_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, first, second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        // A git that never returns on its own: the query's first subprocess hangs in it, so only
+        // the kill can end the request in time.
+        let slow_git = tools.path().join("slow-git");
+        fs::write(&slow_git, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&slow_git, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut state = state_for_repo(repo.path(), cache.path(), false);
+        {
+            let config = &mut Arc::get_mut(&mut state).unwrap().config;
+            config.request_timeout = Duration::from_millis(100);
+            config.git_path = slow_git;
+        }
+
+        let started = Instant::now();
+        let response = request(
+            &state,
+            &format!(
+                "GET /impacted_targets?from={first}&to={second} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+        assert!(
+            response.contains("request timed out after 0s"),
+            "{response}"
+        );
+        assert!(response.contains("\"cancelled\":true"), "{response}");
+        assert!(response.contains("\"workspaceBusy\":false"), "{response}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the hanging git was not killed; request took {:?}",
+            started.elapsed()
+        );
+        // The 504 was only sent once the query had released the workspace and stopped counting.
+        assert!(!state.workspace.is_busy());
+        assert_eq!(state.active_queries.load(Ordering::SeqCst), 0);
+        // Nothing was cached for the generation the client walked away from.
+        assert!(cache_entries(cache.path()).is_empty());
     }
 
     #[test]

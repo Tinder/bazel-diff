@@ -1,0 +1,10 @@
+exports_files(["value.txt"])
+
+genrule(
+    name = "consumer",
+    srcs = ["@bridge//:mirror.txt"],
+    outs = ["copied.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+filegroup(name = "unrelated")

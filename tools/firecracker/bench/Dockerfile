@@ -5,7 +5,7 @@
 FROM eclipse-temurin:21-jdk
 
 ARG BAZELISK_ARCH=arm64
-ARG BAZELISK_VERSION=v1.20.0
+ARG BAZELISK_VERSION=v1.30.0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

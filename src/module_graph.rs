@@ -185,9 +185,8 @@ mod tests {
     fn hash(kind: &str, value: &str) -> TargetHash {
         TargetHash {
             kind: kind.to_owned(),
-            hash: value.to_owned(),
-            direct_hash: value.to_owned(),
-            deps: Vec::new(),
+            hash: value.into(),
+            direct_hash: value.into(),
         }
     }
 
@@ -502,6 +501,110 @@ mod tests {
         assert_eq!(
             impacted_with_module_changes(&from, &to, None).unwrap(),
             to.hashes.keys().cloned().collect()
+        );
+    }
+
+    /// The module graph is compared by parsed modules, not by text: two `bazel mod graph`
+    /// outputs that differ only in formatting or in Bazel's chatter before the JSON name the
+    /// same modules at the same versions, so the result is the plain hash diff and Bazel is
+    /// never asked anything.
+    #[test]
+    fn equivalent_module_graph_text_is_not_a_module_change() {
+        let from = HashFileData {
+            hashes: BTreeMap::from([
+                ("//app:lib".into(), hash("Rule", "old")),
+                ("//app:untouched".into(), hash("Rule", "same")),
+            ]),
+            module_graph_json: Some(graph("0.50.1")),
+            ..Default::default()
+        };
+        let reformatted = graph("0.50.1")
+            .replace("noise before JSON", "INFO: Invocation ID: 1234")
+            .replace("\n", "")
+            .replace("  ", " ");
+        assert_ne!(reformatted, graph("0.50.1"));
+        let to = HashFileData {
+            hashes: BTreeMap::from([
+                ("//app:lib".into(), hash("Rule", "new")),
+                ("//app:untouched".into(), hash("Rule", "same")),
+            ]),
+            module_graph_json: Some(reformatted),
+            ..Default::default()
+        };
+        let impacted = impacted_with_module_query(&from, &to, true, |expression| {
+            panic!("unexpected Bazel query {expression}")
+        })
+        .unwrap();
+        assert_eq!(impacted, BTreeSet::from(["//app:lib".to_owned()]));
+    }
+
+    /// A changed module whose repository no hash file mentions (nothing in either revision was
+    /// hashed under `@@module+version//`) has no repository to query dependents of, so the
+    /// result is the plain hash diff and Bazel is never asked anything.
+    #[test]
+    fn changed_module_without_hashed_repositories_skips_the_query() {
+        let from = HashFileData {
+            hashes: BTreeMap::from([
+                ("//app:lib".into(), hash("Rule", "old")),
+                ("@@gazelle+0.40.0//:gazelle".into(), hash("Rule", "same")),
+            ]),
+            module_graph_json: Some(graph("0.49.0")),
+            ..Default::default()
+        };
+        let to = HashFileData {
+            hashes: BTreeMap::from([
+                ("//app:lib".into(), hash("Rule", "new")),
+                ("@@gazelle+0.40.0//:gazelle".into(), hash("Rule", "same")),
+            ]),
+            module_graph_json: Some(graph("0.50.1")),
+            ..Default::default()
+        };
+        assert_eq!(
+            changed_modules(&graph("0.49.0"), &graph("0.50.1")),
+            BTreeSet::from(["rules_go".to_owned()])
+        );
+        let impacted = impacted_with_module_query(&from, &to, true, |expression| {
+            panic!("unexpected Bazel query {expression}")
+        })
+        .unwrap();
+        assert_eq!(impacted, BTreeSet::from(["//app:lib".to_owned()]));
+    }
+
+    /// The rdeps query is scoped to `//...`, but Bazel can still answer with targets of the
+    /// external repositories themselves; only workspace targets are added to the result, and
+    /// targets that are not rules or files contribute nothing.
+    #[test]
+    fn module_query_results_keep_workspace_targets_only() {
+        let from = HashFileData {
+            hashes: BTreeMap::from([(
+                "@@rules_go+0.49.0//go:def.bzl".into(),
+                hash("SourceFile", "old"),
+            )]),
+            module_graph_json: Some(graph("0.49.0")),
+            ..Default::default()
+        };
+        let to = HashFileData {
+            hashes: BTreeMap::from([(
+                "@@rules_go+0.50.1//go:def.bzl".into(),
+                hash("SourceFile", "new"),
+            )]),
+            module_graph_json: Some(graph("0.50.1")),
+            ..Default::default()
+        };
+        let impacted = impacted_with_module_query(&from, &to, true, |_| {
+            Ok(vec![
+                rule_target("//app:consumer"),
+                rule_target("@@rules_go+0.50.1//go:tool"),
+                Target::default(),
+            ])
+        })
+        .unwrap();
+        assert_eq!(
+            impacted,
+            BTreeSet::from([
+                "//app:consumer".to_owned(),
+                "@@rules_go+0.50.1//go:def.bzl".to_owned(),
+            ])
         );
     }
 }

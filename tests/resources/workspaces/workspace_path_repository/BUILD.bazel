@@ -1,0 +1,14 @@
+filegroup(
+    name = "consumer",
+    srcs = ["@vendored//:data"],
+)
+
+filegroup(
+    name = "tool_user",
+    srcs = ["@ext//:tool"],
+)
+
+filegroup(
+    name = "control",
+    srcs = ["control.txt"],
+)

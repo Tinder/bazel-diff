@@ -47,9 +47,14 @@ fn fine_grained_bzlmod_repo_cquery() {
     zipped_golden_case(
         "fine-grained-hash-bzlmod-test-1.zip",
         "fine-grained-hash-bzlmod-test-2.zip",
+        // The apparent name, as the query-mode case passes: it names the same repository on
+        // every Bazel version, where the canonical spelling changed from `~~maven~maven`
+        // (Bazel 7) to `++maven+maven` (Bazel 8). With cquery's canonical labels now reaching
+        // the `//external:bazel_diff_maven` node, a flag that names nothing makes the lock-file
+        // change fan out to every maven consumer instead of the fine-grained set.
         &[
             "--fineGrainedHashExternalRepos",
-            "@@rules_jvm_external~~maven~maven",
+            "@bazel_diff_maven",
             "--useCquery",
         ],
         "fine-grained-hash-bzlmod-cquery-test-impacted-targets.txt",
@@ -71,9 +76,10 @@ fn bzlmod_transitive_deps_cquery() {
     zipped_golden_case(
         "bzlmod-transitive-test-1.zip",
         "bzlmod-transitive-test-2.zip",
+        // Apparent name for the same reason as fine_grained_bzlmod_repo_cquery.
         &[
             "--fineGrainedHashExternalRepos",
-            "@@rules_jvm_external~~maven~maven",
+            "@bazel_diff_maven",
             "--useCquery",
         ],
         "bzlmod-transitive-test-cquery-impacted-targets.txt",
@@ -199,6 +205,26 @@ fn transitive_external_repo_change_reaches_consumer() {
     assert!(impacted.contains("//:consume") || impacted.contains("@@//:consume"));
 }
 
+/// cquery prints canonical labels (`@@inner+//:data`) where query prints apparent ones
+/// (`@inner//:data`). The synthetic `//external:inner` node is named by the apparent name, so
+/// until the canonical name was translated the edge from `@@outer+//:lib` to the node was dropped
+/// and a change inside `inner` never reached `//:consume` under `--useCquery`. hashbench
+/// (2026-10-18) hit the same gap on a rules_multitool lockfile bump.
+#[test]
+fn transitive_external_repo_change_reaches_consumer_cquery() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("bzlmod_transitive_external");
+    let second = copy_workspace("bzlmod_transitive_external");
+    fs::write(second.path().join("inner/data.txt"), "world\n").unwrap();
+    let impacted = diff_local(first.path(), second.path(), &["--useCquery"]);
+    assert!(
+        impacted.contains("//:consume") || impacted.contains("@@//:consume"),
+        "{impacted:?}"
+    );
+}
+
 #[test]
 fn remote_proto_bump_impacts_consumer() {
     let first = copy_workspace("proto_external_version_bump");
@@ -263,6 +289,131 @@ fn hub_spoke_version_bump_impacts_consumer_behind_fine_grained_hub() {
     );
 }
 
+// The Bzlmod form of the case above, with the hub named by its canonical name. `query` prints the
+// apparent `@crates//:a`, which must still count as fine-grained: otherwise the input falls back to
+// the hub's `//external:crates` node, which depends on every spoke, and bumping one crate impacts
+// every consumer of the hub. The hub's own `versions.txt`, also named by its apparent label, must
+// be hashed by content under either name, or `//:uses_versions` misses the bump.
+#[test]
+fn hub_named_by_canonical_name_is_fine_grained_under_its_apparent_name() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("fine_grained_hub_by_canonical_name");
+    let second = copy_workspace("fine_grained_hub_by_canonical_name");
+    edit(&second.path().join("versions.json"), |text| {
+        text.replace("\"a\": \"1.0\"", "\"a\": \"2.0\"")
+    });
+    for repo in ["@crates", "@@+crates+crates"] {
+        let impacted = diff_local(
+            first.path(),
+            second.path(),
+            &["--fineGrainedHashExternalRepos", repo],
+        );
+        let main: BTreeSet<_> = impacted
+            .iter()
+            .filter(|label| !label.starts_with("//external:") && !label.starts_with("@@crates"))
+            .map(|label| label.trim_start_matches("@@").to_owned())
+            .filter(|label| label.starts_with("//"))
+            .collect();
+        assert_eq!(
+            main,
+            BTreeSet::from(["//:uses_a".to_owned(), "//:uses_versions".to_owned()]),
+            "{repo}: {impacted:?}"
+        );
+    }
+}
+
+// Module `ext`'s extension generates the `@crates` hub and its spokes, whose targets use a rule
+// `ext` defines. In query mode `//external:ext` stands in for everything its extensions generate,
+// so a fine-grained spoke target reaching `ext` through it changes whenever any other spoke does.
+// With the extension listed in `--labelOnlyModuleExtensions`, bumping spoke `b` impacts only
+// `//:uses_b`, while a change to `ext` itself still impacts both consumers. Without it, the
+// conservative edge stays and the bump impacts both.
+#[test]
+fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let fine_grained = [
+        "--fineGrainedHashExternalRepos",
+        "@crates,@@ext++crates+crates__a",
+        "--labelOnlyModuleExtensions",
+        "@ext//:crates.bzl%crates",
+    ];
+    let main = |impacted: BTreeSet<String>| -> BTreeSet<String> {
+        impacted
+            .into_iter()
+            .map(|label| label.trim_start_matches("@@").to_owned())
+            .filter(|label| label.starts_with("//") && !label.starts_with("//external:"))
+            .collect()
+    };
+    let first = copy_workspace("extension_spokes_through_owner");
+    let bumped = copy_workspace("extension_spokes_through_owner");
+    edit(&bumped.path().join("versions.json"), |text| {
+        text.replace("\"b\": \"1.0\"", "\"b\": \"2.0\"")
+    });
+    let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained));
+    assert_eq!(impacted, BTreeSet::from(["//:uses_b".to_owned()]));
+    let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained[..2]));
+    assert_eq!(
+        impacted,
+        BTreeSet::from(["//:uses_a".to_owned(), "//:uses_b".to_owned()])
+    );
+
+    let changed_rule = copy_workspace("extension_spokes_through_owner");
+    fs::write(changed_rule.path().join("ext/tool.sh"), "exit 1\n").unwrap();
+    let impacted = main(diff_local(first.path(), changed_rule.path(), &fine_grained));
+    assert_eq!(
+        impacted,
+        BTreeSet::from(["//:uses_a".to_owned(), "//:uses_b".to_owned()])
+    );
+}
+
+// Module `ext`'s extension generates `@app`, whose rule resolves a toolchain, and the repositories
+// that toolchain can come from. A query never shows a resolved toolchain as an input, so with
+// `@app` fine-grained the change has to reach `//:uses_app` through `ext`, however `ext` registers
+// the toolchain: from a repository it imports, through an alias whose toolchain lives in a
+// repository nobody imports, or by canonical label without importing anything. This is why
+// `--labelOnlyModuleExtensions` is opt-in: an extension like this one must not be listed.
+#[test]
+fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    for registration in [
+        "use_repo(tools, \"tc\")\nregister_toolchains(\"@tc//:all\")",
+        "use_repo(tools, \"tc_alias\")\nregister_toolchains(\"@tc_alias//:tc\")",
+        "register_toolchains(\"@@ext++tools+tc//:tc\")",
+    ] {
+        let first = copy_workspace("extension_toolchain_through_owner");
+        let bumped = copy_workspace("extension_toolchain_through_owner");
+        for workspace in [&first, &bumped] {
+            fs::write(
+                workspace.path().join("ext/MODULE.bazel"),
+                format!(
+                    "module(name = \"ext\")\n\ntools = use_extension(\"//:tools.bzl\", \"tools\")\n{registration}\n"
+                ),
+            )
+            .unwrap();
+        }
+        edit(&bumped.path().join("versions.json"), |text| {
+            text.replace("1.0", "2.0")
+        });
+        let impacted = diff_local(
+            first.path(),
+            bumped.path(),
+            &["--fineGrainedHashExternalRepos", "@app"],
+        );
+        assert!(
+            impacted
+                .iter()
+                .any(|label| label == "//:uses_app" || label == "@@//:uses_app"),
+            "{registration}: {impacted:?}"
+        );
+    }
+}
+
 fn diff_local(
     first: &std::path::Path,
     second: &std::path::Path,
@@ -276,4 +427,45 @@ fn diff_local(
     assert!(generate(second, &to, args).status.success());
     assert!(impacted(second, &from, &to, &result, &[]).status.success());
     read_lines(&result)
+}
+
+#[test]
+fn returned_external_source_reaches_consumer() {
+    let workspace = copy_workspace("returned_external_source");
+    let output = tempfile::tempdir().unwrap();
+    let before = output.path().join("before.json");
+    let after = output.path().join("after.json");
+    let result = output.path().join("impacted.txt");
+    let args = [
+        "--useCquery",
+        "--cqueryExpression",
+        "deps(set(//:consumer //:unrelated))",
+    ];
+    for (contents, snapshot) in [("before\n", &before), ("after\n", &after)] {
+        fs::write(workspace.path().join("value.txt"), contents).unwrap();
+        assert!(generate(workspace.path(), snapshot, &args).status.success());
+        assert!(std::process::Command::new(bazel())
+            .current_dir(workspace.path())
+            .args(["build", "//:consumer"])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("bazel-bin/copied.txt")).unwrap(),
+            contents
+        );
+    }
+    assert!(impacted(workspace.path(), &before, &after, &result, &[])
+        .status
+        .success());
+    let targets = read_lines(&result);
+    assert!(
+        targets.iter().any(|t| t.ends_with("//:mirror.txt")),
+        "{targets:?}"
+    );
+    assert!(
+        targets.contains("@@//:consumer") || targets.contains("//:consumer"),
+        "{targets:?}"
+    );
+    assert!(!targets.contains("@@//:unrelated") && !targets.contains("//:unrelated"));
 }

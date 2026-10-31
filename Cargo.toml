@@ -14,7 +14,7 @@ name = "bazel-diff"
 path = "src/main.rs"
 
 [features]
-default = ["vendored-protoc"]
+default = ["mimalloc", "vendored-protoc"]
 vendored-protoc = ["dep:protoc-bin-vendored"]
 
 [dependencies]
@@ -22,9 +22,15 @@ anyhow = "1.0"
 attohttpc = { version = "=0.28.5", default-features = false, features = ["basic-auth", "tls-rustls-webpki-roots"] }
 buffa = "0.9.1"
 clap = { version = "4.5", features = ["derive", "env"] }
-gcp_auth = "=0.12.3"
+flate2 = "1.1"
+# gcp_auth is async-only and brings hyper/tokio for its token requests. Its default features
+# would add the OS trust store (rustls-native-certs); the serve binary trusts webpki-roots
+# everywhere else, so that is selected instead. hyper-rustls is listed only to enable the
+# `ring` provider gcp_auth's default feature set would otherwise have enabled.
+gcp_auth = { version = "=0.12.3", default-features = false, features = ["webpki-roots"] }
 hex = "0.4"
-mimalloc = "0.1"
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring"] }
+mimalloc = { version = "0.1", optional = true }
 rayon = "1.10"
 rustls-pki-types = "1.15"
 rust-s3 = { version = "=0.36.0", default-features = false, features = ["sync-rustls-tls"] }

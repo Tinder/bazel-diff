@@ -1,0 +1,4 @@
+filegroup(
+    name = "uses_app",
+    srcs = ["@app//:lib"],
+)

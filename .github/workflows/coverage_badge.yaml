@@ -31,13 +31,17 @@ jobs:
           done
           export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
+      # Repository cache shared with ci.yaml (.github/actions/cache-bazel).
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: '9.x'
       - name: Run bazel-diff tests with coverage
         env:
           USE_BAZEL_VERSION: '9.x'
         # Retries guard against transient toolchain/crate fetch errors failing the daily cron.
         run: |
           for i in 1 2 3; do
-            ~/go/bin/bazelisk coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... --enable_bzlmod=true --enable_workspace=false && break
+            ~/go/bin/bazelisk coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... --enable_bzlmod=true --enable_workspace=false --config=ci && break
             if [ "$i" = 3 ]; then exit 1; fi
             echo "coverage run failed (attempt $i); retrying in 15s..."
             sleep 15
@@ -46,7 +50,10 @@ jobs:
         env:
           USE_BAZEL_VERSION: '9.x'
           COVERAGE_THRESHOLD: '90'
-        run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+        run: ~/go/bin/bazelisk run //tools:coverage-check --config=ci -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+      - name: Report Bazel failures
+        if: failure()
+        run: python3 tools/report_bazel_failures.py bazel-bep.json
       - name: Open PR if coverage badge changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

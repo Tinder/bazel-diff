@@ -1,0 +1,22 @@
+module(
+    name = "hidden_wrapper_external_repo_test",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "facade", version = "1.0")
+bazel_dep(name = "leaf", version = "1.0")
+
+local_path_override(
+    module_name = "facade",
+    path = "facade",
+)
+
+local_path_override(
+    module_name = "middle",
+    path = "middle",
+)
+
+local_path_override(
+    module_name = "leaf",
+    path = "leaf",
+)

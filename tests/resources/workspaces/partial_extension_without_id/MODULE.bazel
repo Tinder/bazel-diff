@@ -1,0 +1,9 @@
+module(
+    name = "partial_extension_without_id",
+    version = "1.0",
+)
+
+healthy = use_extension("//:extensions.bzl", "healthy")
+use_repo(healthy, "healthy")
+
+broken = use_extension("//:extensions.bzl", "broken")

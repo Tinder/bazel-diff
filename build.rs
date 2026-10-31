@@ -15,6 +15,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .files(&[&build_proto, &analysis_proto])
         .includes(&[include])
         .include_file("proto.rs")
+        // Box optional payloads to reduce the inline size of retained query targets.
+        .box_type_in(
+            buffa_build::PointerRepr::Box,
+            &[
+                ".blaze_query.Target.generated_file",
+                ".blaze_query.Target.package_group",
+                ".blaze_query.Target.environment_group",
+                ".blaze_query.SourceFile.license",
+            ],
+        )
         .generate_views(false)
         .compile()?;
     println!("cargo:rerun-if-changed=rust/proto/build.proto");

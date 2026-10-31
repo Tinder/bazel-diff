@@ -1,7 +1,7 @@
 module(
     name = "bazel-diff",
-    version = "50.0.0",
-    bazel_compatibility = [">=8.5.0"],
+    version = "69.0.0",
+    bazel_compatibility = [">=8.7.0"],
 )
 
 bazel_dep(name = "aspect_rules_lint", version = "2.1.0", dev_dependency = True)
@@ -11,7 +11,7 @@ bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_license", version = "1.0.0")
 
 # build.rs uses protoc to compile rust/proto/*.proto.
-bazel_dep(name = "protobuf", version = "33.4")
+bazel_dep(name = "protobuf", version = "36.2")
 
 bazel_dep(name = "rules_python", version = "1.8.4", dev_dependency = True)
 bazel_dep(name = "rules_go", version = "0.62.0", dev_dependency = True)
@@ -19,16 +19,16 @@ bazel_dep(name = "rules_go", version = "0.62.0", dev_dependency = True)
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk", dev_dependency = True)
 go_sdk.download(version = "1.23.1")
 
-# llvm 0.8.20+ adds hermetic Windows MSVC toolchains, which fail on a Windows
-# MSVC exec host (rules_rs#271, hermetic-llvm#809). 0.8.19 has none, so Windows
-# builds use the locally installed Visual Studio toolchain.
-bazel_dep(name = "llvm", version = "0.8.19")
-bazel_dep(name = "rules_rs", version = "0.0.112")
-single_version_override(
-    module_name = "rules_rs",
-    patch_strip = 1,
-    patches = ["//patches:rules_rs_package_name.patch"],
-)
+# llvm 0.8.20-0.8.25 hermetic Windows MSVC toolchains hit an analysis cycle on a
+# Windows exec host (hermetic-llvm#809, rules_rs#271); 0.8.26 fixed it, but the
+# toolchain downloads the MSVC runtime and Windows SDK, which need Microsoft
+# license acceptance from every Windows builder. register_toolchains below
+# therefore lists only the Linux and macOS toolchains, so Windows keeps using
+# the locally installed Visual Studio toolchain.
+bazel_dep(name = "llvm", version = "0.8.26")
+
+# rules_rs 0.2.0 requires Bazel 8.7+, hence bazel_compatibility above.
+bazel_dep(name = "rules_rs", version = "0.2.0")
 
 # LLVM 22.1.8 reads Rust 1.90's coverage profiles.
 llvm = use_extension("@llvm//extensions:llvm.bzl", "llvm")
@@ -50,9 +50,26 @@ rust.toolchain(
 )
 use_repo(rust, "bd_rust")
 
+# Every Linux/macOS exec-to-target pair llvm declares; release-linux configs
+# cross-compile musl Linux binaries from macOS and Linux.
 register_toolchains(
     "@bd_rust//...",
-    "@llvm//toolchain:all",
+    "@llvm//toolchain:linux_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:linux_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:linux_aarch64_to_macos_aarch64",
+    "@llvm//toolchain:linux_aarch64_to_macos_x86_64",
+    "@llvm//toolchain:linux_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:linux_x86_64_to_macos_aarch64",
+    "@llvm//toolchain:linux_x86_64_to_macos_x86_64",
+    "@llvm//toolchain:macos_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:macos_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:macos_aarch64_to_macos_aarch64",
+    "@llvm//toolchain:macos_aarch64_to_macos_x86_64",
+    "@llvm//toolchain:macos_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:macos_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:macos_x86_64_to_macos_aarch64",
+    "@llvm//toolchain:macos_x86_64_to_macos_x86_64",
 )
 
 # CI selects this toolchain explicitly to check Cargo.toml's rust-version.

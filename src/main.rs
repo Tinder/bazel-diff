@@ -2,20 +2,24 @@ use anyhow::{bail, Context, Result};
 use bazel_diff::bazel::BazelOptions;
 use bazel_diff::explain::{self, ExplainFormat, ExplainLimits};
 use bazel_diff::fingerprint;
+use bazel_diff::git::{self, DerivationPolicy, Git};
 use bazel_diff::hash::{generate_hashes, HashOptions};
 use bazel_diff::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
 };
 use bazel_diff::module_graph::impacted_with_module_changes;
+use bazel_diff::partial::{self, Classification, Glob};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 // Use mimalloc's per-thread heaps for parallel protobuf decoding in generate-hashes.
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -113,6 +117,16 @@ struct HashingArgs {
     fine_grained_hash_external_repos_file: Option<PathBuf>,
 
     #[arg(
+        long = "labelOnlyModuleExtensions",
+        value_delimiter = ',',
+        help = "Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories use each \
+                other only through labels, never by resolving a toolchain from one another. A \
+                fine-grained target in one of their repositories then does not change whenever any \
+                other repository of the extension does"
+    )]
+    label_only_module_extensions: Vec<String>,
+
+    #[arg(
         long = "useCquery",
         action = ArgAction::Set,
         num_args = 0..=1,
@@ -182,6 +196,36 @@ struct GenerateHashesArgs {
 
     #[arg(short = 'm', long = "modified-filepaths")]
     modified_filepaths: Option<PathBuf>,
+
+    /// Opt-in: hash the workspace's git tree (the working tree as it is, committed or not) and
+    /// record every rule's hashing recipe, so a later run can derive a revision's hashes from
+    /// this file with --baseHashes and no `bazel query` when the diff between the two only edits
+    /// regular source files. The file always includes target types. Incompatible with
+    /// --useCquery, --fineGrainedHashExternalRepos, --alwaysAffectedTags, --contentHashPath,
+    /// --modified-filepaths and --targetType
+    #[arg(
+        long = "partialGraph",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = false
+    )]
+    partial_graph: bool,
+
+    /// Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file
+    /// name) of workspace paths whose change always forces a full generation under --partialGraph
+    #[arg(long = "partialGraphRebuildPattern", value_delimiter = ',')]
+    partial_graph_rebuild_patterns: Vec<String>,
+
+    /// A hash file written with --partialGraph to derive this revision's hashes from, when the
+    /// diff between its tree and the workspace's allows it; otherwise a full generation runs
+    #[arg(long = "baseHashes")]
+    base_hashes: Option<PathBuf>,
+
+    /// Path to the git executable --partialGraph reads the workspace's tree with
+    #[arg(long = "gitPath", default_value = "git")]
+    git_path: PathBuf,
 
     output_path: Option<PathBuf>,
 }
@@ -363,6 +407,25 @@ struct ServeArgs {
     )]
     dependency_fingerprint: bool,
 
+    /// Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query`
+    /// when the diff between them only edits regular source files; every entry then also records
+    /// the hashing recipes that makes possible. Incompatible with --useCquery,
+    /// --fineGrainedHashExternalRepos and --alwaysAffectedTags
+    #[arg(
+        long = "partialGraph",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = false
+    )]
+    partial_graph: bool,
+
+    /// Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file
+    /// name) of workspace paths whose change always forces a full generation under --partialGraph
+    #[arg(long = "partialGraphRebuildPattern", value_delimiter = ',')]
+    partial_graph_rebuild_patterns: Vec<String>,
+
     #[arg(long = "no-initial-fetch")]
     no_initial_fetch: bool,
 
@@ -381,6 +444,9 @@ struct ServeArgs {
     #[arg(long = "cachePruneInterval", default_value = "1h")]
     cache_prune_interval: String,
 
+    #[arg(long = "cacheMemoryMax", default_value = "512MB")]
+    cache_memory_max: String,
+
     #[arg(long = "s3Bucket", conflicts_with_all = ["nexus_url", "gcs_bucket"])]
     s3_bucket: Option<String>,
 
@@ -396,9 +462,11 @@ struct ServeArgs {
     #[arg(long = "s3ForcePathStyle")]
     s3_force_path_style: bool,
 
+    /// Google Cloud Storage bucket used as the shared cache tier (Application Default Credentials)
     #[arg(long = "gcsBucket", conflicts_with_all = ["s3_bucket", "nexus_url"])]
     gcs_bucket: Option<String>,
 
+    /// Object-name prefix for cache entries in --gcsBucket
     #[arg(long = "gcsPrefix", requires = "gcs_bucket", default_value = "")]
     gcs_prefix: String,
 
@@ -521,10 +589,12 @@ fn bazel_options(args: &HashingArgs, verbose: bool) -> Result<BazelOptions> {
         cquery_expression: args.cquery_expression.clone(),
         keep_going: args.keep_going,
         fine_grained_external_repos: repos,
+        label_only_module_extensions: args.label_only_module_extensions.iter().cloned().collect(),
         exclude_external_targets: args.exclude_external_targets,
         exclude_targets_query: args.exclude_targets_query.clone(),
         no_bazelrc: false,
         verbose,
+        cancellation: None,
     })
 }
 
@@ -554,6 +624,7 @@ fn hash_options(
         modified_filepaths: read_lines(modified_filepaths)?,
         track_deps,
         always_affected_tags: args.always_affected_tags.iter().cloned().collect(),
+        partial_tree: None,
     })
 }
 
@@ -602,6 +673,16 @@ fn fingerprint_flags(
                 .join(","),
         ),
         (
+            "labelOnlyModuleExtensions".into(),
+            args.label_only_module_extensions
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        (
             "ignoredRuleHashingAttributes".into(),
             args.ignored_rule_hashing_attributes
                 .iter()
@@ -619,26 +700,25 @@ fn fingerprint_flags(
     ])
 }
 
+fn write_json_file(file: File, value: &impl Serialize) -> Result<()> {
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer(&mut writer, value)?;
+    writer.flush()?;
+    Ok(())
+}
+
 fn write_json(path: Option<&Path>, value: &impl Serialize) -> Result<()> {
-    match path {
-        Some(path) if path != Path::new("-") => {
-            let mut writer = BufWriter::new(
-                File::create(path)
-                    .with_context(|| format!("failed to create {}", path.display()))?,
-            );
-            serde_json::to_writer(&mut writer, value)
-                .with_context(|| format!("failed to write {}", path.display()))?;
-            writer
-                .flush()
-                .with_context(|| format!("failed to write {}", path.display()))?;
-        }
-        _ => {
-            let stdout = io::stdout();
-            let mut writer = stdout.lock();
-            serde_json::to_writer(&mut writer, value)?;
-            writer.write_all(b"\n")?;
-        }
+    if let Some(path) = path.filter(|path| *path != Path::new("-")) {
+        let file =
+            File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+        return write_json_file(file, value)
+            .with_context(|| format!("failed to write {}", path.display()));
     }
+
+    let mut writer = BufWriter::new(io::stdout().lock());
+    serde_json::to_writer(&mut writer, value)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -651,27 +731,154 @@ fn run_generate_with(
     verbose: bool,
     generate: impl FnOnce(&HashOptions) -> Result<HashFileData>,
 ) -> Result<HashFileData> {
-    let options = hash_options(
+    let mut options = hash_options(
         &args.hashing,
         args.content_hash_path.as_deref(),
         args.modified_filepaths.as_deref(),
         args.dep_edges_file.is_some(),
         verbose,
     )?;
-    let mut data = generate(&options)?;
+    let mut data = if args.partial_graph {
+        partial_graph_hashes(args, &mut options, generate)?
+    } else if args.base_hashes.is_some() {
+        bail!("--baseHashes needs --partialGraph");
+    } else {
+        generate(&options)?
+    };
     if !args.target_type.is_empty() {
         let types = args.target_type.iter().cloned().collect::<HashSet<_>>();
         data.hashes.retain(|_, hash| types.contains(&hash.kind));
     }
+    // A partial-graph file carries every target's type and its dependency edges, which a
+    // derivation from it needs to evaluate the recipes and to write --depEdgesFile.
     write_json(
         args.output_path.as_deref(),
-        &data.serialized(args.include_target_type, false),
+        &data.serialized(
+            args.include_target_type || args.partial_graph,
+            args.partial_graph && args.dep_edges_file.is_some(),
+        ),
     )?;
     if let Some(path) = &args.dep_edges_file {
-        fs::write(path, serde_json::to_vec(&data.dep_edges)?)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        let context = || format!("failed to write {}", path.display());
+        let file = File::create(path).with_context(context)?;
+        write_json_file(file, &data.dep_edges).with_context(context)?;
     }
     Ok(data)
+}
+
+/// `--partialGraph` for `generate-hashes`: the hashes describe the working tree's git tree, and
+/// come from re-evaluating the `--baseHashes` entry's recipes against it when the diff between
+/// the two allows it (see [`bazel_diff::partial`]), or from a full generation that records the
+/// recipes otherwise. Either way the file written is the same.
+fn partial_graph_hashes(
+    args: &GenerateHashesArgs,
+    options: &mut HashOptions,
+    generate: impl FnOnce(&HashOptions) -> Result<HashFileData>,
+) -> Result<HashFileData> {
+    partial::validate_hash_options(options)?;
+    if args.content_hash_path.is_some() {
+        bail!("--partialGraph does not support --contentHashPath: source content is read from the git tree");
+    }
+    if args.modified_filepaths.is_some() {
+        bail!("--partialGraph does not support --modified-filepaths");
+    }
+    if !args.target_type.is_empty() {
+        bail!("--partialGraph does not support --targetType: a file missing targets cannot be derived from (filter in get-impacted-targets instead)");
+    }
+    let rebuild_patterns = args
+        .partial_graph_rebuild_patterns
+        .iter()
+        .map(|pattern| Glob::new(pattern))
+        .collect::<Result<Vec<_>>>()?;
+    let git = Git::new(&args.git_path, &args.hashing.workspace_path);
+    // bazel-diff's own files are not part of the revision, wherever the user keeps them.
+    let own_files = [
+        args.output_path.as_deref(),
+        args.base_hashes.as_deref(),
+        args.dep_edges_file.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let tree = git.snapshot_working_tree(&own_files)?;
+    let tree_id = tree
+        .id()
+        .expect("a working tree snapshot carries its tree id")
+        .to_owned();
+    eprintln!(
+        "[Info] partial graph: workspace tree {tree_id} ({} tracked paths)",
+        tree.len()
+    );
+    let fallback = match &args.base_hashes {
+        Some(path) => {
+            let base = HashFileData::read(path)
+                .with_context(|| format!("failed to read --baseHashes {}", path.display()))?;
+            match base.tree.as_deref() {
+                _ if base.partial.is_none() => {
+                    format!("{} carries no partial-graph recipes", path.display())
+                }
+                _ if args.dep_edges_file.is_some()
+                    && base.dep_edges.is_empty()
+                    && !base.hashes.is_empty() =>
+                {
+                    format!(
+                        "{} records no dependency edges, which --depEdgesFile needs",
+                        path.display()
+                    )
+                }
+                None => format!("{} records no git tree", path.display()),
+                Some(base_tree) if base_tree == tree_id => {
+                    eprintln!(
+                        "[Info] partial graph: {} already describes tree {tree_id}",
+                        path.display()
+                    );
+                    return Ok(base);
+                }
+                Some(base_tree) => {
+                    let policy = DerivationPolicy {
+                        seed_filepaths: &options.seed_filepaths,
+                        rebuild_patterns: &rebuild_patterns,
+                    };
+                    match git::classify_revisions(&git, base_tree, &tree_id, &base, &tree, &policy)
+                    {
+                        Ok(Classification::Derivable {
+                            changed_sources,
+                            unmatched_paths,
+                        }) => match partial::derive(&base, &tree) {
+                            Ok(data) => {
+                                eprintln!(
+                                    "[Info] partial graph: derived {tree_id} from {base_tree}: {} changed source targets, {} changed paths outside the graph, {} targets",
+                                    changed_sources.len(),
+                                    unmatched_paths.len(),
+                                    data.hashes.len()
+                                );
+                                return Ok(data);
+                            }
+                            Err(error) => format!("derivation failed: {error:#}"),
+                        },
+                        Ok(Classification::Rebuild { reason }) => reason,
+                        Err(error) => format!("classification failed: {error:#}"),
+                    }
+                }
+            }
+        }
+        None => "no --baseHashes to derive from".to_owned(),
+    };
+    eprintln!("[Info] partial graph: full generation for {tree_id}: {fallback}");
+    options.content_hashes = Some(tree.content_hashes());
+    options.partial_tree = Some(Arc::new(tree));
+    generate(options)
+}
+
+/// Hashes of the two modes follow different formulas, so comparing a `--partialGraph` file with
+/// a default-mode one would report every target as impacted.
+fn ensure_same_mode(from: &HashFileData, to: &HashFileData) -> Result<()> {
+    if from.partial.is_some() != to.partial.is_some() {
+        bail!(
+            "the starting and final hashes were not generated in the same mode: one carries --partialGraph recipes and the other does not, and hashes of the two modes are not comparable"
+        );
+    }
+    Ok(())
 }
 
 fn get_bazel_options(args: &GetImpactedTargetsArgs, verbose: bool) -> BazelOptions {
@@ -685,16 +892,19 @@ fn get_bazel_options(args: &GetImpactedTargetsArgs, verbose: bool) -> BazelOptio
         cquery_expression: None,
         keep_going: false,
         fine_grained_external_repos: BTreeSet::new(),
+        label_only_module_extensions: BTreeSet::new(),
         exclude_external_targets: false,
         exclude_targets_query: None,
         no_bazelrc: args.no_bazelrc,
         verbose,
+        cancellation: None,
     }
 }
 
 fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> {
     let from = HashFileData::read(&args.starting_hashes)?;
     let to = HashFileData::read(&args.final_hashes)?;
+    ensure_same_mode(&from, &to)?;
     let bazel = get_bazel_options(args, verbose);
     let exclude_external = args
         .exclude_external_targets
@@ -744,6 +954,7 @@ fn run_explain(args: &ExplainArgs, verbose: bool) -> Result<()> {
         .context("Incorrect starting hashes: file doesn't exist or can't be read.")?;
     let to = HashFileData::read(&args.final_hashes)
         .context("Incorrect final hashes: file doesn't exist or can't be read.")?;
+    ensure_same_mode(&from, &to)?;
     let dep_edges: BTreeMap<String, Vec<String>> = serde_json::from_slice(
         &fs::read(&args.dep_edges_file)
             .context("Incorrect dep edges file: file doesn't exist or can't be read.")?,
@@ -808,6 +1019,10 @@ fn run_warmup_with(
         target_type: args.generate.target_type.clone(),
         dep_edges_file: args.generate.dep_edges_file.clone(),
         modified_filepaths: args.generate.modified_filepaths.clone(),
+        partial_graph: args.generate.partial_graph,
+        partial_graph_rebuild_patterns: args.generate.partial_graph_rebuild_patterns.clone(),
+        base_hashes: args.generate.base_hashes.clone(),
+        git_path: args.generate.git_path.clone(),
         output_path: Some(args.base_hashes.clone()),
     };
     generate.output_path = Some(args.base_hashes.clone());
@@ -876,7 +1091,7 @@ impl ServeArgs {
         } else {
             None
         };
-        Ok(bazel_diff::server::ServerConfig {
+        let config = bazel_diff::server::ServerConfig {
             hash_options: hash_options(&self.hashing, None, None, self.track_deps, verbose)?,
             git_path: self.git_path.clone(),
             port: self.port,
@@ -884,6 +1099,12 @@ impl ServeArgs {
             cache_dir: self.cache_dir.clone(),
             track_deps: self.track_deps,
             dependency_fingerprint: self.dependency_fingerprint,
+            partial_graph: self.partial_graph,
+            partial_graph_rebuild_patterns: self
+                .partial_graph_rebuild_patterns
+                .iter()
+                .map(|pattern| bazel_diff::partial::Glob::new(pattern))
+                .collect::<Result<Vec<_>>>()?,
             no_initial_fetch: self.no_initial_fetch,
             warmup_revisions: self.warmup_revisions.clone(),
             cache_max_age: self
@@ -898,6 +1119,7 @@ impl ServeArgs {
                 .map(bazel_diff::server::parse_byte_size)
                 .transpose()?,
             cache_prune_interval: bazel_diff::server::parse_duration(&self.cache_prune_interval)?,
+            cache_memory_max: bazel_diff::server::parse_byte_size(&self.cache_memory_max)?,
             remote_cache,
             s3_bucket: self.s3_bucket.clone(),
             s3_prefix: self.s3_prefix.clone(),
@@ -911,7 +1133,9 @@ impl ServeArgs {
             nexus_prefix: self.nexus_prefix.clone(),
             nexus_credentials,
             nexus_ca_cert: self.nexus_ca_cert.clone(),
-        })
+        };
+        bazel_diff::server::validate_partial_graph(&config)?;
+        Ok(config)
     }
 }
 
@@ -986,6 +1210,7 @@ mod tests {
             cquery_command_options: Vec::new(),
             fine_grained_hash_external_repos: Vec::new(),
             fine_grained_hash_external_repos_file: None,
+            label_only_module_extensions: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
             keep_going: false,
@@ -1243,8 +1468,10 @@ mod tests {
         first.exclude_external_targets = true;
         first.fine_grained_hash_external_repos = vec!["maven".into(), "abc".into()];
         first.ignored_rule_hashing_attributes = vec!["z".into(), "a".into()];
+        first.label_only_module_extensions = vec!["@b//:e.bzl%b".into(), "@a//:e.bzl%a".into()];
         let mut second = first.clone();
         second.fine_grained_hash_external_repos.reverse();
+        second.label_only_module_extensions.reverse();
         second.ignored_rule_hashing_attributes.reverse();
 
         let first_flags = fingerprint_flags(&first, true, &["Rule".into(), "GeneratedFile".into()]);
@@ -1254,6 +1481,10 @@ mod tests {
         assert_eq!(first_flags["bazelStartupOptions"], "--a --b");
         assert_eq!(first_flags["targetType"], "GeneratedFile,Rule");
         assert_eq!(first_flags["fineGrainedHashExternalRepos"], "abc,maven");
+        assert_eq!(
+            first_flags["labelOnlyModuleExtensions"],
+            "@a//:e.bzl%a,@b//:e.bzl%b"
+        );
     }
 
     #[test]
@@ -1299,6 +1530,8 @@ mod tests {
             "10gb",
             "--cacheMaxEntries",
             "500",
+            "--cacheMemoryMax",
+            "2gb",
             "--s3Bucket",
             "bucket",
             "--s3Prefix",
@@ -1322,6 +1555,7 @@ mod tests {
         assert_eq!(config.cache_max_size, Some(10 * 1024u64.pow(3)));
         assert_eq!(config.cache_max_entries, Some(500));
         assert_eq!(config.cache_prune_interval, Duration::from_secs(3600));
+        assert_eq!(config.cache_memory_max, 2 * 1024u64.pow(3));
         assert_eq!(
             config.remote_cache.as_deref(),
             Some("s3://bucket/team/repo/")
@@ -1505,6 +1739,69 @@ mod tests {
     }
 
     #[test]
+    fn serve_partial_graph_is_opt_in_and_validated() {
+        let serve_args = |extra: &[&str]| {
+            let mut argv = vec![
+                "bazel-diff",
+                "serve",
+                "--workspacePath",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+            ];
+            argv.extend_from_slice(extra);
+            let Commands::Serve(args) = parse(&argv).command else {
+                panic!("expected serve");
+            };
+            args
+        };
+        let config = serve_args(&[]).to_config(false).unwrap();
+        assert!(!config.partial_graph);
+        assert!(config.partial_graph_rebuild_patterns.is_empty());
+
+        let config = serve_args(&[
+            "--partialGraph",
+            "--partialGraphRebuildPattern",
+            "*.lock,tools/**",
+            "--partialGraphRebuildPattern",
+            "requirements.txt",
+        ])
+        .to_config(false)
+        .unwrap();
+        assert!(config.partial_graph);
+        assert_eq!(
+            config
+                .partial_graph_rebuild_patterns
+                .iter()
+                .map(|glob| glob.pattern())
+                .collect::<Vec<_>>(),
+            ["*.lock", "tools/**", "requirements.txt"]
+        );
+        assert!(
+            !serve_args(&["--partialGraph=false"])
+                .to_config(false)
+                .unwrap()
+                .partial_graph
+        );
+
+        let error = serve_args(&["--partialGraph", "--useCquery"])
+            .to_config(false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--useCquery"), "{error}");
+        let error = serve_args(&["--partialGraph", "--alwaysAffectedTags", "flaky"])
+            .to_config(false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--alwaysAffectedTags"), "{error}");
+        assert!(
+            serve_args(&["--partialGraph", "--partialGraphRebuildPattern", ""])
+                .to_config(false)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn serve_nexus_flags_require_each_other_and_conflict_with_s3() {
         for extra in [
             &["--nexusUrl", "https://host"][..],
@@ -1639,6 +1936,10 @@ mod tests {
                 target_type: vec!["Rule".into()],
                 dep_edges_file: Some(deps.clone()),
                 modified_filepaths: None,
+                partial_graph: false,
+                partial_graph_rebuild_patterns: Vec::new(),
+                base_hashes: None,
+                git_path: PathBuf::from("git"),
                 output_path: Some(output.clone()),
             },
             false,
@@ -1651,7 +1952,6 @@ mod tests {
                                 kind: "Rule".into(),
                                 hash: "rule".into(),
                                 direct_hash: "direct".into(),
-                                deps: vec!["//app:source".into()],
                             },
                         ),
                         (
@@ -1660,11 +1960,13 @@ mod tests {
                                 kind: "SourceFile".into(),
                                 hash: "source".into(),
                                 direct_hash: "source".into(),
-                                deps: Vec::new(),
                             },
                         ),
                     ]),
-                    dep_edges: BTreeMap::from([("//app:rule".into(), vec!["//app:source".into()])]),
+                    dep_edges: BTreeMap::from([
+                        ("//app:rule".into(), vec!["//app:source".into()]),
+                        ("//app:source".into(), vec![]),
+                    ]),
                     ..Default::default()
                 })
             },
@@ -1674,7 +1976,10 @@ mod tests {
         let written: serde_json::Value =
             serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
         assert_eq!(written["//app:rule"], "Rule#rule~direct");
-        assert!(fs::read_to_string(deps).unwrap().contains("//app:source"));
+        assert_eq!(
+            fs::read(deps).unwrap(),
+            br#"{"//app:rule":["//app:source"],"//app:source":[]}"#
+        );
     }
 
     #[test]
@@ -1689,7 +1994,6 @@ mod tests {
             kind: "Rule".into(),
             hash: hash.into(),
             direct_hash: direct_hash.into(),
-            deps: Vec::new(),
         };
         let from = HashFileData {
             hashes: BTreeMap::from([
@@ -1877,6 +2181,10 @@ mod tests {
                 target_type: vec!["Rule".into()],
                 dep_edges_file: None,
                 modified_filepaths: None,
+                partial_graph: false,
+                partial_graph_rebuild_patterns: Vec::new(),
+                base_hashes: None,
+                git_path: PathBuf::from("git"),
                 output_path: None,
             },
             base_hashes: workspace.path().join("nested/base.json"),
@@ -1911,5 +2219,313 @@ mod tests {
         )
         .is_err());
         assert!(!fingerprint_called.get());
+    }
+
+    fn git_in(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn partial_generate_args(workspace: &Path, output: &Path) -> GenerateHashesArgs {
+        GenerateHashesArgs {
+            hashing: hashing_args(workspace),
+            content_hash_path: None,
+            include_target_type: false,
+            target_type: Vec::new(),
+            dep_edges_file: None,
+            modified_filepaths: None,
+            partial_graph: true,
+            partial_graph_rebuild_patterns: Vec::new(),
+            base_hashes: None,
+            git_path: PathBuf::from("git"),
+            output_path: Some(output.to_path_buf()),
+        }
+    }
+
+    /// A partial-graph entry for the repository's current tree whose only target is the source
+    /// file `file.txt`, as a full generation in the mode would write it.
+    fn partial_base(repo: &Path, path: &Path) -> HashFileData {
+        let git = Git::new("git", repo);
+        let tree = git.snapshot_working_tree(&[]).unwrap();
+        let recipes = bazel_diff::partial::PartialRecipes {
+            version: bazel_diff::partial::RECIPE_VERSION,
+            seed_hash: "00".repeat(32),
+            package_seeds: true,
+            ..Default::default()
+        };
+        let targets = BTreeMap::from([("//:file.txt".to_owned(), "SourceFile".to_owned())]);
+        let data = HashFileData {
+            hashes: bazel_diff::partial::evaluate(&recipes, &targets, &tree).unwrap(),
+            partial: Some(recipes),
+            tree: tree.id().map(str::to_owned),
+            ..Default::default()
+        };
+        fs::write(
+            path,
+            serde_json::to_vec(&data.serialized(true, false)).unwrap(),
+        )
+        .unwrap();
+        data
+    }
+
+    #[test]
+    fn generate_partial_graph_flags_parse() {
+        let cli = parse(&[
+            "bazel-diff",
+            "generate-hashes",
+            "-w",
+            ".",
+            "--partialGraph",
+            "--partialGraphRebuildPattern",
+            "*.lock,third_party/**",
+            "--baseHashes",
+            "base.json",
+            "--gitPath",
+            "/opt/git",
+            "out.json",
+        ]);
+        let Commands::GenerateHashes(args) = cli.command else {
+            panic!("expected generate-hashes");
+        };
+        assert!(args.partial_graph);
+        assert_eq!(
+            args.partial_graph_rebuild_patterns,
+            ["*.lock", "third_party/**"]
+        );
+        assert_eq!(args.base_hashes, Some(PathBuf::from("base.json")));
+        assert_eq!(args.git_path, PathBuf::from("/opt/git"));
+        let Commands::GenerateHashes(defaults) =
+            parse(&["bazel-diff", "generate-hashes", "-w", "."]).command
+        else {
+            panic!("expected generate-hashes");
+        };
+        assert!(!defaults.partial_graph);
+        assert!(defaults.base_hashes.is_none());
+        assert_eq!(defaults.git_path, PathBuf::from("git"));
+    }
+
+    #[test]
+    fn generate_partial_graph_rejects_incompatible_options() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = workspace.path().join("out.json");
+        let never = |_: &HashOptions| -> Result<HashFileData> { panic!("must not generate") };
+        let error = |args: &GenerateHashesArgs| {
+            run_generate_with(args, false, never)
+                .unwrap_err()
+                .to_string()
+        };
+        let mut cquery = partial_generate_args(workspace.path(), &output);
+        cquery.hashing.use_cquery = true;
+        assert!(error(&cquery).contains("--useCquery"));
+        let mut content = partial_generate_args(workspace.path(), &output);
+        content.content_hash_path = Some(workspace.path().join("content.json"));
+        fs::write(workspace.path().join("content.json"), "{}").unwrap();
+        assert!(error(&content).contains("--contentHashPath"));
+        let mut modified = partial_generate_args(workspace.path(), &output);
+        modified.modified_filepaths = Some(workspace.path().join("modified.txt"));
+        fs::write(workspace.path().join("modified.txt"), "").unwrap();
+        assert!(error(&modified).contains("--modified-filepaths"));
+        let mut typed = partial_generate_args(workspace.path(), &output);
+        typed.target_type = vec!["Rule".into()];
+        assert!(error(&typed).contains("--targetType"));
+        let mut pattern = partial_generate_args(workspace.path(), &output);
+        pattern.partial_graph_rebuild_patterns = vec!["[".into()];
+        assert!(!error(&pattern).is_empty());
+        let mut without_mode = partial_generate_args(workspace.path(), &output);
+        without_mode.partial_graph = false;
+        without_mode.base_hashes = Some(workspace.path().join("base.json"));
+        assert!(error(&without_mode).contains("--baseHashes needs --partialGraph"));
+        // Not a git repository: the snapshot fails before any generation.
+        assert!(!error(&partial_generate_args(workspace.path(), &output)).is_empty());
+    }
+
+    #[test]
+    fn generate_partial_graph_derives_from_base_or_falls_back() {
+        let repo = tempfile::tempdir().unwrap();
+        git_in(repo.path(), &["init", "-q"]);
+        git_in(repo.path(), &["config", "user.email", "test@example.com"]);
+        git_in(repo.path(), &["config", "user.name", "Test"]);
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        git_in(repo.path(), &["add", "-A"]);
+        git_in(repo.path(), &["commit", "-q", "-m", "one"]);
+        let base_path = repo.path().join("base.json");
+        let base = partial_base(repo.path(), &base_path);
+        let output = repo.path().join("out.json");
+        let never = |_: &HashOptions| -> Result<HashFileData> { panic!("must not generate") };
+        let mut args = partial_generate_args(repo.path(), &output);
+        args.base_hashes = Some(base_path.clone());
+
+        // The base already describes the working tree: returned as is, no generation.
+        let same = run_generate_with(&args, false, never).unwrap();
+        assert_eq!(same.hashes, base.hashes);
+        assert_eq!(same.tree, base.tree);
+
+        // An uncommitted source edit is derived: no generation, a new tree, a moved hash.
+        fs::write(repo.path().join("file.txt"), "two").unwrap();
+        let derived = run_generate_with(&args, false, never).unwrap();
+        assert_ne!(derived.tree, base.tree);
+        assert_ne!(derived.hashes["//:file.txt"], base.hashes["//:file.txt"]);
+        assert_eq!(derived.partial, base.partial);
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(written["metadata"]["tree"], derived.tree.clone().unwrap());
+        assert!(
+            written["hashes"]["//:file.txt"]
+                .as_str()
+                .unwrap()
+                .starts_with("SourceFile#"),
+            "partial-graph files always carry target types: {written}"
+        );
+        // The hash files inside the workspace are not part of the snapshot.
+        let expected_tree = |excluded: &[&Path]| {
+            Git::new("git", repo.path())
+                .snapshot_working_tree(excluded)
+                .unwrap()
+                .id()
+                .map(str::to_owned)
+        };
+        assert_eq!(derived.tree, expected_tree(&[&output, &base_path]));
+        assert_ne!(derived.tree, expected_tree(&[]));
+
+        // A graph-defining edit falls back to a full generation that hashes from the tree.
+        fs::write(repo.path().join("BUILD"), "").unwrap();
+        let generated = std::cell::Cell::new(false);
+        let full = run_generate_with(&args, false, |options| {
+            generated.set(true);
+            let tree = options.partial_tree.as_ref().expect("tree for generation");
+            assert!(tree.get("BUILD").is_some());
+            assert_eq!(
+                options.content_hashes.as_ref().unwrap()["file.txt"],
+                tree.content_hashes()["file.txt"]
+            );
+            Ok(HashFileData {
+                tree: tree.id().map(str::to_owned),
+                ..Default::default()
+            })
+        })
+        .unwrap();
+        assert!(generated.get());
+        assert_eq!(full.tree, expected_tree(&[&output, &base_path]));
+        fs::remove_file(repo.path().join("BUILD")).unwrap();
+
+        // A base without recipes or without a tree, and no base at all, all generate.
+        let counted = |args: &GenerateHashesArgs| {
+            let calls = std::cell::Cell::new(0);
+            run_generate_with(args, false, |_| {
+                calls.set(calls.get() + 1);
+                Ok(HashFileData::default())
+            })
+            .unwrap();
+            calls.get()
+        };
+        let mut no_recipes = base.clone();
+        no_recipes.partial = None;
+        fs::write(
+            &base_path,
+            serde_json::to_vec(&no_recipes.serialized(true, false)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(counted(&args), 1);
+        let mut with_edges = partial_generate_args(repo.path(), &output);
+        with_edges.base_hashes = Some(base_path.clone());
+        with_edges.dep_edges_file = Some(repo.path().join("deps.json"));
+        fs::write(
+            &base_path,
+            serde_json::to_vec(&base.serialized(true, false)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            counted(&with_edges),
+            1,
+            "a base without edges cannot feed -d"
+        );
+        let mut edged = base.clone();
+        edged.dep_edges = BTreeMap::from([("//:file.txt".to_owned(), vec![])]);
+        fs::write(
+            &base_path,
+            serde_json::to_vec(&edged.serialized(true, true)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(counted(&with_edges), 0, "a base with edges derives");
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(
+            written["metadata"]["depEdges"]["//:file.txt"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            fs::read(repo.path().join("deps.json")).unwrap(),
+            br#"{"//:file.txt":[]}"#
+        );
+        let mut no_tree = base.clone();
+        no_tree.tree = None;
+        fs::write(
+            &base_path,
+            serde_json::to_vec(&no_tree.serialized(true, false)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(counted(&args), 1);
+        let mut unknown_tree = base.clone();
+        unknown_tree.tree = Some("0".repeat(40));
+        fs::write(
+            &base_path,
+            serde_json::to_vec(&unknown_tree.serialized(true, false)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            counted(&args),
+            1,
+            "a base tree missing from the clone falls back"
+        );
+        assert_eq!(counted(&partial_generate_args(repo.path(), &output)), 1);
+        // A base file that cannot be read is a misconfiguration, not a fallback.
+        args.base_hashes = Some(repo.path().join("missing.json"));
+        assert!(run_generate_with(&args, false, never)
+            .unwrap_err()
+            .to_string()
+            .contains("missing.json"));
+    }
+
+    #[test]
+    fn impacted_and_explain_refuse_mixed_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let explain = explain_args(dir.path(), &[]);
+        let (from, to, deps) = explain_fixture(dir.path());
+        let mut partial = HashFileData::read(&to).unwrap();
+        partial.partial = Some(bazel_diff::partial::PartialRecipes::default());
+        fs::write(
+            &to,
+            serde_json::to_vec(&partial.serialized(true, false)).unwrap(),
+        )
+        .unwrap();
+        let error = run_get_impacted(
+            &GetImpactedTargetsArgs {
+                starting_hashes: from.clone(),
+                final_hashes: to.clone(),
+                dep_edges_file: Some(deps.clone()),
+                target_type: Vec::new(),
+                output: None,
+                workspace_path: dir.path().to_path_buf(),
+                bazel_path: PathBuf::from("/definitely/missing/bazel"),
+                bazel_startup_options: Vec::new(),
+                no_bazelrc: false,
+                exclude_external_targets: Some(false),
+            },
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("same mode"), "{error}");
+        let error = run_explain(&explain, false).unwrap_err().to_string();
+        assert!(error.contains("same mode"), "{error}");
     }
 }

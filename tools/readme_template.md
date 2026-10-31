@@ -68,6 +68,59 @@ See https://github.com/aspect-extensions/impacted
 
 * We run `bazel-diff` on the starting and final JSON hash filepaths to get our impacted set of targets. This impacted set of targets is written to a file.
 
+## Partial Graph Updates
+
+A full `generate-hashes` pays for a `bazel query` over the whole graph even when the change
+cannot have altered that graph: editing the body of a source file changes what Bazel builds,
+never which targets exist or how they depend on each other. `generate-hashes --partialGraph`
+skips that query when it can:
+
+* The hashes describe the workspace's *git tree* rather than the files on disk: the working tree
+  as it stands, committed or not, is written as a tree object (an untracked file `.gitignore`
+  does not exclude is part of it, an ignored one is not, and neither are the hash files the run
+  itself reads and writes: the output, `--baseHashes` and `--depEdgesFile`), and source content
+  is read from that tree. A clean working tree yields the commit's own tree. The file records
+  the tree's id under `metadata.tree`, and every rule's hashing *recipe* (the digest of
+  everything that feeds its hash except source content, plus its ordered source inputs and
+  dependencies) under `metadata.partialGraph`. The file always includes every target's type, as
+  `--includeTargetType` would.
+* With `--baseHashes <file>` naming a file written this way, the recipes it carries are
+  re-evaluated against the workspace's tree when `git diff` between the two trees only modifies
+  the content of regular files -- no `bazel query`, no Bazel at all. Anything else falls back to a
+  full generation: an added, deleted, renamed or type-changed path; a symlink or submodule on
+  either side; a change to a file Bazel reads while loading (`BUILD`, `BUILD.bazel`, `*.bzl`,
+  `*.scl`, `MODULE.bazel`, `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`, `VENDOR.bazel`,
+  `*bazelrc`, `.bazelversion`, `.bazelignore`, `.bazeliskrc`, `tools/bazel`, `*.BUILD`,
+  `BUILD.*`, `*.patch`, `*.diff`); a file `MODULE.bazel` or a `WORKSPACE` file names by label;
+  anything a repository rule read from the workspace while the graph was generated; a
+  `--seed-filepaths` file; a path matching `--partialGraphRebuildPattern` (a glob: `*` within a
+  path segment, `**` across, a pattern without `/` matches the file name; repeatable); or a base
+  whose tree the local clone does not have. A fallback costs speed, never correctness, and the
+  log says which path each run took. A modified file no target reads impacts nothing, as it
+  would in a full generation.
+* The file a derivation writes is byte-identical to the one a full generation under the flag
+  writes for the same tree, so derived files are themselves bases for later runs. A base that
+  already describes the workspace's tree is written back as is. With `--depEdgesFile` the hash
+  file also carries the dependency edges, so a derivation can write them; a base without them
+  cannot feed `--depEdgesFile` and forces a full generation.
+* Hashes under the flag follow a slightly different formula from the default mode's, so
+  `get-impacted-targets` and `explain` refuse a pair of files of which only one carries recipes.
+  Not supported together with `--useCquery`, `--fineGrainedHashExternalRepos`,
+  `--alwaysAffectedTags`, `--contentHashPath`, `--modified-filepaths` or `--targetType` (a file
+  missing targets cannot be derived from; filter in `get-impacted-targets` instead): a derivation
+  reads only the git tree and keys recipes by bare label. The workspace must be the repository
+  root, and `--gitPath` names the git binary (default `git`).
+
+A typical CI job hashes the merge base once on the main branch and keeps the file; a pull
+request run then needs no Bazel for the common case of a source-only change:
+
+```terminal
+bazel-diff generate-hashes -w . -b bazel --partialGraph --baseHashes main_hashes.json pr_hashes.json
+bazel-diff get-impacted-targets --startingHashes main_hashes.json --finalHashes pr_hashes.json -o impacted.txt
+```
+
+The [query service](#query-service) runs the same derivation server-side behind a cache.
+
 ## Build Graph Distance Metrics
 
 `bazel-diff` can optionally compute build graph distance metrics between two revisions. This is
@@ -199,7 +252,7 @@ supported for production use.
 
 Instead of running `generate-hashes` from scratch on every CI invocation, you can run `bazel-diff` as
 a long-running HTTP service that answers affectedness queries between two git revisions and caches
-the generated hashes per commit SHA. This is the "bazel-diff as a service" model described in the
+the generated hashes per git tree. This is the "bazel-diff as a service" model described in the
 [BazelCon talk](https://youtu.be/9Dk7mtIm7_A?t=1875) that inspired this repo (see
 [issue #29](https://github.com/Tinder/bazel-diff/issues/29)).
 
@@ -214,8 +267,11 @@ bazel-diff serve \
 ```
 
 On startup the service performs an initial `git fetch` and only then reports healthy. For each
-request it resolves the `from`/`to` revisions, generates (and caches, keyed by commit SHA) the hashes
-for each, and reuses the exact same affectedness logic as `get-impacted-targets`.
+request it resolves the `from`/`to` revisions, generates (and caches, keyed by the commit's tree hash,
+so a rebase, an amended message, or a merge commit that changes no file reuses the entry) the hashes
+for each, and reuses the exact same affectedness logic as `get-impacted-targets`. Source files are
+hashed from the blob ids git already holds (one `git ls-tree` per revision) rather than by reading
+the working tree, so a cold hash costs the `bazel query`, not a read of every file.
 
 Endpoints:
 
@@ -299,7 +355,11 @@ curl 'http://localhost:8080/dependency_edges?from=main&to=my-feature-branch'
   identity, liveness, and cache size usage without scraping logs. Unlike the query endpoints it is
   never gated on readiness, so it still responds on an un-ready or lame-ducked instance (the `ready`
   field reports the current state). The `cache` size fields are populated for the local-disk backend
-  and are `null` for a backend whose size is not cheaply knowable in-process.
+  and are `null` for a backend whose size is not cheaply knowable in-process. `activeQueries` counts
+  the queries accepted and not yet finished (queued, running, or abandoned by a client that stopped
+  waiting), and `workspaceBusy` is `true` while any operation holds `--workspacePath` (a query's
+  checkout and `bazel query`, or a startup warmup). A tool that shares the checkout with the server
+  should wait for `workspaceBusy` to be `false` before touching it.
 
 ```bash
 curl 'http://localhost:8080/metrics'
@@ -310,9 +370,11 @@ curl 'http://localhost:8080/metrics'
   "version": "31.4.0",
   "uptimeSeconds": 3600,
   "ready": true,
+  "activeQueries": 1,
+  "workspaceBusy": true,
   "gitEngine": "subprocess",
   "trackDeps": false,
-  "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB"},
+  "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB", "memory": {"entries": 2, "sizeBytes": 75374, "maxBytes": 536870912}},
   "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
 }
 ```
@@ -334,7 +396,10 @@ bazel-diff serve \
 
 With `--s3Bucket` set the cache becomes two-tiered: reads check local disk first and fall back to
 the bucket (backfilling local disk on a hit), and every generated entry is published to both, so
-any replica can serve a revision another replica already hashed. Credentials and region resolve
+any replica can serve a revision another replica already hashed. Entries are published
+gzip-compressed as `<key>.json.gz`, 2-3x smaller than the JSON a replica keeps on local disk; a
+read tries the compressed object first and falls back to the plain `<key>.json` an older release
+wrote, so a mixed fleet keeps sharing entries during an upgrade. Credentials and region resolve
 through the standard AWS default provider chains (environment variables, profile, IRSA web
 identity on EKS, IMDS), or pin the region with `--s3Region`. `--s3Endpoint` plus
 `--s3ForcePathStyle` point the client at an S3-compatible store (MinIO, LocalStack) for local
@@ -346,6 +411,40 @@ degrades throughput rather than availability. Concurrent replicas racing to hash
 revision are also harmless — entries are deterministic per key, so last-write-wins over identical
 content. The `--cacheMax*` pruning flags bound the *local* tier only; bound the bucket with an S3
 lifecycle policy instead.
+
+### Shared GCS cache
+
+A Google Cloud Storage bucket can serve as the shared tier instead of S3 when the service runs on
+Google Cloud. It behaves exactly like the S3 tier above — local disk first, GCS on a local miss
+(backfilling disk on a hit), every generated entry published to both, and every GCS failure
+degraded to a miss or a local-only write — and the shared-tier backends are mutually exclusive.
+
+```bash
+bazel-diff serve \
+  --workspacePath /path/to/workspace-clone \
+  --cacheDir /var/cache/bazel-diff \
+  --gcsBucket my-hash-cache-bucket \
+  --gcsPrefix bazel-diff/my-repo
+```
+
+Entries live at `gs://<gcsBucket>/<gcsPrefix>/<key>.json.gz` (gzip-compressed, with the same
+fallback read of a plain `<key>.json` as the other tiers) and are read and written through the
+JSON API at `storage.googleapis.com`. `/metrics` reports the tier as that `gs://` location.
+
+* **Credentials.** The service uses
+  [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials):
+  `GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account key file, the credentials
+  `gcloud auth application-default login` stores, or the metadata server on GCE and GKE
+  (Workload Identity). They are resolved once at startup, so a misconfigured environment fails
+  fast. No HMAC keys or AWS settings are involved.
+* **Permissions.** The account needs `storage.objects.get` and `storage.objects.create` on the
+  bucket, plus `storage.objects.delete` so a replica can overwrite an entry another replica
+  already published (`roles/storage.objectUser` grants all three).
+* **Retention.** The `--cacheMax*` flags prune local disk only; bound the bucket with a GCS
+  lifecycle rule.
+
+CI exercises the GCS backend against a mock HTTP server only; it has not been validated against a
+real bucket by this repository's CI.
 
 ### Shared Sonatype Nexus cache
 
@@ -366,8 +465,9 @@ bazel-diff serve \
   --nexusUsername bazel-diff-svc
 ```
 
-Entries live at `<nexusUrl>/repository/<nexusRepository>/<nexusPrefix>/<key>.json` and are read
-and written with plain `GET`/`PUT` against Nexus's raw content API. Include any context path Nexus
+Entries live at `<nexusUrl>/repository/<nexusRepository>/<nexusPrefix>/<key>.json.gz`
+(gzip-compressed, with a fallback read of the plain `<key>.json` an older release wrote) and are
+read and written with plain `GET`/`PUT` against Nexus's raw content API. Include any context path Nexus
 is served under in `--nexusUrl` (e.g. `https://example.com/nexus`).
 
 * **Repository setup.** Create a *raw (hosted)* repository and set its *Deployment policy* to
@@ -408,16 +508,61 @@ Notes and operational guidance:
   not part of the cache key: a guarded server rewrites unguarded entries with a fingerprint as it
   regenerates them, and an unguarded server serves guarded entries as-is.
 
+* Partial graph updates (`--partialGraph`) are opt-in. A full generation pays for a `bazel query`
+  over the whole graph even when the change cannot have altered that graph: editing the body of a
+  source file changes what Bazel builds, never which targets exist or how they depend on each
+  other. With the flag on, every generated entry also records a hashing *recipe* per target (the
+  digest of everything that feeds its hash except source content, plus its ordered source inputs
+  and dependencies), and a request whose `to` revision is not cached is answered by re-evaluating
+  the cached `from` entry's recipes against `git ls-tree` of `to` -- no checkout, no `bazel query`
+  -- when `git diff` between the two only modifies the content of regular files. Anything else
+  falls back to a full generation: an added, deleted, renamed or type-changed path; a symlink or
+  submodule on either side; a change to a file Bazel reads while loading (`BUILD`, `BUILD.bazel`,
+  `*.bzl`, `*.scl`, `MODULE.bazel`, `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`,
+  `VENDOR.bazel`, `*bazelrc`, `.bazelversion`, `.bazelignore`, `.bazeliskrc`, `tools/bazel`,
+  `*.BUILD`, `BUILD.*`, `*.patch`, `*.diff`); a file `MODULE.bazel` or a `WORKSPACE` file names
+  by label (a requirements or lock file a module extension reads); anything a repository rule
+  read from the workspace while the graph was generated (the root of a `local_repository` or
+  `local_path_override`, the files its attributes name, and the files Bazel's repository marker
+  files record as read), which every entry records; a `--seed-filepaths` file; or
+  a path matching `--partialGraphRebuildPattern` (a glob: `*` within a path segment, `**` across,
+  a pattern without `/` matches the file name; repeatable). A fallback costs speed, never
+  correctness. A modified file no target reads impacts nothing, as it would in a full generation.
+  The entry a derivation writes is byte-identical to the one a full generation under the flag
+  writes for the same revision, so derived entries are themselves bases for later derivations and
+  are shared through the S3 or Nexus tier like any other. Hashes under the flag follow a slightly
+  different formula from the default mode's, so the flag is part of the cache key and entries of
+  the two modes are never compared with one another. The profile reports how an entry was
+  produced (`generation.mode` is `derived` or `full`, with `partialFallbackReason`, `changedSources`,
+  `unmatchedPaths`, `classifyMillis` and `deriveMillis`), `/metrics` counts both under
+  `partialGraph`, and the server log says which path each generation took. Not supported together
+  with `--useCquery`, `--fineGrainedHashExternalRepos` or `--alwaysAffectedTags` (the server
+  refuses to start): a derivation reads only the git tree and keys recipes by bare label. The
+  nightly [`partial-graph-bench`](.github/workflows/partial-graph-bench.yml) workflow checks the
+  mode's speed and its exact agreement with the default mode (see `tools/perf/README.md`). The
+  one-shot `generate-hashes --partialGraph` writes the same entries (see [Partial Graph
+  Updates](#partial-graph-updates)).
+
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
   so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.
+* `--requestTimeout <seconds>` (default `0`, no limit) bounds how long a query may run. A query that
+  exceeds it is cancelled, not merely abandoned: its `git` and `bazel` subprocesses are killed, the
+  hashes it had not finished generating are not written to the local or shared cache, and the `504`
+  is sent only after the query has released the workspace. The `504` body reports `cancelled`
+  (`true` once the query has stopped; `false` only if it was still winding down a minute later, in
+  which case `/metrics` `activeQueries` reports when it is done) and `workspaceBusy` (whether
+  another operation holds the workspace at that moment). A client that enforces its own deadline
+  instead cannot cancel the server-side work: it keeps running to completion, so poll `/metrics` for
+  `workspaceBusy` before reusing the checkout, or prefer `--requestTimeout`. A killed `git checkout`
+  can leave the clone mid-switch; the next query repairs it with `git checkout --force`.
 * Git operations (fetch and checkout) shell out to the `git` binary at `--gitPath` (default `git`
   on the `PATH`), so a `git` binary must be available on the host. The working tree is checked out
   on disk for `bazel query` to read. Because native git performs every fetch, all clone shapes are
   supported -- including shallow (`--depth`) and partial (`--filter=blob:none`) clones, whose thin
   packs are delta-compressed against objects the clone does not have.
 * Hashes are cached on local disk via `--cacheDir` and survive restarts. Left unbounded the cache
-  grows by one entry per distinct commit SHA queried, so a long-running server can bound it with any
+  grows by one entry per distinct tree hashed, so a long-running server can bound it with any
   combination of `--cacheMaxAge` (expire entries not read or written within a window, e.g. `7d`),
   `--cacheMaxEntries`, and `--cacheMaxSize` (e.g. `10GB`, `500MB`, or a bare byte count). A background
   sweeper enforces the limits once at startup and then every `--cachePruneInterval` (default `1h`),
@@ -426,13 +571,19 @@ Notes and operational guidance:
   cache is never pruned (the previous behavior). The `--cacheMax*` flags always bound the local-disk
   tier only; the shared S3 or Nexus tier (see above) manages its own retention via a bucket
   lifecycle policy or a Nexus cleanup policy.
+* Parsed entries are also kept in memory, least recently used out first, within `--cacheMemoryMax`
+  (default `512MB`; `0` disables the tier). Nearly every request shares its `from` revision with
+  the previous one, and reading and parsing a large entry costs seconds, so a repeated revision
+  skips the disk read and the JSON parse entirely. The budget counts each entry's serialized size,
+  a proxy for its heap footprint, and `/metrics` reports the tier under `cache.memory`.
 * Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
   `generate-hashes`, and are folded into the cache key so a server started with different flags never
   serves another configuration's cached hashes.
 * `modifiedFilepaths` (POST only) is scoped per request, not a server flag. A scoped hash of a
   revision is only comparable to another revision hashed with the *same* set, so cached scoped
-  entries are keyed by `<sha>.<fingerprint>.<digest-of-the-set>` — never mixed with, or served in
-  place of, the full-content `<sha>.<fingerprint>` entry. The trade-off: on the scoped path the
+  entries are keyed by `<tree>.<fingerprint>.<digest-of-the-set>` — never mixed with, or served in
+  place of, the full-content `<tree>.<fingerprint>` entry. Scoped entries read the listed files from
+  disk; only the full-content entry is seeded from git blob ids. The trade-off: on the scoped path the
   shared-base full-hash cache is not reused (each distinct changed-set re-hashes the base), but each
   such hash is cheaper because it skips reading unchanged files. The extra entries are bounded by the
   same LRU `--cacheMax*` pruning as everything else.
@@ -449,6 +600,39 @@ are the summation of the rule implementation hash, the SHA256 value
 for every attribute of the rule and then the summation of the SHA256 value for
 all `rule_inputs` using the same exact algorithm. For source_file inputs the
 content of the file are converted into a SHA256 value.
+
+A few inputs are normalized or extended on the way in:
+
+* A source label that names a **directory** hashes the whole tree (entry names, kinds, file
+  contents and executable bits, symlink targets), so an edit inside it impacts its consumers.
+* A **repository rule** (`//external:*`) that pins its download with `sha256` or `integrity` is
+  hashed without its `url`/`urls`, since a mirror or registry move cannot change what it fetches.
+  The main-repository files its attributes name -- patches, build files, lock files -- are hashed
+  by content, so a changed patch is a changed repository.
+  An attribute that names a workspace path absolutely (a crate or Go module built from a directory
+  in the workspace, a `file://%workspace%` registry URL) is hashed relative to the workspace, so
+  identical checkouts at different paths hash the same.
+  In query mode the module that owns a module extension stands in for every repository the
+  extension generates, because a toolchain resolved from one of them is not a query input. A
+  fine-grained target inside one of those repositories that uses a rule from the owning module
+  therefore changes whenever any repository of the extension does. Listing the extension in
+  `--labelOnlyModuleExtensions` (for example `@rules_rs//rs:extensions.bzl%crate`) asserts that
+  its repositories use each other only through labels, so such a target reaches the owning module
+  without them. Do not list an extension whose targets resolve a toolchain the same extension
+  generates: that change would be missed. An extension whose name another `.bzl` file of the same
+  module also exports is reported and ignored, since Bazel tells their repositories apart only by
+  a numeric suffix.
+  Bzlmod repositories are read from `bazel mod show_repo`, asked for by name in as many
+  invocations as the platform's command-line limit allows, or in one `--all_repos` invocation
+  when that would take several. The limit is 8191 characters wherever `cmd.exe` is involved --
+  a `--bazelPath` naming a batch file, or Bazelisk running a workspace's `tools/bazel.bat`
+  wrapper -- so on Windows each invocation is given at most 6 KiB of names. Set
+  `BAZEL_DIFF_MOD_ARGUMENT_BYTE_BUDGET` to a byte count to change that on any platform.
+* A **dependency cycle** in the query graph (which a build never sees, but which rules_go's
+  `go_context_data` and nogo analyzers form through non-dependency attributes) no longer fails
+  hashing. The back edge is hashed from the entered target's own definition, with a one-line
+  warning naming the cycle. Targets are visited in label order so the result does not depend on
+  the order `bazel query` emitted them.
 
 ## Installing
 
@@ -481,21 +665,6 @@ With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 ```bazel
 bazel_dep(name = "bazel-diff", version = "{{BAZEL_DIFF_VERSION}}")
 ```
-
-Until `rules_rs` fixes `all_crate_deps(package_name = "")`, copy
-[`rules_rs_package_name.patch`](patches/rules_rs_package_name.patch) into your
-workspace root and add this override to the same `MODULE.bazel`:
-
-```bazel
-single_version_override(
-    module_name = "rules_rs",
-    version = "0.0.112",
-    patch_strip = 1,
-    patches = ["//:rules_rs_package_name.patch"],
-)
-```
-
-Bazel only applies overrides from the root module.
 
 You can now run the tool with:
 

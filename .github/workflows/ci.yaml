@@ -32,10 +32,23 @@ jobs:
             sleep 10
           done
       - uses: actions/checkout@v4
+      # GitHub-cached repository and disk caches (.github/actions/cache-bazel):
+      # read on every ref, saved from master. $BAZEL_DISK_CACHE holds the
+      # disk-cache flags for the outer command only.
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: ${{ matrix.bazel }}
+          disk-cache: candidate-${{ matrix.bazel }}
+      # --config=ci writes bazel-bep.json (see .bazelrc). On failure, the report
+      # step prints the stderr of failed actions and the test.log of failed tests
+      # as annotations and a job summary.
       - name: Check Bazel build and tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        run: ~/go/bin/bazelisk test //:rust_tests //:rust_clippy_check //:rust_format_check //tools/... --enable_bzlmod=true --enable_workspace=false
+        run: ~/go/bin/bazelisk test //:rust_tests //:rust_clippy_check //:rust_format_check //tools/... --enable_bzlmod=true --enable_workspace=false --config=ci $BAZEL_DISK_CACHE
+      - name: Report Bazel failures
+        if: failure()
+        run: python3 tools/report_bazel_failures.py bazel-bep.json
 
   rust-candidate-e2e:
     name: Rust candidate E2E
@@ -63,11 +76,18 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           echo "BAZEL=$(go env GOPATH)/bin/bazelisk" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: '8.x'
+          disk-cache: e2e-8.x
       - name: Run native behavioral suite
         env:
           # Read twice: by the outer bazelisk, and by the nested one.
           USE_BAZEL_VERSION: '8.x'
-        run: bazelisk test //tests:e2e_test --enable_bzlmod=true --enable_workspace=false
+        run: bazelisk test //tests:e2e_test --enable_bzlmod=true --enable_workspace=false --config=ci $BAZEL_DISK_CACHE
+      - name: Report Bazel failures
+        if: failure()
+        run: python3 tools/report_bazel_failures.py bazel-bep.json
 
   # Check the generated E2E targets and the generator in //tools/e2e.
   e2e-split-regen:
@@ -87,10 +107,16 @@ jobs:
             sleep 10
           done
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: '8.x'
       - name: Check the e2e test split is up to date
         env:
           USE_BAZEL_VERSION: '8.x'
-        run: ~/go/bin/bazelisk test //tools/e2e:regen_check //tools/e2e:split_e2e_tests_test --enable_bzlmod=true --enable_workspace=false --test_output=errors
+        run: ~/go/bin/bazelisk test //tools/e2e:regen_check //tools/e2e:split_e2e_tests_test --enable_bzlmod=true --enable_workspace=false --test_output=errors --config=ci
+      - name: Report Bazel failures
+        if: failure()
+        run: python3 tools/report_bazel_failures.py bazel-bep.json
 
   rust-candidate-msrv:
     name: Rust candidate MSRV
@@ -109,6 +135,9 @@ jobs:
             sleep 10
           done
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: '8.x'
       # Match Cargo.toml's rust-version. --extra_toolchains takes precedence
       # over registered toolchains. Clippy and rustfmt use the default compiler.
       - name: Check declared minimum Rust version
@@ -118,7 +147,10 @@ jobs:
           ~/go/bin/bazelisk build //src:bazel-diff \
             --extra_toolchains=@bd_msrv//rustc:all \
             --output_groups=-clippy_checks,-rustfmt_checks \
-            --enable_bzlmod=true --enable_workspace=false
+            --enable_bzlmod=true --enable_workspace=false --config=ci
+      - name: Report Bazel failures
+        if: failure()
+        run: python3 tools/report_bazel_failures.py bazel-bep.json
 
   # Enforce 90% line coverage for Rust and Go on Linux and macOS.
   coverage:
@@ -152,17 +184,20 @@ jobs:
           done
           export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: ${{ matrix.bazel }}
       - name: Build license target
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        run: ~/go/bin/bazelisk build //:license --enable_bzlmod=true --enable_workspace=false
+        run: ~/go/bin/bazelisk build //:license --enable_bzlmod=true --enable_workspace=false --config=ci
       - name: Run bazel-diff tests with coverage
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
         # Retries guard against transient toolchain/crate fetch errors failing the whole job.
         run: |
           for i in 1 2 3; do
-            ~/go/bin/bazelisk coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false && break
+            ~/go/bin/bazelisk coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false --config=ci && break
             if [ "$i" = 3 ]; then exit 1; fi
             echo "coverage run failed (attempt $i); retrying in 15s..."
             sleep 15
@@ -179,12 +214,15 @@ jobs:
           # Reuse the coverage step's Bazel version and output directory.
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           COVERAGE_THRESHOLD: '90'
-        run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+        run: ~/go/bin/bazelisk run //tools:coverage-check --config=ci -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
       - name: Enforce Go coverage threshold (>= 90% line coverage under tools/go/)
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
         # Enforce coverage for tools/go/ independently of Rust coverage.
-        run: ~/go/bin/bazelisk run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
+        run: ~/go/bin/bazelisk run //tools:coverage-check --config=ci -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
+      - name: Report Bazel failures
+        if: failure()
+        run: python3 tools/report_bazel_failures.py bazel-bep.json
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()
@@ -203,7 +241,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            bazel: '8.5.0'
+            bazel: '8.7.0'
             disable_workspace: 'true'
             extra_flags: ''
           - os: ubuntu-latest
@@ -261,6 +299,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # The example script runs Bazel itself; the repository cache reaches it
+      # through the system rc the action writes.
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: ${{ matrix.bazel }}
       - name: Run bazel-diff example script (Linux)
         if: runner.os != 'Windows'
         env:
@@ -290,13 +333,29 @@ jobs:
         #
         # Keep Windows output paths short for the build and nested queries.
         # A startup option cannot live in a --config.
+        #
+        # Build bazel-diff once at HEAD and hand the script that binary
+        # (BAZEL_DIFF_BINARY) instead of letting it `bazel run` at each
+        # revision: rebuilding the previous revision in the output base the
+        # HEAD build populated fails MSVC's include validation when the two
+        # revisions resolve different rules_cc versions (undeclared inclusion
+        # of a _virtual_includes header). Linux's clang checking is unaffected.
         run: |
           New-Item -ItemType Directory -Force -Path "$env:ProgramData" | Out-Null
           Add-Content -Path "$env:ProgramData\bazel.bazelrc" -Value "startup --output_base=C:/b"
           $prevRev = git rev-parse HEAD~1
           $currRev = git rev-parse HEAD
+          $bazel = "$env:USERPROFILE\go\bin\bazelisk.exe"
           for ($i = 1; $i -le 3; $i++) {
-            .\bazel-diff-example.ps1 -WorkspacePath "$env:GITHUB_WORKSPACE" -BazelPath "$env:USERPROFILE\go\bin\bazelisk.exe" -PreviousRevision $prevRev -FinalRevision $currRev
+            # -c opt matches the `run -c opt` the script's own `bazel run` would use.
+            & $bazel build -c opt //:bazel-diff
+            if ($LASTEXITCODE -eq 0) {
+              $execRoot = & $bazel info execution_root
+              $built = (& $bazel cquery -c opt --output=files //:bazel-diff) | Where-Object { $_ -match 'bazel-diff\.exe$' } | Select-Object -First 1
+              Copy-Item "$execRoot/$built" "$env:RUNNER_TEMP\bazel-diff.exe" -Force
+              $env:BAZEL_DIFF_BINARY = "$env:RUNNER_TEMP\bazel-diff.exe"
+              .\bazel-diff-example.ps1 -WorkspacePath "$env:GITHUB_WORKSPACE" -BazelPath $bazel -PreviousRevision $prevRev -FinalRevision $currRev
+            }
             if ($LASTEXITCODE -eq 0) { break }
             if ($i -eq 3) { exit 1 }
             Write-Host "example script failed (attempt $i); retrying in 15s..."
@@ -362,6 +421,9 @@ jobs:
           }
           echo "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cache-bazel
+        with:
+          bazel-version: bazelversion
       # Use the same archive script as release_prep.sh.
       - name: Build release source archive
         if: matrix.upload_archive
@@ -378,7 +440,7 @@ jobs:
         env:
           # Prevent Git Bash from rewriting Bazel target labels as Windows paths.
           MSYS2_ARG_CONV_EXCL: '//'
-        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} ${{ matrix.bazel_extra_flags }}
+        run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} --config=ci ${{ matrix.bazel_extra_flags }}
       - name: Validate Linux release binary
         if: runner.os == 'Linux'
         run: |
@@ -393,8 +455,14 @@ jobs:
       - name: Build Rust binary (linux-arm64)
         if: runner.os == 'Linux'
         run: |
-          bazelisk build //release:bazel-diff-rust --config=release-linux-arm64
+          bazelisk build //release:bazel-diff-rust --config=release-linux-arm64 --config=ci
           .github/workflows/assert_static_binary.sh bazel-bin/release/bazel-diff-rust-linux-arm64
+      - name: Report Bazel failures
+        if: failure()
+        shell: bash
+        run: |
+          py=$(command -v python3 || command -v python)
+          "$py" tools/report_bazel_failures.py bazel-bep.json
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Linux'
         with:

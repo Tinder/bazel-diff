@@ -1,4 +1,4 @@
-load("@bd_crates//:defs.bzl", "all_crate_deps")
+load("//:crate_deps.bzl", "normal_and_dev_crate_deps")
 load("//tools/e2e:defs.bzl", "rust_e2e_tests")
 load("//tools/e2e:rust_e2e_cases.bzl", "RUST_E2E_SUITES")
 
@@ -69,11 +69,7 @@ rust_e2e_tests(
     # un-split target this macro also emits, so they check the crate once
     # instead of once per case.
     visibility = ["//:__pkg__"],
-    deps = all_crate_deps(
-        package_name = "",
-        normal = True,
-        normal_dev = True,
-    ),
+    deps = normal_and_dev_crate_deps(),
 )
 
 # The Rust e2e sources //tools/e2e:regen_check re-derives the generated case

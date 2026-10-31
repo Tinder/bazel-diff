@@ -5,11 +5,15 @@
 //! tests; its module-level API is not a stability commitment.
 
 pub mod bazel;
+pub mod cache;
+pub mod cancel;
 pub mod explain;
 pub mod fingerprint;
+pub mod git;
 pub mod hash;
 pub mod model;
 pub mod module_graph;
+pub mod partial;
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/proto.rs"));

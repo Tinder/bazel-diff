@@ -148,6 +148,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::deleted_package_labels_are_not_impacted",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::extension_repo_nodes_are_stable_without_a_change",
                 "timeout": "moderate",
             },
@@ -233,6 +237,10 @@ RUST_E2E_SUITES = [
             },
             {
                 "name": "regressions::same_symbol_extension_failure_keeps_healthy_repo_hashed",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::serve_deleted_package_labels_are_not_impacted",
                 "timeout": "moderate",
             },
             {

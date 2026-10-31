@@ -705,6 +705,9 @@ pub fn validate_hash_options(options: &HashOptions) -> Result<()> {
     if !options.bazel.fine_grained_external_repos.is_empty() {
         bail!("--partialGraph does not support --fineGrainedHashExternalRepos");
     }
+    if options.bazel.isolated_dependency_root.is_some() {
+        bail!("--partialGraph does not support --isolatedDependencyRoot");
+    }
     if !options.always_affected_tags.is_empty() {
         bail!("--partialGraph does not support --alwaysAffectedTags");
     }

@@ -117,10 +117,15 @@ fn find_bazel() -> Option<PathBuf> {
 
 pub fn bazel_version() -> (u32, u32, u32) {
     let output = Command::new(bazel())
+        .current_dir(std::env::temp_dir())
         .arg("version")
         .output()
         .expect("run bazel version");
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let text = String::from_utf8_lossy(&output.stdout);
     let version = text
         .lines()

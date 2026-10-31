@@ -1,0 +1,4 @@
+filegroup(
+    name = "uses_owner",
+    srcs = ["@ext//:tool.sh"],
+)

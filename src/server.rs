@@ -764,6 +764,9 @@ pub fn validate_partial_graph(config: &ServerConfig) -> Result<()> {
 }
 
 pub fn serve(config: ServerConfig) -> Result<()> {
+    if let Some(root) = &config.hash_options.bazel.isolated_dependency_root {
+        bail!("serve does not support --isolatedDependencyRoot={root}");
+    }
     validate_partial_graph(&config)?;
     fs::create_dir_all(&config.cache_dir)?;
     let remote = RemoteCache::new(&config)?;
@@ -1959,6 +1962,7 @@ mod tests {
                     keep_going: false,
                     fine_grained_external_repos: BTreeSet::new(),
                     label_only_module_extensions: BTreeSet::new(),
+                    isolated_dependency_root: None,
                     exclude_external_targets: false,
                     exclude_targets_query: None,
                     no_bazelrc: false,
@@ -2260,6 +2264,21 @@ mod tests {
             }),
             "rebuild patterns only steer the classifier, never the hashes"
         );
+    }
+
+    #[test]
+    fn serve_rejects_isolated_root_before_cache_setup() {
+        let cache = tempfile::NamedTempFile::new().unwrap();
+        fs::write(cache.path(), b"preserved").unwrap();
+        let mut config = test_config();
+        config.cache_dir = cache.path().to_path_buf();
+        config.hash_options.bazel.isolated_dependency_root = Some("@hub".into());
+        assert!(validate_partial_graph(&config).is_ok());
+        assert_eq!(
+            serve(config).unwrap_err().to_string(),
+            "serve does not support --isolatedDependencyRoot=@hub"
+        );
+        assert_eq!(fs::read(cache.path()).unwrap(), b"preserved");
     }
 
     #[test]

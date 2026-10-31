@@ -412,6 +412,40 @@ revision are also harmless — entries are deterministic per key, so last-write-
 content. The `--cacheMax*` pruning flags bound the *local* tier only; bound the bucket with an S3
 lifecycle policy instead.
 
+### Shared GCS cache
+
+A Google Cloud Storage bucket can serve as the shared tier instead of S3 when the service runs on
+Google Cloud. It behaves exactly like the S3 tier above — local disk first, GCS on a local miss
+(backfilling disk on a hit), every generated entry published to both, and every GCS failure
+degraded to a miss or a local-only write — and the shared-tier backends are mutually exclusive.
+
+```bash
+bazel-diff serve \
+  --workspacePath /path/to/workspace-clone \
+  --cacheDir /var/cache/bazel-diff \
+  --gcsBucket my-hash-cache-bucket \
+  --gcsPrefix bazel-diff/my-repo
+```
+
+Entries live at `gs://<gcsBucket>/<gcsPrefix>/<key>.json.gz` (gzip-compressed, with the same
+fallback read of a plain `<key>.json` as the other tiers) and are read and written through the
+JSON API at `storage.googleapis.com`. `/metrics` reports the tier as that `gs://` location.
+
+* **Credentials.** The service uses
+  [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials):
+  `GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account key file, the credentials
+  `gcloud auth application-default login` stores, or the metadata server on GCE and GKE
+  (Workload Identity). They are resolved once at startup, so a misconfigured environment fails
+  fast. No HMAC keys or AWS settings are involved.
+* **Permissions.** The account needs `storage.objects.get` and `storage.objects.create` on the
+  bucket, plus `storage.objects.delete` so a replica can overwrite an entry another replica
+  already published (`roles/storage.objectUser` grants all three).
+* **Retention.** The `--cacheMax*` flags prune local disk only; bound the bucket with a GCS
+  lifecycle rule.
+
+CI exercises the GCS backend against a mock HTTP server only; it has not been validated against a
+real bucket by this repository's CI.
+
 ### Shared Sonatype Nexus cache
 
 If your organization already runs [Sonatype Nexus Repository](https://www.sonatype.com/products/sonatype-nexus-repository),

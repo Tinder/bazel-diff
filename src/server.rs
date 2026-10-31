@@ -66,6 +66,8 @@ pub struct ServerConfig {
     pub s3_region: Option<String>,
     pub s3_endpoint: Option<String>,
     pub s3_force_path_style: bool,
+    pub gcs_bucket: Option<String>,
+    pub gcs_prefix: String,
     pub nexus_url: Option<String>,
     pub nexus_repository: Option<String>,
     pub nexus_prefix: String,
@@ -301,6 +303,7 @@ impl Drop for ActiveQuery {
 /// outage of the shared store costs throughput, never availability.
 enum RemoteCache {
     S3(S3Cache),
+    Gcs(Box<GcsCache>),
     Nexus(Box<NexusCache>),
 }
 
@@ -308,6 +311,12 @@ impl RemoteCache {
     fn new(config: &ServerConfig) -> Result<Option<Self>> {
         if let Some(bucket_name) = &config.s3_bucket {
             return Ok(Some(Self::S3(S3Cache::new(config, bucket_name)?)));
+        }
+        if let Some(bucket_name) = &config.gcs_bucket {
+            return Ok(Some(Self::Gcs(Box::new(GcsCache::new(
+                bucket_name,
+                &config.gcs_prefix,
+            )?))));
         }
         if let (Some(url), Some(repository)) = (&config.nexus_url, &config.nexus_repository) {
             return Ok(Some(Self::Nexus(Box::new(NexusCache::new(
@@ -360,6 +369,7 @@ impl RemoteCache {
     fn fetch(&self, name: &str) -> Fetched {
         match self {
             Self::S3(cache) => cache.get(name),
+            Self::Gcs(cache) => cache.get(name),
             Self::Nexus(cache) => cache.get(name),
         }
     }
@@ -367,6 +377,7 @@ impl RemoteCache {
     fn store(&self, name: &str, data: &[u8], content_type: &str) {
         match self {
             Self::S3(cache) => cache.put(name, data),
+            Self::Gcs(cache) => cache.put(name, data, content_type),
             Self::Nexus(cache) => cache.put(name, data, content_type),
         }
     }
@@ -496,6 +507,158 @@ fn normalize_s3_prefix(prefix: &str) -> String {
     }
 }
 
+/// Produces a bearer token for `storage.googleapis.com`; abstracted so tests can run the backend
+/// against a local server without Google credentials.
+type GcsTokenSource = Box<dyn Fn() -> Result<String> + Send + Sync>;
+
+/// Cache entries stored as objects in a Google Cloud Storage bucket, addressed through the JSON
+/// API with a bearer token from Application Default Credentials: a media download
+/// `GET /storage/v1/b/<bucket>/o/<prefix><key>.json.gz?alt=media` and a media upload
+/// `POST /upload/storage/v1/b/<bucket>/o?uploadType=media&name=<prefix><key>.json.gz`.
+struct GcsCache {
+    session: attohttpc::Session,
+    endpoint: Url,
+    bucket: String,
+    prefix: String,
+    token_source: GcsTokenSource,
+}
+
+const GCS_ENDPOINT: &str = "https://storage.googleapis.com";
+const GCS_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
+
+impl GcsCache {
+    fn new(bucket: &str, prefix: &str) -> Result<Self> {
+        // `gcp_auth` is async-only. A single-threaded runtime owned by the token source drives
+        // credential discovery here and every later token refresh; the provider caches tokens, so
+        // a refresh is rare and `block_on` from a request thread is cheap.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create the GCS credential runtime")?;
+        let provider = runtime
+            .block_on(gcp_auth::provider())
+            .context("failed to resolve Google Cloud credentials")?;
+        Self::with_token_source(
+            bucket,
+            prefix,
+            GCS_ENDPOINT,
+            Box::new(move || {
+                let token = runtime
+                    .block_on(provider.token(&[GCS_SCOPE]))
+                    .context("failed to obtain a Google Cloud access token")?;
+                Ok(token.as_str().to_owned())
+            }),
+        )
+    }
+
+    fn with_token_source(
+        bucket: &str,
+        prefix: &str,
+        endpoint: &str,
+        token_source: GcsTokenSource,
+    ) -> Result<Self> {
+        let endpoint =
+            Url::parse(endpoint).with_context(|| format!("invalid GCS endpoint {endpoint:?}"))?;
+        if !matches!(endpoint.scheme(), "http" | "https") {
+            bail!("GCS endpoint must be http or https: {endpoint}");
+        }
+        if bucket.is_empty() || bucket.contains('/') {
+            bail!("GCS bucket must be a single non-empty name: {bucket:?}");
+        }
+        let mut session = attohttpc::Session::new();
+        session.connect_timeout(HTTP_CONNECT_TIMEOUT);
+        session.read_timeout(HTTP_READ_TIMEOUT);
+        // A redirect is reported, never followed: following one would replay the bearer token
+        // against whatever host the `Location` names.
+        session.follow_redirects(false);
+        Ok(Self {
+            session,
+            endpoint,
+            bucket: bucket.to_owned(),
+            prefix: normalize_s3_prefix(prefix),
+            token_source,
+        })
+    }
+
+    fn object_name(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
+    }
+
+    /// The media-download URL: the object name is a single percent-encoded path segment, so a
+    /// prefix's `/` travels as `%2F`.
+    fn object_url(&self, name: &str) -> Url {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .expect("validated by with_token_source")
+            .pop_if_empty()
+            .extend(["storage", "v1", "b", &self.bucket, "o"])
+            .push(&self.object_name(name));
+        url.query_pairs_mut().append_pair("alt", "media");
+        url
+    }
+
+    fn upload_url(&self, name: &str) -> Url {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .expect("validated by with_token_source")
+            .pop_if_empty()
+            .extend(["upload", "storage", "v1", "b", &self.bucket, "o"]);
+        url.query_pairs_mut()
+            .append_pair("uploadType", "media")
+            .append_pair("name", &self.object_name(name));
+        url
+    }
+
+    fn authorized<B>(
+        &self,
+        request: attohttpc::RequestBuilder<B>,
+    ) -> Result<attohttpc::RequestBuilder<B>> {
+        Ok(request.bearer_auth((self.token_source)()?))
+    }
+
+    /// Reads an entry, degrading to a miss on any failure. GCS answers a missing object (or a
+    /// missing bucket) with a plain `404`.
+    fn get(&self, name: &str) -> Fetched {
+        let url = self.object_url(name);
+        let failure = match self
+            .authorized(self.session.get(url.as_str()))
+            .and_then(|request| request.send().map_err(Into::into))
+        {
+            Ok(response) if response.status() == attohttpc::StatusCode::OK => {
+                match response.bytes() {
+                    Ok(bytes) => return Fetched::Found(bytes),
+                    Err(error) => error.to_string(),
+                }
+            }
+            Ok(response) if response.status() == attohttpc::StatusCode::NOT_FOUND => {
+                return Fetched::Missing
+            }
+            Ok(response) => http_response_failure(response),
+            Err(error) => format!("{error:#}"),
+        };
+        eprintln!("[Warn] GCS cache read of {url} failed (treating as a miss): {failure}");
+        Fetched::Failed
+    }
+
+    fn put(&self, name: &str, data: &[u8], content_type: &str) {
+        let url = self.upload_url(name);
+        let failure = match self
+            .authorized(self.session.post(url.as_str()))
+            .and_then(|request| {
+                request
+                    .header(attohttpc::header::CONTENT_TYPE, content_type)
+                    .bytes(data)
+                    .send()
+                    .map_err(Into::into)
+            }) {
+            Ok(response) if response.is_success() => return,
+            Ok(response) => http_response_failure(response),
+            Err(error) => format!("{error:#}"),
+        };
+        eprintln!("[Warn] GCS cache write of {url} failed (entry not shared): {failure}");
+    }
+}
+
 /// Username and password (or a Nexus user token's name and pass codes) for HTTP basic auth.
 #[derive(Clone)]
 pub struct NexusCredentials {
@@ -522,11 +685,12 @@ struct NexusCache {
     credentials: Option<NexusCredentials>,
 }
 
-const NEXUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const NEXUS_READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Timeouts shared by the plain-HTTP backends (Nexus, GCS).
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bounds how much of an error body (Nexus answers many failures with a full HTML page) is
 /// echoed into a warning.
-const NEXUS_ERROR_BODY_LIMIT: usize = 200;
+const HTTP_ERROR_BODY_LIMIT: usize = 200;
 
 impl NexusCache {
     fn new(
@@ -535,8 +699,8 @@ impl NexusCache {
         ca_cert: Option<&Path>,
     ) -> Result<Self> {
         let mut session = attohttpc::Session::new();
-        session.connect_timeout(NEXUS_CONNECT_TIMEOUT);
-        session.read_timeout(NEXUS_READ_TIMEOUT);
+        session.connect_timeout(HTTP_CONNECT_TIMEOUT);
+        session.read_timeout(HTTP_READ_TIMEOUT);
         // A redirect is reported, never followed: following one would replay the basic-auth
         // header against whatever host the `Location` names.
         session.follow_redirects(false);
@@ -584,7 +748,7 @@ impl NexusCache {
             Ok(response) if response.status() == attohttpc::StatusCode::NOT_FOUND => {
                 return Fetched::Missing
             }
-            Ok(response) => nexus_http_failure(response),
+            Ok(response) => http_response_failure(response),
             Err(error) => error.to_string(),
         };
         eprintln!("[Warn] Nexus cache read of {url} failed (treating as a miss): {failure}");
@@ -603,20 +767,21 @@ impl NexusCache {
             Ok(response) if response.status() == attohttpc::StatusCode::BAD_REQUEST => format!(
                 "{} (a raw hosted repository answers 400 when its deployment policy forbids \
                  redeploying an existing component; set it to \"Allow redeploy\")",
-                nexus_http_failure(response)
+                http_response_failure(response)
             ),
-            Ok(response) => nexus_http_failure(response),
+            Ok(response) => http_response_failure(response),
             Err(error) => error.to_string(),
         };
         eprintln!("[Warn] Nexus cache write of {url} failed (entry not shared): {failure}");
     }
 }
 
-fn nexus_http_failure(response: attohttpc::Response) -> String {
+/// Renders a non-2xx `attohttpc` response for a warning, in the same shape as `http_failure`.
+fn http_response_failure(response: attohttpc::Response) -> String {
     let status = response.status().as_u16();
     let body = response.text().unwrap_or_default();
     let body = body.trim();
-    let shown = match body.char_indices().nth(NEXUS_ERROR_BODY_LIMIT) {
+    let shown = match body.char_indices().nth(HTTP_ERROR_BODY_LIMIT) {
         Some((cut, _)) => format!("{}...", &body[..cut]),
         None => body.to_owned(),
     };
@@ -1999,6 +2164,8 @@ mod tests {
             s3_region: None,
             s3_endpoint: None,
             s3_force_path_style: false,
+            gcs_bucket: None,
+            gcs_prefix: String::new(),
             nexus_url: None,
             nexus_repository: None,
             nexus_prefix: String::new(),
@@ -2794,23 +2961,10 @@ esac
         );
     }
 
-    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIBkTCCATegAwIBAgIUaqMU9czNCvWG1R457FBnv8BzZfQwCgYIKoZIzj0EAwIw
-HTEbMBkGA1UEAwwSYmF6ZWwtZGlmZi10ZXN0LWNhMCAXDTI2MTAwNTE0NTUwOVoY
-DzIxMjYwOTExMTQ1NTA5WjAdMRswGQYDVQQDDBJiYXplbC1kaWZmLXRlc3QtY2Ew
-WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASRkDRNQ1MfFy+8eM1z9tY6FseE+Bqs
-p3hQcwR/2L3wzZKwFWhaDmfn5WFKAINVfcGxOAKWKcXrhK+xWOz9KmYoo1MwUTAd
-BgNVHQ4EFgQUzsQ/MEApeEP6b/jW5ecBMceQbJcwHwYDVR0jBBgwFoAUzsQ/MEAp
-eEP6b/jW5ecBMceQbJcwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBF
-AiEAixF88BBeQUzoM0fYxa/ivGx5U4kHdLW82V9LIFiOV14CIG/00V8ZKfomL0v0
-nQBeQ4AIl47nDOrFeVnvse8R9IHJ
------END CERTIFICATE-----
-";
+    /// A canned HTTP reply for a mocked shared tier: status, extra headers, body.
+    type HttpReply = (u16, Vec<(&'static str, &'static str)>, Vec<u8>);
 
-    /// A canned Nexus reply: status, extra headers, body.
-    type NexusReply = (u16, Vec<(&'static str, &'static str)>, Vec<u8>);
-
-    struct CapturedNexusRequest {
+    struct CapturedHttpRequest {
         method: Method,
         url: String,
         authorization: Option<String>,
@@ -2818,17 +2972,16 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         body: Vec<u8>,
     }
 
-    fn nexus_cache_with_responses(
-        prefix: &str,
-        credentials: Option<NexusCredentials>,
-        responses: Vec<NexusReply>,
+    /// Serves `responses` in order from a local HTTP server, capturing every request it answers.
+    fn mock_http_server(
+        responses: Vec<HttpReply>,
     ) -> (
-        RemoteCache,
-        std_mpsc::Receiver<CapturedNexusRequest>,
+        String,
+        std_mpsc::Receiver<CapturedHttpRequest>,
         thread::JoinHandle<()>,
     ) {
         let server = Server::http("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}/nexus", server.server_addr().to_ip().unwrap());
+        let endpoint = format!("http://{}", server.server_addr().to_ip().unwrap());
         let (sender, receiver) = std_mpsc::channel();
         let handle = thread::spawn(move || {
             for (status, headers, body) in responses {
@@ -2845,7 +2998,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 let mut received = Vec::new();
                 request.as_reader().read_to_end(&mut received).unwrap();
                 sender
-                    .send(CapturedNexusRequest {
+                    .send(CapturedHttpRequest {
                         method: request.method().clone(),
                         url: request.url().to_owned(),
                         authorization,
@@ -2860,7 +3013,196 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 request.respond(response).unwrap();
             }
         });
-        let base = nexus_base_url(&endpoint, "bazel-diff", prefix).unwrap();
+        (endpoint, receiver, handle)
+    }
+
+    fn gcs_cache_with_responses(
+        prefix: &str,
+        responses: Vec<HttpReply>,
+    ) -> (
+        RemoteCache,
+        std_mpsc::Receiver<CapturedHttpRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let (endpoint, receiver, handle) = mock_http_server(responses);
+        let cache = GcsCache::with_token_source(
+            "cache-bucket",
+            prefix,
+            &endpoint,
+            Box::new(|| Ok("test-token".to_owned())),
+        )
+        .unwrap();
+        (RemoteCache::Gcs(Box::new(cache)), receiver, handle)
+    }
+
+    #[test]
+    fn gcs_cache_addresses_objects_through_the_json_api() {
+        let cache = GcsCache::with_token_source(
+            "cache-bucket",
+            "/team/repo/",
+            GCS_ENDPOINT,
+            Box::new(|| Ok(String::new())),
+        )
+        .unwrap();
+        assert_eq!(
+            cache.object_url("sha.fp.json.gz").as_str(),
+            "https://storage.googleapis.com/storage/v1/b/cache-bucket/o/team%2Frepo%2Fsha.fp.json.gz?alt=media"
+        );
+        assert_eq!(
+            cache.upload_url("sha.fp.json.gz").as_str(),
+            "https://storage.googleapis.com/upload/storage/v1/b/cache-bucket/o?uploadType=media&name=team%2Frepo%2Fsha.fp.json.gz"
+        );
+        for (bucket, endpoint) in [
+            ("", GCS_ENDPOINT),
+            ("a/b", GCS_ENDPOINT),
+            ("cache-bucket", "not a url"),
+            ("cache-bucket", "ftp://storage.googleapis.com"),
+            ("cache-bucket", "mailto:ops@example.com"),
+        ] {
+            assert!(
+                GcsCache::with_token_source(bucket, "", endpoint, Box::new(|| Ok(String::new())))
+                    .is_err(),
+                "{bucket} {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn gcs_cache_reads_and_writes_with_bearer_auth() {
+        let (remote, requests, handle) = gcs_cache_with_responses(
+            "/team/repo/",
+            vec![
+                (200, Vec::new(), gzip(b"hello").unwrap()),
+                (404, Vec::new(), b"No such object".to_vec()),
+                (404, Vec::new(), b"No such object".to_vec()),
+                (200, Vec::new(), b"{\"kind\":\"storage#object\"}".to_vec()),
+            ],
+        );
+        assert_eq!(remote.get("sha.fp"), Some(b"hello".to_vec()));
+        assert_eq!(remote.get("missing"), None);
+        remote.put("sha.fp", b"data");
+        handle.join().unwrap();
+        let captured = requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(captured.len(), 4);
+        let methods = captured
+            .iter()
+            .map(|r| r.method.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            [Method::Get, Method::Get, Method::Get, Method::Post]
+        );
+        assert_eq!(
+            captured[0].url,
+            "/storage/v1/b/cache-bucket/o/team%2Frepo%2Fsha.fp.json.gz?alt=media"
+        );
+        assert_eq!(
+            captured[1].url,
+            "/storage/v1/b/cache-bucket/o/team%2Frepo%2Fmissing.json.gz?alt=media"
+        );
+        assert_eq!(
+            captured[2].url,
+            "/storage/v1/b/cache-bucket/o/team%2Frepo%2Fmissing.json?alt=media"
+        );
+        assert_eq!(
+            captured[3].url,
+            "/upload/storage/v1/b/cache-bucket/o?uploadType=media&name=team%2Frepo%2Fsha.fp.json.gz"
+        );
+        for request in &captured {
+            assert_eq!(request.authorization.as_deref(), Some("Bearer test-token"));
+        }
+        assert_eq!(
+            captured[3].content_type.as_deref(),
+            Some("application/gzip")
+        );
+        assert_eq!(gunzip(&captured[3].body).unwrap(), b"data");
+    }
+
+    #[test]
+    fn gcs_cache_failures_degrade_without_following_redirects() {
+        let (remote, requests, handle) = gcs_cache_with_responses(
+            "",
+            vec![
+                (500, Vec::new(), b"backend error".to_vec()),
+                (403, Vec::new(), b"permission denied".to_vec()),
+                (
+                    302,
+                    vec![("Location", "http://127.0.0.1:9/elsewhere")],
+                    Vec::new(),
+                ),
+                (401, Vec::new(), b"invalid token".to_vec()),
+            ],
+        );
+        assert_eq!(remote.get("failure"), None);
+        assert_eq!(remote.get("denied"), None);
+        assert_eq!(remote.get("moved"), None);
+        remote.put("denied", b"data");
+        handle.join().unwrap();
+        // Exactly one request per call: nothing is retried and the redirect is not followed.
+        assert_eq!(requests.try_iter().count(), 4);
+    }
+
+    #[test]
+    fn gcs_cache_token_and_transport_errors_degrade_without_failing() {
+        // No token, no request: the failure is reported as a miss before anything is sent. The
+        // server's one canned reply is consumed by hand afterwards so its thread exits.
+        let (endpoint, requests, handle) = mock_http_server(vec![(200, Vec::new(), Vec::new())]);
+        let remote = RemoteCache::Gcs(Box::new(
+            GcsCache::with_token_source(
+                "cache-bucket",
+                "",
+                &endpoint,
+                Box::new(|| bail!("metadata server unreachable")),
+            )
+            .unwrap(),
+        ));
+        assert_eq!(remote.get("no-token"), None);
+        remote.put("no-token", b"data");
+        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
+        attohttpc::get(&endpoint).send().unwrap();
+        handle.join().unwrap();
+        assert_eq!(requests.try_iter().count(), 1);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let remote = RemoteCache::Gcs(Box::new(
+            GcsCache::with_token_source(
+                "cache-bucket",
+                "",
+                &endpoint,
+                Box::new(|| Ok("test-token".to_owned())),
+            )
+            .unwrap(),
+        ));
+        assert_eq!(remote.get("unreachable"), None);
+        remote.put("unreachable", b"data");
+    }
+
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBkTCCATegAwIBAgIUaqMU9czNCvWG1R457FBnv8BzZfQwCgYIKoZIzj0EAwIw
+HTEbMBkGA1UEAwwSYmF6ZWwtZGlmZi10ZXN0LWNhMCAXDTI2MTAwNTE0NTUwOVoY
+DzIxMjYwOTExMTQ1NTA5WjAdMRswGQYDVQQDDBJiYXplbC1kaWZmLXRlc3QtY2Ew
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASRkDRNQ1MfFy+8eM1z9tY6FseE+Bqs
+p3hQcwR/2L3wzZKwFWhaDmfn5WFKAINVfcGxOAKWKcXrhK+xWOz9KmYoo1MwUTAd
+BgNVHQ4EFgQUzsQ/MEApeEP6b/jW5ecBMceQbJcwHwYDVR0jBBgwFoAUzsQ/MEAp
+eEP6b/jW5ecBMceQbJcwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBF
+AiEAixF88BBeQUzoM0fYxa/ivGx5U4kHdLW82V9LIFiOV14CIG/00V8ZKfomL0v0
+nQBeQ4AIl47nDOrFeVnvse8R9IHJ
+-----END CERTIFICATE-----
+";
+
+    fn nexus_cache_with_responses(
+        prefix: &str,
+        credentials: Option<NexusCredentials>,
+        responses: Vec<HttpReply>,
+    ) -> (
+        RemoteCache,
+        std_mpsc::Receiver<CapturedHttpRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let (endpoint, receiver, handle) = mock_http_server(responses);
+        let base = nexus_base_url(&format!("{endpoint}/nexus"), "bazel-diff", prefix).unwrap();
         (
             RemoteCache::Nexus(Box::new(NexusCache::new(base, credentials, None).unwrap())),
             receiver,
@@ -3021,7 +3363,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
     }
 
     #[test]
-    fn nexus_http_failure_truncates_long_bodies() {
+    fn http_response_failure_truncates_long_bodies() {
         let server = Server::http("127.0.0.1:0").unwrap();
         let address = server.server_addr().to_ip().unwrap();
         let handle = thread::spawn(move || {
@@ -3034,7 +3376,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 .unwrap();
         });
         let response = attohttpc::get(format!("http://{address}/")).send().unwrap();
-        let failure = nexus_http_failure(response);
+        let failure = http_response_failure(response);
         handle.join().unwrap();
         assert_eq!(
             failure,

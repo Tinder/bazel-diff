@@ -248,6 +248,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::serve_rejects_packages_the_revision_does_not_track",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::single_version_override_patch_change_reaches_consumer_cquery",
                 "timeout": "moderate",
             },

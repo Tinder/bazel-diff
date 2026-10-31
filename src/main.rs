@@ -426,6 +426,11 @@ struct ServeArgs {
     #[arg(long = "partialGraphRebuildPattern", value_delimiter = ',')]
     partial_graph_rebuild_patterns: Vec<String>,
 
+    /// Cache a revision whose bazel query loaded packages its git tree does not contain
+    /// (untracked or ignored BUILD files in the working tree) instead of failing the request
+    #[arg(long = "allowUntrackedPackages")]
+    allow_untracked_packages: bool,
+
     #[arg(long = "no-initial-fetch")]
     no_initial_fetch: bool,
 
@@ -1079,6 +1084,7 @@ impl ServeArgs {
                 .iter()
                 .map(|pattern| bazel_diff::partial::Glob::new(pattern))
                 .collect::<Result<Vec<_>>>()?,
+            allow_untracked_packages: self.allow_untracked_packages,
             no_initial_fetch: self.no_initial_fetch,
             warmup_revisions: self.warmup_revisions.clone(),
             cache_max_age: self
@@ -1636,6 +1642,13 @@ mod tests {
         let config = serve_args(&[]).to_config(false).unwrap();
         assert!(!config.partial_graph);
         assert!(config.partial_graph_rebuild_patterns.is_empty());
+        assert!(!config.allow_untracked_packages);
+        assert!(
+            serve_args(&["--allowUntrackedPackages"])
+                .to_config(false)
+                .unwrap()
+                .allow_untracked_packages
+        );
 
         let config = serve_args(&[
             "--partialGraph",

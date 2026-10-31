@@ -5,7 +5,9 @@ use crate::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
 };
 use crate::module_graph::impacted_with_module_changes;
-use crate::partial::{self, Classification, ClassifyInputs, Glob, TreeIndex, MODULE_FILES};
+use crate::partial::{
+    self, Classification, ClassifyInputs, Glob, TreeIndex, TreeKind, MODULE_FILES,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -46,6 +48,11 @@ pub struct ServerConfig {
     pub partial_graph: bool,
     /// Paths whose change always forces a full generation in partial-graph mode.
     pub partial_graph_rebuild_patterns: Vec<Glob>,
+    /// Opt-out of the working-tree check. A full generation fails when `bazel query` returned a
+    /// main-repository package whose `BUILD` file is not in the revision's git tree, because the
+    /// query loaded it from an untracked or ignored file and the entry would be cached under a
+    /// revision it does not describe. With the flag the mismatch is logged and cached anyway.
+    pub allow_untracked_packages: bool,
     pub no_initial_fetch: bool,
     pub warmup_revisions: Vec<String>,
     pub cache_max_age: Option<Duration>,
@@ -84,6 +91,9 @@ struct State {
     /// fell back to. `/metrics` reports both.
     partial_derived: AtomicUsize,
     partial_rebuilds: AtomicUsize,
+    /// Full generations refused because the working tree held packages the revision does not
+    /// track (see [`check_tracked_packages`]). `/metrics` reports it.
+    untracked_package_rejections: AtomicUsize,
     /// Queries accepted and not yet finished: waiting for the workspace, running, or abandoned by
     /// a timed-out client but still running. `/metrics` reports it as `activeQueries`.
     active_queries: AtomicUsize,
@@ -179,6 +189,7 @@ impl State {
             ready: AtomicBool::new(false),
             partial_derived: AtomicUsize::new(0),
             partial_rebuilds: AtomicUsize::new(0),
+            untracked_package_rejections: AtomicUsize::new(0),
             workspace: Workspace::default(),
             active_queries: AtomicUsize::new(0),
             started: Instant::now(),
@@ -1408,6 +1419,10 @@ fn get_hashes_locked(
                 options.partial_tree = tree.clone();
             }
             let (data, timings) = generate_hashes_timed(&options)?;
+            // The scoped `modifiedFilepaths` path has no tree index and keeps its disk semantics.
+            if let Some(tree) = &tree {
+                check_tracked_packages(state, sha, &data, tree)?;
+            }
             (data, timings, checkout_millis)
         }
     };
@@ -1746,6 +1761,104 @@ fn git_tree_index(state: &State, sha: &str) -> Result<TreeIndex> {
     Ok(TreeIndex::parse_ls_tree(&output))
 }
 
+/// Main-repository packages among `labels` whose `BUILD` or `BUILD.bazel` is not in `tree`.
+/// `bazel query` reads the working tree, which `git checkout --force` leaves untracked and
+/// ignored files in, so such a package was loaded from a file the revision does not contain.
+/// External labels are not the revision's to track. Packages below a tracked symlink or a
+/// submodule are skipped: `ls-tree` lists neither's contents, and Bazel follows both.
+pub fn untracked_packages<'a>(
+    labels: impl IntoIterator<Item = &'a str>,
+    tree: &TreeIndex,
+) -> Vec<String> {
+    let packages = labels
+        .into_iter()
+        .filter(|label| label.starts_with("//") && !label.starts_with("//external:"))
+        .map(|label| {
+            let path = &label[2..];
+            path.split_once(':').map_or(path, |(package, _)| package)
+        })
+        .collect::<BTreeSet<_>>();
+    packages
+        .into_iter()
+        .filter(|package| {
+            let build_file = |name: &str| {
+                if package.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{package}/{name}")
+                }
+            };
+            tree.get(&build_file("BUILD")).is_none()
+                && tree.get(&build_file("BUILD.bazel")).is_none()
+                && !below_symlink_or_submodule(package, tree)
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether `package` or one of its ancestor directories is a symlink or submodule in `tree`.
+fn below_symlink_or_submodule(package: &str, tree: &TreeIndex) -> bool {
+    let mut end = 0;
+    while end < package.len() {
+        let next = package[end..]
+            .find('/')
+            .map_or(package.len(), |offset| end + offset);
+        if matches!(
+            tree.get(&package[..next]).map(|entry| &entry.kind),
+            Some(TreeKind::Symlink | TreeKind::Submodule)
+        ) {
+            return true;
+        }
+        end = next + 1;
+    }
+    false
+}
+
+/// How many untracked packages a rejection names before it switches to a count.
+const UNTRACKED_PACKAGES_SHOWN: usize = 10;
+
+/// Refuses to cache a full generation of `sha` whose query loaded packages the revision does
+/// not track, so a stale working tree surfaces as a failed request rather than as impacted
+/// labels no consumer checkout has. `--allowUntrackedPackages` demotes it to a warning.
+fn check_tracked_packages(
+    state: &State,
+    sha: &str,
+    data: &HashFileData,
+    tree: &TreeIndex,
+) -> Result<()> {
+    let untracked = untracked_packages(data.hashes.keys().map(String::as_str), tree);
+    if untracked.is_empty() {
+        return Ok(());
+    }
+    let shown = untracked
+        .iter()
+        .take(UNTRACKED_PACKAGES_SHOWN)
+        .map(|package| format!("//{package}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = untracked
+        .len()
+        .checked_sub(UNTRACKED_PACKAGES_SHOWN)
+        .filter(|rest| *rest > 0)
+        .map(|rest| format!(" and {rest} more"))
+        .unwrap_or_default();
+    let message = format!(
+        "the working tree at {sha} contains {} package(s) the revision does not track: \
+         {shown}{more}; bazel query loaded them from untracked or ignored files, so the hashes \
+         would not describe {sha}. Remove them (for example `git clean -fdx`) or start serve \
+         with --allowUntrackedPackages to cache them anyway",
+        untracked.len()
+    );
+    if state.config.allow_untracked_packages {
+        eprintln!("[Warn] {message}");
+        return Ok(());
+    }
+    state
+        .untracked_package_rejections
+        .fetch_add(1, Ordering::SeqCst);
+    bail!(message)
+}
+
 /// Decides whether `sha` can be derived from the cached `base_sha` entry: the raw diff between
 /// the two, the module and workspace files' label references at `sha`, and the server's
 /// rebuild patterns and seed files go through [`partial::classify`].
@@ -1880,6 +1993,10 @@ fn metrics(state: &State) -> Value {
             "enabled": state.config.partial_graph,
             "derived": state.partial_derived.load(Ordering::SeqCst),
             "fullGenerations": state.partial_rebuilds.load(Ordering::SeqCst),
+        },
+        "untrackedPackages": {
+            "allowed": state.config.allow_untracked_packages,
+            "rejections": state.untracked_package_rejections.load(Ordering::SeqCst),
         },
         "cache": {
             "directory": state.config.cache_dir.to_string_lossy(),
@@ -2058,6 +2175,7 @@ mod tests {
             dependency_fingerprint: false,
             partial_graph: false,
             partial_graph_rebuild_patterns: Vec::new(),
+            allow_untracked_packages: false,
             no_initial_fetch: true,
             warmup_revisions: Vec::new(),
             cache_max_age: None,
@@ -2448,6 +2566,97 @@ esac
             target.encode_length_delimited(&mut encoded);
         }
         encoded
+    }
+
+    #[test]
+    fn untracked_packages_skips_external_labels_symlinks_and_submodules() {
+        let tree = TreeIndex::parse_ls_tree(
+            concat!(
+                "100644 blob 1111111111111111111111111111111111111111\tBUILD\0",
+                "100644 blob 2222222222222222222222222222222222222222\tpkg/BUILD.bazel\0",
+                "120000 blob 3333333333333333333333333333333333333333\tlinked\0",
+                "160000 commit 4444444444444444444444444444444444444444\tvendor/mod\0",
+                "100644 blob 5555555555555555555555555555555555555555\tgone/src.txt\0",
+            )
+            .as_bytes(),
+        );
+        let labels = [
+            "//:root",
+            "//pkg:lib",
+            "//pkg:a.txt",
+            "//gone:lib",
+            "//gone:src.txt",
+            "//also/gone:lib",
+            "//linked/inner:lib",
+            "//vendor/mod/pkg:lib",
+            "//external:dep_repo",
+            "@@dep_repo//pkg:lib",
+            "@dep_repo//pkg:lib",
+        ];
+        assert_eq!(untracked_packages(labels, &tree), ["also/gone", "gone"]);
+        assert!(untracked_packages([], &tree).is_empty());
+    }
+
+    /// A package whose files sit in the working tree but in no revision -- a generator's
+    /// leftovers, which `git checkout --force` never removes -- must not be cached as part of
+    /// the revision: the request fails and names the package, unless the operator opted out.
+    #[cfg(unix)]
+    #[test]
+    fn full_generation_rejects_packages_the_revision_does_not_track() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(repo.join("pkg")).unwrap();
+        fs::create_dir_all(repo.join("tools")).unwrap();
+        let bazel = fake_bazel(root.path());
+        git_command(&repo, &["init", "-q"]);
+        git_command(&repo, &["config", "user.email", "test@example.com"]);
+        git_command(&repo, &["config", "user.name", "Test"]);
+        fs::write(repo.join(".gitignore"), "pkg/\n").unwrap();
+        fs::write(repo.join("tools/defs.bzl"), "def macro(): pass").unwrap();
+        fs::write(repo.join("targets.pb"), encoded_targets()).unwrap();
+        fs::write(repo.join("pkg/BUILD.bazel"), "# generated, ignored").unwrap();
+        fs::write(repo.join("pkg/a.txt"), "one").unwrap();
+        fs::write(repo.join("pkg/b.txt"), "bee").unwrap();
+        git_command(&repo, &["add", "-A"]);
+        git_command(&repo, &["commit", "-q", "-m", "base"]);
+        let sha = git_command(&repo, &["rev-parse", "HEAD"]);
+        let cache = root.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let state_with = |allow: bool| {
+            let mut config = test_config();
+            config.hash_options.bazel.workspace = repo.clone();
+            config.hash_options.bazel.bazel = bazel.clone();
+            config.hash_options.bazel.no_bazelrc = false;
+            config.cache_dir = cache.clone();
+            config.allow_untracked_packages = allow;
+            ready_state(config, None)
+        };
+
+        let strict = state_with(false);
+        let error = get_hashes_locked(&strict, &sha, &BTreeSet::new(), None)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("//pkg"), "{error}");
+        assert!(error.contains("--allowUntrackedPackages"), "{error}");
+        assert_eq!(
+            strict.untracked_package_rejections.load(Ordering::SeqCst),
+            1
+        );
+        assert!(
+            fs::read_dir(&cache).unwrap().next().is_none(),
+            "a rejected generation must not be cached"
+        );
+        assert_eq!(metrics(&strict)["untrackedPackages"]["rejections"], 1);
+
+        let lenient = state_with(true);
+        let retrieval = get_hashes_locked(&lenient, &sha, &BTreeSet::new(), None).unwrap();
+        assert!(retrieval.data.hashes.contains_key("//pkg:lib"));
+        assert_eq!(
+            lenient.untracked_package_rejections.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(metrics(&lenient)["untrackedPackages"]["allowed"], true);
     }
 
     /// A repository with the fixed graph above and four commits: `base`; a source and a README

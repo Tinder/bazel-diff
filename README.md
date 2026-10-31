@@ -410,6 +410,17 @@ Notes and operational guidance:
   reuses a previously cached entry of the other kind. This mirrors the `generate-hashes --depEdgesFile`
   / `get-impacted-targets --depEdgesFile` flow used by the CLI.
 
+* Working-tree integrity is checked on every full generation. `serve` switches revisions with
+  `git checkout --force`, which removes the files a revision no longer tracks but leaves untracked
+  and ignored files where they are, so a generated `BUILD` file left behind by an earlier run would
+  be loaded by `bazel query` at every revision and its targets cached under revisions that do not
+  contain them -- and reported as impacted to consumers whose checkout has no such package. After
+  the query, every main-repository package it returned must have its `BUILD` or `BUILD.bazel` in
+  the revision's git tree (packages below a tracked symlink or a submodule are not checked);
+  otherwise the request fails, the error names the packages, and nothing is cached.
+  `--allowUntrackedPackages` turns that into a warning for workspaces that generate `BUILD` files
+  outside git. `/metrics` counts rejections under `untrackedPackages`.
+
 * Dependency fingerprinting (`--dependencyFingerprint`) is opt-in. When enabled, every generated
   cache entry records a fingerprint of the workspace's external-dependency state (the bzlmod module
   graph and the resolved repository definitions, via `bazel mod`), and a cached entry -- local or
@@ -735,6 +746,8 @@ Options:
           Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query` when the diff between them only edits regular source files; every entry then also records the hashing recipes that makes possible. Incompatible with --useCquery, --fineGrainedHashExternalRepos and --alwaysAffectedTags [default: false] [possible values: true, false]
       --partialGraphRebuildPattern <PARTIAL_GRAPH_REBUILD_PATTERNS>
           Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file name) of workspace paths whose change always forces a full generation under --partialGraph
+      --allowUntrackedPackages
+          Cache a revision whose bazel query loaded packages its git tree does not contain (untracked or ignored BUILD files in the working tree) instead of failing the request
       --no-initial-fetch
           
       --warmupRevision <WARMUP_REVISIONS>

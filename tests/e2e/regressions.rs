@@ -972,3 +972,214 @@ fn fine_grained_repo_rule_is_not_shadowed_by_a_same_named_module() {
         "{impacted:?}"
     );
 }
+
+/// Removes the `keep/LibraryTests` package from `workspace` and edits `keep/keep.sh`, the
+/// source both that package and `//consumer` depend on. The edit is what makes the diff
+/// non-empty: at the "to" revision `//keep` and `//consumer` are impacted, and
+/// `//keep/LibraryTests` would have been too, had it still existed.
+fn delete_library_tests_package(workspace: &Path) {
+    fs::remove_dir_all(workspace.join("keep/LibraryTests")).unwrap();
+    edit(&workspace.join("keep/keep.sh"), |text| {
+        text.replace("echo keep", "echo keep v2")
+    });
+}
+
+/// The impacted labels every path must report for [`delete_library_tests_package`]: the
+/// edited source, its rule, and the one surviving dependent. Nothing under
+/// `//keep/LibraryTests`.
+fn expected_after_deletion() -> BTreeSet<String> {
+    BTreeSet::from([
+        "//consumer:consumer".to_owned(),
+        "//keep:keep".to_owned(),
+        "//keep:keep.sh".to_owned(),
+    ])
+}
+
+fn assert_no_deleted_labels<'a>(labels: impl IntoIterator<Item = &'a str>, context: &str) {
+    let stale = labels
+        .into_iter()
+        .filter(|label| label.starts_with("//keep/LibraryTests"))
+        .collect::<Vec<_>>();
+    assert!(
+        stale.is_empty(),
+        "{context}: labels from the deleted package were reported as impacted: {stale:?}"
+    );
+}
+
+/// Feeds `labels` to `bazel query --query_file` at `workspace`, the way a CI consumer turns an
+/// impacted-targets file into a target set. A single label whose package no longer exists
+/// fails the whole query with `no such package`, which is the failure the report describes.
+fn assert_labels_resolve_at(workspace: &Path, labels: &BTreeSet<String>) {
+    let query_file = workspace.join("impacted.query");
+    fs::write(
+        &query_file,
+        format!(
+            "set({})\n",
+            labels.iter().cloned().collect::<Vec<_>>().join(" ")
+        ),
+    )
+    .unwrap();
+    let query = std::process::Command::new(bazel())
+        .args(["query", &format!("--query_file={}", query_file.display())])
+        .current_dir(workspace)
+        .output()
+        .expect("run bazel query");
+    assert!(
+        query.status.success(),
+        "bazel query over the impacted labels failed at the \"to\" revision: {}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let resolved = String::from_utf8_lossy(&query.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(&resolved, labels);
+}
+
+/// A package deleted between the two revisions (`keep/LibraryTests`, a leaf test package that
+/// depends on the edited `//keep`) must not appear in `get-impacted-targets` output, with or
+/// without distances, and the labels that are reported must all resolve with `bazel query`
+/// at the "to" revision. Reported against a precomputed impacted-targets file whose labels
+/// named `.../LibraryTests` packages the consumer's checkout no longer had, so its
+/// `bazel query --query_file` aborted with `no such package` and discarded all 33k labels.
+#[test]
+fn deleted_package_labels_are_not_impacted() {
+    let first = copy_workspace("deleted_package");
+    let second = copy_workspace("deleted_package");
+    delete_library_tests_package(second.path());
+
+    let output = tempfile::tempdir().unwrap();
+    let from = output.path().join("from.json");
+    let to = output.path().join("to.json");
+    let deps = output.path().join("deps.json");
+    assert!(generate(first.path(), &from, &["--includeTargetType"])
+        .status
+        .success());
+    assert!(generate(
+        second.path(),
+        &to,
+        &["--includeTargetType", "-d", deps.to_str().unwrap()],
+    )
+    .status
+    .success());
+    // The deleted package is in the "from" hashes and only there: that is the input shape the
+    // report suspects of producing stale labels.
+    let from_hashes = hashes(&from);
+    let to_hashes = hashes(&to);
+    assert!(from_hashes.contains_key("//keep/LibraryTests:keep_tests"));
+    assert!(!to_hashes.contains_key("//keep/LibraryTests:keep_tests"));
+
+    let result = output.path().join("impacted.txt");
+    assert!(impacted(second.path(), &from, &to, &result, &[])
+        .status
+        .success());
+    let labels = read_lines(&result);
+    assert_no_deleted_labels(labels.iter().map(String::as_str), "get-impacted-targets");
+    assert_eq!(labels, expected_after_deletion());
+
+    let distances = output.path().join("impacted.json");
+    assert!(impacted(
+        second.path(),
+        &from,
+        &to,
+        &distances,
+        &["-d", deps.to_str().unwrap()],
+    )
+    .status
+    .success());
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(&distances).unwrap()).unwrap();
+    let distance_labels = entries
+        .iter()
+        .map(|entry| entry["label"].as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_no_deleted_labels(
+        distance_labels.iter().map(String::as_str),
+        "get-impacted-targets --depEdgesFile",
+    );
+    assert_eq!(distance_labels, expected_after_deletion());
+
+    assert_labels_resolve_at(second.path(), &labels);
+}
+
+/// The same deletion through `serve`, whose answers are what a precompute consumer fetches:
+/// the default mode and `--partialGraph` must both leave the deleted package out, and the
+/// partial mode must fall back to a full generation for the deletion rather than deriving
+/// the "to" hashes from a base that still contains the package.
+#[test]
+fn serve_deleted_package_labels_are_not_impacted() {
+    let workspace = copy_workspace("deleted_package");
+    let from = init_git(workspace.path());
+    delete_library_tests_package(workspace.path());
+    let to = commit(
+        workspace.path(),
+        "delete keep/LibraryTests and edit keep.sh",
+    );
+
+    let query = |server: &ServerProcess, path: &str| -> serde_json::Value {
+        let (status, body) = server.get(path).unwrap();
+        assert_eq!(status, 200, "{path}: {body}");
+        serde_json::from_str(&body).unwrap()
+    };
+    let labels_of = |body: &serde_json::Value| -> BTreeSet<String> {
+        body["impactedTargets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|label| {
+                label
+                    .as_str()
+                    .or_else(|| label["label"].as_str())
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    {
+        let cache = tempfile::tempdir().unwrap();
+        let server = ServerProcess::start(workspace.path(), cache.path(), &["--trackDeps"]);
+        let labels = labels_of(&query(
+            &server,
+            &format!("/impacted_targets?from={from}&to={to}"),
+        ));
+        assert_no_deleted_labels(labels.iter().map(String::as_str), "serve /impacted_targets");
+        assert_eq!(labels, expected_after_deletion());
+        let labels = labels_of(&query(
+            &server,
+            &format!("/impacted_targets_with_distances?from={from}&to={to}"),
+        ));
+        assert_no_deleted_labels(
+            labels.iter().map(String::as_str),
+            "serve /impacted_targets_with_distances",
+        );
+        assert_eq!(labels, expected_after_deletion());
+    }
+    {
+        let cache = tempfile::tempdir().unwrap();
+        let server = ServerProcess::start(workspace.path(), cache.path(), &["--partialGraph"]);
+        let body = query(
+            &server,
+            &format!("/impacted_targets?from={from}&to={to}&profile=true"),
+        );
+        let labels = labels_of(&body);
+        assert_no_deleted_labels(
+            labels.iter().map(String::as_str),
+            "serve --partialGraph /impacted_targets",
+        );
+        assert_eq!(labels, expected_after_deletion());
+        let generation = &body["profile"]["hashRetrievals"][1]["generation"];
+        assert_eq!(generation["mode"], "full", "{body}");
+        assert!(
+            generation["partialFallbackReason"]
+                .as_str()
+                .unwrap()
+                .contains("deleted"),
+            "{body}"
+        );
+    }
+
+    // The serve process left the working tree at `to`; the labels it reported must resolve there.
+    assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), to);
+    assert_labels_resolve_at(workspace.path(), &expected_after_deletion());
+}

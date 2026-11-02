@@ -213,6 +213,7 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
         module_graph_json,
         root_mapping,
         scoped_sources,
+        output_base,
     } = options.bazel.query_all_targets_with(|batch, inputs| {
         let prehash = |target: &mut Target, shared_inputs| {
             let rule = target.rule.as_option_mut()?;
@@ -249,6 +250,7 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
         module_graph_json,
         root_mapping,
         scoped_sources,
+        output_base,
     )?;
     timings.bazel_query_millis = bazel_query_millis;
     Ok((data, timings))
@@ -263,6 +265,7 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
         None,
         None,
         ScopedSources::default(),
+        None,
     )
     .map(|(data, _)| data)
 }
@@ -274,9 +277,11 @@ fn hash_targets_with_digests(
     module_graph_json: Option<String>,
     root_mapping: Option<Vec<u8>>,
     scoped_sources: ScopedSources,
+    output_base: Option<PathBuf>,
 ) -> Result<(HashFileData, GenerationTimings)> {
     let hash_started = Instant::now();
-    let mut external_resolver = ExternalRepoResolver::new(&options.bazel, root_mapping)?;
+    let mut external_resolver =
+        ExternalRepoResolver::new(&options.bazel, root_mapping, output_base)?;
     external_resolver.scoped_sources = scoped_sources;
     let module_graph_started = Instant::now();
     let module_graph_json = module_graph_json.or_else(|| options.bazel.module_graph_json());
@@ -2196,21 +2201,32 @@ struct ExternalRepoResolver {
 }
 
 impl ExternalRepoResolver {
-    fn new(options: &BazelOptions, root_mapping: Option<Vec<u8>>) -> Result<Self> {
-        let mut command = options.command_for_hashing();
-        command.arg("info").arg("output_base").stdin(Stdio::null());
-        let output = cancel::output(options.cancellation.as_deref(), &mut command)
-            .context("failed to determine Bazel output_base")?;
-        if !output.status.success() {
-            bail!(
-                "bazel info output_base failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+    /// `output_base` is the one the query already got from `bazel info`; without it this asks.
+    fn new(
+        options: &BazelOptions,
+        root_mapping: Option<Vec<u8>>,
+        output_base: Option<PathBuf>,
+    ) -> Result<Self> {
+        let output_base = match output_base {
+            Some(output_base) => output_base,
+            None => {
+                let mut command = options.command_for_hashing();
+                command.arg("info").arg("output_base").stdin(Stdio::null());
+                let output = cancel::output(options.cancellation.as_deref(), &mut command)
+                    .context("failed to determine Bazel output_base")?;
+                if !output.status.success() {
+                    bail!(
+                        "bazel info output_base failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+            }
+        };
         Ok(Self {
             workspace: options.workspace.clone(),
             bazel: options.bazel.clone(),
-            output_base: PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()),
+            output_base,
             startup_options: options.startup_options.clone(),
             no_bazelrc: options.no_bazelrc,
             cancellation: options.cancellation.clone(),

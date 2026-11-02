@@ -81,6 +81,26 @@ fn canonical_is_base_for_module(canonical: &str, module: &str) -> bool {
     !version.contains('+') && !version.contains('~')
 }
 
+/// Whether the end revision's workspace resolves its dependencies through Bzlmod, which decides
+/// the default of `--excludeExternalTargets` for impacted targets.
+///
+/// A hash file carries the module graph only when `bazel mod graph` answered while it was
+/// generated, which is exactly when [`BazelOptions::is_bzlmod_enabled`] would have answered yes
+/// for that revision. Reading it there spares the probe's Bazel invocation, which on a cold
+/// server (a CI job that downloads hashes generated elsewhere) means starting Bazel and
+/// resolving the module graph just to learn a boolean. Without a module graph the hash file
+/// cannot tell Bzlmod off from a graph that was never recorded, so Bazel is asked as before.
+pub fn bzlmod_enabled_for(to: &HashFileData, bazel: &BazelOptions) -> bool {
+    records_bzlmod(to) || bazel.is_bzlmod_enabled()
+}
+
+fn records_bzlmod(hashes: &HashFileData) -> bool {
+    hashes
+        .module_graph_json
+        .as_deref()
+        .is_some_and(|graph| !graph.trim().is_empty())
+}
+
 pub fn impacted_with_module_changes(
     from: &HashFileData,
     to: &HashFileData,
@@ -279,6 +299,19 @@ mod tests {
         );
         assert!(changed_modules(&graph("0.50.1"), &graph("0.50.1")).is_empty());
         assert!(changed_modules("invalid", &graph("0.50.1")).is_empty());
+    }
+
+    #[test]
+    fn records_bzlmod_only_for_a_recorded_module_graph() {
+        let with_graph = |graph: Option<&str>| HashFileData {
+            module_graph_json: graph.map(str::to_owned),
+            ..Default::default()
+        };
+        assert!(records_bzlmod(&with_graph(Some(&graph("0.50.1")))));
+        // No graph, or an empty answer, leaves the question to Bazel.
+        assert!(!records_bzlmod(&with_graph(None)));
+        assert!(!records_bzlmod(&with_graph(Some(""))));
+        assert!(!records_bzlmod(&with_graph(Some(" \n"))));
     }
 
     #[test]

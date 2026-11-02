@@ -6,7 +6,7 @@ use crate::hash::{generate_hashes_timed, HashOptions};
 use crate::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
 };
-use crate::module_graph::impacted_with_module_changes;
+use crate::module_graph::{bzlmod_enabled_for, impacted_with_module_changes};
 use crate::partial::{self, Classification, Glob, TreeIndex, TreeKind};
 use anyhow::{anyhow, bail, Context, Result};
 use flate2::read::GzDecoder;
@@ -1247,7 +1247,7 @@ fn compute_query(
     let diff_started = Instant::now();
     checkout(state, &to_sha)?;
     let bazel = state.bazel_options();
-    let exclude_external = bazel.is_bzlmod_enabled();
+    let exclude_external = bzlmod_enabled_for(&to, &bazel);
     let impacted = impacted_with_module_changes(&from, &to, Some(&bazel))?;
     let impacted_value = if matches!(kind, QueryKind::Distances) {
         let hash_impacted = impacted_targets(&from.hashes, &to.hashes, None, false)?

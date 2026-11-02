@@ -794,12 +794,19 @@ pub fn is_graph_defining_path(path: &str) -> bool {
             | ".bazeliskrc"
     ) || name.ends_with(".bzl")
         || name.ends_with(".scl")
+        || is_module_segment(name)
         || name.ends_with("bazelrc")
         || name.ends_with(".BUILD")
         || name.starts_with("BUILD.")
         || name.ends_with(".patch")
         || name.ends_with(".diff")
         || path == "tools/bazel"
+}
+
+/// Whether a file name is a segment `MODULE.bazel` can `include()`. Bazel rejects an include
+/// whose file name does not end in `.MODULE.bazel` (`ModuleFileFunction`).
+pub fn is_module_segment(name: &str) -> bool {
+    name.ends_with(".MODULE.bazel")
 }
 
 /// Files that `MODULE.bazel` and the `WORKSPACE` files may name by label. Their content is
@@ -1474,6 +1481,7 @@ mod tests {
             "third_party/BUILD.foo.bazel",
             "third_party/fix.patch",
             "third_party/fix.diff",
+            "third_party/llvm/llvm.MODULE.bazel",
             "tools/bazel",
         ] {
             assert!(is_graph_defining_path(path), "{path}");

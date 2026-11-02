@@ -177,7 +177,8 @@ impl TreeIndex {
 /// label) with git's view standing in for the working tree: a file is its blob id and mode, a
 /// symlink its link blob, a submodule its commit, a directory the ordered digest of everything
 /// under it, and a label outside the main repository the digest of nothing, as in the default
-/// mode without fine-grained external repositories.
+/// mode without fine-grained external repositories. (A fine-grained external source's digest
+/// is read from disk once and kept in [`PartialRecipes::external_sources`].)
 pub fn source_digest(tree: &TreeIndex, label: &str, seed: &[u8]) -> DigestBytes {
     let Some(path) = main_repo_path(label) else {
         return Sha256::digest([]).into();
@@ -301,6 +302,13 @@ pub struct PartialRecipes {
     /// repository marker files list. A change under any of them forces a full generation.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub load_inputs: BTreeSet<String>,
+    /// Source file labels outside the main repository (those of
+    /// `--fineGrainedHashExternalRepos`) to the hex digest the full generation read from the
+    /// output base. The git tree does not hold them, so a derivation reuses these; anything
+    /// that can change an external repository's files (a module or lock file, a patch, a file
+    /// its repository rule read) forces a full generation instead.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub external_sources: BTreeMap<String, String>,
 }
 
 impl PartialRecipes {
@@ -345,6 +353,12 @@ impl RecipeRecorder {
 
     pub(crate) fn record_loading_inputs(&mut self, paths: impl IntoIterator<Item = String>) {
         self.recipes.load_inputs.extend(paths);
+    }
+
+    pub(crate) fn record_external_source(&mut self, label: &str, digest: DigestBytes) {
+        self.recipes
+            .external_sources
+            .insert(label.to_owned(), hex::encode(digest));
     }
 
     pub(crate) fn record_generated(&mut self, label: &str, generating_rule: &str) {
@@ -506,16 +520,19 @@ pub fn evaluate(
         source_labels
             .par_iter()
             .map(|label| {
+                if let Some(digest) = recipes.external_sources.get(*label) {
+                    return Ok(((*label).to_owned(), decode_digest(digest)?));
+                }
                 let mut seed = Sha256::new();
                 seed.update(label.as_bytes());
                 for subinclude in recipes.subincludes(label) {
                     seed.update(subinclude.as_bytes());
                 }
                 let seed: DigestBytes = seed.finalize().into();
-                ((*label).to_owned(), source_digest(tree, label, &seed))
+                Ok(((*label).to_owned(), source_digest(tree, label, &seed)))
             })
-            .collect::<HashMap<_, _>>()
-    });
+            .collect::<Result<HashMap<_, _>>>()
+    })?;
     let package_seeds = if recipes.package_seeds {
         package_seeds(recipes, &source_labels, tree)
     } else {
@@ -694,16 +711,13 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
 }
 
 /// Rejects hashing options partial-graph mode cannot honour. The derivation evaluates recipes
-/// keyed by bare label from the revision's git tree alone, so it has no configured instances
-/// (cquery), no files outside the tree (fine-grained external repositories) and no
+/// keyed by bare label from the revision's git tree and the recorded external source digests
+/// alone, so it has no configured instances (cquery), no isolated repository inputs and no
 /// per-invocation seeds (always-affected tags); each of those would make a derived entry differ
 /// from a full generation, which is the one property the mode rests on.
 pub fn validate_hash_options(options: &HashOptions) -> Result<()> {
     if options.bazel.use_cquery {
         bail!("--partialGraph does not support --useCquery");
-    }
-    if !options.bazel.fine_grained_external_repos.is_empty() {
-        bail!("--partialGraph does not support --fineGrainedHashExternalRepos");
     }
     if options.bazel.isolated_dependency_root.is_some() {
         bail!("--partialGraph does not support --isolatedDependencyRoot");

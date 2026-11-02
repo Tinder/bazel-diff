@@ -205,8 +205,8 @@ struct GenerateHashesArgs {
     /// record every rule's hashing recipe, so a later run can derive a revision's hashes from
     /// this file with --baseHashes and no `bazel query` when the diff between the two only edits
     /// regular source files. The file always includes target types. Incompatible with
-    /// --useCquery, --fineGrainedHashExternalRepos, --alwaysAffectedTags, --contentHashPath,
-    /// --modified-filepaths and --targetType
+    /// --useCquery, --alwaysAffectedTags, --contentHashPath, --modified-filepaths and
+    /// --targetType
     #[arg(
         long = "partialGraph",
         action = ArgAction::Set,
@@ -413,8 +413,8 @@ struct ServeArgs {
 
     /// Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query`
     /// when the diff between them only edits regular source files; every entry then also records
-    /// the hashing recipes that makes possible. Incompatible with --useCquery,
-    /// --fineGrainedHashExternalRepos and --alwaysAffectedTags
+    /// the hashing recipes that makes possible. Incompatible with --useCquery and
+    /// --alwaysAffectedTags
     #[arg(
         long = "partialGraph",
         action = ArgAction::Set,

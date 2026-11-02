@@ -105,11 +105,13 @@ skips that query when it can:
   cannot feed `--depEdgesFile` and forces a full generation.
 * Hashes under the flag follow a slightly different formula from the default mode's, so
   `get-impacted-targets` and `explain` refuse a pair of files of which only one carries recipes.
-  Not supported together with `--useCquery`, `--fineGrainedHashExternalRepos`,
-  `--alwaysAffectedTags`, `--contentHashPath`, `--modified-filepaths` or `--targetType` (a file
-  missing targets cannot be derived from; filter in `get-impacted-targets` instead): a derivation
-  reads only the git tree and keys recipes by bare label. The workspace must be the repository
-  root, and `--gitPath` names the git binary (default `git`).
+  Not supported together with `--useCquery`, `--alwaysAffectedTags`, `--contentHashPath`,
+  `--modified-filepaths` or `--targetType` (a file missing targets cannot be derived from;
+  filter in `get-impacted-targets` instead): a derivation reads only the git tree and keys
+  recipes by bare label. With `--fineGrainedHashExternalRepos`, the digests of those
+  repositories' source files are recorded with the recipes and reused by a derivation, since
+  any change that could alter them forces a full generation. The workspace must be the
+  repository root, and `--gitPath` names the git binary (default `git`).
 
 A typical CI job hashes the merge base once on the main branch and keeps the file; a pull
 request run then needs no Bazel for the common case of a source-only change:
@@ -547,8 +549,8 @@ Notes and operational guidance:
   produced (`generation.mode` is `derived` or `full`, with `partialFallbackReason`, `changedSources`,
   `unmatchedPaths`, `classifyMillis` and `deriveMillis`), `/metrics` counts both under
   `partialGraph`, and the server log says which path each generation took. Not supported together
-  with `--useCquery`, `--fineGrainedHashExternalRepos` or `--alwaysAffectedTags` (the server
-  refuses to start): a derivation reads only the git tree and keys recipes by bare label. The
+  with `--useCquery` or `--alwaysAffectedTags` (the server refuses to start): a derivation reads
+  only the git tree and the recorded external source digests, and keys recipes by bare label. The
   nightly [`partial-graph-bench`](.github/workflows/partial-graph-bench.yml) workflow checks the
   mode's speed and its exact agreement with the default mode (see `tools/perf/README.md`). The
   one-shot `generate-hashes --partialGraph` writes the same entries (see [Partial Graph
@@ -684,7 +686,7 @@ Options:
   -m, --modified-filepaths <MODIFIED_FILEPATHS>
           
       --partialGraph[=<PARTIAL_GRAPH>]
-          Opt-in: hash the workspace's git tree (the working tree as it is, committed or not) and record every rule's hashing recipe, so a later run can derive a revision's hashes from this file with --baseHashes and no `bazel query` when the diff between the two only edits regular source files. The file always includes target types. Incompatible with --useCquery, --fineGrainedHashExternalRepos, --alwaysAffectedTags, --contentHashPath, --modified-filepaths and --targetType [default: false] [possible values: true, false]
+          Opt-in: hash the workspace's git tree (the working tree as it is, committed or not) and record every rule's hashing recipe, so a later run can derive a revision's hashes from this file with --baseHashes and no `bazel query` when the diff between the two only edits regular source files. The file always includes target types. Incompatible with --useCquery, --alwaysAffectedTags, --contentHashPath, --modified-filepaths and --targetType [default: false] [possible values: true, false]
       --partialGraphRebuildPattern <PARTIAL_GRAPH_REBUILD_PATTERNS>
           Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file name) of workspace paths whose change always forces a full generation under --partialGraph
       --baseHashes <BASE_HASHES>
@@ -844,7 +846,7 @@ Options:
       --dependencyFingerprint[=<DEPENDENCY_FINGERPRINT>]
           Opt-in: only serve cached entries whose external-dependency fingerprint still matches [default: false] [possible values: true, false]
       --partialGraph[=<PARTIAL_GRAPH>]
-          Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query` when the diff between them only edits regular source files; every entry then also records the hashing recipes that makes possible. Incompatible with --useCquery, --fineGrainedHashExternalRepos and --alwaysAffectedTags [default: false] [possible values: true, false]
+          Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query` when the diff between them only edits regular source files; every entry then also records the hashing recipes that makes possible. Incompatible with --useCquery and --alwaysAffectedTags [default: false] [possible values: true, false]
       --partialGraphRebuildPattern <PARTIAL_GRAPH_REBUILD_PATTERNS>
           Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file name) of workspace paths whose change always forces a full generation under --partialGraph
       --allowUntrackedPackages

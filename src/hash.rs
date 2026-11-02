@@ -416,6 +416,17 @@ fn hash_targets_with_environment(
             })
             .collect::<Result<Vec<_>>>()
     })?;
+    if let Some(recorder) = &mut recorder {
+        // Evaluation reads main-repository sources from the git tree, which has no external
+        // repository's files; keep what was read from disk. An unresolved label's empty digest
+        // is what evaluation computes anyway, so it is left out.
+        let unresolved: DigestBytes = Sha256::digest([]).into();
+        for (label, digest) in &physical {
+            if !is_main_repo(label) && *digest != unresolved {
+                recorder.record_external_source(label, *digest);
+            }
+        }
+    }
     let mut source_digests = Vec::with_capacity(physical.len());
     for (label, digest) in physical {
         rules.slot(label).set_source(&mut source_digests, digest);
@@ -3571,6 +3582,80 @@ esac
         );
         assert_eq!(derived.hashes, rebuilt.hashes);
         assert_eq!(derived.dep_edges, rebuilt.dep_edges);
+    }
+
+    /// A fine-grained external source is not in the git tree, so the full generation records
+    /// the digest it read from the output base and a derivation reuses it: derived and full
+    /// entries stay identical, and a full generation still sees an edit to the external file.
+    #[test]
+    fn partial_recipe_records_fine_grained_external_sources() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        let repo_root = output_base
+            .join("external")
+            .join("rules_jvm_external++maven+maven");
+        fs::create_dir_all(&repo_root).unwrap();
+        let jar = repo_root.join("guava.jar");
+        fs::write(&jar, "first").unwrap();
+        let external = "@maven//:guava.jar";
+        let targets = vec![
+            source_target("//:src", &[]),
+            source_target(external, &[]),
+            rule_target(Rule {
+                name: "//:consumer".into(),
+                rule_class: "genrule".into(),
+                rule_input: vec!["//:src".into(), external.into()],
+                ..Default::default()
+            }),
+        ];
+        let full = |tree: &TreeIndex| {
+            let mut options = hash_options(workspace.path());
+            options
+                .bazel
+                .fine_grained_external_repos
+                .insert("@maven".into());
+            options.partial_tree = Some(Arc::new(tree.clone()));
+            let resolver = ExternalRepoResolver {
+                workspace: workspace.path().to_path_buf(),
+                bazel: PathBuf::from("bazel"),
+                output_base: output_base.clone(),
+                repo_mapping: Arc::new(OnceLock::from(HashMap::from([(
+                    "maven".to_owned(),
+                    "rules_jvm_external++maven+maven".to_owned(),
+                )]))),
+                ..Default::default()
+            };
+            hash_targets_with_environment(
+                &options,
+                targets.clone(),
+                PreparedRules::default(),
+                resolver,
+                Some(r#"{"name":"root"}"#.to_owned()),
+            )
+            .unwrap()
+        };
+        let tree = TreeIndex::parse_ls_tree(b"100644 blob a\tsrc\0");
+        let before = full(&tree);
+        let recipes = before.partial.as_ref().unwrap();
+        assert_eq!(
+            recipes.external_sources.keys().collect::<Vec<_>>(),
+            [external]
+        );
+
+        let edited_tree = TreeIndex::parse_ls_tree(b"100644 blob b\tsrc\0");
+        let derived = partial::derive(&before, &edited_tree).unwrap();
+        let rebuilt = full(&edited_tree);
+        assert_eq!(derived.hashes, rebuilt.hashes);
+        assert_eq!(derived.partial, rebuilt.partial);
+        assert_eq!(derived.hashes[external], before.hashes[external]);
+
+        fs::write(&jar, "second").unwrap();
+        let changed = full(&tree);
+        assert_ne!(before.hashes[external].hash, changed.hashes[external].hash);
+        assert_ne!(
+            before.hashes["//:consumer"].hash,
+            changed.hashes["//:consumer"].hash
+        );
     }
 
     #[cfg(unix)]

@@ -11,9 +11,11 @@ use buffa::{EncodeSink, Message, SizeCache};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
+use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -203,7 +205,7 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
     {
         anyhow::bail!("--isolatedDependencyRoot requires full physical source hashing");
     }
-    let mut definition_digests = HashMap::new();
+    let mut definition_digests = PreparedRules::default();
     let mut digests = Vec::new();
     let query_started = Instant::now();
     let QueriedTargets {
@@ -257,7 +259,7 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
     hash_targets_with_digests(
         options,
         targets,
-        HashMap::new(),
+        PreparedRules::default(),
         None,
         None,
         ScopedSources::default(),
@@ -268,7 +270,7 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
 fn hash_targets_with_digests(
     options: &HashOptions,
     targets: Vec<Target>,
-    definition_digests: HashMap<String, PreparedRule>,
+    definition_digests: PreparedRules,
     module_graph_json: Option<String>,
     root_mapping: Option<Vec<u8>>,
     scoped_sources: ScopedSources,
@@ -298,7 +300,7 @@ fn hash_targets_with_digests(
 fn hash_targets_with_environment(
     options: &HashOptions,
     targets: Vec<Target>,
-    mut definition_digests: HashMap<String, PreparedRule>,
+    definition_digests: PreparedRules,
     external_resolver: ExternalRepoResolver,
     module_graph_json: Option<String>,
 ) -> Result<HashFileData> {
@@ -343,7 +345,14 @@ fn hash_targets_with_environment(
         .is_some()
         .then(|| RecipeRecorder::new(seed_hash, !has_instantiation_stacks));
 
-    let mut rules = HashMap::<String, Rc<RuleNode>>::with_capacity(definition_digests.len());
+    let PreparedRules {
+        mut ids,
+        mut prepared,
+    } = definition_digests;
+    ids.reserve(targets.len().saturating_sub(ids.len()));
+    let mut slots = Vec::with_capacity(targets.len());
+    slots.resize_with(ids.len(), LabelSlot::default);
+    let mut rules = Labels { ids, slots };
     let mut decoded_rules = Vec::<(String, Rule)>::new();
     let mut source_targets = Vec::new();
     let mut hash_targets = Vec::with_capacity(targets.len());
@@ -354,9 +363,13 @@ fn hash_targets_with_environment(
                     hash_targets.push(HashTarget::Rule(rule.name.clone()));
                     // Generated targets are prehashed and deduplicated; raw callers provide no
                     // digests and retain the ordered fallback below, including duplicate names.
-                    match definition_digests.remove_entry(&rule.name) {
-                        Some((name, prepared)) => {
-                            rules.insert(name, Rc::new(RuleNode { rule, prepared }));
+                    match rules
+                        .ids
+                        .get(&rule.name)
+                        .and_then(|&id| prepared.get_mut(id)?.take().map(|value| (id, value)))
+                    {
+                        Some((id, prepared)) => {
+                            rules.slots[id].rule = Some(Rc::new(RuleNode::new(rule, prepared)));
                         }
                         None => decoded_rules.push((rule.name.clone(), rule)),
                     }
@@ -386,20 +399,22 @@ fn hash_targets_with_environment(
             _ => {}
         }
     }
-    let source_digests = hash_pool()
-        .install(|| {
-            source_targets
-                .into_par_iter()
-                .map(|source| {
-                    let seed = source_seed(&source);
-                    source_hasher
-                        .digest_source(&source.name, &seed, options.bazel.use_cquery)
-                        .map(|digest| (source.name, digest))
-                })
-                .collect::<Result<Vec<_>>>()
-        })?
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+    drop(prepared);
+    let physical = hash_pool().install(|| {
+        source_targets
+            .into_par_iter()
+            .map(|source| {
+                let seed = source_seed(&source);
+                source_hasher
+                    .digest_source(&source.name, &seed, options.bazel.use_cquery)
+                    .map(|digest| (source.name, digest))
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    let mut source_digests = Vec::with_capacity(physical.len());
+    for (label, digest) in physical {
+        rules.slot(label).set_source(&mut source_digests, digest);
+    }
     let processed_rules = hash_pool().install(|| {
         decoded_rules
             .into_par_iter()
@@ -408,21 +423,19 @@ fn hash_targets_with_environment(
                 let loading_inputs = partial_loading_inputs(options, &rule);
                 (
                     name,
-                    RuleNode {
-                        rule,
-                        prepared: PreparedRule {
-                            definition_digest,
-                            shared_inputs: None,
-                            loading_inputs,
-                        },
+                    rule,
+                    PreparedRule {
+                        definition_digest,
+                        shared_inputs: None,
+                        loading_inputs,
                     },
                 )
             })
             .collect::<Vec<_>>()
     });
-    rules.reserve(processed_rules.len());
-    for (name, node) in processed_rules {
-        rules.insert(name, Rc::new(node));
+
+    for (name, rule, prepared) in processed_rules {
+        rules.slot(name).rule = Some(Rc::new(RuleNode::new(rule, prepared)));
     }
     // Fold each returned source into the existing hub once. Using the source
     // digests directly avoids cycles from a member's BUILD back to the hub.
@@ -438,12 +451,16 @@ fn hash_targets_with_environment(
             .as_deref()
             .expect("bound root");
         let name = format!("//external:{}", root.trim_start_matches('@'));
-        let hub = rules
+        let hub_definition = rules
             .get_mut(&name)
+            .and_then(|slot| slot.rule.as_mut())
             .and_then(Rc::get_mut)
-            .with_context(|| format!("--isolatedDependencyRoot: missing synthetic root {name}"))?;
-        let files: BTreeMap<_, _> = source_digests
+            .with_context(|| format!("--isolatedDependencyRoot: missing synthetic root {name}"))?
+            .prepared
+            .definition_digest;
+        let files: BTreeMap<_, _> = rules
             .iter()
+            .filter_map(|(label, slot)| Some((label, slot.source(&source_digests)?)))
             .filter(|(label, _)| {
                 label
                     .trim_start_matches('@')
@@ -459,7 +476,7 @@ fn hash_targets_with_environment(
             })
             .collect();
         let mut digest = Sha256::new();
-        digest.update(hub.prepared.definition_digest);
+        digest.update(hub_definition);
         for (label, bytes) in files {
             digest.update((label.len() as u64).to_le_bytes());
             digest.update(label.as_bytes());
@@ -479,8 +496,23 @@ fn hash_targets_with_environment(
                 label,
             )?);
         }
-        hub.prepared.definition_digest = digest.finalize().into();
+        rules
+            .get_mut(&name)
+            .and_then(|slot| slot.rule.as_mut())
+            .and_then(Rc::get_mut)
+            .expect("validated unique root")
+            .prepared
+            .definition_digest = digest.finalize().into();
     }
+    // An already captured mapping can be reused without a new Bazel call.
+    // Configured inputs retain their on-demand lookup.
+    if !options.bazel.use_cquery && source_hasher.external_resolver.repo_mapping.get().is_some() {
+        rules.prepare_inputs(
+            &options.bazel.fine_grained_external_repos,
+            source_hasher.external_resolver.canonical_repo_nodes(),
+        );
+    }
+
     let mut label_instances = None;
     for target in &hash_targets {
         let HashTarget::Generated {
@@ -492,19 +524,31 @@ fn hash_targets_with_environment(
         };
         let rule = rules
             .get(generating_rule)
+            .and_then(|slot| slot.rule.as_ref())
             .or_else(|| {
                 label_instances
-                    .get_or_insert_with(|| configured_label_instances(rules.keys()))
+                    .get_or_insert_with(|| {
+                        configured_label_instances(
+                            rules
+                                .iter()
+                                .filter_map(|(key, slot)| slot.rule.as_ref().map(|_| key)),
+                        )
+                    })
                     .get(target_label(generating_rule))
                     .and_then(|keys| keys.first())
-                    .and_then(|key| rules.get(key))
+                    .and_then(|key| rules.get(key)?.rule.as_ref())
             })
             .cloned()
             .ok_or_else(|| anyhow!("Unexpected generating rule {generating_rule}"))?;
         if let Some(recorder) = &mut recorder {
             recorder.record_generated(name, &rule.rule.name);
         }
-        rules.insert(name.clone(), rule);
+        let slot = rules.slot(name.clone());
+        if let Some(previous) = slot.rule.replace(rule) {
+            if &previous.rule.name == name && slot.replaced_canonical.is_none() {
+                slot.replaced_canonical = Some(previous);
+            }
+        }
         if let (Some(index), (label, Some(_))) = (&mut label_instances, split_configured(name)) {
             let instances = index.entry(label.to_owned()).or_default();
             if let Err(position) = instances.binary_search(name) {
@@ -517,7 +561,7 @@ fn hash_targets_with_environment(
         // What repository rules read from the workspace while the graph loads: named by their
         // attributes, and recorded by Bazel in the repository marker files of everything it
         // fetched. A change to any of it forces a full generation.
-        for node in rules.values() {
+        for node in rules.slots.iter().filter_map(|slot| slot.rule.as_ref()) {
             recorder.record_loading_inputs(node.prepared.loading_inputs.iter().cloned());
         }
         recorder.record_loading_inputs(partial::marker_loading_inputs(
@@ -530,7 +574,6 @@ fn hash_targets_with_environment(
         source_digests,
         rules,
         label_instances,
-        cache: HashMap::new(),
         repository_input_digests: HashMap::new(),
         seed_hash,
         package_bzl_seeds,
@@ -559,7 +602,11 @@ fn hash_targets_with_environment(
             }
             HashTarget::Source(label) => {
                 let mut hasher = Sha256::new();
-                if let Some(digest) = context.source_digests.get(&label) {
+                if let Some(digest) = context
+                    .rules
+                    .get(&label)
+                    .and_then(|slot| slot.source(&context.source_digests))
+                {
                     hasher.update(digest);
                 }
                 hasher.update(context.seed_hash);
@@ -730,17 +777,157 @@ fn label_hash(
     )
 }
 
+#[derive(Default)]
+struct PreparedRules {
+    ids: HashMap<String, usize>,
+    prepared: Vec<Option<PreparedRule>>,
+}
+
+impl Extend<(String, PreparedRule)> for PreparedRules {
+    fn extend<I: IntoIterator<Item = (String, PreparedRule)>>(&mut self, rules: I) {
+        for (name, prepared) in rules {
+            let id = self.ids.entry(name).or_insert_with(|| {
+                self.prepared.push(None);
+                self.prepared.len() - 1
+            });
+            self.prepared[*id] = Some(prepared);
+        }
+    }
+}
+
+// Ordinals assigned during query prehashing survive the addition of sources and
+// generated aliases. A slot's source can still be promoted during ordered DFS.
+struct Labels {
+    ids: HashMap<String, usize>,
+    slots: Vec<LabelSlot>,
+}
+
+impl Labels {
+    fn prepare_inputs(&mut self, fine: &BTreeSet<String>, mapping: &HashMap<String, String>) {
+        let empty = HashMap::new();
+        let canonical_fine = fine.iter().any(|repo| repo.starts_with("@@"));
+        let work: Vec<_> = self
+            .slots
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let node = Rc::get_mut(slot.rule.as_mut()?)?;
+                Some((index, std::mem::take(&mut node.rule.rule_input)))
+            })
+            .collect();
+        let ids = &self.ids;
+        let prepared = hash_pool().install(|| {
+            work.into_par_iter()
+                .map(|(index, mut inputs)| {
+                    let canonical = if needs_repo_nodes(&inputs, canonical_fine) {
+                        mapping
+                    } else {
+                        &empty
+                    };
+                    for i in 0..inputs.len() {
+                        if let Cow::Owned(synthetic) =
+                            transform_external_input(&inputs[i], fine, canonical)
+                        {
+                            inputs.push(synthetic);
+                        }
+                    }
+                    inputs.sort_unstable();
+                    inputs.dedup();
+                    let positions = inputs
+                        .iter()
+                        .map(|key| {
+                            ids.get(target_label(key))
+                                .and_then(|id| NonZeroUsize::new(id + 1))
+                        })
+                        .collect::<Box<[_]>>();
+                    (index, inputs, positions)
+                })
+                .collect::<Vec<_>>()
+        });
+        for (index, inputs, positions) in prepared {
+            let node = self.slots[index]
+                .rule
+                .as_mut()
+                .and_then(Rc::get_mut)
+                .expect("unique input owner");
+            node.rule.rule_input = inputs;
+            node.input_positions = Some(positions);
+        }
+    }
+
+    fn slot(&mut self, name: String) -> &mut LabelSlot {
+        let id = self.ids.entry(name).or_insert_with(|| {
+            self.slots.push(LabelSlot::default());
+            self.slots.len() - 1
+        });
+        &mut self.slots[*id]
+    }
+
+    fn get(&self, name: &str) -> Option<&LabelSlot> {
+        self.ids.get(name).map(|&id| &self.slots[id])
+    }
+
+    fn get_mut(&mut self, name: &str) -> Option<&mut LabelSlot> {
+        self.ids.get(name).map(|&id| &mut self.slots[id])
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&String, &LabelSlot)> {
+        self.ids.iter().map(|(name, &id)| (name, &self.slots[id]))
+    }
+}
+
+#[derive(Default)]
+struct LabelSlot {
+    rule: Option<Rc<RuleNode>>,
+    source: Option<NonZeroUsize>,
+    replaced_canonical: Option<Rc<RuleNode>>,
+}
+
+impl LabelSlot {
+    fn completed(&self, key: &str) -> Option<&TargetDigest> {
+        self.replaced_canonical
+            .as_ref()
+            .or_else(|| self.rule.as_ref().filter(|node| node.rule.name == key))?
+            .digest
+            .get()
+    }
+    fn resolving<'a>(&self, key: Cow<'a, str>) -> Option<Input<'a>> {
+        let prior = self
+            .replaced_canonical
+            .as_ref()
+            .and_then(|node| node.digest.get())
+            .map(|digest| digest.overall);
+        Some(Input::Rule(key, self.rule.clone()?, prior))
+    }
+    fn source(&self, digests: &[DigestBytes]) -> Option<DigestBytes> {
+        self.source.map(|i| digests[i.get() - 1])
+    }
+
+    fn set_source(&mut self, digests: &mut Vec<DigestBytes>, digest: DigestBytes) {
+        if let Some(i) = self.source {
+            digests[i.get() - 1] = digest;
+        } else {
+            digests.push(digest);
+            self.source = NonZeroUsize::new(digests.len());
+        }
+    }
+}
+
+enum Input<'a> {
+    Source(DigestBytes),
+    Rule(Cow<'a, str>, Rc<RuleNode>, Option<DigestBytes>),
+}
+
 struct HashContext<'a> {
     options: &'a HashOptions,
     source_hasher: &'a SourceHasher<'a>,
-    source_digests: HashMap<String, DigestBytes>,
-    rules: HashMap<String, Rc<RuleNode>>,
+    source_digests: Vec<DigestBytes>,
+    rules: Labels,
     /// Keys in `rules` grouped by label, sorted, for configured keys only: the fallback when
     /// an input names a configured instance that is not in `rules`. Built on the first miss,
     /// since most graphs never need it, and never for a plain query, where every key is a
     /// bare label and resolves directly.
     label_instances: Option<HashMap<String, Vec<String>>>,
-    cache: HashMap<String, TargetDigest>,
     repository_input_digests: HashMap<String, (Vec<u8>, Sha256)>,
     seed_hash: DigestBytes,
     package_bzl_seeds: BTreeMap<String, DigestBytes>,
@@ -770,12 +957,14 @@ impl HashContext<'_> {
                 for label in &inputs.labels {
                     // An unfinished rule may enter a cycle; let the normal traversal decide
                     // its digest. A source contributes to the owner's direct hash instead.
-                    let Some(digest) = self.cache.get(label) else {
+                    let Some(digest) = self
+                        .rules
+                        .get(label)
+                        .filter(|slot| slot.source.is_none())
+                        .and_then(|slot| slot.completed(label))
+                    else {
                         return false;
                     };
-                    if self.source_digests.contains_key(label) {
-                        return false;
-                    }
                     labels.extend_from_slice(label.as_bytes());
                     transitive.update(digest.overall);
                 }
@@ -796,37 +985,39 @@ impl HashContext<'_> {
         true
     }
 
-    fn cached_rule_digest(&self, key: &str) -> Option<&TargetDigest> {
-        self.cache.get(key).or_else(|| {
-            self.rules
-                .get(key)
-                .and_then(|rule| self.cache.get(&rule.rule.name))
-        })
-    }
-
-    fn rule_overall_digest(&mut self, key: &str, path: &mut Vec<String>) -> Result<DigestBytes> {
-        // Parents do not need a cached dependency vector when propagating a child's digest.
-        if let Some(digest) = self.cached_rule_digest(key) {
-            return Ok(digest.overall);
-        }
-        self.rule_digest(key, path).map(|digest| digest.overall)
-    }
-
     /// Digests one rule, named by its key: its label, or under cquery its configured identity
     /// `label|checksum` (see [`crate::bazel::CONFIGURED_SEPARATOR`]). Two configured instances
     /// of one label are two nodes here, each with its own inputs, so an edge from one instance
     /// to the other is a dependency and not a cycle.
-    fn rule_digest(&mut self, key: &str, path: &mut Vec<String>) -> Result<TargetDigest> {
-        if let Some(digest) = self.cached_rule_digest(key) {
-            return Ok(digest.clone());
-        }
-        let rule = self
+    fn rule_digest(&mut self, key: &str, path: &mut Vec<Rc<RuleNode>>) -> Result<TargetDigest> {
+        let slot = self
             .rules
             .get(key)
-            .cloned()
             .ok_or_else(|| anyhow!("Unable to find rule {key}"))?;
+        if let Some(digest) = slot
+            .replaced_canonical
+            .as_ref()
+            .and_then(|node| node.digest.get())
+        {
+            return Ok(digest.clone());
+        }
+        let rule = slot
+            .rule
+            .clone()
+            .ok_or_else(|| anyhow!("Unable to find rule {key}"))?;
+        self.node_digest(&rule, path)
+    }
+
+    fn node_digest(
+        &mut self,
+        rule: &Rc<RuleNode>,
+        path: &mut Vec<Rc<RuleNode>>,
+    ) -> Result<TargetDigest> {
+        if let Some(digest) = rule.digest.get() {
+            return Ok(digest.clone());
+        }
         let canonical_key = &rule.rule.name;
-        if let Some(index) = path.iter().position(|entry| entry == canonical_key) {
+        if let Some(index) = path.iter().position(|entry| Rc::ptr_eq(entry, rule)) {
             // A back edge: the query graph can hold cycles a build never sees (rules_go's
             // `go_context_data` and the nogo analyzers reference each other through non-dependency
             // attributes). The target is still being hashed, so stand in with a digest of its own
@@ -835,6 +1026,7 @@ impl HashContext<'_> {
             if self.cycle_warnings.insert(canonical_key.clone()) {
                 let cycle = path[index..]
                     .iter()
+                    .map(|node| &node.rule.name)
                     .chain(std::iter::once(canonical_key))
                     .cloned()
                     .collect::<Vec<_>>()
@@ -853,7 +1045,7 @@ impl HashContext<'_> {
                 deps: None,
             });
         }
-        path.push(canonical_key.clone());
+        path.push(Rc::clone(rule));
 
         let mut builder =
             TargetDigestBuilder::new(self.options.track_deps, self.recorder.is_some());
@@ -875,41 +1067,45 @@ impl HashContext<'_> {
             builder.direct(self.always_affected_seed);
         }
 
-        // cquery prints canonical labels (`@@rules_rs++crate+bd_crates//:anyhow`), while the
-        // synthetic `//external:<repo>` nodes are named by the root's apparent names. Only fetch
-        // the translation when a rule actually names a canonical repository, or a fine-grained
-        // repository is given by its canonical name and has to be recognized under the apparent
-        // name `query` prints, so a plain `query` or WORKSPACE run never pays for the extra
-        // `bazel mod` call.
-        let empty_repo_nodes = HashMap::new();
-        let canonical_repo_nodes = if rule
-            .rule
-            .rule_input
-            .iter()
-            .any(|input| is_canonical_external_label(input))
-            || self
-                .options
-                .bazel
-                .fine_grained_external_repos
-                .iter()
-                .any(|repo| repo.starts_with("@@"))
-        {
-            self.source_hasher.external_resolver.canonical_repo_nodes()
-        } else {
-            &empty_repo_nodes
-        };
         // Only a listed extension has views, so a run without the flag never resolves the
         // rule's repository, which can cost a `bazel mod` call.
         let extension = (!self.options.bazel.use_cquery
             && !self.options.bazel.label_only_module_extensions.is_empty())
         .then(|| self.rule_extension(&rule.rule.name))
         .flatten();
-        let mut inputs = rule_inputs(
-            &rule.rule,
-            self.options.bazel.use_cquery,
-            &self.options.bazel.fine_grained_external_repos,
-            canonical_repo_nodes,
-        );
+        let mut inputs: Vec<Cow<'_, str>> = if rule.input_positions.is_some() {
+            rule.rule
+                .rule_input
+                .iter()
+                .map(|name| Cow::Borrowed(name.as_str()))
+                .collect()
+        } else {
+            // cquery prints canonical labels (`@@rules_rs++crate+bd_crates//:anyhow`), while the
+            // synthetic `//external:<repo>` nodes are named by the root's apparent names. Only fetch
+            // the translation when a rule actually names a canonical repository, or a fine-grained
+            // repository is given by its canonical name and has to be recognized under the apparent
+            // name `query` prints, so a plain `query` or WORKSPACE run never pays for the extra
+            // `bazel mod` call.
+            let empty_repo_nodes = HashMap::new();
+            let canonical_repo_nodes = if needs_repo_nodes(
+                &rule.rule.rule_input,
+                self.options
+                    .bazel
+                    .fine_grained_external_repos
+                    .iter()
+                    .any(|repo| repo.starts_with("@@")),
+            ) {
+                self.source_hasher.external_resolver.canonical_repo_nodes()
+            } else {
+                &empty_repo_nodes
+            };
+            rule_inputs(
+                &rule.rule,
+                self.options.bazel.use_cquery,
+                &self.options.bazel.fine_grained_external_repos,
+                canonical_repo_nodes,
+            )
+        };
         if let Some(group) = &rule.prepared.shared_inputs {
             if !self.apply_repository_inputs(group, &mut builder) {
                 inputs.extend(
@@ -920,7 +1116,11 @@ impl HashContext<'_> {
                 );
             }
         }
-        for encoded_input in inputs {
+        for (position, encoded_input) in inputs.into_iter().enumerate() {
+            let mut input_slot = rule
+                .input_positions
+                .as_ref()
+                .and_then(|ids| ids.get(position).copied().flatten());
             // A target in an extension's repository reaches its owning module through the view
             // without that extension's repositories, when there is one (query mode only).
             let encoded_input = match extension.as_deref().and_then(|extension| {
@@ -929,29 +1129,44 @@ impl HashContext<'_> {
                     "//external:{}",
                     crate::bazel::extension_view_node(node, extension)
                 );
-                self.rules.contains_key(&view).then_some(view)
+                self.rules
+                    .get(&view)
+                    .is_some_and(|slot| slot.rule.is_some())
+                    .then_some(view)
             }) {
-                Some(view) => Cow::Owned(view),
+                Some(view) => {
+                    input_slot = None;
+                    Cow::Owned(view)
+                }
                 None => encoded_input,
             };
             builder.direct(encoded_input.as_bytes());
             let input_label = target_label(&encoded_input);
-            if let Some(source_digest) = self.source_digests.get(input_label) {
-                builder.source(input_label, source_digest);
-            } else if let Some(dependency) = self
-                .resolve_dependency(&encoded_input, input_label, path)
-                .filter(|dependency| dependency.as_ref() != canonical_key)
-            {
-                let digest = self.rule_overall_digest(&dependency, path)?;
-                builder.transitive(&dependency, || self.canonical_key(&dependency), digest);
-            } else if let Some(digest) = self.source_hasher.soft_digest(input_label, &[])? {
-                self.source_digests.insert(input_label.to_owned(), digest);
-                builder.source(input_label, digest);
-            } else if self.options.bazel.verbose {
-                eprintln!(
-                    "[Warn] Unable to calculate digest for input {input_label} for rule {}",
-                    rule.rule.name
-                );
+            match self.resolve_input(&encoded_input, input_label, input_slot, path) {
+                Some(Input::Source(digest)) => builder.source(input_label, digest),
+                Some(Input::Rule(dependency, node, prior))
+                    if dependency.as_ref() != canonical_key =>
+                {
+                    let digest =
+                        match prior.or_else(|| node.digest.get().map(|digest| digest.overall)) {
+                            Some(digest) => digest,
+                            None => self.node_digest(&node, path)?.overall,
+                        };
+                    builder.transitive(&dependency, || node.rule.name.clone(), digest);
+                }
+                _ => {
+                    if let Some(digest) = self.source_hasher.soft_digest(input_label, &[])? {
+                        self.rules
+                            .slot(input_label.to_owned())
+                            .set_source(&mut self.source_digests, digest);
+                        builder.source(input_label, digest);
+                    } else if self.options.bazel.verbose {
+                        eprintln!(
+                            "[Warn] Unable to calculate digest for input {input_label} for rule {}",
+                            rule.rule.name
+                        );
+                    }
+                }
             }
         }
 
@@ -960,33 +1175,36 @@ impl HashContext<'_> {
                 if package_group == target_label(canonical_key) {
                     continue;
                 }
-                let Some(group) = self.rules.get(package_group) else {
+                let Some(group_slot) = self.rules.get(package_group) else {
+                    continue;
+                };
+                let Some(group) = group_slot.rule.as_ref() else {
                     continue;
                 };
                 if group.rule.rule_class != "package_group" {
                     continue;
                 }
                 builder.direct(package_group.as_bytes());
-                let digest = self.rule_overall_digest(package_group, path)?;
+                let digest = match group_slot
+                    .completed(package_group)
+                    .or_else(|| group.digest.get())
+                {
+                    Some(digest) => digest.overall,
+                    None => self.node_digest(&Rc::clone(group), path)?.overall,
+                };
                 builder.transitive(package_group, || package_group.to_owned(), digest);
             }
         }
 
-        let canonical_key = path.pop().expect("rule path contains the current rule");
+        path.pop().expect("rule path contains the current rule");
         let (digest, recipe) = builder.finish();
         if let (Some(recorder), Some(recipe)) = (&mut self.recorder, recipe) {
-            recorder.record_rule(&canonical_key, recipe);
+            recorder.record_rule(canonical_key, recipe);
         }
-        self.cache.insert(canonical_key, digest.clone());
+        rule.digest
+            .set(digest.clone())
+            .expect("a completed rule is returned from its node");
         Ok(digest)
-    }
-
-    /// The name a dependency key is hashed under: a generated file's key maps to its
-    /// generating rule, every other key to itself.
-    fn canonical_key(&self, key: &str) -> String {
-        self.rules
-            .get(key)
-            .map_or_else(|| key.to_owned(), |rule| rule.rule.name.clone())
     }
 
     /// The key of the rule a rule input resolves to.
@@ -998,28 +1216,49 @@ impl HashContext<'_> {
     /// fallback never closes a cycle through the path being hashed: a configured graph Bazel
     /// analyzed has none, so such an edge points at an instance that is simply not in the
     /// result, and is dropped.
-    fn resolve_dependency<'a>(
+    fn resolve_input<'a>(
         &mut self,
         encoded_input: &'a str,
         input_label: &'a str,
-        path: &[String],
-    ) -> Option<Cow<'a, str>> {
-        if self.rules.contains_key(encoded_input) {
-            return Some(Cow::Borrowed(encoded_input));
+        input_slot: Option<NonZeroUsize>,
+        path: &[Rc<RuleNode>],
+    ) -> Option<Input<'a>> {
+        let bare = input_slot
+            .map(|id| &self.rules.slots[id.get() - 1])
+            .or_else(|| self.rules.get(input_label));
+        if let Some(digest) = bare.and_then(|slot| slot.source(&self.source_digests)) {
+            return Some(Input::Source(digest));
         }
-        if self.rules.contains_key(input_label) {
-            return Some(Cow::Borrowed(input_label));
+        if encoded_input != input_label {
+            if let Some(resolved) = self
+                .rules
+                .get(encoded_input)
+                .and_then(|slot| slot.resolving(Cow::Borrowed(encoded_input)))
+            {
+                return Some(resolved);
+            }
+        }
+        if let Some(resolved) = bare.and_then(|slot| slot.resolving(Cow::Borrowed(input_label))) {
+            return Some(resolved);
         }
         let rules = &self.rules;
         let fallback = self
             .label_instances
-            .get_or_insert_with(|| configured_label_instances(rules.keys()))
+            .get_or_insert_with(|| {
+                configured_label_instances(
+                    rules
+                        .iter()
+                        .filter_map(|(key, slot)| slot.rule.as_ref().map(|_| key)),
+                )
+            })
             .get(input_label)?
             .first()?;
-        if path.iter().any(|entry| entry == fallback) {
+        if path.iter().any(|entry| entry.rule.name == *fallback) {
             return None;
         }
-        Some(Cow::Owned(fallback.clone()))
+        rules
+            .get(fallback)
+            .and_then(|slot| slot.resolving(Cow::Owned(fallback.clone())))
     }
 
     /// The usage prefix of the module extension that generated the repository `label` is in
@@ -1077,6 +1316,19 @@ impl HashContext<'_> {
 struct RuleNode {
     rule: Rule,
     prepared: PreparedRule,
+    digest: OnceCell<TargetDigest>,
+    input_positions: Option<Box<[Option<NonZeroUsize>]>>,
+}
+
+impl RuleNode {
+    fn new(rule: Rule, prepared: PreparedRule) -> Self {
+        Self {
+            rule,
+            prepared,
+            digest: OnceCell::new(),
+            input_positions: None,
+        }
+    }
 }
 
 struct PreparedRule {
@@ -1560,6 +1812,30 @@ fn is_canonical_external_label(label: &str) -> bool {
     label.starts_with("@@") && !label.starts_with("@@//")
 }
 
+fn needs_repo_nodes(inputs: &[String], canonical_fine: bool) -> bool {
+    canonical_fine
+        || inputs
+            .iter()
+            .any(|input| is_canonical_external_label(input))
+}
+
+fn external_input_repo<'a>(
+    input: &'a str,
+    canonical_repo_nodes: &'a HashMap<String, String>,
+) -> Option<(&'a str, &'a str)> {
+    if is_main_repo(input) || !input.starts_with('@') {
+        return None;
+    }
+    let (repo, _) = input.split_once("//")?;
+    let name = repo.trim_start_matches('@');
+    let node = if repo.starts_with("@@") {
+        canonical_repo_nodes.get(name).map_or(name, String::as_str)
+    } else {
+        name
+    };
+    Some((name, node))
+}
+
 /// Rewrites an input label in an external repository to the synthetic `//external:<repo>` node
 /// `bazel::lower_repositories` produces for that repository, unless the repository is hashed
 /// fine-grained, in which case the label is kept and resolved target by target.
@@ -1576,17 +1852,8 @@ fn transform_external_input<'a>(
     fine_grained_repos: &BTreeSet<String>,
     canonical_repo_nodes: &HashMap<String, String>,
 ) -> Cow<'a, str> {
-    if is_main_repo(input) || !input.starts_with('@') {
+    let Some((name, node)) = external_input_repo(input, canonical_repo_nodes) else {
         return Cow::Borrowed(input);
-    }
-    let Some((repo, _)) = input.split_once("//") else {
-        return Cow::Borrowed(input);
-    };
-    let name = repo.trim_start_matches('@');
-    let node = if repo.starts_with("@@") {
-        canonical_repo_nodes.get(name).map_or(name, String::as_str)
-    } else {
-        name
     };
     // Match on the full repo name, not a bare string prefix: with hub-and-spoke repos (e.g.
     // rules_python's `@pip` hub and `@pip_<pkg>` spokes), a bare prefix check makes every spoke
@@ -2301,7 +2568,7 @@ mod tests {
         hash_targets_with_environment(
             options,
             targets,
-            HashMap::new(),
+            PreparedRules::default(),
             ExternalRepoResolver {
                 workspace: options.bazel.workspace.clone(),
                 bazel: options.bazel.bazel.clone(),
@@ -2310,6 +2577,30 @@ mod tests {
             },
             Some(r#"{"name":"root"}"#.to_owned()),
         )
+    }
+
+    fn hash_with_and_without_input_slots(
+        options: &HashOptions,
+        targets: Vec<Target>,
+        output_base: &Path,
+    ) -> Result<HashFileData> {
+        let reference = hash_targets_for_test(options, targets.clone(), output_base)?;
+        let indexed = hash_targets_with_environment(
+            options,
+            targets,
+            PreparedRules::default(),
+            ExternalRepoResolver {
+                workspace: options.bazel.workspace.clone(),
+                bazel: options.bazel.bazel.clone(),
+                output_base: output_base.to_path_buf(),
+                repo_mapping: Arc::new(OnceLock::from(HashMap::new())),
+                ..Default::default()
+            },
+            Some(r#"{"name":"root"}"#.to_owned()),
+        )?;
+        assert_eq!(indexed.hashes, reference.hashes);
+        assert_eq!(indexed.dep_edges, reference.dep_edges);
+        Ok(indexed)
     }
 
     fn source_target(name: &str, subincludes: &[&str]) -> Target {
@@ -2697,7 +2988,7 @@ esac
                         ..Default::default()
                     }),
                 ],
-                HashMap::new(),
+                PreparedRules::default(),
                 ExternalRepoResolver {
                     workspace: options.bazel.workspace.clone(),
                     bazel: options.bazel.bazel.clone(),
@@ -2853,7 +3144,7 @@ esac
             hash_targets_with_environment(
                 &options,
                 targets(lock_hash),
-                HashMap::new(),
+                PreparedRules::default(),
                 ExternalRepoResolver {
                     workspace: options.bazel.workspace.clone(),
                     bazel: options.bazel.bazel.clone(),
@@ -3106,6 +3397,129 @@ esac
     }
 
     #[test]
+    fn preparing_apparent_inputs_uses_mapping_only_when_the_rule_needs_it() {
+        let mut labels = Labels {
+            ids: HashMap::new(),
+            slots: Vec::new(),
+        };
+        let fine = BTreeSet::from(["@canonical".to_owned()]);
+        let canonical = HashMap::from([("canonical".to_owned(), "apparent".to_owned())]);
+        let mut reference = HashMap::new();
+        let empty = HashMap::new();
+        for (name, extras) in [
+            ("//:plain", vec![]),
+            ("//:mapped", vec!["@@canonical//:trigger".into()]),
+        ] {
+            let mut rule = Rule {
+                name: name.to_owned(),
+                rule_input: vec!["@apparent//:x".into()],
+                ..Default::default()
+            };
+            rule.rule_input.extend(extras);
+            let mapping = if rule
+                .rule_input
+                .iter()
+                .any(|input| is_canonical_external_label(input))
+            {
+                &canonical
+            } else {
+                &empty
+            };
+            reference.insert(
+                name,
+                rule_inputs(&rule, false, &fine, mapping)
+                    .into_iter()
+                    .map(Cow::into_owned)
+                    .collect::<Vec<_>>(),
+            );
+            let prepared = PreparedRule {
+                definition_digest: prehash_rule(&mut rule, &HashSet::new()),
+                shared_inputs: None,
+                loading_inputs: Vec::new(),
+            };
+            labels.slot(name.to_owned()).rule = Some(Rc::new(RuleNode::new(rule, prepared)));
+        }
+        labels.prepare_inputs(&fine, &canonical);
+        let inputs = |name| {
+            &labels
+                .get(name)
+                .unwrap()
+                .rule
+                .as_ref()
+                .unwrap()
+                .rule
+                .rule_input
+        };
+        for (name, expected) in reference {
+            assert_eq!(inputs(name), &expected);
+        }
+        assert!(inputs("//:plain")
+            .iter()
+            .any(|value| value == "//external:apparent"));
+        assert!(!inputs("//:mapped")
+            .iter()
+            .any(|value| value == "//external:apparent"));
+    }
+
+    #[test]
+    fn overwritten_canonical_key_reads_completed_original() {
+        let workspace = tempfile::tempdir().unwrap();
+        let rule = |name: &str, input: Option<&str>| {
+            rule_target(Rule {
+                name: name.into(),
+                rule_class: "genrule".into(),
+                rule_input: input.into_iter().map(str::to_owned).collect(),
+                ..Default::default()
+            })
+        };
+        let rows = vec![
+            rule("//:a", Some("//:b_early")),
+            rule("//:m", None),
+            rule("//:x", Some("//:m")),
+            rule("//:z", None),
+            generated_target("//:b_early", "//:m"),
+        ];
+        let options = hash_options(workspace.path());
+        let base =
+            hash_with_and_without_input_slots(&options, rows.clone(), workspace.path()).unwrap();
+        let mut overlapped = rows;
+        overlapped.push(generated_target("//:m", "//:z"));
+        let actual =
+            hash_with_and_without_input_slots(&options, overlapped, workspace.path()).unwrap();
+        assert_eq!(actual.hashes["//:x"].hash, base.hashes["//:x"].hash);
+        assert_eq!(actual.dep_edges["//:x"], ["//:m"]);
+    }
+
+    #[test]
+    fn a_reader_keeps_the_source_promoted_by_another_rules_self_input() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        fs::write(workspace.path().join("b"), b"source").unwrap();
+        let targets = ["//:a", "//:b", "//:c"]
+            .into_iter()
+            .map(|name| {
+                rule_target(Rule {
+                    name: name.into(),
+                    rule_class: "filegroup".into(),
+                    rule_input: vec!["//:b".into()],
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let result = hash_with_and_without_input_slots(
+            &hash_options(workspace.path()),
+            targets,
+            &output_base,
+        )
+        .unwrap();
+        // a resolves b as a rule and recurses. b sees its own physical file, so c sees the source.
+        assert_eq!(result.dep_edges["//:a"], ["//:b"]);
+        assert!(result.dep_edges["//:b"].is_empty());
+        assert!(result.dep_edges["//:c"].is_empty());
+    }
+
+    #[test]
     fn partial_recipe_records_producer_of_generated_input() {
         let workspace = tempfile::tempdir().unwrap();
         let rule = |name: &str, input: &str| {
@@ -3325,19 +3739,19 @@ esac
             })
             .collect();
         let expected = hash_targets_for_test(&options, targets.clone(), workspace.path()).unwrap();
-        let mut prepared = HashMap::new();
+        let mut prepared = PreparedRules::default();
         for target in &mut targets {
             let rule = target.rule.as_option_mut().unwrap();
             if rule.rule_input == group.labels {
                 rule.rule_input.clear();
-                prepared.insert(
+                prepared.extend([(
                     rule.name.clone(),
                     PreparedRule {
                         definition_digest: prehash_rule(rule, &options.ignored_attributes),
                         shared_inputs: Some(Arc::clone(&group)),
                         loading_inputs: Vec::new(),
                     },
-                );
+                )]);
             }
         }
         let actual = hash_targets_with_environment(
@@ -3359,7 +3773,7 @@ esac
         let output_base = workspace.path().join("output");
         fs::create_dir_all(output_base.join("external")).unwrap();
         let options = hash_options(workspace.path());
-        let missing = hash_targets_for_test(
+        let missing = hash_with_and_without_input_slots(
             &options,
             vec![generated_target("//:out", "//:missing")],
             &output_base,

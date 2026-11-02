@@ -397,22 +397,22 @@ impl BazelOptions {
         if let Some(strict) = &strict {
             // Direct users may name a target the hub doesn't export. Ask only about
             // edges actually seen in the ordinary graph, and keep the primary's rows.
-            let missing = scope.missing_inputs(&targets);
+            let mut coverage = ScopedCoverage::default();
+            coverage.record(&scope, &targets);
             let mut additions = Vec::new();
-            if !missing.is_empty() {
-                let roots = query_labels(missing.iter())?;
+            if !coverage.missing.is_empty() {
+                let roots = query_labels(coverage.missing.iter())?;
                 additions.push(format!(
                     "(let direct = deps({roots}) in $direct + buildfiles($direct))"
                 ));
             }
-            let files = scope.returned_source_files(&targets);
             let readers: BTreeSet<_> = loads
                 .iter()
                 .filter(|(_, names)| {
                     names
                         .iter()
                         .filter_map(|name| scope.canonical(name))
-                        .any(|name| !files.contains(&name))
+                        .any(|name| !coverage.files.contains(&name))
                 })
                 .map(|(build, _)| build)
                 .collect();
@@ -427,17 +427,15 @@ impl BazelOptions {
                 let mut extra = strict.query_with(&query, false, version, &mut |batch| {
                     scope.record_build_loads(batch, &mut loads);
                 })?;
-                let present: HashSet<_> = targets.iter().filter_map(target_name).collect();
-                extra.retain(|target| {
-                    target_name(target).is_some_and(|name| !present.contains(name))
-                });
+                retain_supplemental_targets(&mut extra, &targets);
                 transform(&mut extra, None);
+                coverage.record(&scope, &extra);
                 targets.extend(extra);
-                if let Some(missing) = scope.missing_inputs(&targets).first() {
+                if let Some(missing) = coverage.missing.first() {
                     bail!("--isolatedDependencyRoot: scoped input {missing} was not returned");
                 }
             }
-            scope.connect_external_readers(&loads, &mut targets)?;
+            scope.connect_external_readers(&loads, &mut targets, &coverage)?;
         }
         self.check_failed_extension_references(
             &targets,
@@ -1645,6 +1643,65 @@ fn query_labels<'a>(labels: impl Iterator<Item = &'a String>) -> Result<String> 
         .map(|labels| labels.join(" + "))
 }
 
+/// Coverage of the retained primary targets followed by any accepted supplement.
+#[derive(Default)]
+struct ScopedCoverage {
+    names: HashSet<String>,
+    files: HashSet<String>,
+    missing: BTreeSet<String>,
+    direct_readers: Vec<bool>,
+}
+
+impl ScopedCoverage {
+    fn record(&mut self, scope: &IsolatedRepoScope, targets: &[Target]) {
+        for target in targets {
+            if let Some(name) = target_name(target).and_then(|name| scope.canonical(name)) {
+                self.missing.remove(&name);
+                self.names.insert(name);
+            }
+            if let Some(name) = target
+                .source_file
+                .as_option()
+                .and_then(|file| scope.canonical(&file.name))
+            {
+                self.files.insert(name);
+            }
+        }
+        for target in targets {
+            let mut direct = false;
+            if let Some(rule) = target.rule.as_option() {
+                for input in rule
+                    .rule_input
+                    .iter()
+                    .filter_map(|label| scope.canonical(label))
+                {
+                    direct = true;
+                    if !self.names.contains(&input) {
+                        self.missing.insert(input);
+                    }
+                }
+            }
+            self.direct_readers.push(direct);
+        }
+    }
+}
+
+// The primary wins on equal names. Preserve repeated records in the supplement
+// when no primary record has their name.
+fn retain_supplemental_targets(extra: &mut Vec<Target>, primary: &[Target]) {
+    if extra.is_empty() {
+        return;
+    }
+    let primary_names = primary.iter().filter_map(target_name);
+    let present: HashSet<_> = if extra.len() <= primary.len() / 2 {
+        let names: HashSet<_> = extra.iter().filter_map(target_name).collect();
+        primary_names.filter(|name| names.contains(name)).collect()
+    } else {
+        primary_names.collect()
+    };
+    extra.retain(|target| target_name(target).is_some_and(|name| !present.contains(name)));
+}
+
 impl IsolatedRepoScope {
     fn expression(&self, ordinary: &str) -> String {
         format!("let members = deps('@{}//...:all-targets') in ({ordinary}) + $members + buildfiles($members)", self.anchor)
@@ -1660,39 +1717,27 @@ impl IsolatedRepoScope {
         Some(format!("@@{canonical}//{rest}"))
     }
 
-    fn package(&self, label: &str) -> String {
+    fn package<'a>(&self, label: &'a str) -> Cow<'a, str> {
         let package = label.rsplit_once(':').map_or(label, |(package, _)| package);
         if let Some((repo, path)) = package
             .strip_prefix('@')
             .and_then(|label| label.split_once("//"))
         {
+            if repo.starts_with('@') && repo.len() > 1 {
+                return Cow::Borrowed(package);
+            }
             let canonical = repo
                 .strip_prefix('@')
                 .or_else(|| self.aliases.get(repo).map(String::as_str));
             if let Some(repo) = canonical {
                 return if repo.is_empty() {
-                    format!("//{path}")
+                    Cow::Owned(format!("//{path}"))
                 } else {
-                    format!("@@{repo}//{path}")
+                    Cow::Owned(format!("@@{repo}//{path}"))
                 };
             }
         }
-        package.to_owned()
-    }
-
-    fn missing_inputs(&self, targets: &[Target]) -> BTreeSet<String> {
-        let present: HashSet<_> = targets
-            .iter()
-            .filter_map(target_name)
-            .filter_map(|name| self.canonical(name))
-            .collect();
-        targets
-            .iter()
-            .filter_map(|target| target.rule.as_option())
-            .flat_map(|rule| &rule.rule_input)
-            .filter_map(|label| self.canonical(label))
-            .filter(|label| !present.contains(label))
-            .collect()
+        Cow::Borrowed(package)
     }
 
     // Ordinary query can emit two source records for a BUILD, even within one stream.
@@ -1729,31 +1774,24 @@ impl IsolatedRepoScope {
         }
     }
 
-    fn returned_source_files(&self, targets: &[Target]) -> HashSet<String> {
-        targets
-            .iter()
-            .filter_map(|target| target.source_file.as_option())
-            .filter_map(|source| self.canonical(&source.name))
-            .collect()
-    }
-
     fn connect_external_readers(
         &self,
         loads_by_package: &BTreeMap<String, BTreeSet<String>>,
         targets: &mut [Target],
+        coverage: &ScopedCoverage,
     ) -> Result<()> {
-        let files = self.returned_source_files(targets);
+        debug_assert_eq!(targets.len(), coverage.direct_readers.len());
         let mut readers = BTreeSet::new();
         for (build, loads) in loads_by_package {
             for load in loads.iter().filter_map(|label| self.canonical(label)) {
-                if !files.contains(&load) {
+                if !coverage.files.contains(&load) {
                     bail!("--isolatedDependencyRoot: buildfiles did not return scoped load {load}");
                 }
                 readers.insert(self.package(build));
             }
         }
         let root = format!("//external:{}", self.anchor);
-        for target in targets {
+        for (index, target) in targets.iter_mut().enumerate() {
             if let Some(source) = target.source_file.as_option_mut() {
                 if self.canonical(&source.name).is_some() {
                     if let Some(loads) = loads_by_package.get(&source.name) {
@@ -1764,11 +1802,9 @@ impl IsolatedRepoScope {
             if let Some(rule) = target.rule.as_option_mut() {
                 if !rule.name.starts_with("//external:")
                     && self.canonical(&rule.name).is_none()
-                    && (readers.contains(&self.package(&rule.name))
-                        || rule
-                            .rule_input
-                            .iter()
-                            .any(|input| self.canonical(input).is_some()))
+                    && (coverage.direct_readers[index]
+                        || (!readers.is_empty()
+                            && readers.contains(self.package(&rule.name).as_ref())))
                     && !rule.rule_input.contains(&root)
                 {
                     rule.rule_input.push(root.clone());
@@ -5148,6 +5184,64 @@ exit 1
     }
 
     #[test]
+    fn filtering_preserves_new_variants_for_small_and_large_supplements() {
+        let primary = ["//p:a", "//p:b", "//p:c", "//p:d", "//p:e", "//p:f"].map(rule_target);
+        for primary in [&primary[..1], &primary[..]] {
+            let mut extra = vec![
+                rule_target("//p:new"),
+                rule_target("//p:a"),
+                rule_target("//p:new"),
+            ];
+            retain_supplemental_targets(&mut extra, primary);
+            assert_eq!(
+                extra.iter().filter_map(target_name).collect::<Vec<_>>(),
+                ["//p:new", "//p:new"]
+            );
+        }
+    }
+
+    #[test]
+    fn supplement_extends_coverage_without_replacing_primary_or_deduplicating_new_names() {
+        let member = "owner++_ext+++usage+hub";
+        let scope = IsolatedRepoScope {
+            anchor: "hub".into(),
+            members: BTreeSet::from([member.to_owned()]),
+            aliases: RepoMapping::from([("hub".to_owned(), member.to_owned())]),
+            ..Default::default()
+        };
+        let rule = |name: &str, input: &str| {
+            let mut target = rule_target(name);
+            target
+                .rule
+                .as_option_mut()
+                .unwrap()
+                .rule_input
+                .push(input.to_owned());
+            target
+        };
+        let primary = [rule("//pkg:reader", "@hub//:new")];
+        let mut coverage = ScopedCoverage::default();
+        coverage.record(&scope, &primary);
+        assert_eq!(
+            coverage.missing,
+            BTreeSet::from([format!("@@{member}//:new")])
+        );
+        let mut extra = vec![
+            rule("//pkg:reader", "@hub//:discarded"),
+            rule("@hub//:new", "@hub//:new"),
+            rule("@hub//:new", "@hub//:still_missing"),
+        ];
+        retain_supplemental_targets(&mut extra, &primary);
+        assert_eq!(extra.len(), 2);
+        coverage.record(&scope, &extra);
+        assert_eq!(
+            coverage.missing,
+            BTreeSet::from([format!("@@{member}//:still_missing")])
+        );
+        assert_eq!(coverage.direct_readers, [true, true, true]);
+    }
+
+    #[test]
     fn scoped_build_loads_union_duplicate_observations_before_deduplication() {
         let repo = "owner++_ext+++usage+hub";
         let scope = IsolatedRepoScope {
@@ -5179,12 +5273,15 @@ exit 1
                 rule_target("//pkg:consumer"),
                 source("@hub//:BUILD.bazel", &[]),
             ];
+            let mut coverage = ScopedCoverage::default();
+            coverage.record(&scope, &targets);
             assert!(scope
-                .connect_external_readers(&loads, &mut targets)
+                .connect_external_readers(&loads, &mut targets, &coverage)
                 .is_err());
             targets.push(source("@hub//:defs.bzl", &[]));
+            coverage.record(&scope, &targets[coverage.direct_readers.len()..]);
             scope
-                .connect_external_readers(&loads, &mut targets)
+                .connect_external_readers(&loads, &mut targets, &coverage)
                 .unwrap();
             assert_eq!(
                 targets[0].rule.as_option().unwrap().rule_input,

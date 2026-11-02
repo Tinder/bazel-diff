@@ -20,6 +20,19 @@ from pathlib import Path
 import perf_proof as pp
 
 
+class StartupOptionsTest(unittest.TestCase):
+    def test_nohome_rc_is_always_first(self):
+        self.assertEqual(pp.startup_options_for(""), ["--nohome_rc"])
+        self.assertEqual(pp.startup_options_for("--host_jvm_args=-Xmx8g"), ["--nohome_rc", "--host_jvm_args=-Xmx8g"])
+        self.assertEqual(pp.startup_options_for("--nohome_rc --foo"), ["--nohome_rc", "--foo"])
+
+    def test_home_rc_is_refused(self):
+        with self.assertRaises(SystemExit):
+            pp.startup_options_for("--home_rc")
+        with self.assertRaises(SystemExit):
+            pp.startup_options_for("--host_jvm_args=-Xmx8g --home_rc=true")
+
+
 class RusageTest(unittest.TestCase):
     def test_maxrss_units(self):
         self.assertEqual(pp.maxrss_to_bytes(4096, system="Darwin"), 4096)
@@ -234,7 +247,8 @@ class ParserTest(unittest.TestCase):
         self.assertIsNone(args.iterations)
         self.assertEqual(args.builder, "bazel")
         self.assertEqual(args.threshold, 5.0)
-        self.assertEqual(args.bazel_startup_options, "--nohome_rc")
+        self.assertEqual(args.bazel_startup_options, "")
+        self.assertEqual(args.build_bazel_startup_options, "")
         self.assertIsNone(args.workload)
         wls = pp.select_workloads(args)
         self.assertEqual([w[0] for w in wls], ["small", "medium", "large"])

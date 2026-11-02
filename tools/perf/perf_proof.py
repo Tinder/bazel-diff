@@ -58,6 +58,9 @@ Usage (from a checkout; the harness builds from git, your tree is never modified
     # Measure the harness's own noise floor: the base binary against itself.
     python3 tools/perf/perf_proof.py --aa
 
+Every Bazel invocation the harness makes, builds included, runs with ``--nohome_rc``; it is not
+configurable, because a run that a developer's ``~/.bazelrc`` can shape is not reproducible.
+
 Builds happen in a worktree under ``~/.cache/bazel-diff-perf-proof/`` that persists between runs,
 so only the first run on a machine pays a cold Bazel build; later runs rebuild incrementally.
 
@@ -134,6 +137,11 @@ EXACT_MAX_COMBINATIONS = 20000
 
 RSS_SAMPLE_INTERVAL_S = 0.05
 
+# Every Bazel invocation the harness makes, builds included, starts with this. A developer's
+# ~/.bazelrc can change compilation flags, add a build event service, or alter query behaviour,
+# so without it two runs on two machines are not comparable. It is not configurable.
+MANDATORY_STARTUP_OPTIONS = ["--nohome_rc"]
+
 log = tc.log
 vlog = tc.vlog
 
@@ -141,6 +149,19 @@ vlog = tc.vlog
 # ----------------------------------------------------------------------------------------------
 # Pure helpers (unit-tested in perf_proof_test.py; nothing here shells out)
 # ----------------------------------------------------------------------------------------------
+
+
+def startup_options_for(extra: str) -> list[str]:
+    """The mandatory startup options followed by the user's extra ones. Anything that would
+    re-enable the home rc is refused, since it would make the run irreproducible."""
+    out = list(MANDATORY_STARTUP_OPTIONS)
+    for opt in extra.split():
+        if opt == "--home_rc" or opt.startswith("--home_rc="):
+            raise SystemExit(f"{opt} is not allowed: the harness always runs Bazel with --nohome_rc "
+                             "so a ~/.bazelrc cannot shape the measurement")
+        if opt not in out:
+            out.append(opt)
+    return out
 
 
 def maxrss_to_bytes(ru_maxrss: int, system: Optional[str] = None) -> int:
@@ -919,7 +940,7 @@ def build_variants(args: argparse.Namespace, workdir: Path, base: Variant, cand:
     need_cand = cand.binary is None and not args.aa
     if need_base or need_cand:
         build_dir = Path(args.build_dir).resolve() if args.build_dir else default_build_dir()
-        build_startup = args.build_bazel_startup_options.split()
+        build_startup = startup_options_for(args.build_bazel_startup_options)
         wt = SourceWorktree(build_dir, base.commit or "HEAD", args.build_bazel, build_startup, fresh=args.fresh_build)
         try:
             if need_base:
@@ -1219,9 +1240,9 @@ def build_parser() -> argparse.ArgumentParser:
     cs.add_argument("--builder", choices=("bazel", "cargo"), default="bazel",
                     help="how to build each side: bazel (--config=release, what releases ship; default) or cargo (--release, faster rebuilds)")
     cs.add_argument("--build-bazel", default="bazel", help="bazel binary used to BUILD bazel-diff (default: bazel)")
-    cs.add_argument("--build-bazel-startup-options", default="--nohome_rc",
-                    help="startup options for the builds (default: --nohome_rc, so a ~/.bazelrc that streams to a build "
-                         "event service or changes compilation flags stays out of the measured binaries; pass '' to use it)")
+    cs.add_argument("--build-bazel-startup-options", default="",
+                    help="extra startup options for the builds, added after the mandatory --nohome_rc (a ~/.bazelrc that "
+                         "streams to a build event service or changes compilation flags must not shape the compared binaries)")
     cs.add_argument("--build-dir", help="persistent build directory (worktree + Bazel output base) reused across runs "
                                         "(default: $XDG_CACHE_HOME/bazel-diff-perf-proof/<repo-key>, ~/.cache otherwise)")
     cs.add_argument("--fresh-build", action="store_true", help="delete the build directory first (a cold build, minutes)")
@@ -1243,8 +1264,9 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--warmup-runs", type=int, default=1, help="untimed flows with the base binary before timing (default: 1)")
     m.add_argument("--quick", action="store_true", help="smoke profile: tiny workload, 2 iterations")
     m.add_argument("--bazel", default="bazel", help="bazel binary the measured workspaces use (default: bazel)")
-    m.add_argument("--bazel-startup-options", default="--nohome_rc",
-                   help="startup options for every measured Bazel invocation (default: --nohome_rc, so your ~/.bazelrc never joins the measurement)")
+    m.add_argument("--bazel-startup-options", default="",
+                   help="extra startup options for every measured Bazel invocation, added after the mandatory --nohome_rc "
+                        "(your ~/.bazelrc never joins the measurement)")
     m.add_argument("--generate-arg", action="append", default=[],
                    help="extra flag for every generate-hashes invocation, e.g. --generate-arg=--useCquery (repeatable)")
     m.add_argument("--stage-timeout", type=float, default=1800.0, help="seconds before a stage is killed (default: 1800)")
@@ -1304,7 +1326,7 @@ def main(argv: list[str]) -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     keep = args.keep_workdir or bool(args.workdir)
     log(f"workdir: {workdir}" + ("" if keep else " (removed at the end; --keep-workdir keeps it)"))
-    startup_options = args.bazel_startup_options.split()
+    startup_options = startup_options_for(args.bazel_startup_options)
     ctx = FlowContext(bazel=args.bazel, startup_options=startup_options, generate_args=args.generate_arg,
                       timeout_s=args.stage_timeout)
     t_start = time.monotonic()
@@ -1373,7 +1395,7 @@ def main(argv: list[str]) -> int:
                 "verdict_metrics": verdict_metrics,
                 "allow_output_diff": args.allow_output_diff,
                 "builder": args.builder,
-                "build_bazel_startup_options": args.build_bazel_startup_options.split(),
+                "build_bazel_startup_options": startup_options_for(args.build_bazel_startup_options),
                 "bazel_startup_options": startup_options,
                 "generate_args": args.generate_arg,
                 "stages": STAGES,

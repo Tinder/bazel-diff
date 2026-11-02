@@ -45,10 +45,9 @@ Requirements: `git`, a `bazel`/`bazelisk` binary (`--bazel` for the measured wor
 only. The harness checks the two sides out, in turn, into a build worktree under
 `~/.cache/bazel-diff-perf-proof/<repo-key>/` (`--build-dir` to move it) with its own Bazel output
 base, and builds them with `--config=release`, the flags releases ship with (`--builder cargo`
-for `cargo build --release` instead). Builds run with `--nohome_rc` as well
-(`--build-bazel-startup-options` to change): a `~/.bazelrc` that streams to a build event service
-or changes compilation flags must not shape the binaries being compared. Your checkout is never
-modified. The build directory
+for `cargo build --release` instead). Builds run with `--nohome_rc` as well, always: a `~/.bazelrc`
+that streams to a build event service or changes compilation flags must not shape the binaries
+being compared. Your checkout is never modified. The build directory
 persists between runs, so only the first run on a machine pays a cold build (a fresh output base
 fetches and compiles every crate and the toolchain: well over ten minutes); after that each side
 is an incremental build of a few seconds. `--fresh-build` discards it. Budget a few minutes per
@@ -70,9 +69,11 @@ For every stage the harness records, from the kernel's accounting of the reaped 
 separately so a change that trades syscalls for computation is visible) and **peak RSS**, plus its
 **wall time**, and the **Bazel server's CPU** delta over the stage (read from the server pid; the
 server is a daemon outside the process tree, so it is reported separately rather than mixed in).
-Every measured Bazel invocation runs with `--nohome_rc` (`--bazel-startup-options` to change) so a
-developer's `~/.bazelrc` never joins the measurement; `--generate-arg` adds flags such as
-`--useCquery` to every `generate-hashes`.
+Every Bazel invocation the harness makes, builds included, runs with `--nohome_rc`, and that is
+not configurable: a run that a developer's `~/.bazelrc` can shape is not reproducible, so
+`--bazel-startup-options` and `--build-bazel-startup-options` only *add* options after it and
+`--home_rc` is refused. `--generate-arg` adds flags such as `--useCquery` to every
+`generate-hashes`.
 
 Base and candidate run back to back in every iteration, and the order flips each iteration, so
 drift over the run (thermal throttling, page cache, other processes) lands on both sides. One

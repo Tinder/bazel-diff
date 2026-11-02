@@ -1286,8 +1286,17 @@ fn repository_input_digest(
 }
 
 fn hash_permissions(digest: &mut Sha256, metadata: &fs::Metadata) {
+    // Preserve the existing encoding of ordinary 0644 files and 0755 executables/directories.
+    // The checkout's umask is not part of a Bazel source artifact.
     #[cfg(unix)]
-    digest.update((metadata.permissions().mode() & 0o777).to_le_bytes());
+    {
+        let mode: u32 = if metadata.is_dir() || metadata_owner_executable(metadata) {
+            0o755
+        } else {
+            0o644
+        };
+        digest.update(mode.to_le_bytes());
+    }
     #[cfg(not(unix))]
     digest.update([u8::from(metadata.permissions().readonly())]);
 }
@@ -2201,6 +2210,33 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("generate_hashes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_inputs_follow_source_executable_permissions_across_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("external/source");
+        let dir = repo.join("tree");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("patch");
+        fs::write(&file, "contents").unwrap();
+        let digests = || {
+            ["@@source//:tree/patch", "@@source//:tree"]
+                .map(|label| repository_input_digest(root.path(), root.path(), label).unwrap())
+        };
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let baseline = digests();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o664)).unwrap();
+        assert_eq!(digests(), baseline);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        let executable = digests();
+        assert_ne!(executable[0], baseline[0]);
+        assert_ne!(executable[1], baseline[1]);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(digests(), executable);
     }
 
     #[test]

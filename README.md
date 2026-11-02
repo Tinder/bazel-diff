@@ -89,9 +89,10 @@ skips that query when it can:
   the content of regular files -- no `bazel query`, no Bazel at all. Anything else falls back to a
   full generation: an added, deleted, renamed or type-changed path; a symlink or submodule on
   either side; a change to a file Bazel reads while loading (`BUILD`, `BUILD.bazel`, `*.bzl`,
-  `*.scl`, `MODULE.bazel`, `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`, `VENDOR.bazel`,
-  `*bazelrc`, `.bazelversion`, `.bazelignore`, `.bazeliskrc`, `tools/bazel`, `*.BUILD`,
-  `BUILD.*`, `*.patch`, `*.diff`); a file `MODULE.bazel` or a `WORKSPACE` file names by label;
+  `*.scl`, `MODULE.bazel`, the `*.MODULE.bazel` segments it can include, `MODULE.bazel.lock`,
+  `WORKSPACE*`, `REPO.bazel`, `VENDOR.bazel`, `*bazelrc`, `.bazelversion`, `.bazelignore`,
+  `.bazeliskrc`, `tools/bazel`, `*.BUILD`, `BUILD.*`, `*.patch`, `*.diff`); a file one of
+  those module files or a `WORKSPACE` file names by label;
   anything a repository rule read from the workspace while the graph was generated; a
   `--seed-filepaths` file; a path matching `--partialGraphRebuildPattern` (a glob: `*` within a
   path segment, `**` across, a pattern without `/` matches the file name; repeatable); or a base
@@ -529,10 +530,11 @@ Notes and operational guidance:
   -- when `git diff` between the two only modifies the content of regular files. Anything else
   falls back to a full generation: an added, deleted, renamed or type-changed path; a symlink or
   submodule on either side; a change to a file Bazel reads while loading (`BUILD`, `BUILD.bazel`,
-  `*.bzl`, `*.scl`, `MODULE.bazel`, `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`,
-  `VENDOR.bazel`, `*bazelrc`, `.bazelversion`, `.bazelignore`, `.bazeliskrc`, `tools/bazel`,
-  `*.BUILD`, `BUILD.*`, `*.patch`, `*.diff`); a file `MODULE.bazel` or a `WORKSPACE` file names
-  by label (a requirements or lock file a module extension reads); anything a repository rule
+  `*.bzl`, `*.scl`, `MODULE.bazel`, the `*.MODULE.bazel` segments it can include,
+  `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`, `VENDOR.bazel`, `*bazelrc`, `.bazelversion`,
+  `.bazelignore`, `.bazeliskrc`, `tools/bazel`, `*.BUILD`, `BUILD.*`, `*.patch`, `*.diff`); a
+  file one of those module files or a `WORKSPACE` file names by label (a requirements or lock
+  file a module extension reads); anything a repository rule
   read from the workspace while the graph was generated (the root of a `local_repository` or
   `local_path_override`, the files its attributes name, and the files Bazel's repository marker
   files record as read), which every entry records; a `--seed-filepaths` file; or

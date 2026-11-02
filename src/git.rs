@@ -294,9 +294,10 @@ pub struct DerivationPolicy<'a> {
 }
 
 /// Decides whether `revision` can be derived from the entry generated at `base_revision`: the
-/// raw diff between the two, the module and workspace files' label references at `revision`,
-/// and the policy's rebuild patterns and seed files go through [`partial::classify`]. Both
-/// arguments may be commits or tree ids.
+/// raw diff between the two, the label references at `revision` of the module and workspace
+/// files and of the `*.MODULE.bazel` segments a module file can include, and the policy's
+/// rebuild patterns and seed files go through [`partial::classify`]. Both arguments may be
+/// commits or tree ids.
 pub fn classify_revisions(
     git: &Git,
     base_revision: &str,
@@ -315,10 +316,15 @@ pub fn classify_revisions(
     ])?;
     let diff = partial::parse_diff_raw(&diff)?;
     let mut module_referenced = BTreeSet::new();
-    for file in MODULE_FILES {
-        if tree.get(file).is_none() {
-            continue;
-        }
+    let segments = tree
+        .under("")
+        .map(|(path, _)| path)
+        .filter(|path| partial::is_module_segment(path.rsplit('/').next().unwrap_or(path)));
+    for file in MODULE_FILES
+        .into_iter()
+        .filter(|file| tree.get(file).is_some())
+        .chain(segments)
+    {
         let text = git.show(revision, file)?;
         module_referenced.extend(partial::referenced_main_repo_paths(
             &String::from_utf8_lossy(&text),
@@ -675,5 +681,49 @@ mod tests {
         )
         .is_ok());
         assert!(classify_revisions(&git, "missing", &base_tree, &base, &edited, &policy).is_err());
+    }
+
+    /// A file an included `*.MODULE.bazel` segment names by label is read while resolving
+    /// external repositories, so an edit to it cannot be derived.
+    #[test]
+    fn module_segment_label_references_force_a_rebuild() {
+        let (repo, git) = repository();
+        fs::create_dir_all(repo.path().join("deps")).unwrap();
+        fs::write(
+            repo.path().join("deps/pip.MODULE.bazel"),
+            "pip.parse(lock = \"//deps:lock.txt\")\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("deps/lock.txt"), "one").unwrap();
+        let base_tree = git.snapshot_working_tree(&[]).unwrap();
+        let base = HashFileData {
+            partial: Some(partial::PartialRecipes {
+                version: partial::RECIPE_VERSION,
+                seed_hash: "00".repeat(32),
+                package_seeds: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let seeds = BTreeSet::new();
+        let policy = DerivationPolicy {
+            seed_filepaths: &seeds,
+            rebuild_patterns: &[],
+        };
+        fs::write(repo.path().join("deps/lock.txt"), "two").unwrap();
+        let edited = git.snapshot_working_tree(&[]).unwrap();
+        let classification = classify_revisions(
+            &git,
+            base_tree.id().unwrap(),
+            edited.id().unwrap(),
+            &base,
+            &edited,
+            &policy,
+        )
+        .unwrap();
+        assert!(
+            matches!(classification, Classification::Rebuild { .. }),
+            "{classification:?}"
+        );
     }
 }

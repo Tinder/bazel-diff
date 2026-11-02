@@ -7,7 +7,7 @@ use bazel_diff::hash::{generate_hashes, HashOptions};
 use bazel_diff::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
 };
-use bazel_diff::module_graph::impacted_with_module_changes;
+use bazel_diff::module_graph::{bzlmod_enabled_for, impacted_with_module_changes};
 use bazel_diff::partial::{self, Classification, Glob};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -923,7 +923,7 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
     let bazel = get_bazel_options(args, verbose);
     let exclude_external = args
         .exclude_external_targets
-        .unwrap_or_else(|| bazel.is_bzlmod_enabled());
+        .unwrap_or_else(|| bzlmod_enabled_for(&to, &bazel));
     let target_types = (!args.target_type.is_empty())
         .then(|| args.target_type.iter().cloned().collect::<HashSet<_>>());
     let output = if let Some(dep_edges_file) = &args.dep_edges_file {

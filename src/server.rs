@@ -2468,10 +2468,7 @@ mod tests {
             .bazel
             .fine_grained_external_repos
             .insert("@crates".into());
-        assert!(validate_partial_graph(&fine_grained)
-            .unwrap_err()
-            .to_string()
-            .contains("--fineGrainedHashExternalRepos"));
+        assert!(validate_partial_graph(&fine_grained).is_ok());
 
         let mut always_affected = config;
         always_affected

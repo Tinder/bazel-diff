@@ -20,6 +20,22 @@ use tempfile::NamedTempFile;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct BazelVersion(u32, u32, u32);
 
+/// The flag that decides whether the `//external` package exists.
+const WORKSPACE_FLAG: &str = "enable_workspace";
+
+/// What one `bazel info release output_base starlark-semantics` reports. Generation asks for
+/// these together before querying so that the same call replaces `bazel version`, the later
+/// `bazel info output_base` of the hashing pass, and -- when WORKSPACE is known to be disabled --
+/// the `//external:all-targets` query that would only fail and be retried without it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ServerInfo {
+    version: Option<BazelVersion>,
+    pub(crate) output_base: Option<PathBuf>,
+    /// Whether `//external` exists. `None` when it cannot be told from `bazel info` alone, which
+    /// keeps the query probing for it.
+    external_package: Option<bool>,
+}
+
 #[derive(Clone, Debug)]
 pub struct BazelOptions {
     pub workspace: PathBuf,
@@ -265,6 +281,87 @@ impl BazelOptions {
         Ok(hex::encode(hasher.finalize()))
     }
 
+    /// Asks Bazel for its release, output base and Starlark semantics in one invocation. `None`
+    /// when the call fails (an older Bazel without one of the keys, say), so callers fall back to
+    /// the separate calls they made before.
+    ///
+    /// The call carries the startup options and bazelrc the query will use but not
+    /// `--bazelCommandOptions`, which are `bazel query` flags `bazel info` may reject.
+    fn server_info(&self) -> Option<ServerInfo> {
+        let output = self
+            .run_capture(&["info", "release", "output_base", "starlark-semantics"])
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let mut info = parse_server_info(&String::from_utf8_lossy(&output.stdout))?;
+        // `bazel info` reads the `common`, `build` and `info` sections of a bazelrc and
+        // `bazel query` the `common` and `query` ones, and the query alone gets
+        // `--bazelCommandOptions`. Leave the question open unless neither can set the flag.
+        if info.external_package.is_some()
+            && (self
+                .command_options
+                .iter()
+                .any(|option| option.contains(WORKSPACE_FLAG))
+                || self.bazelrc_mentions(WORKSPACE_FLAG))
+        {
+            info.external_package = None;
+        }
+        Some(info)
+    }
+
+    /// Whether any bazelrc Bazel reads for this workspace, or one they import, names `flag`.
+    /// Deliberately coarse: a comment or an unrelated config naming it also counts.
+    fn bazelrc_mentions(&self, flag: &str) -> bool {
+        if self.no_bazelrc {
+            return false;
+        }
+        let mut pending = vec![
+            self.workspace.join(".bazelrc"),
+            PathBuf::from("/etc/bazel.bazelrc"),
+        ];
+        if let Some(home) = std::env::var_os("HOME") {
+            pending.push(PathBuf::from(home).join(".bazelrc"));
+        }
+        pending.extend(
+            self.startup_options
+                .iter()
+                .filter_map(|option| option.strip_prefix("--bazelrc="))
+                .map(PathBuf::from),
+        );
+        let mut seen = HashSet::new();
+        while let Some(path) = pending.pop() {
+            if seen.len() > 64 || !seen.insert(path.clone()) {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if text.contains(flag) {
+                return true;
+            }
+            for line in text.lines() {
+                let line = line.trim();
+                let Some(import) = line
+                    .strip_prefix("try-import")
+                    .or_else(|| line.strip_prefix("import"))
+                else {
+                    continue;
+                };
+                let import = import
+                    .trim()
+                    .replace("%workspace%", &self.workspace.to_string_lossy());
+                let import = PathBuf::from(import);
+                pending.push(if import.is_relative() {
+                    self.workspace.join(import)
+                } else {
+                    import
+                });
+            }
+        }
+        false
+    }
+
     fn version(&self) -> Result<BazelVersion> {
         let output = self.run_capture(&["version"])?;
         if !output.status.success() {
@@ -308,7 +405,11 @@ impl BazelOptions {
             }
         }
         let mut bzlmod = BzlmodRepos::default();
-        let checked_version = self.version();
+        let server_info = self.server_info().unwrap_or_default();
+        let checked_version = match server_info.version {
+            Some(version) => Ok(version),
+            None => self.version(),
+        };
         let supports_bzlmod = checked_version
             .as_ref()
             .is_ok_and(|found| *found >= BazelVersion(8, 6, 0) && *found != BazelVersion(9, 0, 0));
@@ -377,23 +478,27 @@ impl BazelOptions {
             ..self.clone()
         });
         let mut loads = BTreeMap::new();
-        let mut targets = self.collect_all_targets(bzlmod_repos, |expression, use_cquery| {
-            if let Some(strict) = &strict {
-                strict.query_with(
-                    &self.with_exclude_filter(scope.expression(expression)),
-                    false,
-                    version,
-                    &mut |batch| {
-                        scope.record_build_loads(batch, &mut loads);
-                        transform(batch, None);
-                    },
-                )
-            } else {
-                self.query_with(expression, use_cquery, version, &mut |batch| {
-                    transform(batch, None)
-                })
-            }
-        })?;
+        let mut targets = self.collect_all_targets(
+            bzlmod_repos,
+            server_info.external_package,
+            |expression, use_cquery| {
+                if let Some(strict) = &strict {
+                    strict.query_with(
+                        &self.with_exclude_filter(scope.expression(expression)),
+                        false,
+                        version,
+                        &mut |batch| {
+                            scope.record_build_loads(batch, &mut loads);
+                            transform(batch, None);
+                        },
+                    )
+                } else {
+                    self.query_with(expression, use_cquery, version, &mut |batch| {
+                        transform(batch, None)
+                    })
+                }
+            },
+        )?;
         if let Some(strict) = &strict {
             // Direct users may name a target the hub doesn't export. Ask only about
             // edges actually seen in the ordinary graph, and keep the primary's rows.
@@ -446,6 +551,7 @@ impl BazelOptions {
             targets,
             module_graph_json,
             root_mapping,
+            output_base: server_info.output_base,
             scoped_sources: ScopedSources {
                 repositories: scope
                     .aliases
@@ -460,13 +566,17 @@ impl BazelOptions {
         })
     }
 
+    /// `external_package` is whether `//external` exists, when known; `Some(false)` leaves it out
+    /// of the query instead of trying it and retrying without it.
     fn collect_all_targets(
         &self,
         bzlmod_repos: Vec<Target>,
+        external_package: Option<bool>,
         mut query: impl FnMut(&str, bool) -> Result<Vec<Target>>,
     ) -> Result<Vec<Target>> {
+        let include_external = !self.exclude_external_targets && external_package != Some(false);
         let mut queries = Vec::new();
-        if !self.exclude_external_targets {
+        if include_external {
             queries.push("'//external:all-targets'".to_owned());
         }
         if self.use_cquery {
@@ -475,7 +585,7 @@ impl BazelOptions {
                 .clone()
                 .unwrap_or_else(|| "deps(//...:all-targets)".to_owned());
             let mut targets = query(&self.with_exclude_filter(expression), true)?;
-            if !self.exclude_external_targets {
+            if include_external {
                 match query("'//external:all-targets'", false) {
                     Ok(external) => targets.extend(external),
                     Err(error) if is_external_package_error(&error.to_string()) => {
@@ -501,10 +611,7 @@ impl BazelOptions {
                     targets.extend(bzlmod_repos);
                     deduplicate_targets(targets)
                 }
-                Err(error)
-                    if !self.exclude_external_targets
-                        && is_external_package_error(&error.to_string()) =>
-                {
+                Err(error) if include_external && is_external_package_error(&error.to_string()) => {
                     let without_external = self.with_exclude_filter(
                         std::iter::once("'//...:all-targets'".to_owned())
                             .chain(
@@ -2154,6 +2261,8 @@ pub(crate) struct QueriedTargets {
     pub(crate) module_graph_json: Option<String>,
     pub(crate) root_mapping: Option<Vec<u8>>,
     pub(crate) scoped_sources: ScopedSources,
+    /// The output base `bazel info` reported before the query, when it was asked.
+    pub(crate) output_base: Option<PathBuf>,
 }
 
 /// The repositories `bazel mod` describes for a Bzlmod workspace, lowered to `//external:`
@@ -2476,6 +2585,44 @@ fn parse_bazel_version(text: &str) -> Option<BazelVersion> {
         parts.next().unwrap_or(0),
         parts.next().unwrap_or(0),
     ))
+}
+
+/// Parses `bazel info release output_base starlark-semantics`. `None` unless every key is there.
+fn parse_server_info(text: &str) -> Option<ServerInfo> {
+    let mut release = None;
+    let mut output_base = None;
+    let mut semantics = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(": ") else {
+            continue;
+        };
+        match key {
+            "release" => release = Some(value.trim()),
+            "output_base" => output_base = Some(PathBuf::from(value.trim())),
+            "starlark-semantics" => semantics = Some(value.trim()),
+            _ => {}
+        }
+    }
+    let (release, output_base, semantics) = (release?, output_base?, semantics?);
+    // `release 8.8.2`, or `development version` for a source build, whose version stays unknown.
+    let version = release
+        .strip_prefix("release ")
+        .filter(|version| version.starts_with(|c: char| c.is_ascii_digit()))
+        .and_then(|version| parse_bazel_version(&format!("bazel {version}")));
+    // The semantics print only flags that differ from their defaults: WORKSPACE is on by default
+    // before Bazel 8, off from 8 on, and gone in 9.
+    let external_package = if semantics.contains("enable_workspace=true") {
+        Some(true)
+    } else if semantics.contains("enable_workspace=false") {
+        Some(false)
+    } else {
+        version.map(|version| version < BazelVersion(8, 0, 0))
+    };
+    Some(ServerInfo {
+        version,
+        output_base: Some(output_base),
+        external_package,
+    })
 }
 
 fn is_external_package_error(message: &str) -> bool {
@@ -3692,6 +3839,106 @@ mod tests {
         assert!(!is_external_package_error("another error"));
     }
 
+    fn test_options(workspace: PathBuf, bazel: PathBuf) -> BazelOptions {
+        BazelOptions {
+            workspace,
+            bazel,
+            startup_options: Vec::new(),
+            command_options: Vec::new(),
+            cquery_options: Vec::new(),
+            use_cquery: false,
+            cquery_expression: None,
+            keep_going: false,
+            fine_grained_external_repos: BTreeSet::new(),
+            label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
+            exclude_external_targets: false,
+            exclude_targets_query: None,
+            no_bazelrc: false,
+            verbose: false,
+            cancellation: None,
+        }
+    }
+
+    #[test]
+    fn server_info_reports_version_output_base_and_external_package() {
+        let info = |release: &str, semantics: &str| {
+            parse_server_info(&format!(
+                "release: {release}\noutput_base: /cache/ob\nstarlark-semantics: {semantics}\n"
+            ))
+            .unwrap()
+        };
+        let default = "StarlarkSemantics{internal_bazel_only_utf_8_byte_strings=true}";
+        let bazel8 = info("release 8.8.2", default);
+        assert_eq!(bazel8.version, Some(BazelVersion(8, 8, 2)));
+        assert_eq!(bazel8.output_base, Some(PathBuf::from("/cache/ob")));
+        assert_eq!(bazel8.external_package, Some(false));
+        assert_eq!(
+            info("release 8.8.2", "StarlarkSemantics{enable_workspace=true}").external_package,
+            Some(true)
+        );
+        assert_eq!(info("release 7.4.1", default).external_package, Some(true));
+        assert_eq!(
+            info("release 7.4.1", "StarlarkSemantics{enable_workspace=false}").external_package,
+            Some(false)
+        );
+        assert_eq!(
+            info("release 9.0.0rc1", default).version,
+            Some(BazelVersion(9, 0, 0))
+        );
+        let development = info("development version", default);
+        assert_eq!(development.version, None);
+        assert_eq!(development.external_package, None);
+        assert_eq!(parse_server_info("release: release 8.8.2\n"), None);
+    }
+
+    #[test]
+    fn server_info_leaves_external_package_open_when_the_query_may_set_it() {
+        let workspace = tempfile::tempdir().unwrap();
+        let script = workspace.path().join("bazel");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'release: release 8.8.2\\noutput_base: /ob\\nstarlark-semantics: StarlarkSemantics{}\\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut options = test_options(workspace.path().to_path_buf(), script);
+        options.no_bazelrc = true;
+        assert_eq!(options.server_info().unwrap().external_package, Some(false));
+        options.command_options = vec!["--enable_workspace".into()];
+        assert_eq!(options.server_info().unwrap().external_package, None);
+        options.command_options.clear();
+        options.no_bazelrc = false;
+        fs::write(
+            workspace.path().join(".bazelrc"),
+            "try-import %workspace%/user.bazelrc\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("user.bazelrc"),
+            "query --enable_workspace\n",
+        )
+        .unwrap();
+        assert_eq!(options.server_info().unwrap().external_package, None);
+    }
+
+    #[test]
+    fn known_missing_external_package_is_not_queried() {
+        let options = test_options(PathBuf::new(), PathBuf::new());
+        let mut queries = Vec::new();
+        options
+            .collect_all_targets(Vec::new(), Some(false), |expression, _| {
+                queries.push(expression.to_owned());
+                Ok(vec![rule_target("//app:lib")])
+            })
+            .unwrap();
+        assert_eq!(queries, ["'//...:all-targets'"]);
+    }
+
     #[test]
     fn decodes_query_and_cquery_streams() {
         let directory = tempfile::tempdir().unwrap();
@@ -4196,6 +4443,7 @@ mod tests {
         let targets = options
             .collect_all_targets(
                 vec![rule_target("//external:bzlmod")],
+                None,
                 |expression, cquery| {
                     queries.push((expression.to_owned(), cquery));
                     if queries.len() == 1 {
@@ -4239,7 +4487,7 @@ mod tests {
         };
         let mut queries = Vec::new();
         let targets = options
-            .collect_all_targets(Vec::new(), |expression, cquery| {
+            .collect_all_targets(Vec::new(), None, |expression, cquery| {
                 queries.push((expression.to_owned(), cquery));
                 if cquery {
                     Ok(vec![rule_target("//app:lib")])

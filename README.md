@@ -1138,6 +1138,32 @@ one target per case (see [`tools/e2e/README.md`](tools/e2e/README.md)):
 bazel test //tests:e2e_test
 ```
 
+## Proving a performance change
+
+A change that claims to make bazel-diff faster or leaner proves it with the perf-proof
+harness, and only with it: it is the one piece of evidence a performance PR carries. The
+harness builds a bazel-diff binary from each side of your changeset, runs both on Bazel
+workspaces of several sizes (interleaved, so drift lands on both sides), measures what the
+bazel-diff process itself cost in CPU time and peak memory, checks that both sides produced
+byte-identical hashes and the same impacted set, and renders a verdict with a significance
+test behind it:
+
+```terminal
+make perf-proof
+```
+
+That compares `HEAD` with its merge-base on `master`. Other changesets:
+
+```terminal
+python3 tools/perf/perf_proof.py --base v70.0.0 --candidate my-branch
+python3 tools/perf/perf_proof.py --base master --patch 0001-faster.patch
+python3 tools/perf/perf_proof.py --candidate WORKTREE   # the uncommitted working tree
+```
+
+Attach the resulting `perf-proof-summary.md` to the PR. See
+[`tools/perf/README.md`](tools/perf/README.md) for the stages, the metrics, how the verdict is
+decided, and the flags (workload sizes, iterations, a real repository, prebuilt binaries).
+
 ## Code coverage
 
 CI enforces a minimum **90% line coverage** on production sources. Rust

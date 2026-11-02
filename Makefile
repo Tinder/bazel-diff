@@ -42,6 +42,25 @@ regen-e2e-check:
 generate-readme:
 	bazel run //tools:generate-readme
 
+# Prove a changeset's effect on bazel-diff's CPU and memory: builds base and candidate, runs both
+# on synthetic workspaces of several sizes, interleaved, and writes perf-proof-summary.md +
+# perf-proof-metrics.json. Attach the summary to the PR. Defaults compare HEAD with its
+# merge-base on master; pass flags through PERF_PROOF_ARGS, e.g.
+#   make perf-proof PERF_PROOF_ARGS="--candidate WORKTREE --workload medium --iterations 8"
+# Not `bazel run`: the harness itself invokes `bazel build`. See tools/perf/README.md.
+.PHONY: perf-proof
+perf-proof:
+	python3 tools/perf/perf_proof.py $(PERF_PROOF_ARGS)
+
+# Smoke profile of the same harness (tiny workload, 2 iterations): checks the setup, proves nothing.
+.PHONY: perf-proof-quick
+perf-proof-quick:
+	python3 tools/perf/perf_proof.py --quick $(PERF_PROOF_ARGS)
+
+.PHONY: perf-proof-test
+perf-proof-test:
+	bazel test //tools/perf:perf_proof_test
+
 COVERAGE_TARGETS = //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...
 
 .PHONY: coverage

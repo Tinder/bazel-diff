@@ -1,4 +1,139 @@
-# bazel-diff vs Tango performance harness
+# Performance harnesses
+
+| Harness | Question it answers | Runs |
+|---|---|---|
+| [`perf_proof.py`](perf_proof.py) | **Did my changeset make bazel-diff faster or leaner?** | by the change's author, locally (`make perf-proof`) |
+| [`tango_compare.py`](tango_compare.py) | How does bazel-diff compare with Uber's Tango on the same workloads? | nightly |
+| [`cache_probe_bench.py`](cache_probe_bench.py) | Is remote-cache probing sound and a win over hashing? (experiment) | nightly |
+| [`partial_graph_bench.py`](partial_graph_bench.py) | Is `serve --partialGraph` exactly as accurate and faster? | nightly |
+
+## Proving a performance change: `perf_proof.py`
+
+A PR that claims to make bazel-diff faster or to use less memory proves it with this harness and
+nothing else: no ad-hoc `time` runs, no flamegraph screenshots as the evidence. The harness takes
+the changeset, builds a bazel-diff binary from each side, runs both on Bazel workspaces of several
+sizes, and reports what the bazel-diff *process* cost on each side, with a statistical verdict and
+a correctness check. Attach `perf-proof-summary.md` to the PR.
+
+```bash
+# HEAD against its merge-base with master, on small + medium + large, 5 interleaved iterations.
+make perf-proof
+
+# The same through the script, with explicit revisions, a patch series, or the uncommitted tree.
+python3 tools/perf/perf_proof.py --base v70.0.0 --candidate my-branch
+python3 tools/perf/perf_proof.py --base master --patch 0001-faster.patch --patch 0002.patch
+python3 tools/perf/perf_proof.py --candidate WORKTREE
+
+# More power on one size; a real repository alongside the synthetic ones; prebuilt binaries.
+python3 tools/perf/perf_proof.py --workload large --iterations 10
+python3 tools/perf/perf_proof.py --repo-url https://github.com/bazelbuild/bazel-skylib.git --repo-clone-args --depth=50
+python3 tools/perf/perf_proof.py --base-binary ~/Downloads/bazel-diff-70.0.1 --candidate-binary bazel-bin/src/bazel-diff
+
+# Smoke profile (tiny workload, 2 iterations: checks the setup, proves nothing), and the noise floor.
+make perf-proof-quick
+python3 tools/perf/perf_proof.py --aa
+```
+
+The default threshold comes from that noise floor: an A/A run (the same binary on both sides,
+`--aa`) on the `small` workload moves bazel-diff's CPU median by about 4% between sides at five
+iterations, with p far above 0.05, so differences under 5% are reported as unchanged. A change
+whose effect is smaller than that needs a bigger workload (`--workload large`), where the
+process's own work dwarfs the fixed costs, or more iterations.
+
+Requirements: `git`, a `bazel`/`bazelisk` binary (`--bazel` for the measured workspaces,
+`--build-bazel` for the builds; both default to `bazel` on `PATH`), Python 3.9+, standard library
+only. The harness checks the two sides out, in turn, into a build worktree under
+`~/.cache/bazel-diff-perf-proof/<repo-key>/` (`--build-dir` to move it) with its own Bazel output
+base, and builds them with `--config=release`, the flags releases ship with (`--builder cargo`
+for `cargo build --release` instead). Builds run with `--nohome_rc` as well
+(`--build-bazel-startup-options` to change): a `~/.bazelrc` that streams to a build event service
+or changes compilation flags must not shape the binaries being compared. Your checkout is never
+modified. The build directory
+persists between runs, so only the first run on a machine pays a cold build (a fresh output base
+fetches and compiles every crate and the toolchain: well over ten minutes); after that each side
+is an incremental build of a few seconds. `--fresh-build` discards it. Budget a few minutes per
+workload for the measurement itself.
+
+### What is measured
+
+Per workload and iteration, each side runs the README recipe split into four stages:
+
+| Stage | Command | Why it is its own stage |
+|---|---|---|
+| `generate-hashes @base, cold` | `git checkout base; bazel shutdown; generate-hashes` | what a CI job pays: server start, full graph load, hashing |
+| `generate-hashes @base, warm` | `generate-hashes` again | Bazel's share is smallest here, so bazel-diff's own cost is clearest |
+| `generate-hashes @head --depEdgesFile` | `git checkout head; generate-hashes -d deps.json` | dependency tracking on: the memory-heavy variant |
+| `get-impacted-targets` | `get-impacted-targets -d deps.json` | pure bazel-diff: parsing, diffing, closure |
+
+For every stage the harness records, from the kernel's accounting of the reaped child
+(`os.wait4`), the bazel-diff process tree's **CPU time** (user + system, with the two shown
+separately so a change that trades syscalls for computation is visible) and **peak RSS**, plus its
+**wall time**, and the **Bazel server's CPU** delta over the stage (read from the server pid; the
+server is a daemon outside the process tree, so it is reported separately rather than mixed in).
+Every measured Bazel invocation runs with `--nohome_rc` (`--bazel-startup-options` to change) so a
+developer's `~/.bazelrc` never joins the measurement; `--generate-arg` adds flags such as
+`--useCquery` to every `generate-hashes`.
+
+Base and candidate run back to back in every iteration, and the order flips each iteration, so
+drift over the run (thermal throttling, page cache, other processes) lands on both sides. One
+untimed warm-up flow runs first so Bazel's one-off fetches (`bazel_tools`) are not timed.
+
+### The verdict
+
+Per workload, stage and metric the harness compares medians and runs a two-sided Mann-Whitney U
+test over the per-iteration samples (exact for small samples). Lower is always better.
+
+| Verdict | Meaning |
+|---|---|
+| improved / regressed | the median moved by at least `--threshold` percent (default 5) **and** p < `--alpha` (default 0.05) |
+| unchanged | the median moved by less than the threshold |
+| inconclusive | the median moved by more than the threshold but the samples do not confirm it: rerun with more `--iterations` |
+| insufficient data | too few iterations for *any* outcome to reach α (two iterations cannot; four can at α=0.05) |
+
+The headline folds the verdicts of the *verdict metrics* (`--verdict-metrics`, default bazel-diff
+CPU and peak RSS) over every workload and stage: any regression makes it **REGRESSED** (a change
+that helps one size and hurts another is not a proven improvement), otherwise any improvement makes
+it **IMPROVED**, otherwise **NO CHANGE**, **INSUFFICIENT DATA** or **INCONCLUSIVE**. Wall time and
+Bazel server CPU are reported for context but do not drive the headline by default: on the
+`generate-hashes` stages wall time is mostly `bazel query`, whose variance has nothing to do with
+the change.
+
+Correctness is part of the proof. Every run's `generate-hashes` outputs (both revisions and the
+dependency edges) must be byte-identical to the first base run's, and the impacted set must match
+label for label. A mismatch is called out at the top of the report and fails the harness
+(exit 2) unless `--allow-output-diff` says the change is meant to move the hashes, in which case
+the report still shows which outputs moved. `--fail-on-regression` (exit 3) and
+`--require-improvement` (exit 4) turn the headline into an exit status for scripting.
+
+### Workloads
+
+The synthetic presets are the layered genrule workspaces of
+[`gen_project.py`](../firecracker/bench/gen_project.py) that the nightly benches use (table in the
+Tango section below): `small`, `medium` and `large` by default, `--workload xlarge` for a
+~130k-target query, `--synthetic name:packages:targets_per_package[:layers]` for a custom size, and
+`--repo-url URL [--repo-from REV --repo-to REV]` to add a real repository and commit pair.
+
+### Output
+
+`--summary-out` (default `perf-proof-summary.md`) is the markdown report: the headline verdict and
+its reasons, both sides' commit, tree, `--version` and build, the environment, the correctness
+table, and one table per workload with every stage and metric. `--metrics-out` (default
+`perf-proof-metrics.json`) has the same plus every raw sample (user, sys, wall, peak RSS, sampled
+RSS peak, Bazel CPU, exit codes) and the first differing keys of any mismatched output.
+`--keep-workdir` keeps the scratch directory with the workspaces, both binaries and every stage's
+log and output file.
+
+### Unit tests
+
+```bash
+bazel test //tools/perf:perf_proof_test
+```
+
+They cover the pure helpers: rusage normalisation, the `ps` and `/proc` parsers, the Mann-Whitney
+test, the verdict rules, candidate-spec classification, hash-map diffing and the rendering, plus
+`measure_process` on a real child process.
+
+## bazel-diff vs Tango: `tango_compare.py`
 
 [`tango_compare.py`](tango_compare.py) benchmarks bazel-diff against
 [Uber's Tango](https://github.com/uber/tango) (Target Analyzer in Go) on the same workspaces and
@@ -6,7 +141,7 @@ commit pairs, and cross-checks that both tools report the same impacted targets.
 [`perf-tango-compare` workflow](../../.github/workflows/perf-tango-compare.yml) runs it nightly
 and publishes the comparison as a step summary plus a 90-day metrics artifact.
 
-## What is compared
+### What is compared
 
 Both tools compute impacted targets the same way: check out each revision, `bazel query` the whole
 graph (`deps(//...:all-targets)`, streamed proto), hash every target, diff the two hash maps. The
@@ -37,7 +172,7 @@ The impacted sets from the last iteration are compared label by label. The tools
 close enough that the synthetic workloads agree exactly; on real repositories differences (external
 repository handling, generated files) are reported, not failed, unless `--require-match` is given.
 
-## Workloads
+### Workloads
 
 Synthetic workspaces come from [`tools/firecracker/bench/gen_project.py`](../firecracker/bench/gen_project.py):
 layered genrule DAGs with real source files and no external toolchains, so query time is graph
@@ -58,7 +193,7 @@ nightly presets.
 Custom sizes: `--synthetic name:packages:targets_per_package[:layers]`. A real repository:
 `--repo-url URL --repo-from HEAD~1 --repo-to HEAD [--repo-clone-args --depth=50]`.
 
-## Running locally
+### Running locally
 
 ```bash
 # Build bazel-diff, clone+build Tango at the pinned commit, run the four presets x 3 iterations.
@@ -83,7 +218,7 @@ this as a dispatch input). `--tango-pool-size 2` lets Tango analyse the two revi
 two workers -- an architectural advantage it has over bazel-diff's sequential flow -- at the cost of
 twice the Bazel servers; the default of 1 keeps the comparison sequential-vs-sequential.
 
-## Output
+### Output
 
 `--summary-out` is GitHub-flavored markdown (the workflow appends it to `$GITHUB_STEP_SUMMARY`):
 the per-workload timing table, bazel-diff's cold stage breakdown, the impacted-set agreement table,
@@ -93,7 +228,7 @@ durations), and the full label diff when the tools disagree.
 
 Exit status is non-zero when any run fails, and with `--require-match` also when the tools disagree.
 
-## Unit tests
+### Unit tests
 
 ```bash
 bazel test //tools/perf:tango_compare_test
@@ -102,7 +237,7 @@ bazel test //tools/perf:tango_compare_test
 The harness is not a `py_binary` (it builds bazel-diff with `bazel build`, which would deadlock under
 `bazel run`); the test covers the pure helpers between raw tool output and the summary.
 
-## Cache probe experiment
+## Cache probe experiment: `cache_probe_bench.py`
 
 [`cache_probe_bench.py`](cache_probe_bench.py) is an **experiment, not a feature**. bazel-diff has
 no cache-probe mode and the top-level README does not mention one. The
@@ -206,7 +341,7 @@ bazel test //tools/perf:cache_probe_bench_test
   cache the two coincide; the `partial_*` scenarios measure how far they drift apart when they do
   not, and whether bounding the probe by bazel-diff's candidates (hybrid) keeps the drift in check.
 
-## Partial-graph mode harness
+## Partial-graph mode harness: `partial_graph_bench.py`
 
 [`partial_graph_bench.py`](partial_graph_bench.py) is the nightly proof behind the opt-in
 `bazel-diff serve --partialGraph` mode (see the top-level README, "Query Service"). The mode answers

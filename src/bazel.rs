@@ -2498,13 +2498,19 @@ fn deduplicate_targets(mut targets: Vec<Target>) -> Result<Vec<Target>> {
 }
 
 pub fn decode_delimited<M: Message>(path: &Path) -> Result<Vec<M>> {
-    let mut reader = BufReader::new(File::open(path)?);
+    let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
+    let mut batch = RawBatch::default();
     let mut messages = Vec::new();
-    loop {
-        if reader.fill_buf()?.is_empty() {
-            break;
+    let mut decoded = Vec::new();
+    while read_raw_batch(&mut reader, &mut batch)? {
+        batch
+            .slices()
+            .map(|bytes| buffa::DecodeOptions::new().decode_from_slice::<M>(bytes))
+            .collect_into_vec(&mut decoded);
+        messages.reserve(decoded.len());
+        for message in decoded.drain(..) {
+            messages.push(message?);
         }
-        messages.push(buffa::DecodeOptions::new().decode_length_delimited_reader(&mut reader)?);
     }
     Ok(messages)
 }
@@ -2549,16 +2555,19 @@ fn read_message_length(reader: &mut impl BufRead) -> Result<Option<usize>> {
             bail!("truncated length prefix in Bazel query output");
         };
         reader.consume(1);
+        if shift == 63 && byte > 1 {
+            bail!("length prefix in Bazel query output overflows a u64");
+        }
         value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
+            if value > u64::from(buffa::message::MAX_MESSAGE_BYTES) {
+                bail!("message exceeds the protobuf size limit");
+            }
             return usize::try_from(value)
                 .map(Some)
                 .map_err(|_| anyhow!("length prefix {value} does not fit in usize"));
         }
         shift += 7;
-        if shift >= 64 {
-            bail!("length prefix in Bazel query output overflows a u64");
-        }
     }
 }
 
@@ -2571,7 +2580,8 @@ fn read_raw_batch(reader: &mut impl BufRead, batch: &mut RawBatch) -> Result<boo
             break;
         };
         let start = batch.buffer.len();
-        batch.buffer.reserve(length);
+        // Grow with bytes actually delivered if the stream declares a large frame.
+        batch.buffer.reserve(length.min(64 * 1024));
         let copied = std::io::copy(
             &mut reader.take(length as u64),
             &mut &mut batch.buffer as &mut dyn std::io::Write,
@@ -3737,6 +3747,11 @@ mod tests {
         assert!(read_message_length(&mut [0x80].as_slice()).is_err());
         // Never-terminating prefix overflows the shift.
         assert!(read_message_length(&mut [0x80; 10].as_slice()).is_err());
+        let mut overflow = [0x80; 10];
+        overflow[9] = 0x02;
+        assert!(read_message_length(&mut overflow.as_slice()).is_err());
+        // 2 GiB is one byte over the protobuf limit.
+        assert!(read_message_length(&mut [0x80, 0x80, 0x80, 0x80, 0x08].as_slice()).is_err());
     }
 
     #[test]
@@ -3747,6 +3762,7 @@ mod tests {
             .map(|index| rule_target(&format!("//pkg:target{index}")))
             .collect::<Vec<_>>();
         write_delimited(&path, &written);
+        assert_eq!(decode_delimited::<Target>(&path).unwrap(), written);
         let mut seen = Vec::new();
         let decoded = decode_target_stream(&path, &mut |batch| {
             seen.extend(
@@ -3773,12 +3789,40 @@ mod tests {
     }
 
     #[test]
+    fn delimited_repositories_preserve_duplicates_and_unknown_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repositories.pb");
+        // Alternate duplicates, a different value for an unknown field, and an empty record.
+        let bytes = [
+            6, 0x0a, 1, b'r', 0xa0, 6, 7, 6, 0x0a, 1, b'r', 0xa0, 6, 8, 0, 6, 0x0a, 1, b'r', 0xa0,
+            6, 7,
+        ];
+        fs::write(&path, bytes).unwrap();
+
+        let mut input = bytes.as_slice();
+        let mut expected = Vec::new();
+        while !input.is_empty() {
+            expected.push(
+                buffa::DecodeOptions::new()
+                    .decode_length_delimited_reader::<Repository>(&mut input)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(expected.len(), 4);
+        assert_eq!(decode_delimited::<Repository>(&path).unwrap(), expected);
+    }
+
+    #[test]
     fn decode_target_stream_rejects_truncated_message() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("truncated.pb");
         // A length prefix of 16 followed by only two bytes of payload.
         fs::write(&path, [0x10u8, 0x00, 0x00]).unwrap();
         assert!(decode_target_stream(&path, &mut |_| {}).is_err());
+        assert!(decode_delimited::<Repository>(&path).is_err());
+        // One empty repository followed by a complete frame containing an invalid wire tag.
+        fs::write(&path, [0x00, 0x01, 0x00]).unwrap();
+        assert!(decode_delimited::<Repository>(&path).is_err());
     }
 
     #[test]

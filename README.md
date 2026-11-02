@@ -934,10 +934,9 @@ A few inputs are normalized or extended on the way in:
   Other usages keep their existing owner dependencies. Generation requires ordinary query with
   supported Bzlmod discovery and fails on an unrecognized mapping, an incomplete inventory, or a
   known outside repository-file reader.
-  Typed labels hash their contents, file kind, and absence at their filesystem location,
-  regardless of target kind. On Unix, only a regular file's owner-executable bit contributes
-  to its permissions hash. Other platforms use the read-only attribute. Readers must be
-  independent of untracked permission bits and symlink locations.
+  Typed labels hash their contents, mode, and absence at their filesystem location, regardless
+  of target kind. A reader that relies on the location of a symlink rather than its contents
+  does not satisfy this contract.
   Unavailable repositories, unreadable inputs, or unsupported directory entries fail generation.
   Use `generate_hashes` when using this mode through the library. The raw target API cannot retain
   the repository inputs, and `serve` does not support this mode. Review the assertion
@@ -983,7 +982,7 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "70.0.0")
+bazel_dep(name = "bazel-diff", version = "70.0.1")
 ```
 
 You can now run the tool with:

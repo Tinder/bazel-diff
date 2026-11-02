@@ -132,6 +132,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::label_only_extension_bump_does_not_reach_modules_depending_on_the_owner",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::remote_proto_bump_impacts_consumer",
                 "timeout": "moderate",
             },

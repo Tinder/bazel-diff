@@ -1,0 +1,18 @@
+load("@dependent//:defs.bzl", "wrap")
+
+filegroup(
+    name = "uses_a",
+    srcs = ["@crates//:a"],
+)
+
+filegroup(
+    name = "uses_b",
+    srcs = ["@crates//:b"],
+)
+
+# Uses a rule of `dependent` and nothing from `@crates`, like a `copy_file` from
+# bazel_lib or a `jest_test` from rules_jest.
+wrap(
+    name = "uses_dependent",
+    srcs = ["input.txt"],
+)

@@ -370,6 +370,57 @@ fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
     );
 }
 
+// Issue #603. Module `dependent` has a `bazel_dep` on `ext`, which owns the `@crates` extension,
+// the way rules_js reaches gazelle (owner of `go_deps`) through protobuf and rules_android. In
+// query mode `//external:ext` depends on every repository its extensions generate, and
+// `//external:dependent` depends on `//external:ext`, so bumping spoke `b` impacts every target
+// that uses a rule of `dependent` -- here `//:uses_dependent`, which names nothing in `@crates`.
+// `--labelOnlyModuleExtensions` gives the spokes themselves a view of `ext` without its extension
+// repositories, but a dependent module still reaches the full node. With the extension listed,
+// the bump should impact only `//:uses_b`; a change to `ext` itself must still reach
+// `//:uses_dependent`.
+#[test]
+fn label_only_extension_bump_does_not_reach_modules_depending_on_the_owner() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let fine_grained = [
+        "--fineGrainedHashExternalRepos",
+        "@crates,@@ext++crates+crates__a,@@ext++crates+crates__b",
+        "--labelOnlyModuleExtensions",
+        "@ext//:crates.bzl%crates",
+    ];
+    let main = |impacted: BTreeSet<String>| -> BTreeSet<String> {
+        impacted
+            .into_iter()
+            .map(|label| label.trim_start_matches("@@").to_owned())
+            .filter(|label| label.starts_with("//") && !label.starts_with("//external:"))
+            .collect()
+    };
+    let first = copy_workspace("extension_owner_dependent_module");
+    let bumped = copy_workspace("extension_owner_dependent_module");
+    edit(&bumped.path().join("versions.json"), |text| {
+        text.replace("\"b\": \"1.0\"", "\"b\": \"2.0\"")
+    });
+    // Without the opt-in the conservative owner edge stays, and the bump reaches the dependent
+    // module's rule. This is the behavior the issue reports.
+    let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained[..2]));
+    assert!(impacted.contains("//:uses_dependent"), "{impacted:?}");
+
+    let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained));
+    assert_eq!(impacted, BTreeSet::from(["//:uses_b".to_owned()]));
+
+    // `dependent` really depends on `ext`: a change to `ext`'s own tree must still reach it.
+    let changed_owner = copy_workspace("extension_owner_dependent_module");
+    fs::write(changed_owner.path().join("ext/tool.sh"), "exit 1\n").unwrap();
+    let impacted = main(diff_local(
+        first.path(),
+        changed_owner.path(),
+        &fine_grained,
+    ));
+    assert!(impacted.contains("//:uses_dependent"), "{impacted:?}");
+}
+
 const ISOLATED_ROOT: &[&str] = &["--isolatedDependencyRoot", "@hub"];
 
 fn assert_product(workspace: &std::path::Path, target: &str, file: &str, expected: &str) {

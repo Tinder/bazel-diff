@@ -55,3 +55,22 @@ py_test(
     python_version = "PY3",
     deps = [":partial_graph_bench_lib"],
 )
+
+# perf_proof.py (the changeset A/B harness authors run to prove a performance change) is not a
+# py_binary for the same reason: it builds both sides of the changeset with `bazel build`. Run it
+# directly: `make perf-proof` or `python3 tools/perf/perf_proof.py` (see README.md). It imports
+# tango_compare for the shared workload and subprocess helpers.
+py_library(
+    name = "perf_proof_lib",
+    srcs = ["perf_proof.py"],
+    imports = ["."],
+    visibility = ["//visibility:private"],
+    deps = [":tango_compare_lib"],
+)
+
+py_test(
+    name = "perf_proof_test",
+    srcs = ["perf_proof_test.py"],
+    python_version = "PY3",
+    deps = [":perf_proof_lib"],
+)

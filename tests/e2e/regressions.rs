@@ -1259,3 +1259,84 @@ fn serve_rejects_packages_the_revision_does_not_track() {
         assert!(labels.is_superset(&expected_after_deletion()), "{labels:?}");
     }
 }
+
+/// Control for <https://github.com/Tinder/bazel-diff/issues/612>: in query mode a change
+/// behind a main-repository `alias` reaches the target that uses the alias.
+#[test]
+fn main_repo_alias_change_reaches_consumer_query() {
+    let first = copy_workspace("cquery_main_repo_alias");
+    let second = copy_workspace("cquery_main_repo_alias");
+    fs::write(second.path().join("bar/baz.txt"), "after\n").unwrap();
+    let impacted = diff_workspaces(first.path(), second.path(), &[]);
+    for name in ["//bar:baz.txt", "//bar:baz", "//:tool", "//:wrapper"] {
+        assert!(
+            impacted
+                .iter()
+                .any(|label| label == name || label.trim_start_matches("@@") == name),
+            "{name} should be impacted through the alias, got {impacted:?}"
+        );
+    }
+}
+
+/// Reproducer for <https://github.com/Tinder/bazel-diff/issues/612>: under `--useCquery`
+/// the compatible-target cquery names a main-repository alias by `repr(target)`, which
+/// Bazel prints with its apparent label (`//:tool`) even under `--consistent_labels`,
+/// while the target itself is named canonically (`@@//:tool`). The two never match, so
+/// the alias is filtered out as if it were platform-incompatible and takes its edges with
+/// it: `//:wrapper` has no node for `//:tool` to depend on and is never impacted.
+#[test]
+fn main_repo_alias_change_reaches_consumer_cquery() {
+    let first = copy_workspace("cquery_main_repo_alias");
+    let second = copy_workspace("cquery_main_repo_alias");
+    fs::write(second.path().join("bar/baz.txt"), "after\n").unwrap();
+
+    let output = tempfile::tempdir().unwrap();
+    let from = output.path().join("from.json");
+    let to = output.path().join("to.json");
+    let edges_file = output.path().join("edges.json");
+    let result = output.path().join("impacted.txt");
+    assert!(generate(first.path(), &from, &["--useCquery"])
+        .status
+        .success());
+    assert!(generate(
+        second.path(),
+        &to,
+        &[
+            "--useCquery",
+            "--depEdgesFile",
+            edges_file.to_str().unwrap()
+        ],
+    )
+    .status
+    .success());
+    assert!(impacted(second.path(), &from, &to, &result, &[])
+        .status
+        .success());
+
+    let hashes = hashes(&to);
+    assert!(
+        hashes.keys().any(|label| label.ends_with("//:tool")),
+        "the alias //:tool was dropped from the cquery hashes: {:?}",
+        hashes.keys().collect::<Vec<_>>()
+    );
+    let edges = dep_edges(&edges_file);
+    let wrapper_edges = edges
+        .iter()
+        .find(|(label, _)| label.ends_with("//:wrapper"))
+        .map(|(_, deps)| deps.clone())
+        .expect("//:wrapper has dep edges");
+    assert!(
+        wrapper_edges.iter().any(|dep| dep.ends_with("//:tool")),
+        "//:wrapper lost its edge to the alias //:tool: {wrapper_edges:?}"
+    );
+
+    let impacted = read_lines(&result);
+    for name in ["//bar:baz.txt", "//bar:baz", "//:tool", "//:wrapper"] {
+        assert!(
+            impacted
+                .iter()
+                .any(|label| label == name || label.trim_start_matches("@@") == name),
+            "{name} should be impacted through the alias under cquery, got {impacted:?}"
+        );
+    }
+}

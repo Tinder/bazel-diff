@@ -1072,12 +1072,6 @@ impl HashContext<'_> {
             builder.direct(self.always_affected_seed);
         }
 
-        // Only a listed extension has views, so a run without the flag never resolves the
-        // rule's repository, which can cost a `bazel mod` call.
-        let extension = (!self.options.bazel.use_cquery
-            && !self.options.bazel.label_only_module_extensions.is_empty())
-        .then(|| self.rule_extension(&rule.rule.name))
-        .flatten();
         let mut inputs: Vec<Cow<'_, str>> = if rule.input_positions.is_some() {
             rule.rule
                 .rule_input
@@ -1122,29 +1116,10 @@ impl HashContext<'_> {
             }
         }
         for (position, encoded_input) in inputs.into_iter().enumerate() {
-            let mut input_slot = rule
+            let input_slot = rule
                 .input_positions
                 .as_ref()
                 .and_then(|ids| ids.get(position).copied().flatten());
-            // A target in an extension's repository reaches its owning module through the view
-            // without that extension's repositories, when there is one (query mode only).
-            let encoded_input = match extension.as_deref().and_then(|extension| {
-                let node = encoded_input.strip_prefix("//external:")?;
-                let view = format!(
-                    "//external:{}",
-                    crate::bazel::extension_view_node(node, extension)
-                );
-                self.rules
-                    .get(&view)
-                    .is_some_and(|slot| slot.rule.is_some())
-                    .then_some(view)
-            }) {
-                Some(view) => {
-                    input_slot = None;
-                    Cow::Owned(view)
-                }
-                None => encoded_input,
-            };
             builder.direct(encoded_input.as_bytes());
             let input_label = target_label(&encoded_input);
             match self.resolve_input(&encoded_input, input_label, input_slot, path) {
@@ -1264,24 +1239,6 @@ impl HashContext<'_> {
         rules
             .get(fallback)
             .and_then(|slot| slot.resolving(Cow::Owned(fallback.clone())))
-    }
-
-    /// The usage prefix of the module extension that generated the repository `label` is in
-    /// (`rules_rs++crate` for `@@rules_rs++crate+crates__anyhow//:anyhow`), if any.
-    fn rule_extension(&self, label: &str) -> Option<String> {
-        let label = target_label(label);
-        let repo = label.strip_prefix('@')?.split_once("//")?.0;
-        let canonical = match repo.strip_prefix('@') {
-            Some("") => return None,
-            Some(canonical) => canonical,
-            None => self
-                .source_hasher
-                .external_resolver
-                .repo_mapping()
-                .get(repo)?
-                .as_str(),
-        };
-        crate::bazel::extension_usage_prefix(canonical).map(str::to_owned)
     }
 
     fn rule_bzl_seed(&mut self, rule: &Rule) -> Result<Option<DigestBytes>> {

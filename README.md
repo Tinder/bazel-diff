@@ -656,7 +656,7 @@ Options:
       --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
           
       --labelOnlyModuleExtensions <LABEL_ONLY_MODULE_EXTENSIONS>
-          Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories use each other only through labels, never by resolving a toolchain from one another. A fine-grained target in one of their repositories then does not change whenever any other repository of the extension does
+          Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories are used only through labels, never by resolving a toolchain from one of them. The module that owns such an extension then does not stand in for its repositories, so a lockfile bump impacts only the targets that depend on the bumped repository
       --isolatedDependencyRoot <ISOLATED_DEPENDENCY_ROOT>
           Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
       --useCquery[=<USE_CQUERY>]
@@ -814,7 +814,7 @@ Options:
       --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
           
       --labelOnlyModuleExtensions <LABEL_ONLY_MODULE_EXTENSIONS>
-          Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories use each other only through labels, never by resolving a toolchain from one another. A fine-grained target in one of their repositories then does not change whenever any other repository of the extension does
+          Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories are used only through labels, never by resolving a toolchain from one of them. The module that owns such an extension then does not stand in for its repositories, so a lockfile bump impacts only the targets that depend on the bumped repository
       --isolatedDependencyRoot <ISOLATED_DEPENDENCY_ROOT>
           Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
       --useCquery[=<USE_CQUERY>]
@@ -914,13 +914,16 @@ A few inputs are normalized or extended on the way in:
   in the workspace, a `file://%workspace%` registry URL) is hashed relative to the workspace, so
   identical checkouts at different paths hash the same.
   In query mode the module that owns a module extension stands in for every repository the
-  extension generates, because a toolchain resolved from one of them is not a query input. A
-  fine-grained target inside one of those repositories that uses a rule from the owning module
-  therefore changes whenever any repository of the extension does. Listing the extension in
-  `--labelOnlyModuleExtensions` (for example `@rules_rs//rs:extensions.bzl%crate`) asserts that
-  its repositories use each other only through labels, so such a target reaches the owning module
-  without them. Do not list an extension whose targets resolve a toolchain the same extension
-  generates: that change would be missed. An extension whose name another `.bzl` file of the same
+  extension generates, because a toolchain resolved from one of them is not a query input. Every
+  target that uses a rule of the owning module, every target of a module with a `bazel_dep` path
+  to it, and every fine-grained target inside one of those repositories therefore changes whenever
+  any repository of the extension does: a `go.mod` bump through gazelle's `go_deps` or a
+  `pnpm-lock.yaml` bump through rules_js's `npm` impacts most of the workspace. Listing the
+  extension in `--labelOnlyModuleExtensions` (for example
+  `@gazelle//:extensions.bzl%go_deps` or `@rules_rs//rs:extensions.bzl%crate`) asserts that its
+  repositories are used only through labels, which the query reports, so the owning module no
+  longer stands in for them. Do not list an extension that generates a toolchain, such as
+  `rules_go`'s `go_sdk`: a change to it would be missed. An extension whose name another `.bzl` file of the same
   module also exports is reported and ignored, since Bazel tells their repositories apart only by
   a numeric suffix.
   `--isolatedDependencyRoot=@crates` asserts that every outside consumer of this

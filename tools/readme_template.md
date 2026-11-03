@@ -624,13 +624,16 @@ A few inputs are normalized or extended on the way in:
   in the workspace, a `file://%workspace%` registry URL) is hashed relative to the workspace, so
   identical checkouts at different paths hash the same.
   In query mode the module that owns a module extension stands in for every repository the
-  extension generates, because a toolchain resolved from one of them is not a query input. A
-  fine-grained target inside one of those repositories that uses a rule from the owning module
-  therefore changes whenever any repository of the extension does. Listing the extension in
-  `--labelOnlyModuleExtensions` (for example `@rules_rs//rs:extensions.bzl%crate`) asserts that
-  its repositories use each other only through labels, so such a target reaches the owning module
-  without them. Do not list an extension whose targets resolve a toolchain the same extension
-  generates: that change would be missed. An extension whose name another `.bzl` file of the same
+  extension generates, because a toolchain resolved from one of them is not a query input. Every
+  target that uses a rule of the owning module, every target of a module with a `bazel_dep` path
+  to it, and every fine-grained target inside one of those repositories therefore changes whenever
+  any repository of the extension does: a `go.mod` bump through gazelle's `go_deps` or a
+  `pnpm-lock.yaml` bump through rules_js's `npm` impacts most of the workspace. Listing the
+  extension in `--labelOnlyModuleExtensions` (for example
+  `@gazelle//:extensions.bzl%go_deps` or `@rules_rs//rs:extensions.bzl%crate`) asserts that its
+  repositories are used only through labels, which the query reports, so the owning module no
+  longer stands in for them. Do not list an extension that generates a toolchain, such as
+  `rules_go`'s `go_sdk`: a change to it would be missed. An extension whose name another `.bzl` file of the same
   module also exports is reported and ignored, since Bazel tells their repositories apart only by
   a numeric suffix.
   `--isolatedDependencyRoot=@crates` asserts that every outside consumer of this

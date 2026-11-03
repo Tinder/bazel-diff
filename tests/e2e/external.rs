@@ -376,10 +376,10 @@ fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
 // extensions generate, so the bump reaches every target that uses `ext`'s own rule (`//:uses_ext`,
 // like a js_binary) and every target of a module with a `bazel_dep` path to `ext`
 // (`//:uses_dependent`, whose `dependent` reaches `ext` through `middle`, like rules_jest reaching
-// gazelle). Neither names anything in `@crates`. `--labelOnlyModuleExtensions` gives only the
-// extension's own repositories a view of `ext` without its generated repositories. With the
-// extension listed, the bump should impact only the hub's consumers, with or without
-// fine-graining; a change to `ext` itself must still reach both.
+// gazelle). Neither names anything in `@crates`. With the extension listed in
+// `--labelOnlyModuleExtensions`, `ext` no longer stands in for its repositories, so the bump
+// impacts only the hub's consumers, with or without fine-graining; a change to `ext` itself must
+// still reach both.
 #[test]
 fn label_only_extension_bump_does_not_reach_users_of_the_owner_or_its_dependents() {
     if !supports_mod_show_repo() {

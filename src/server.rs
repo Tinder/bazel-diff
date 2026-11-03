@@ -8,6 +8,7 @@ use crate::model::{
 };
 use crate::module_graph::{bzlmod_enabled_for, impacted_with_module_changes};
 use crate::partial::{self, Classification, Glob, TreeIndex, TreeKind};
+use crate::web_identity::WebIdentitySessions;
 use anyhow::{anyhow, bail, Context, Result};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -19,6 +20,7 @@ use s3::request::ResponseData;
 use s3::{Bucket, Region};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
@@ -65,6 +67,9 @@ pub struct ServerConfig {
     pub s3_prefix: String,
     pub s3_region: Option<String>,
     pub s3_endpoint: Option<String>,
+    /// STS endpoint for `AssumeRoleWithWebIdentity`. When set, the S3 tier signs with sessions
+    /// exchanged there (see [`WebIdentitySessions`]) instead of the default provider chain.
+    pub s3_sts_endpoint: Option<String>,
     pub s3_force_path_style: bool,
     pub gcs_bucket: Option<String>,
     pub gcs_prefix: String,
@@ -302,7 +307,7 @@ impl Drop for ActiveQuery {
 /// a miss (the revision is regenerated) and a failed write leaves the entry local-only, so an
 /// outage of the shared store costs throughput, never availability.
 enum RemoteCache {
-    S3(S3Cache),
+    S3(Box<S3Cache>),
     Gcs(Box<GcsCache>),
     Nexus(Box<NexusCache>),
 }
@@ -310,7 +315,7 @@ enum RemoteCache {
 impl RemoteCache {
     fn new(config: &ServerConfig) -> Result<Option<Self>> {
         if let Some(bucket_name) = &config.s3_bucket {
-            return Ok(Some(Self::S3(S3Cache::new(config, bucket_name)?)));
+            return Ok(Some(Self::S3(Box::new(S3Cache::new(config, bucket_name)?))));
         }
         if let Some(bucket_name) = &config.gcs_bucket {
             return Ok(Some(Self::Gcs(Box::new(GcsCache::new(
@@ -414,6 +419,9 @@ fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
 struct S3Cache {
     bucket: Box<Bucket>,
     prefix: String,
+    /// Set when credentials come from a configured STS endpoint; every request then signs with
+    /// the current session.
+    sessions: Option<WebIdentitySessions>,
 }
 
 impl S3Cache {
@@ -431,7 +439,19 @@ impl S3Cache {
             },
             None => region_name.parse().context("invalid S3 region")?,
         };
-        let credentials = Credentials::default().context("failed to resolve AWS credentials")?;
+        let sessions = config
+            .s3_sts_endpoint
+            .as_deref()
+            .map(WebIdentitySessions::from_env)
+            .transpose()?;
+        // A failed first exchange fails startup, as an unresolvable default chain does; later
+        // renewals degrade like any other S3 failure.
+        let credentials = match &sessions {
+            Some(sessions) => sessions
+                .credentials()
+                .context("failed to assume the S3 role at the STS endpoint")?,
+            None => Credentials::default().context("failed to resolve AWS credentials")?,
+        };
         let mut bucket =
             Bucket::new(bucket_name, region, credentials).context("failed to create S3 client")?;
         if config.s3_force_path_style {
@@ -440,7 +460,19 @@ impl S3Cache {
         Ok(Self {
             bucket,
             prefix: normalize_s3_prefix(&config.s3_prefix),
+            sessions,
         })
+    }
+
+    /// The bucket to send the next request with, signed by the current web-identity session when
+    /// one is configured.
+    fn signing_bucket(&self) -> Result<Cow<'_, Bucket>> {
+        let Some(sessions) = &self.sessions else {
+            return Ok(Cow::Borrowed(&self.bucket));
+        };
+        let mut bucket = (*self.bucket).clone();
+        bucket.set_credentials(sessions.credentials()?);
+        Ok(Cow::Owned(bucket))
     }
 
     fn object_key(&self, name: &str) -> String {
@@ -455,13 +487,16 @@ impl S3Cache {
     /// stack fails reading that absent body -- `attohttpc: Io Error: unexpected end of file`. A GET
     /// miss carries a real `NoSuchKey` body, so it reads back cleanly.
     fn get(&self, name: &str) -> Fetched {
-        let failure = match self.bucket.get_object(self.object_key(name)) {
+        let response = self
+            .signing_bucket()
+            .and_then(|bucket| bucket.get_object(self.object_key(name)).map_err(Into::into));
+        let failure = match response {
             Ok(response) if response.status_code() == 200 => {
                 return Fetched::Found(response.to_vec())
             }
             Ok(response) if response.status_code() == 404 => return Fetched::Missing,
             Ok(response) => http_failure(&response),
-            Err(error) => error.to_string(),
+            Err(error) => format!("{error:#}"),
         };
         eprintln!(
             "[Warn] S3 cache read of {} failed (treating as a miss): {failure}",
@@ -471,10 +506,15 @@ impl S3Cache {
     }
 
     fn put(&self, name: &str, data: &[u8]) {
-        let failure = match self.bucket.put_object(self.object_key(name), data) {
+        let response = self.signing_bucket().and_then(|bucket| {
+            bucket
+                .put_object(self.object_key(name), data)
+                .map_err(Into::into)
+        });
+        let failure = match response {
             Ok(response) if (200..300).contains(&response.status_code()) => return,
             Ok(response) => http_failure(&response),
-            Err(error) => error.to_string(),
+            Err(error) => format!("{error:#}"),
         };
         eprintln!(
             "[Warn] S3 cache write of {} failed (entry not shared): {failure}",
@@ -2163,6 +2203,7 @@ mod tests {
             s3_prefix: String::new(),
             s3_region: None,
             s3_endpoint: None,
+            s3_sts_endpoint: None,
             s3_force_path_style: false,
             gcs_bucket: None,
             gcs_prefix: String::new(),
@@ -2356,13 +2397,76 @@ mod tests {
         .unwrap()
         .with_path_style();
         (
-            RemoteCache::S3(S3Cache {
+            RemoteCache::S3(Box::new(S3Cache {
                 bucket,
                 prefix: normalize_s3_prefix(prefix),
-            }),
+                sessions: None,
+            })),
             receiver,
             handle,
         )
+    }
+
+    #[test]
+    fn s3_cache_signs_with_the_web_identity_session() {
+        let sts = Server::http("127.0.0.1:0").unwrap();
+        let sts_endpoint = format!("http://{}/", sts.server_addr().to_ip().unwrap());
+        let sts_thread = thread::spawn(move || {
+            let answer = "<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult>\
+                <Credentials><AccessKeyId>session-key</AccessKeyId>\
+                <SecretAccessKey>session-secret</SecretAccessKey>\
+                <SessionToken>session-token</SessionToken>\
+                <Expiration>2999-01-01T00:00:00Z</Expiration></Credentials>\
+                </AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>";
+            let request = sts.recv().unwrap();
+            request.respond(Response::from_string(answer)).unwrap();
+        });
+        let s3 = Server::http("127.0.0.1:0").unwrap();
+        let s3_endpoint = format!("http://{}", s3.server_addr().to_ip().unwrap());
+        let s3_thread = thread::spawn(move || {
+            let request = s3.recv().unwrap();
+            let token = request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv("x-amz-security-token"))
+                .map(|header| header.value.to_string());
+            request
+                .respond(Response::from_data(Vec::new()).with_status_code(StatusCode(404)))
+                .unwrap();
+            token
+        });
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_file = token_dir.path().join("token");
+        fs::write(&token_file, "service-account-token").unwrap();
+        let sessions = WebIdentitySessions::new(
+            &sts_endpoint,
+            "arn:aws:iam::role/cache".to_owned(),
+            token_file,
+            "bazel-diff".to_owned(),
+        )
+        .unwrap();
+        let placeholder = Credentials::new(Some("key"), Some("secret"), None, None, None).unwrap();
+        let bucket = Bucket::new(
+            "bucket",
+            Region::Custom {
+                region: "us-east-1".to_owned(),
+                endpoint: s3_endpoint,
+            },
+            placeholder,
+        )
+        .unwrap()
+        .with_path_style();
+        let cache = S3Cache {
+            bucket,
+            prefix: String::new(),
+            sessions: Some(sessions),
+        };
+
+        let fetched = cache.get("entry.json.gz");
+
+        sts_thread.join().unwrap();
+        assert!(matches!(fetched, Fetched::Missing));
+        assert_eq!(s3_thread.join().unwrap().as_deref(), Some("session-token"));
     }
 
     #[test]

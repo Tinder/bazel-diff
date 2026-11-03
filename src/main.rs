@@ -471,6 +471,10 @@ struct ServeArgs {
     #[arg(long = "s3ForcePathStyle")]
     s3_force_path_style: bool,
 
+    /// STS endpoint where AWS_WEB_IDENTITY_TOKEN_FILE is exchanged for AWS_ROLE_ARN's credentials (MinIO, SeaweedFS)
+    #[arg(long = "s3StsEndpoint", env = "AWS_ENDPOINT_URL_STS")]
+    s3_sts_endpoint: Option<String>,
+
     /// Google Cloud Storage bucket used as the shared cache tier (Application Default Credentials)
     #[arg(long = "gcsBucket", conflicts_with_all = ["s3_bucket", "nexus_url"])]
     gcs_bucket: Option<String>,
@@ -1142,6 +1146,7 @@ impl ServeArgs {
             s3_region: self.s3_region.clone(),
             s3_endpoint: self.s3_endpoint.clone(),
             s3_force_path_style: self.s3_force_path_style,
+            s3_sts_endpoint: self.s3_sts_endpoint.clone(),
             gcs_bucket: self.gcs_bucket.clone(),
             gcs_prefix: self.gcs_prefix.clone(),
             nexus_url: self.nexus_url.clone(),

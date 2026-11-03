@@ -173,6 +173,7 @@ dependencies = [
  "hex",
  "hyper-rustls",
  "mimalloc",
+ "quick-xml 0.32.0",
  "protoc-bin-vendored",
  "rayon",
  "rust-s3",

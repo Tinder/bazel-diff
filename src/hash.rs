@@ -1762,9 +1762,10 @@ fn prehash_rule(rule: &mut Rule, ignored: &HashSet<String>) -> DigestBytes {
     let digest = rule_definition_digest(rule, ignored);
     rule.attribute
         .retain(|attribute| attribute.name == "tags" || attribute.name == "visibility");
-    if rule.attribute.is_empty() {
-        rule.attribute = Vec::new();
-    }
+    // `retain` keeps the buffer it was decoded into. An `Attribute` is several hundred bytes and a
+    // rule carries dozens of them (every implicit attribute is in the proto), so without this each
+    // queried rule pins tens of kilobytes of dead capacity until hashing ends.
+    rule.attribute.shrink_to_fit();
     digest
 }
 
@@ -2862,6 +2863,8 @@ esac
                 .collect::<Vec<_>>(),
             ["tags", "visibility"]
         );
+        // The dropped attributes' slots are released, not just their contents.
+        assert_eq!(rule.attribute.capacity(), rule.attribute.len());
     }
 
     #[test]

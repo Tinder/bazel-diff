@@ -1552,7 +1552,14 @@ impl BazelOptions {
     if "IncompatiblePlatformProvider" not in providers(target):
         target_repr = repr(target)
         if "<alias target" in target_repr:
-            return target_repr.split(" ")[2]
+            # repr() prints a main-repository alias with its apparent label
+            # (`//:tool`) even under --consistent_labels, while every other
+            # target is canonical (`@@//:tool`). Normalize so the alias
+            # matches the label it is later looked up by.
+            label = target_repr.split(" ")[2]
+            if label.startswith("//"):
+                label = "@@" + label
+            return label
         return str(target.label)
     return ""
 "#,

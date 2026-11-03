@@ -408,6 +408,13 @@ identity on EKS, IMDS), or pin the region with `--s3Region`. `--s3Endpoint` plus
 `--s3ForcePathStyle` point the client at an S3-compatible store (MinIO, LocalStack) for local
 testing.
 
+S3-compatible stores that serve STS themselves (MinIO, SeaweedFS) can take a web identity token
+too, such as a Kubernetes ServiceAccount token. Set `--s3StsEndpoint` (or `AWS_ENDPOINT_URL_STS`)
+along with `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`, and `serve` sends
+`AssumeRoleWithWebIdentity` to that endpoint instead of `sts.amazonaws.com`. It renews the session
+five minutes before it expires, re-reading the token file each time, since kubelet rotates
+projected tokens. `AWS_ROLE_SESSION_NAME` names the session (default `bazel-diff`).
+
 S3 errors never fail a request: a failed read is treated as a cache miss (the revision is
 regenerated — slower, but correct) and a failed write leaves the entry local-only, so an S3 outage
 degrades throughput rather than availability. Concurrent replicas racing to hash the same
@@ -877,6 +884,8 @@ Options:
           
       --s3ForcePathStyle
           
+      --s3StsEndpoint <S3_STS_ENDPOINT>
+          STS endpoint where AWS_WEB_IDENTITY_TOKEN_FILE is exchanged for AWS_ROLE_ARN's credentials (MinIO, SeaweedFS) [env: AWS_ENDPOINT_URL_STS=]
       --gcsBucket <GCS_BUCKET>
           Google Cloud Storage bucket used as the shared cache tier (Application Default Credentials)
       --gcsPrefix <GCS_PREFIX>

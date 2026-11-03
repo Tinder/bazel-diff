@@ -31,6 +31,8 @@ gcp_auth = { version = "=0.12.3", default-features = false, features = ["webpki-
 hex = "0.4"
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring"] }
 mimalloc = { version = "0.1", optional = true }
+# Already resolved for aws-creds; parses STS answers in web_identity.rs.
+quick-xml = { version = "0.32", features = ["serialize"] }
 rayon = "1.10"
 rustls-pki-types = "1.15"
 rust-s3 = { version = "=0.36.0", default-features = false, features = ["sync-rustls-tls"] }

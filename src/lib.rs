@@ -19,3 +19,4 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/proto.rs"));
 }
 pub mod server;
+pub mod web_identity;

@@ -282,7 +282,9 @@ Endpoints:
   balancer should use this to route only to ready instances. If a fatal git error occurs at startup
   the instance "lame-ducks" itself by continuing to report `503` so the load balancer removes it.
 * `GET /impacted_targets?from=<rev>&to=<rev>` — returns the impacted targets as JSON. The optional
-  `targetType` parameter (e.g. `&targetType=Rule,SourceFile`) filters by target type.
+  `targetType` parameter (e.g. `&targetType=Rule,SourceFile`) filters by target type. On a server
+  that serves several repositories, `repo=<name>` names the one to query (see [Serving several
+  repositories](#serving-several-repositories)).
 
 ```bash
 curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
@@ -362,7 +364,9 @@ curl 'http://localhost:8080/dependency_edges?from=main&to=my-feature-branch'
   the queries accepted and not yet finished (queued, running, or abandoned by a client that stopped
   waiting), and `workspaceBusy` is `true` while any operation holds `--workspacePath` (a query's
   checkout and `bazel query`, or a startup warmup). A tool that shares the checkout with the server
-  should wait for `workspaceBusy` to be `false` before touching it.
+  should wait for `workspaceBusy` to be `false` before touching it. `repositories` breaks the
+  per-workspace figures down by repository (see [Serving several
+  repositories](#serving-several-repositories)).
 
 ```bash
 curl 'http://localhost:8080/metrics'
@@ -377,10 +381,48 @@ curl 'http://localhost:8080/metrics'
   "workspaceBusy": true,
   "gitEngine": "subprocess",
   "trackDeps": false,
+  "repositories": {"default": {"workspace": "/path/to/workspace-clone", "ready": true, "activeQueries": 1, "workspaceBusy": true, "partialGraph": {"derived": 0, "fullGenerations": 0}, "untrackedPackages": {"rejections": 0}}},
   "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB", "memory": {"entries": 2, "sizeBytes": 75374, "maxBytes": 536870912}},
   "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
 }
 ```
+
+### Serving several repositories
+
+One instance can answer for several git clones. `bazel-diff serve-multi` takes every `serve`
+flag except `--workspacePath`, which `--repo NAME=PATH` (repeatable) replaces, and a request
+addresses one repository with `repo=NAME`: a query-string parameter on `GET` and `POST`, or a
+`repo` field in the `POST` body, which wins over the query string.
+
+```bash
+bazel-diff serve-multi \
+  --repo app=/clones/app \
+  --repo lib=/clones/lib \
+  --cacheDir /var/cache/bazel-diff \
+  --port 8080
+
+curl 'http://localhost:8080/impacted_targets?repo=lib&from=main&to=my-feature-branch'
+```
+
+* Every repository shares the hashing flags (`--bazelPath`, `--bazelStartupOptions`,
+  `--trackDeps`, `--partialGraph`, ...), the cache (local disk, memory and the shared tier) and
+  the port. A cache entry is keyed by the git tree and the hashing configuration, never by the
+  clone it came from, so two clones that hold the same tree share one entry, and the cache a
+  single-repository instance built stays valid.
+* Each repository has its own working tree, git, Bazel server, workspace lock and readiness, so
+  queries against different repositories run concurrently, while queries against the same
+  repository are serialised as before. Size the instance for that many Bazel servers at once.
+* A request that names no `repo` is answered when the server serves exactly one repository and
+  refused with `400` otherwise; an unknown name is `404`. Either error lists the repositories
+  served. `serve` serves its one `--workspacePath` repository under the name `default`.
+* `--warmupRevision` warms every repository; a revision one clone lacks logs a warning for that
+  repository and does not stop the others.
+* `/health` reports `200` only once every repository's initial fetch succeeded, so a load
+  balancer never routes to an instance that can answer for some of its repositories but not
+  all. `/metrics` reports each repository under `repositories` with its own `ready`,
+  `activeQueries`, `workspaceBusy` and partial-graph counts, while the top-level fields
+  aggregate over all of them (`activeQueries` summed, `workspaceBusy` when any workspace is
+  held).
 
 ### Shared S3 cache for multi-instance deployments
 
@@ -803,6 +845,112 @@ Options:
           
   -w, --workspacePath <WORKSPACE_PATH>
           Path to the Bazel workspace
+  -b, --bazelPath <BAZEL_PATH>
+          Path to the Bazel or Bazelisk executable [default: bazel]
+  -s, --seed-filepaths <SEED_FILEPATHS>
+          File containing workspace-relative paths whose contents seed every target hash
+      --bazelStartupOptions <BAZEL_STARTUP_OPTIONS>
+          Additional space-separated Bazel startup options
+      --bazelCommandOptions <BAZEL_COMMAND_OPTIONS>
+          Additional space-separated `bazel query` options
+      --cqueryCommandOptions <CQUERY_COMMAND_OPTIONS>
+          Additional space-separated `bazel cquery` options
+      --fineGrainedHashExternalRepos <FINE_GRAINED_HASH_EXTERNAL_REPOS>
+          
+      --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
+          
+      --labelOnlyModuleExtensions <LABEL_ONLY_MODULE_EXTENSIONS>
+          Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories are used only through labels, never by resolving a toolchain from one of them. The module that owns such an extension then does not stand in for its repositories, so a lockfile bump impacts only the targets that depend on the bumped repository
+      --isolatedDependencyRoot <ISOLATED_DEPENDENCY_ROOT>
+          Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
+      --useCquery[=<USE_CQUERY>]
+          [default: false] [possible values: true, false]
+      --cqueryExpression <CQUERY_EXPRESSION>
+          
+  -k, --keep_going[=<KEEP_GOING>]
+          [default: false] [possible values: true, false]
+      --ignoredRuleHashingAttributes <IGNORED_RULE_HASHING_ATTRIBUTES>
+          
+      --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
+          [default: false] [possible values: true, false]
+      --excludeTargetsQuery <EXCLUDE_TARGETS_QUERY>
+          
+      --alwaysAffectedTags <ALWAYS_AFFECTED_TAGS>
+          
+      --gitPath <GIT_PATH>
+          [default: git]
+      --port <PORT>
+          [default: 8080]
+      --requestTimeout <REQUEST_TIMEOUT>
+          [default: 0]
+      --cacheDir <CACHE_DIR>
+          
+      --trackDeps[=<TRACK_DEPS>]
+          [default: false] [possible values: true, false]
+      --dependencyFingerprint[=<DEPENDENCY_FINGERPRINT>]
+          Opt-in: only serve cached entries whose external-dependency fingerprint still matches [default: false] [possible values: true, false]
+      --partialGraph[=<PARTIAL_GRAPH>]
+          Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query` when the diff between them only edits regular source files; every entry then also records the hashing recipes that makes possible. Incompatible with --useCquery and --alwaysAffectedTags [default: false] [possible values: true, false]
+      --partialGraphRebuildPattern <PARTIAL_GRAPH_REBUILD_PATTERNS>
+          Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file name) of workspace paths whose change always forces a full generation under --partialGraph
+      --allowUntrackedPackages
+          Cache a revision whose bazel query loaded packages its git tree does not contain (untracked or ignored BUILD files in the working tree) instead of failing the request
+      --no-initial-fetch
+          
+      --warmupRevision <WARMUP_REVISIONS>
+          
+      --cacheMaxAge <CACHE_MAX_AGE>
+          
+      --cacheMaxEntries <CACHE_MAX_ENTRIES>
+          
+      --cacheMaxSize <CACHE_MAX_SIZE>
+          
+      --cachePruneInterval <CACHE_PRUNE_INTERVAL>
+          [default: 1h]
+      --cacheMemoryMax <CACHE_MEMORY_MAX>
+          [default: 512MB]
+      --s3Bucket <S3_BUCKET>
+          
+      --s3Prefix <S3_PREFIX>
+          [default: ""]
+      --s3Region <S3_REGION>
+          
+      --s3Endpoint <S3_ENDPOINT>
+          
+      --s3ForcePathStyle
+          
+      --gcsBucket <GCS_BUCKET>
+          Google Cloud Storage bucket used as the shared cache tier (Application Default Credentials)
+      --gcsPrefix <GCS_PREFIX>
+          Object-name prefix for cache entries in --gcsBucket [default: ""]
+      --nexusUrl <NEXUS_URL>
+          Base URL of a Sonatype Nexus Repository instance used as the shared cache tier
+      --nexusRepository <NEXUS_REPOSITORY>
+          Raw hosted repository on --nexusUrl that holds cache entries
+      --nexusPrefix <NEXUS_PREFIX>
+          [default: ""]
+      --nexusUsername <NEXUS_USERNAME>
+          Basic-auth user; the password is read from the BAZEL_DIFF_NEXUS_PASSWORD environment variable [env: BAZEL_DIFF_NEXUS_USERNAME=]
+      --nexusCaCert <NEXUS_CA_CERT>
+          PEM bundle of extra CA certificates to trust for --nexusUrl
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
+
+### `serve-multi` command
+
+```terminal
+Run the HTTP impacted-target query service for several repositories at once
+
+Usage: bazel-diff serve-multi [OPTIONS] --repo <NAME=PATH> --cacheDir <CACHE_DIR>
+
+Options:
+      --repo <NAME=PATH>
+          A repository to serve, as NAME=PATH (repeatable). Queries address one with `repo=NAME`. Every repository shares the hashing flags, the cache and the port
+  -v, --verbose
+          
   -b, --bazelPath <BAZEL_PATH>
           Path to the Bazel or Bazelisk executable [default: bazel]
   -s, --seed-filepaths <SEED_FILEPATHS>

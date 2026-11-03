@@ -282,7 +282,9 @@ Endpoints:
   balancer should use this to route only to ready instances. If a fatal git error occurs at startup
   the instance "lame-ducks" itself by continuing to report `503` so the load balancer removes it.
 * `GET /impacted_targets?from=<rev>&to=<rev>` — returns the impacted targets as JSON. The optional
-  `targetType` parameter (e.g. `&targetType=Rule,SourceFile`) filters by target type.
+  `targetType` parameter (e.g. `&targetType=Rule,SourceFile`) filters by target type. On a server
+  that serves several repositories, `repo=<name>` names the one to query (see [Serving several
+  repositories](#serving-several-repositories)).
 
 ```bash
 curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
@@ -362,7 +364,9 @@ curl 'http://localhost:8080/dependency_edges?from=main&to=my-feature-branch'
   the queries accepted and not yet finished (queued, running, or abandoned by a client that stopped
   waiting), and `workspaceBusy` is `true` while any operation holds `--workspacePath` (a query's
   checkout and `bazel query`, or a startup warmup). A tool that shares the checkout with the server
-  should wait for `workspaceBusy` to be `false` before touching it.
+  should wait for `workspaceBusy` to be `false` before touching it. `repositories` breaks the
+  per-workspace figures down by repository (see [Serving several
+  repositories](#serving-several-repositories)).
 
 ```bash
 curl 'http://localhost:8080/metrics'
@@ -377,10 +381,48 @@ curl 'http://localhost:8080/metrics'
   "workspaceBusy": true,
   "gitEngine": "subprocess",
   "trackDeps": false,
+  "repositories": {"default": {"workspace": "/path/to/workspace-clone", "ready": true, "activeQueries": 1, "workspaceBusy": true, "partialGraph": {"derived": 0, "fullGenerations": 0}, "untrackedPackages": {"rejections": 0}}},
   "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB", "memory": {"entries": 2, "sizeBytes": 75374, "maxBytes": 536870912}},
   "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
 }
 ```
+
+### Serving several repositories
+
+One instance can answer for several git clones. `bazel-diff serve-multi` takes every `serve`
+flag except `--workspacePath`, which `--repo NAME=PATH` (repeatable) replaces, and a request
+addresses one repository with `repo=NAME`: a query-string parameter on `GET` and `POST`, or a
+`repo` field in the `POST` body, which wins over the query string.
+
+```bash
+bazel-diff serve-multi \
+  --repo app=/clones/app \
+  --repo lib=/clones/lib \
+  --cacheDir /var/cache/bazel-diff \
+  --port 8080
+
+curl 'http://localhost:8080/impacted_targets?repo=lib&from=main&to=my-feature-branch'
+```
+
+* Every repository shares the hashing flags (`--bazelPath`, `--bazelStartupOptions`,
+  `--trackDeps`, `--partialGraph`, ...), the cache (local disk, memory and the shared tier) and
+  the port. A cache entry is keyed by the git tree and the hashing configuration, never by the
+  clone it came from, so two clones that hold the same tree share one entry, and the cache a
+  single-repository instance built stays valid.
+* Each repository has its own working tree, git, Bazel server, workspace lock and readiness, so
+  queries against different repositories run concurrently, while queries against the same
+  repository are serialised as before. Size the instance for that many Bazel servers at once.
+* A request that names no `repo` is answered when the server serves exactly one repository and
+  refused with `400` otherwise; an unknown name is `404`. Either error lists the repositories
+  served. `serve` serves its one `--workspacePath` repository under the name `default`.
+* `--warmupRevision` warms every repository; a revision one clone lacks logs a warning for that
+  repository and does not stop the others.
+* `/health` reports `200` only once every repository's initial fetch succeeded, so a load
+  balancer never routes to an instance that can answer for some of its repositories but not
+  all. `/metrics` reports each repository under `repositories` with its own `ready`,
+  `activeQueries`, `workspaceBusy` and partial-graph counts, while the top-level fields
+  aggregate over all of them (`activeQueries` summed, `workspaceBusy` when any workspace is
+  held).
 
 ### Shared S3 cache for multi-instance deployments
 

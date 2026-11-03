@@ -370,6 +370,69 @@ fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
     );
 }
 
+// Issue #603. Module `ext` owns the `@crates` extension, whose spokes are named after their
+// version the way rules_js's `npm` names `npm__user-agents__2.1.229`, so a bump replaces spoke `b`
+// rather than changing it. In query mode `//external:ext` depends on every repository its
+// extensions generate, so the bump reaches every target that uses `ext`'s own rule (`//:uses_ext`,
+// like a js_binary) and every target of a module with a `bazel_dep` path to `ext`
+// (`//:uses_dependent`, whose `dependent` reaches `ext` through `middle`, like rules_jest reaching
+// gazelle). Neither names anything in `@crates`. With the extension listed in
+// `--labelOnlyModuleExtensions`, `ext` no longer stands in for its repositories, so the bump
+// impacts only the hub's consumers, with or without fine-graining; a change to `ext` itself must
+// still reach both.
+#[test]
+fn label_only_extension_bump_does_not_reach_users_of_the_owner_or_its_dependents() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let label_only = ["--labelOnlyModuleExtensions", "@ext//:crates.bzl%crates"];
+    let fine_grained = [
+        label_only[0],
+        label_only[1],
+        "--fineGrainedHashExternalRepos",
+        "@crates",
+    ];
+    let main = |impacted: BTreeSet<String>| -> BTreeSet<String> {
+        impacted
+            .into_iter()
+            .map(|label| label.trim_start_matches("@@").to_owned())
+            .filter(|label| label.starts_with("//") && !label.starts_with("//external:"))
+            .collect()
+    };
+    let set = |labels: &[&str]| -> BTreeSet<String> {
+        labels.iter().map(|label| label.to_string()).collect()
+    };
+    let first = copy_workspace("extension_owner_dependent_module");
+    let bumped = copy_workspace("extension_owner_dependent_module");
+    edit(&bumped.path().join("versions.json"), |text| {
+        text.replace("\"b\": \"1.0\"", "\"b\": \"2.0\"")
+    });
+    // Without the opt-in the conservative owner edge stays and the bump reaches both, which is
+    // what the issue reports.
+    let impacted = main(diff_local(first.path(), bumped.path(), &[]));
+    assert!(
+        impacted.contains("//:uses_ext") && impacted.contains("//:uses_dependent"),
+        "{impacted:?}"
+    );
+
+    // Without fine-graining every consumer of the `@crates` hub sees the bump.
+    let impacted = main(diff_local(first.path(), bumped.path(), &label_only));
+    assert_eq!(impacted, set(&["//:uses_a", "//:uses_b"]), "label-only");
+    let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained));
+    assert_eq!(impacted, set(&["//:uses_b"]), "label-only, fine-grained");
+
+    // `dependent` and `//:uses_ext` really depend on `ext`: a change to its own tree reaches them.
+    let changed_owner = copy_workspace("extension_owner_dependent_module");
+    fs::write(changed_owner.path().join("ext/tool.sh"), "exit 1\n").unwrap();
+    for flags in [&label_only[..], &fine_grained[..]] {
+        let impacted = main(diff_local(first.path(), changed_owner.path(), flags));
+        assert!(
+            impacted.contains("//:uses_ext") && impacted.contains("//:uses_dependent"),
+            "{flags:?}: {impacted:?}"
+        );
+    }
+}
+
 const ISOLATED_ROOT: &[&str] = &["--isolatedDependencyRoot", "@hub"];
 
 fn assert_product(workspace: &std::path::Path, target: &str, file: &str, expected: &str) {

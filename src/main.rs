@@ -119,10 +119,10 @@ struct HashingArgs {
     #[arg(
         long = "labelOnlyModuleExtensions",
         value_delimiter = ',',
-        help = "Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories use each \
-                other only through labels, never by resolving a toolchain from one another. A \
-                fine-grained target in one of their repositories then does not change whenever any \
-                other repository of the extension does"
+        help = "Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories are \
+                used only through labels, never by resolving a toolchain from one of them. The \
+                module that owns such an extension then does not stand in for its repositories, so \
+                a lockfile bump impacts only the targets that depend on the bumped repository"
     )]
     label_only_module_extensions: Vec<String>,
 

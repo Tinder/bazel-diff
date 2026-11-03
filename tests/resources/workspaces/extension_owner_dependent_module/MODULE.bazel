@@ -1,0 +1,19 @@
+module(name = "extension_owner_dependent_module_test")
+
+bazel_dep(name = "ext")
+local_path_override(module_name = "ext", path = "ext")
+
+bazel_dep(name = "dependent")
+local_path_override(module_name = "dependent", path = "dependent")
+
+local_path_override(module_name = "middle", path = "middle")
+
+# Module `ext` owns an extension that generates a hub `@crates` and one spoke per
+# entry of versions.json, named after its version, like rules_js's `npm` or
+# gazelle's `go_deps`. Root targets use `ext`'s rule directly, like a js_binary
+# uses rules_js. Module `dependent` reaches `ext` only through `middle`'s
+# `bazel_dep`, like rules_jest -> rules_js -> protobuf -> rules_android -> gazelle.
+# See issue #603 and external.rs.
+crates = use_extension("@ext//:crates.bzl", "crates")
+crates.lock(file = "//:versions.json")
+use_repo(crates, "crates")

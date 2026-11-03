@@ -49,9 +49,8 @@ pub struct BazelOptions {
     pub fine_grained_external_repos: BTreeSet<String>,
     /// Module extensions, as `bazel mod show_extension` names them
     /// (`@rules_rs//rs:extensions.bzl%crate`), whose repositories use each other only through
-    /// labels: no target in one of them resolves a toolchain from another. A target inside such an
-    /// extension's repository reaches the module that owns the extension without the extension's
-    /// other repositories (see `extension_view_node`).
+    /// labels: no target resolves a toolchain from one of them. The module that owns such an
+    /// extension then does not stand in for its repositories (see `lower_repositories`).
     pub label_only_module_extensions: BTreeSet<String>,
     /// A root-isolated extension import whose external consumers are discoverable through
     /// ordinary target inputs and BUILD loads.
@@ -723,7 +722,7 @@ impl BazelOptions {
         };
         let mut scope = IsolatedRepoScope::default();
         let label_only = LabelOnlyRepositories {
-            sibling_extensions: self
+            extensions: self
                 .label_only_extension_prefixes(&canonical_to_apparent, &extension_repos.generated),
             owner_exemptions: if let Some(root) = &self.isolated_dependency_root {
                 if let Some(extension) = failed.extensions.first() {
@@ -1924,7 +1923,8 @@ impl IsolatedRepoScope {
 
 #[derive(Default)]
 struct LabelOnlyRepositories {
-    sibling_extensions: BTreeSet<String>,
+    /// Usage prefixes of `label_only_module_extensions`; their owners get no stand-in edges.
+    extensions: BTreeSet<String>,
     owner_exemptions: BTreeSet<String>,
 }
 
@@ -2434,15 +2434,15 @@ fn lower_repositories(
     // and each imported repository of an extension depends on the siblings nobody imports (the
     // `@bd_crates` hub reaches its `bd_crates__*` spokes). Spokes themselves stay leaves, so no
     // cycle forms.
-    // For an extension the user lists in `label_only_module_extensions`, a target inside one of
-    // its repositories reaches the owning module through a view without the extension's own
-    // repositories (`extension_view_node`): the user asserts that it uses its siblings only
-    // through labels, which the query reports. Otherwise every fine-grained spoke would change
-    // whenever any other spoke does. The view is opt-in because a toolchain resolved from a
-    // sibling is invisible to a query, however it is registered.
+    // An extension the user lists in `label_only_module_extensions` gets no owner edges: the user
+    // asserts that its repositories are reached only through labels, which the query reports,
+    // never through a resolved toolchain. Otherwise every target of the owning module, of every
+    // module with a `bazel_dep` path to it, and every fine-grained spoke would change whenever
+    // any repository of the extension does (issue #603). It is opt-in because a toolchain
+    // resolved from one of them is invisible to a query, however it is registered.
     // An explicitly label-only imported repository needs no owner fallback. Its own node,
     // the hub-to-spoke inputs and the owner's edges to other generators remain.
-    let mut module_extension_repos = BTreeMap::<String, BTreeMap<String, BTreeSet<String>>>::new();
+    let mut module_extension_repos = BTreeMap::<String, BTreeSet<String>>::new();
     let mut extension_spokes = BTreeMap::<String, BTreeSet<String>>::new();
     if let Some(imported) = extension_edges {
         for repository in &repositories {
@@ -2453,14 +2453,14 @@ fn lower_repositories(
             if let Some((module_repo, _definition_hash)) =
                 extension_repo_owner(extension, &module_definitions).filter(
                     |(module_repo, _definition_hash)| {
-                        !module_repo.is_empty() && !label_only.owner_exemptions.contains(canonical)
+                        !module_repo.is_empty()
+                            && !label_only.owner_exemptions.contains(canonical)
+                            && !label_only.extensions.contains(extension)
                     },
                 )
             {
                 module_extension_repos
                     .entry(module_repo.clone())
-                    .or_default()
-                    .entry(extension.to_owned())
                     .or_default()
                     .extend(node_names(canonical));
             }
@@ -2490,8 +2490,7 @@ fn lower_repositories(
             .filter_map(|dependency| module_to_canonical.get(dependency))
             .flat_map(|canonical| node_names(canonical))
             .collect::<BTreeSet<_>>();
-        let extensions = module_extension_repos.get(canonical);
-        for repos in extensions.into_iter().flat_map(BTreeMap::values) {
+        if let Some(repos) = module_extension_repos.get(canonical) {
             dependencies.extend(repos.iter().cloned());
         }
         let spokes = extension
@@ -2509,17 +2508,12 @@ fn lower_repositories(
         if names.is_empty() {
             continue;
         }
-        let views = extensions
-            .into_iter()
-            .flatten()
-            .filter(|(extension, _)| label_only.sibling_extensions.contains(*extension))
-            .collect::<Vec<_>>();
         let files = module_files
             .remove(&index)
             .unwrap_or_else(|| prepare_repository(&mut repository, &workspace));
         let rule = repository_rule(repository, files, owner_definition_hash);
-        // All apparent names and views have the same definition. Move it into the final output.
-        let mut rules = std::iter::repeat_n(rule, names.len() * (1 + views.len()));
+        // All apparent names have the same definition. Move it into the final output.
+        let mut rules = std::iter::repeat_n(rule, names.len());
         for apparent in names {
             // Imported hubs of one extension share its ordered hidden siblings. Pass
             // the same allocation to the hash traversal when no owner-specific edge
@@ -2543,24 +2537,9 @@ fn lower_repositories(
             let mut target = repository_target(rules.next().unwrap(), &apparent, inputs);
             transform(&mut target, shared);
             targets.push(target);
-            for (extension, repos) in &views {
-                let mut view = repository_target(
-                    rules.next().unwrap(),
-                    &extension_view_node(&apparent, extension),
-                    &dependencies.difference(repos).cloned().collect(),
-                );
-                transform(&mut view, None);
-                targets.push(view);
-            }
         }
     }
     targets
-}
-
-/// The node a target in a repository of `extension` reaches its owning module `node` through:
-/// the module without the extension's own repositories (see `lower_repositories`).
-pub(crate) fn extension_view_node(node: &str, extension: &str) -> String {
-    format!("{node}%{extension}")
 }
 
 fn parse_bazel_version(text: &str) -> Option<BazelVersion> {
@@ -4557,7 +4536,7 @@ mod tests {
     }
 
     #[test]
-    fn apparent_names_and_views_share_one_read_of_the_repository_inputs() {
+    fn apparent_names_share_one_read_of_the_repository_inputs() {
         let workspace = tempfile::tempdir().unwrap();
         let patch = workspace.path().join("dep.patch");
         fs::write(&patch, "first").unwrap();
@@ -4585,10 +4564,7 @@ mod tests {
             &parse_repo_mapping(r#"{"before":"before+","a":"dep+","b":"dep+"}"#),
             &BTreeMap::new(),
             Some(&BTreeSet::new()),
-            &LabelOnlyRepositories {
-                sibling_extensions: BTreeSet::from(["dep++ext".into()]),
-                ..Default::default()
-            },
+            &LabelOnlyRepositories::default(),
             workspace.path(),
             &mut |target, _| {
                 // The module definitions have been hashed, but dep's targets have not been emitted.
@@ -4619,9 +4595,7 @@ mod tests {
             [
                 ("//external:before", None),
                 ("//external:a", first),
-                ("//external:a%dep++ext", first),
                 ("//external:b", first),
-                ("//external:b%dep++ext", first),
                 ("//external:dep++ext+spoke", Some(second.as_str())),
             ]
         );
@@ -5367,17 +5341,11 @@ exit 1
             &mapping,
             &edges,
             Some(&imported),
-            &LabelOnlyRepositories {
-                sibling_extensions: BTreeSet::from([
-                    "rules_go++go_sdk".to_owned(),
-                    "rules_rs++crate".to_owned(),
-                ]),
-                ..Default::default()
-            },
+            &LabelOnlyRepositories::default(),
             Path::new("."),
             &mut materialize_repository_inputs,
         );
-        assert_eq!(query.len(), 10);
+        assert_eq!(query.len(), 8);
         // The owning module reaches everything its extensions generate, after its module deps.
         assert_eq!(
             inputs_of(&query, "//external:rules_go"),
@@ -5394,16 +5362,6 @@ exit 1
                 "//external:rules_rs++_crate+++isolated_crates+crate_repo",
                 "//external:rules_rs++crate+bd_crates__anyhow-1.0.104",
             ]
-        );
-        // Its view from inside one extension leaves out that extension's repositories, and keeps
-        // those of its other usages, an isolated usage of the same extension included.
-        assert_eq!(
-            inputs_of(&query, "//external:rules_go%rules_go++go_sdk"),
-            ["//external:rules_rs"]
-        );
-        assert_eq!(
-            inputs_of(&query, "//external:rules_rs%rules_rs++crate"),
-            ["//external:rules_rs++_crate+++isolated_crates+crate_repo"]
         );
         // An imported repository reaches the siblings of its extension nobody imports.
         assert_eq!(
@@ -5422,6 +5380,42 @@ exit 1
         )
         .is_empty());
         assert!(inputs_of(&query, "//external:+local+root_ext_repo").is_empty());
+
+        // A label-only extension's repositories leave its owner's node, while those of its other
+        // usages stay, an isolated usage of the same extension included (issue #603). The
+        // hub-to-spoke edges remain.
+        let label_only = lower_repositories(
+            repositories(),
+            &mapping,
+            &edges,
+            Some(&imported),
+            &LabelOnlyRepositories {
+                extensions: BTreeSet::from([
+                    "rules_go++go_sdk".to_owned(),
+                    "rules_rs++crate".to_owned(),
+                ]),
+                ..Default::default()
+            },
+            Path::new("."),
+            &mut materialize_repository_inputs,
+        );
+        assert_eq!(label_only.len(), 8);
+        assert_eq!(
+            inputs_of(&label_only, "//external:rules_go"),
+            ["//external:rules_rs"]
+        );
+        assert_eq!(
+            inputs_of(&label_only, "//external:rules_rs"),
+            ["//external:rules_rs++_crate+++isolated_crates+crate_repo"]
+        );
+        assert_eq!(
+            inputs_of(&label_only, "//external:bd_crates"),
+            ["//external:rules_rs++crate+bd_crates__anyhow-1.0.104"]
+        );
+        assert_eq!(
+            inputs_of(&label_only, "//external:rules_go++go_sdk+go_toolchains"),
+            ["//external:rules_go++go_sdk+go_default_sdk"]
+        );
 
         let cquery = lower_repositories(
             repositories(),

@@ -1,0 +1,23 @@
+load("@ext//:defs.bzl", "app_lib", "tool")
+
+tool(name = "primary", version = "before")
+tool(name = "other", version = "other")
+
+config_setting(name = "alternative", values = {"define": "tool=other"})
+
+toolchain(
+    name = "registration",
+    toolchain = ":primary",
+    toolchain_type = "@ext//:toolchain_type",
+)
+
+toolchain(
+    name = "choice",
+    toolchain = select({
+        ":alternative": ":other",
+        "//conditions:default": ":primary",
+    }),
+    toolchain_type = "@ext//:toolchain_type",
+)
+
+app_lib(name = "consumer")

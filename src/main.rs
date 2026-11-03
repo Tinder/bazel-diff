@@ -831,28 +831,35 @@ fn partial_graph_hashes(
         Some(path) => {
             let base = HashFileData::read(path)
                 .with_context(|| format!("failed to read --baseHashes {}", path.display()))?;
-            match base.tree.as_deref() {
-                _ if base.partial.is_none() => {
+            match (base.partial.as_ref(), base.tree.as_deref()) {
+                (None, _) => {
                     format!("{} carries no partial-graph recipes", path.display())
                 }
-                _ if args.dep_edges_file.is_some()
-                    && base.dep_edges.is_empty()
-                    && !base.hashes.is_empty() =>
+                (Some(recipes), _) if recipes.version != partial::RECIPE_VERSION => format!(
+                    "{} carries partial-graph recipe version {}, expected {}",
+                    path.display(),
+                    recipes.version,
+                    partial::RECIPE_VERSION
+                ),
+                (_, _)
+                    if args.dep_edges_file.is_some()
+                        && base.dep_edges.is_empty()
+                        && !base.hashes.is_empty() =>
                 {
                     format!(
                         "{} records no dependency edges, which --depEdgesFile needs",
                         path.display()
                     )
                 }
-                None => format!("{} records no git tree", path.display()),
-                Some(base_tree) if base_tree == tree_id => {
+                (_, None) => format!("{} records no git tree", path.display()),
+                (_, Some(base_tree)) if base_tree == tree_id => {
                     eprintln!(
                         "[Info] partial graph: {} already describes tree {tree_id}",
                         path.display()
                     );
                     return Ok(base);
                 }
-                Some(base_tree) => {
+                (_, Some(base_tree)) => {
                     let policy = DerivationPolicy {
                         seed_filepaths: &options.seed_filepaths,
                         rebuild_patterns: &rebuild_patterns,
@@ -895,6 +902,15 @@ fn ensure_same_mode(from: &HashFileData, to: &HashFileData) -> Result<()> {
         bail!(
             "the starting and final hashes were not generated in the same mode: one carries --partialGraph recipes and the other does not, and hashes of the two modes are not comparable"
         );
+    }
+    if let (Some(from), Some(to)) = (&from.partial, &to.partial) {
+        if from.version != to.version {
+            bail!(
+                "the starting and final hashes carry different partial-graph recipe versions ({} and {}); regenerate both with the same bazel-diff build",
+                from.version,
+                to.version
+            );
+        }
     }
     Ok(())
 }
@@ -2458,6 +2474,19 @@ mod tests {
             .unwrap();
             calls.get()
         };
+        // An older formula must regenerate even when the base describes the same tree.
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        assert_eq!(expected_tree(&[&output, &base_path]), base.tree);
+        let mut outdated = base.clone();
+        outdated.partial.as_mut().unwrap().version = partial::RECIPE_VERSION - 1;
+        fs::write(
+            &base_path,
+            serde_json::to_vec(&outdated.serialized(true, false)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(counted(&args), 1);
+        fs::write(repo.path().join("file.txt"), "two").unwrap();
+
         let mut no_recipes = base.clone();
         no_recipes.partial = None;
         fs::write(
@@ -2558,5 +2587,11 @@ mod tests {
         assert!(error.contains("same mode"), "{error}");
         let error = run_explain(&explain, false).unwrap_err().to_string();
         assert!(error.contains("same mode"), "{error}");
+
+        partial.partial.as_mut().unwrap().version = bazel_diff::partial::RECIPE_VERSION;
+        let mut older = partial.clone();
+        older.partial.as_mut().unwrap().version = bazel_diff::partial::RECIPE_VERSION - 1;
+        let error = ensure_same_mode(&older, &partial).unwrap_err().to_string();
+        assert!(error.contains("recipe versions"), "{error}");
     }
 }

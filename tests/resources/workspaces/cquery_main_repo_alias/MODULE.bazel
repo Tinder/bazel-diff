@@ -1,0 +1,4 @@
+module(
+    name = "cquery_main_repo_alias",
+    version = "0.0.0",
+)

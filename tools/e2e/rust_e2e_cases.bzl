@@ -224,6 +224,14 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::main_repo_alias_change_reaches_consumer_cquery",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::main_repo_alias_change_reaches_consumer_query",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::module_comment_and_lock_reformat_are_noops",
                 "timeout": "moderate",
             },

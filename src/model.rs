@@ -5,7 +5,7 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -320,6 +320,40 @@ impl<'de> Deserialize<'de> for JsonStr<'de> {
     }
 }
 
+/// Parses a `--depEdgesFile` (`{label: [dependency labels]}`). `generate-hashes` writes it from a
+/// sorted map, so the entries are collected and the map built in one bulk pass, as for [`Hashes`],
+/// instead of searching the tree for every label; a repeated label keeps its last value, as
+/// deserializing straight into a `BTreeMap` does.
+pub fn dep_edges_from_slice(bytes: &[u8]) -> serde_json::Result<BTreeMap<String, Vec<String>>> {
+    struct DepEdges(BTreeMap<String, Vec<String>>);
+
+    impl<'de> Deserialize<'de> for DepEdges {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct DepEdgesVisitor;
+
+            impl<'de> Visitor<'de> for DepEdgesVisitor {
+                type Value = DepEdges;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str("an object mapping labels to label arrays")
+                }
+
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                    let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                    while let Some(entry) = map.next_entry::<String, Vec<String>>()? {
+                        entries.push(entry);
+                    }
+                    Ok(DepEdges(entries.into_iter().collect()))
+                }
+            }
+
+            deserializer.deserialize_map(DepEdgesVisitor)
+        }
+    }
+
+    serde_json::from_slice::<DepEdges>(bytes).map(|edges| edges.0)
+}
+
 /// The `{label: "kind#hash~direct"}` object, parsed entry by entry.
 struct Hashes(BTreeMap<String, TargetHash>);
 
@@ -335,12 +369,16 @@ impl<'de> Deserialize<'de> for Hashes {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut hashes = BTreeMap::new();
+                // `generate-hashes` writes labels in sorted order, so collecting the entries and
+                // building the map in one bulk pass replaces a root-to-leaf search (a string
+                // comparison per level) for every insert. `BTreeMap::from_iter` sorts stably and
+                // keeps the last value for a repeated label, exactly as repeated inserts would.
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
                 while let Some((label, value)) = map.next_entry::<String, JsonStr<'de>>()? {
                     let hash = TargetHash::parse(&value.0).map_err(de::Error::custom)?;
-                    hashes.insert(label, hash);
+                    entries.push((label, hash));
                 }
-                Ok(Hashes(hashes))
+                Ok(Hashes(entries.into_iter().collect()))
             }
         }
 
@@ -374,11 +412,18 @@ impl<'de> Deserialize<'de> for HashFileData {
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut data = HashFileData::default();
+                // Entries of the bare shape, buffered for one bulk build like `Hashes` does. They
+                // all follow the last `"hashes"` key (which replaces everything before it), so
+                // they are applied last, each overriding an earlier value for its label.
+                let mut bare = Vec::new();
                 // Labels always start with `//`, `@` or a repository name, so the two wrapper
                 // keys cannot collide with one.
                 while let Some(key) = map.next_key::<JsonStr<'de>>()? {
                     match &*key.0 {
-                        "hashes" => data.hashes = map.next_value::<Hashes>()?.0,
+                        "hashes" => {
+                            bare.clear();
+                            data.hashes = map.next_value::<Hashes>()?.0;
+                        }
                         "metadata" => {
                             let metadata = map.next_value::<Metadata>()?;
                             data.module_graph_json = metadata.module_graph_json;
@@ -390,9 +435,14 @@ impl<'de> Deserialize<'de> for HashFileData {
                         label => {
                             let value = map.next_value::<JsonStr<'de>>()?;
                             let hash = TargetHash::parse(&value.0).map_err(de::Error::custom)?;
-                            data.hashes.insert(label.to_owned(), hash);
+                            bare.push((label.to_owned(), hash));
                         }
                     }
+                }
+                if data.hashes.is_empty() {
+                    data.hashes = bare.into_iter().collect();
+                } else {
+                    data.hashes.extend(bare);
                 }
                 Ok(data)
             }
@@ -605,36 +655,38 @@ pub fn impacted_types(
         .collect()
 }
 
-fn calculate_distance(
-    label: &str,
-    dep_edges: &BTreeMap<String, Vec<String>>,
+fn calculate_distance<'a>(
+    label: &'a str,
+    dep_edges: &'a BTreeMap<String, Vec<String>>,
     impact_types: &HashMap<String, ImpactType>,
-    memo: &mut HashMap<String, (usize, usize)>,
-    visiting: &mut BTreeSet<String>,
+    memo: &mut HashMap<&'a str, (usize, usize)>,
+    visiting: &mut HashSet<&'a str>,
 ) -> (usize, usize) {
     if let Some(distance) = memo.get(label) {
         return *distance;
     }
     if impact_types.get(label) == Some(&ImpactType::Direct) {
-        memo.insert(label.to_owned(), (0, 0));
+        memo.insert(label, (0, 0));
         return (0, 0);
     }
-    if !visiting.insert(label.to_owned()) {
+    if !visiting.insert(label) {
         return (0, 0);
     }
+    // Labels are borrowed from the impact map and the dep-edges file for the whole walk, so the
+    // memo, the cycle guard and the dependency list allocate no strings.
     let impacted_deps = dep_edges
         .get(label)
         .into_iter()
         .flatten()
+        .map(String::as_str)
         .filter(|dep| impact_types.contains_key(*dep))
-        .cloned()
         .collect::<Vec<_>>();
     if impacted_deps.is_empty() {
         eprintln!(
             "[Warn] {label} was indirectly impacted, but has no impacted dependencies in the dep-edges file. Falling back to distance 0 -- see https://github.com/Tinder/bazel-diff/issues/268"
         );
         visiting.remove(label);
-        memo.insert(label.to_owned(), (0, 0));
+        memo.insert(label, (0, 0));
         return (0, 0);
     }
     let label_package = label.split(':').next().unwrap_or(label);
@@ -642,14 +694,14 @@ fn calculate_distance(
     let mut package_distance = usize::MAX;
     for dep in impacted_deps {
         let (dep_target, dep_package) =
-            calculate_distance(&dep, dep_edges, impact_types, memo, visiting);
+            calculate_distance(dep, dep_edges, impact_types, memo, visiting);
         target_distance = target_distance.min(dep_target.saturating_add(1));
         package_distance = package_distance
-            .min(dep_package + usize::from(dep.split(':').next().unwrap_or(&dep) != label_package));
+            .min(dep_package + usize::from(dep.split(':').next().unwrap_or(dep) != label_package));
     }
     visiting.remove(label);
     let result = (target_distance, package_distance);
-    memo.insert(label.to_owned(), result);
+    memo.insert(label, result);
     result
 }
 
@@ -661,23 +713,19 @@ pub fn impacted_targets_with_distances(
     exclude_external: bool,
 ) -> Result<Vec<ImpactedTargetWithDistance>> {
     let impact_types = impacted_types(from, to);
-    let mut memo = HashMap::new();
+    let mut memo = HashMap::with_capacity(impact_types.len());
+    // Every walk removes what it adds, so one guard serves all of them.
+    let mut visiting = HashSet::new();
     for label in impact_types.keys() {
-        calculate_distance(
-            label,
-            dep_edges,
-            &impact_types,
-            &mut memo,
-            &mut BTreeSet::new(),
-        );
+        calculate_distance(label, dep_edges, &impact_types, &mut memo, &mut visiting);
     }
-    let mut impacted = memo
+    let impacted = memo
         .into_iter()
         .filter(|(label, _)| !exclude_external || !label.starts_with("//external:"))
         .filter_map(|(label, (target_distance, package_distance))| {
-            match accepts(&label, to, target_types) {
+            match accepts(label, to, target_types) {
                 Ok(true) => Some(Ok(ImpactedTargetWithDistance {
-                    label,
+                    label: label.to_owned(),
                     target_distance,
                     package_distance,
                 })),
@@ -686,13 +734,23 @@ pub fn impacted_targets_with_distances(
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    impacted.sort_by_key(|target| {
-        (
-            kind_rank(to.get(&target.label).or_else(|| from.get(&target.label))),
-            target.label.clone(),
-        )
+    // Rank each label once and sort the pairs. A key closure would look the label up in both maps
+    // and clone it on every comparison: O(n log n) lookups and allocations for an n-label result.
+    // The labels are distinct (they are the memo's keys), so an unstable sort orders them exactly
+    // as a stable one would.
+    let mut ranked = impacted
+        .into_iter()
+        .map(|target| {
+            let rank = kind_rank(to.get(&target.label).or_else(|| from.get(&target.label)));
+            (rank, target)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|(left_rank, left), (right_rank, right)| {
+        left_rank
+            .cmp(right_rank)
+            .then_with(|| left.label.cmp(&right.label))
     });
-    Ok(impacted)
+    Ok(ranked.into_iter().map(|(_, target)| target).collect())
 }
 
 #[cfg(test)]
@@ -906,6 +964,42 @@ mod tests {
         assert_eq!(reordered.dependency_fingerprint.as_deref(), Some("fp"));
         assert_eq!(reordered.hashes.len(), 1);
         assert!(reordered.dep_edges.is_empty());
+    }
+
+    #[test]
+    fn bulk_built_maps_match_insertion_for_unsorted_and_repeated_labels() {
+        // The readers build their maps in one pass; out-of-order and repeated labels must still
+        // land exactly as entry-by-entry inserts would place them: sorted, last value wins.
+        for bytes in [
+            br#"{"//b:b":"b~b","//a:a":"a~a","//b:b":"c~c"}"#.as_slice(),
+            br#"{"hashes":{"//b:b":"b~b","//a:a":"a~a","//b:b":"c~c"}}"#.as_slice(),
+        ] {
+            let parsed = HashFileData::from_slice(bytes).unwrap();
+            assert_eq!(
+                parsed.hashes,
+                BTreeMap::from([
+                    ("//a:a".into(), target("", "a", "a")),
+                    ("//b:b".into(), target("", "c", "c")),
+                ])
+            );
+        }
+        // Bare labels after a wrapper override it; a wrapper after bare labels replaces them.
+        let after = HashFileData::from_slice(br#"{"hashes":{"//a:a":"a~a"},"//a:a":"b~b"}"#);
+        assert_eq!(after.unwrap().hashes["//a:a"], target("", "b", "b"));
+        let before =
+            HashFileData::from_slice(br#"{"//z:z":"z~z","hashes":{"//a:a":"a~a"}}"#).unwrap();
+        assert_eq!(before.hashes.keys().collect::<Vec<_>>(), ["//a:a"]);
+
+        let edges =
+            dep_edges_from_slice(br#"{"//b:b":["//a:a"],"//a:a":[],"//b:b":["//c:c"]}"#).unwrap();
+        assert_eq!(
+            edges,
+            BTreeMap::from([
+                ("//a:a".to_owned(), vec![]),
+                ("//b:b".to_owned(), vec!["//c:c".to_owned()]),
+            ])
+        );
+        assert!(dep_edges_from_slice(br#"{"//a:a":"//b:b"}"#).is_err());
     }
 
     #[test]

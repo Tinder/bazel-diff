@@ -671,6 +671,7 @@ Commands:
   warmup                Warm Bazel and write snapshot hashes and fingerprint metadata
   fingerprint           Compute the snapshot/cache fingerprint for the current workspace
   serve                 Run the HTTP impacted-target query service
+  serve-multi           Run the HTTP impacted-target query service for several repositories at once
   help                  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1034,6 +1035,8 @@ Options:
           
       --s3ForcePathStyle
           
+      --s3StsEndpoint <S3_STS_ENDPOINT>
+          STS endpoint where AWS_WEB_IDENTITY_TOKEN_FILE is exchanged for AWS_ROLE_ARN's credentials (MinIO, SeaweedFS) [env: AWS_ENDPOINT_URL_STS=]
       --gcsBucket <GCS_BUCKET>
           Google Cloud Storage bucket used as the shared cache tier (Application Default Credentials)
       --gcsPrefix <GCS_PREFIX>
@@ -1146,7 +1149,7 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "73.0.0")
+bazel_dep(name = "bazel-diff", version = "74.0.0")
 ```
 
 You can now run the tool with:

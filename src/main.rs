@@ -5,12 +5,14 @@ use bazel_diff::fingerprint;
 use bazel_diff::git::{self, DerivationPolicy, Git};
 use bazel_diff::hash::{generate_hashes, HashOptions};
 use bazel_diff::model::{
-    filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
+    dep_edges_from_slice, filter_and_sort_labels, impacted_targets,
+    impacted_targets_with_distances, HashFileData,
 };
 use bazel_diff::module_graph::{bzlmod_enabled_for, impacted_with_module_changes};
 use bazel_diff::partial::{self, Classification, Glob};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -992,16 +994,23 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
     let target_types = (!args.target_type.is_empty())
         .then(|| args.target_type.iter().cloned().collect::<HashSet<_>>());
     let output = if let Some(dep_edges_file) = &args.dep_edges_file {
-        let dep_edges: BTreeMap<String, Vec<String>> =
-            serde_json::from_slice(&fs::read(dep_edges_file)?)?;
-        let module_impacted = impacted_with_module_changes(&from, &to, Some(&bazel))?;
-        let hash_impacted = impacted_targets(&from.hashes, &to.hashes, None, false)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let mut distance_from = from.hashes.clone();
-        for label in module_impacted.difference(&hash_impacted) {
-            distance_from.remove(label);
-        }
+        let dep_edges = dep_edges_from_slice(&fs::read(dep_edges_file)?)?;
+        // Targets impacted only through a module change are made to look new, so they report
+        // distance 0. With an unchanged module graph there are none (the module-aware set is the
+        // hash diff itself), so the starting hashes are used as they are: no second diff, no copy.
+        let distance_from = if from.module_graph_json == to.module_graph_json {
+            Cow::Borrowed(&from.hashes)
+        } else {
+            let module_impacted = impacted_with_module_changes(&from, &to, Some(&bazel))?;
+            let hash_impacted = impacted_targets(&from.hashes, &to.hashes, None, false)?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let mut distance_from = from.hashes.clone();
+            for label in module_impacted.difference(&hash_impacted) {
+                distance_from.remove(label);
+            }
+            Cow::Owned(distance_from)
+        };
         serde_json::to_string(&impacted_targets_with_distances(
             &distance_from,
             &to.hashes,
@@ -1035,7 +1044,7 @@ fn run_explain(args: &ExplainArgs, verbose: bool) -> Result<()> {
     let to = HashFileData::read(&args.final_hashes)
         .context("Incorrect final hashes: file doesn't exist or can't be read.")?;
     ensure_same_mode(&from, &to)?;
-    let dep_edges: BTreeMap<String, Vec<String>> = serde_json::from_slice(
+    let dep_edges = dep_edges_from_slice(
         &fs::read(&args.dep_edges_file)
             .context("Incorrect dep edges file: file doesn't exist or can't be read.")?,
     )

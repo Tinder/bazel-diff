@@ -1340,3 +1340,64 @@ fn main_repo_alias_change_reaches_consumer_cquery() {
         );
     }
 }
+
+/// Follow-up to <https://github.com/Tinder/bazel-diff/issues/612> for WORKSPACE mode: there
+/// `--consistent_labels` prints main-repository targets as `@//:tool`, not the Bzlmod
+/// `@@//:tool`, so prefixing the alias's apparent label with `@@` still left it unmatched,
+/// dropped as if it were platform-incompatible together with every edge through it.
+#[test]
+fn main_repo_alias_change_reaches_consumer_cquery_workspace_mode() {
+    let first = copy_workspace("cquery_main_repo_alias_workspace");
+    let second = copy_workspace("cquery_main_repo_alias_workspace");
+    fs::write(second.path().join("bar/baz.txt"), "after\n").unwrap();
+
+    let output = tempfile::tempdir().unwrap();
+    let from = output.path().join("from.json");
+    let to = output.path().join("to.json");
+    let edges_file = output.path().join("edges.json");
+    let result = output.path().join("impacted.txt");
+    assert!(generate(first.path(), &from, &["--useCquery"])
+        .status
+        .success());
+    assert!(generate(
+        second.path(),
+        &to,
+        &[
+            "--useCquery",
+            "--depEdgesFile",
+            edges_file.to_str().unwrap()
+        ],
+    )
+    .status
+    .success());
+    assert!(impacted(second.path(), &from, &to, &result, &[])
+        .status
+        .success());
+
+    let hashes = hashes(&to);
+    assert!(
+        hashes.keys().any(|label| label.ends_with("//:tool")),
+        "the alias //:tool was dropped from the cquery hashes: {:?}",
+        hashes.keys().collect::<Vec<_>>()
+    );
+    let edges = dep_edges(&edges_file);
+    let wrapper_edges = edges
+        .iter()
+        .find(|(label, _)| label.ends_with("//:wrapper"))
+        .map(|(_, deps)| deps.clone())
+        .expect("//:wrapper has dep edges");
+    assert!(
+        wrapper_edges.iter().any(|dep| dep.ends_with("//:tool")),
+        "//:wrapper lost its edge to the alias //:tool: {wrapper_edges:?}"
+    );
+
+    let impacted = read_lines(&result);
+    for name in ["//bar:baz.txt", "//bar:baz", "//:tool", "//:wrapper"] {
+        assert!(
+            impacted
+                .iter()
+                .any(|label| label == name || label.trim_start_matches('@') == name),
+            "{name} should be impacted through the alias under cquery, got {impacted:?}"
+        );
+    }
+}

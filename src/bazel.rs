@@ -2741,7 +2741,7 @@ fn decode_target_stream(
             .map(|bytes| {
                 <Target as Message>::decode_from_slice(bytes)
                     .map_err(anyhow::Error::from)
-                    .map(lower_target)
+                    .map(lower_query_target)
             })
             .collect_into_vec(&mut decoded);
         let start = targets.len();
@@ -2934,6 +2934,35 @@ pub fn target_name(target: &Target) -> Option<&str> {
             .as_option()
             .map(|group| group.name.as_str()),
     }
+}
+
+fn lower_query_target(mut target: Target) -> Option<Target> {
+    if let Some(rule) = target
+        .rule
+        .as_option_mut()
+        .filter(|r| r.rule_class == "toolchain")
+    {
+        // Bazel's native toolchain rule points at its implementation with a NODEP_LABEL.
+        // Query prints the label as a nodep string and omits it from rule_input.
+        if let Some(implementation) = rule
+            .attribute
+            .iter()
+            .find(|a| a.name == "toolchain" && a.nodep == Some(true))
+        {
+            rule.rule_input
+                .extend(implementation.string_value.iter().cloned());
+            if let Some(select) = implementation.selector_list.as_option() {
+                rule.rule_input
+                    .extend(select.elements.iter().flat_map(|element| {
+                        element
+                            .entries
+                            .iter()
+                            .filter_map(|entry| entry.string_value.clone())
+                    }));
+            }
+        }
+    }
+    lower_target(target)
 }
 
 fn lower_target(mut target: Target) -> Option<Target> {

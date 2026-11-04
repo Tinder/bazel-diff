@@ -144,6 +144,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::toolchain_declarations_follow_their_implementations",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::transitive_external_repo_change_reaches_consumer",
                 "timeout": "moderate",
             },

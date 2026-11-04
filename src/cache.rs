@@ -81,6 +81,9 @@ pub fn configuration_fingerprint(
         hasher.update(value.as_bytes());
         hasher.update([0]);
     }
+    if !options.bazel.use_cquery {
+        hasher.update(b"queryToolchainImplementations=1\0");
+    }
     if let Some(root) = &options.bazel.isolated_dependency_root {
         hasher.update(b"isolatedDependencyRoot=");
         hasher.update(root.as_bytes());

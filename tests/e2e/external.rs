@@ -598,6 +598,62 @@ fn isolated_dependency_root_keeps_hidden_spoke_changes() {
     assert!(!changed.contains("//outside:uses_owner"), "{changed:?}");
 }
 
+#[test]
+fn toolchain_declarations_follow_their_implementations() {
+    let workspace = copy_workspace("extension_toolchain_through_owner");
+    let root = workspace.path();
+    edit(&root.join("MODULE.bazel"), |module| {
+        format!("{module}\nregister_toolchains(\"//declaration:registration\")\n")
+    });
+    let out = tempfile::tempdir().unwrap();
+    let before = out.path().join("before.json");
+    let after = out.path().join("after.json");
+    let edges = out.path().join("edges.json");
+    let result = out.path().join("impacted.json");
+    let args = [
+        "--bazelCommandOptions=--noproto:flatten_selects",
+        "--includeTargetType",
+        "-d",
+        edges.to_str().unwrap(),
+    ];
+    for (hashes, value) in [(&before, "before"), (&after, "after")] {
+        if value == "after" {
+            edit(&root.join("declaration/BUILD.bazel"), |text| {
+                text.replace("\"before\"", "\"after\"")
+            });
+        }
+        assert_product(
+            root,
+            "//declaration:consumer",
+            "declaration/consumer.txt",
+            value,
+        );
+        assert!(generate(root, hashes, &args).status.success());
+    }
+    assert!(impacted(
+        root,
+        &before,
+        &after,
+        &result,
+        &["-d", edges.to_str().unwrap()]
+    )
+    .status
+    .success());
+    let changes: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+    let distance = |name: &str| {
+        changes
+            .iter()
+            .find(|row| row["label"] == name)
+            .and_then(|row| row["targetDistance"].as_u64())
+    };
+    assert_eq!(distance("//declaration:primary"), Some(0));
+    assert_eq!(distance("//declaration:registration"), Some(1));
+    assert_eq!(distance("//declaration:choice"), Some(1));
+    assert_eq!(distance("//declaration:other"), None);
+    assert!(dep_edges(&edges)["//declaration:choice"].contains("//declaration:other"));
+}
+
 // Module `ext`'s extension generates `@app`, whose rule resolves a toolchain, and the repositories
 // that toolchain can come from. A query never shows a resolved toolchain as an input, so with
 // `@app` fine-grained the change has to reach `//:uses_app` through `ext`, however `ext` registers

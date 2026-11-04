@@ -1526,9 +1526,7 @@ impl BazelOptions {
         }
 
         let mut targets = if use_cquery {
-            decode_cquery_stream(output_file.path(), streamed_cquery, &mut |target| {
-                transform(std::slice::from_mut(target));
-            })?
+            decode_cquery_stream(output_file.path(), streamed_cquery, transform)?
         } else {
             decode_target_stream(output_file.path(), transform)?
         };
@@ -2759,18 +2757,23 @@ fn decode_target_stream(
 fn decode_cquery_stream(
     path: &Path,
     streamed: bool,
-    transform: &mut impl FnMut(&mut Target),
+    transform: &mut impl FnMut(&mut [Target]),
 ) -> Result<Vec<Target>> {
     let mut decoder = CqueryDecoder::default();
     if streamed {
-        let mut reader = BufReader::new(File::open(path)?);
-        loop {
-            if reader.fill_buf()?.is_empty() {
-                break;
+        // Results decode in parallel, a raw batch at a time; naming them stays in stream order
+        // because a result's configuration may be defined by an earlier message.
+        let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
+        let mut batch = RawBatch::default();
+        let mut decoded = Vec::new();
+        while read_raw_batch(&mut reader, &mut batch)? {
+            batch
+                .slices()
+                .map(|bytes| CqueryResult::decode_from_slice(bytes).map_err(anyhow::Error::from))
+                .collect_into_vec(&mut decoded);
+            for result in decoded.drain(..) {
+                decoder.push(result?, transform);
             }
-            let result: CqueryResult =
-                buffa::DecodeOptions::new().decode_length_delimited_reader(&mut reader)?;
-            decoder.push(result, transform);
         }
     } else {
         let bytes = fs::read(path)?;
@@ -2801,15 +2804,21 @@ const NULL_CONFIGURATION_CHECKSUM: &str = "null";
 /// Bazel still populates) and by id into `CqueryResult.configurations`. A streamed result's
 /// id table only arrives after the results that use it, so a result whose inline checksum is
 /// missing waits until the stream ends to be named.
+///
+/// Resolving a checksum is the only step that depends on earlier messages. Named targets queue
+/// in `ready` and are lowered, configured and handed to `transform` a batch at a time in
+/// parallel, in the order they were named.
 #[derive(Default)]
 struct CqueryDecoder {
     targets: Vec<Target>,
     configurations: HashMap<u32, String>,
     pending: Vec<(Target, u32)>,
+    ready: Vec<(Target, Option<String>)>,
+    lowered: Vec<Option<Target>>,
 }
 
 impl CqueryDecoder {
-    fn push(&mut self, result: CqueryResult, transform: &mut impl FnMut(&mut Target)) {
+    fn push(&mut self, result: CqueryResult, transform: &mut impl FnMut(&mut [Target])) {
         for configuration in result.configurations {
             if let Some(checksum) = non_null_checksum(&configuration.checksum) {
                 self.configurations
@@ -2830,36 +2839,50 @@ impl CqueryDecoder {
                 .as_option()
                 .and_then(|configuration| non_null_checksum(&configuration.checksum))
                 .map(str::to_owned);
-            match inline.or_else(|| self.configurations.get(&configuration_id).cloned()) {
-                Some(checksum) => self.accept(target, Some(&checksum), transform),
-                None if configuration_id != 0 => self.pending.push((target, configuration_id)),
-                None => self.accept(target, None, transform),
+            let checksum = inline.or_else(|| self.configurations.get(&configuration_id).cloned());
+            if checksum.is_none() && configuration_id != 0 {
+                self.pending.push((target, configuration_id));
+                continue;
+            }
+            self.ready.push((target, checksum));
+            if self.ready.len() >= DECODE_BATCH_MESSAGES {
+                self.flush(transform);
             }
         }
     }
 
-    fn accept(
-        &mut self,
-        target: Target,
-        checksum: Option<&str>,
-        transform: &mut impl FnMut(&mut Target),
-    ) {
-        let Some(mut target) = lower_target(target) else {
+    fn flush(&mut self, transform: &mut impl FnMut(&mut [Target])) {
+        if self.ready.is_empty() {
             return;
-        };
-        if let Some(checksum) = checksum {
-            configure_target(&mut target, checksum);
         }
-        transform(&mut target);
-        self.targets.push(target);
+        self.ready
+            .par_drain(..)
+            .map(|(target, checksum)| {
+                let mut target = lower_target(target)?;
+                if let Some(checksum) = checksum {
+                    configure_target(&mut target, &checksum);
+                }
+                Some(target)
+            })
+            .collect_into_vec(&mut self.lowered);
+        let start = self.targets.len();
+        self.targets.extend(self.lowered.drain(..).flatten());
+        if self.targets.len() > start {
+            transform(&mut self.targets[start..]);
+        }
     }
 
-    fn finish(mut self, transform: &mut impl FnMut(&mut Target)) -> Vec<Target> {
+    fn finish(mut self, transform: &mut impl FnMut(&mut [Target])) -> Vec<Target> {
+        self.flush(transform);
         let pending = std::mem::take(&mut self.pending);
         for (target, configuration_id) in pending {
             let checksum = self.configurations.get(&configuration_id).cloned();
-            self.accept(target, checksum.as_deref(), transform);
+            self.ready.push((target, checksum));
+            if self.ready.len() >= DECODE_BATCH_MESSAGES {
+                self.flush(transform);
+            }
         }
+        self.flush(transform);
         self.targets
     }
 }
@@ -6871,8 +6894,12 @@ exit 1
         let streamed = directory.path().join("cquery-stream.pb");
         write_delimited(&streamed, &messages);
         let mut seen = Vec::new();
-        let targets = decode_cquery_stream(&streamed, true, &mut |target| {
-            seen.push(target_name(target).unwrap().to_owned())
+        let targets = decode_cquery_stream(&streamed, true, &mut |batch| {
+            seen.extend(
+                batch
+                    .iter()
+                    .map(|target| target_name(target).unwrap().to_owned()),
+            )
         })
         .unwrap();
         let names = targets.iter().filter_map(target_name).collect::<Vec<_>>();

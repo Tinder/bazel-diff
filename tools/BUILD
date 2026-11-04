@@ -8,6 +8,7 @@ genrule(
         "help_get_impacted_targets.txt",
         "help_explain.txt",
         "help_serve.txt",
+        "help_serve_multi.txt",
     ],
     cmd = """
         BINARY=$(location //src:bazel-diff)
@@ -16,6 +17,7 @@ genrule(
         $$BINARY get-impacted-targets --help > $(location help_get_impacted_targets.txt) 2>&1 || true
         $$BINARY explain --help > $(location help_explain.txt) 2>&1 || true
         $$BINARY serve --help > $(location help_serve.txt) 2>&1 || true
+        $$BINARY serve-multi --help > $(location help_serve_multi.txt) 2>&1 || true
     """,
     tools = ["//src:bazel-diff"],
 )

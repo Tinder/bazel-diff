@@ -32,9 +32,58 @@ use std::time::{Duration, Instant, SystemTime};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use url::{form_urlencoded, Url};
 
+/// The name a server started with `--workspacePath` registers its one repository under.
+pub const DEFAULT_REPOSITORY: &str = "default";
+
+/// One git clone the server answers queries for. Every repository shares the hashing
+/// configuration, the cache tiers and the port; each has its own working tree, git, Bazel
+/// server, readiness and workspace lock, so queries against different repositories run
+/// concurrently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Repository {
+    pub name: String,
+    pub workspace: PathBuf,
+}
+
+impl Repository {
+    /// Parses the `NAME=PATH` form of `--repo`. The path is not normalised here; the CLI does
+    /// that with the same rule it applies to `--workspacePath`.
+    pub fn parse(value: &str) -> Result<Self> {
+        let Some((name, workspace)) = value.split_once('=') else {
+            bail!("expected NAME=PATH, got {value:?}");
+        };
+        validate_repository_name(name)?;
+        if workspace.is_empty() {
+            bail!("repository {name:?} has an empty path");
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            workspace: PathBuf::from(workspace),
+        })
+    }
+}
+
+/// A repository name is addressed in URLs and JSON and names a log line, so it is kept to
+/// letters, digits, `.`, `_` and `-`.
+pub fn validate_repository_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("repository name must not be empty");
+    }
+    if !name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'))
+    {
+        bail!("repository name {name:?} may only contain letters, digits, '.', '_' and '-'");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub hash_options: HashOptions,
+    /// The repositories served, in the order given. Empty means the one repository at
+    /// `hash_options.bazel.workspace`, named [`DEFAULT_REPOSITORY`].
+    pub repositories: Vec<Repository>,
     pub git_path: PathBuf,
     pub port: u16,
     pub request_timeout: Duration,
@@ -88,7 +137,12 @@ const CANCEL_GRACE: Duration = Duration::from_secs(60);
 /// How often a query waiting for the workspace re-checks whether it has been cancelled.
 const WORKSPACE_WAIT_POLL: Duration = Duration::from_millis(50);
 
+/// One repository's share of the server (see [`Repository`]). `config` is the server's with
+/// `hash_options.bazel.workspace` set to this repository's clone; the cache tiers behind
+/// `remote` and `memory` are the [`Shared`] ones every repository uses, since a cache key is
+/// the git tree plus the hashing configuration and says nothing about which clone it came from.
 struct State {
+    name: String,
     config: ServerConfig,
     ready: AtomicBool,
     workspace: Workspace,
@@ -102,12 +156,28 @@ struct State {
     /// Queries accepted and not yet finished: waiting for the workspace, running, or abandoned by
     /// a timed-out client but still running. `/metrics` reports it as `activeQueries`.
     active_queries: AtomicUsize,
-    started: Instant,
     fingerprint: String,
-    remote: Option<RemoteCache>,
+    remote: Option<Arc<RemoteCache>>,
     /// Parsed entries, in front of the local-disk tier. Guarded by its own lock rather than the
     /// workspace's so `/metrics` can read its size while a query holds the workspace.
-    memory: Mutex<MemoryCache>,
+    memory: Arc<Mutex<MemoryCache>>,
+}
+
+/// The cache tiers every repository of one server shares: `--cacheDir` is the same path in
+/// each repository's config, and these are the handles to the other two.
+#[derive(Clone)]
+struct Shared {
+    remote: Option<Arc<RemoteCache>>,
+    memory: Arc<Mutex<MemoryCache>>,
+}
+
+impl Shared {
+    fn new(config: &ServerConfig, remote: Option<RemoteCache>) -> Self {
+        Self {
+            remote: remote.map(Arc::new),
+            memory: Arc::new(Mutex::new(MemoryCache::new(config.cache_memory_max))),
+        }
+    }
 }
 
 /// The in-memory tier: entries already parsed, most recently used last.
@@ -186,10 +256,19 @@ fn memory_cache(state: &State) -> std::sync::MutexGuard<'_, MemoryCache> {
 }
 
 impl State {
+    /// A single-repository state named [`DEFAULT_REPOSITORY`] with cache tiers of its own.
+    #[cfg(test)]
     fn new(config: ServerConfig, remote: Option<RemoteCache>) -> Self {
+        let shared = Shared::new(&config, remote);
+        Self::with_shared(DEFAULT_REPOSITORY, config, &shared)
+    }
+
+    fn with_shared(name: &str, config: ServerConfig, shared: &Shared) -> Self {
         let fingerprint = configuration_fingerprint(&config);
         Self {
-            memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
+            name: name.to_owned(),
+            memory: Arc::clone(&shared.memory),
+            remote: shared.remote.clone(),
             config,
             ready: AtomicBool::new(false),
             partial_derived: AtomicUsize::new(0),
@@ -197,10 +276,12 @@ impl State {
             untracked_package_rejections: AtomicUsize::new(0),
             workspace: Workspace::default(),
             active_queries: AtomicUsize::new(0),
-            started: Instant::now(),
             fingerprint,
-            remote,
         }
+    }
+
+    fn workspace(&self) -> &Path {
+        &self.config.hash_options.bazel.workspace
     }
 
     /// Git bound to the query currently holding the workspace, so the subprocesses it spawns die
@@ -300,6 +381,69 @@ impl ActiveQuery {
 impl Drop for ActiveQuery {
     fn drop(&mut self) {
         self.0.active_queries.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The repositories one server answers for, by name, and how a request picks one.
+struct Service {
+    /// In the order the repositories were configured, which `/metrics` keeps.
+    repositories: Vec<Arc<State>>,
+    started: Instant,
+}
+
+/// Why a request's `repo` could not be resolved: the HTTP status and the message to answer with.
+struct UnknownRepository {
+    status: u16,
+    message: String,
+}
+
+impl Service {
+    fn new(repositories: Vec<Arc<State>>) -> Self {
+        Self {
+            repositories,
+            started: Instant::now(),
+        }
+    }
+
+    /// The repository a request addressed. A server with one repository answers for it whether
+    /// or not the request names it; with several, a request must name one.
+    fn select(&self, name: Option<&str>) -> Result<&Arc<State>, UnknownRepository> {
+        let names = || {
+            self.repositories
+                .iter()
+                .map(|state| state.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match name {
+            Some(name) => self
+                .repositories
+                .iter()
+                .find(|state| state.name == name)
+                .ok_or_else(|| UnknownRepository {
+                    status: 404,
+                    message: format!(
+                        "unknown repository {name:?}; this server serves: {}",
+                        names()
+                    ),
+                }),
+            None if self.repositories.len() == 1 => Ok(&self.repositories[0]),
+            None => Err(UnknownRepository {
+                status: 400,
+                message: format!(
+                    "missing required parameter 'repo'; this server serves: {}",
+                    names()
+                ),
+            }),
+        }
+    }
+
+    /// The instance is ready once every repository's startup fetch succeeded, so a load
+    /// balancer never routes to an instance that can answer for only some of them.
+    fn ready(&self) -> bool {
+        self.repositories
+            .iter()
+            .all(|state| state.ready.load(Ordering::Acquire))
     }
 }
 
@@ -874,6 +1018,7 @@ fn read_pem_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueryBody {
+    repo: Option<String>,
     from: Option<String>,
     to: Option<String>,
     target_type: Option<Vec<String>>,
@@ -883,6 +1028,8 @@ struct QueryBody {
 
 #[derive(Debug)]
 struct QueryInputs {
+    /// The `repo` the request named, if any (see [`Service::select`]).
+    repository: Option<String>,
     from: String,
     to: String,
     target_types: Option<HashSet<String>>,
@@ -973,23 +1120,68 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         bail!("serve does not support --isolatedDependencyRoot={root}");
     }
     validate_partial_graph(&config)?;
+    let repositories = repositories(&config)?;
     fs::create_dir_all(&config.cache_dir)?;
     let remote = RemoteCache::new(&config)?;
-    let state = Arc::new(State::new(config, remote));
-    prune_cache(&state)?;
-    start_cache_pruner(&state)?;
-    perform_initial_fetch(&state);
-    let server = Server::http(("0.0.0.0", state.config.port))
+    let shared = Shared::new(&config, remote);
+    let port = config.port;
+    let states = repositories
+        .iter()
+        .map(|repository| {
+            let mut config = config.clone();
+            config.hash_options.bazel.workspace = repository.workspace.clone();
+            Arc::new(State::with_shared(&repository.name, config, &shared))
+        })
+        .collect::<Vec<_>>();
+    // Every repository prunes the same `--cacheDir`, so one pruner is enough.
+    prune_cache(&states[0])?;
+    start_cache_pruner(&states[0])?;
+    perform_initial_fetches(&states);
+    let service = Arc::new(Service::new(states));
+    let server = Server::http(("0.0.0.0", port))
         .map_err(|error| anyhow!("failed to bind HTTP server: {error}"))?;
     eprintln!(
-        "[Info] bazel-diff query service listening on port {}",
-        state.config.port
+        "[Info] bazel-diff query service listening on port {port} for {}",
+        repositories
+            .iter()
+            .map(|repository| format!("{}={}", repository.name, repository.workspace.display()))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     for request in server.incoming_requests() {
-        let state = Arc::clone(&state);
-        std::thread::spawn(move || handle_request(request, state));
+        let service = Arc::clone(&service);
+        std::thread::spawn(move || handle_request(request, service));
     }
     Ok(())
+}
+
+/// The repositories `config` serves: `config.repositories`, or the one at
+/// `hash_options.bazel.workspace` named [`DEFAULT_REPOSITORY`]. Names must be valid and unique.
+pub fn repositories(config: &ServerConfig) -> Result<Vec<Repository>> {
+    if config.repositories.is_empty() {
+        return Ok(vec![Repository {
+            name: DEFAULT_REPOSITORY.to_owned(),
+            workspace: config.hash_options.bazel.workspace.clone(),
+        }]);
+    }
+    let mut seen = HashSet::new();
+    for repository in &config.repositories {
+        validate_repository_name(&repository.name)?;
+        if !seen.insert(repository.name.as_str()) {
+            bail!("repository {:?} is given more than once", repository.name);
+        }
+    }
+    Ok(config.repositories.clone())
+}
+
+/// Fetches and warms every repository at once: each has its own clone and Bazel server, so
+/// the startup cost of an instance is its slowest repository's, not their sum.
+fn perform_initial_fetches(states: &[Arc<State>]) {
+    std::thread::scope(|scope| {
+        for state in states {
+            scope.spawn(move || perform_initial_fetch(state));
+        }
+    });
 }
 
 /// Performs the startup git fetch (unless `--noInitialFetch`) and warmup, then flips `ready`
@@ -997,6 +1189,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
 /// ("lame duck") so `/health` reports 503 and a load balancer removes the instance rather than
 /// us attempting a risky in-place repair; `/metrics` keeps answering with `ready: false`.
 fn perform_initial_fetch(state: &Arc<State>) {
+    let name = &state.name;
     if !state.config.no_initial_fetch {
         let fetch = [
             String::from("fetch"),
@@ -1005,14 +1198,14 @@ fn perform_initial_fetch(state: &Arc<State>) {
         ];
         if let Err(error) = git(state, &fetch) {
             eprintln!(
-                "[Error] initial git fetch failed; server is lame-ducked (health will report NOT_READY): {error:#}"
+                "[Error] initial git fetch of repository {name} failed; server is lame-ducked (health will report NOT_READY): {error:#}"
             );
             return;
         }
     }
     for revision in &state.config.warmup_revisions {
         if let Err(error) = warm_revision(state, revision) {
-            eprintln!("[Warn] failed to warm revision {revision}: {error:#}");
+            eprintln!("[Warn] failed to warm revision {revision} of repository {name}: {error:#}");
         }
     }
     state.ready.store(true, Ordering::Release);
@@ -1042,18 +1235,18 @@ fn start_cache_pruner(state: &Arc<State>) -> Result<()> {
     Ok(())
 }
 
-fn handle_request(request: Request, state: Arc<State>) {
-    if let Err(error) = route(request, &state) {
+fn handle_request(request: Request, service: Arc<Service>) {
+    if let Err(error) = route(request, &service) {
         eprintln!("[Error] failed to handle HTTP request: {error:#}");
     }
 }
 
-fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
+fn route(mut request: Request, service: &Service) -> Result<()> {
     let raw_url = request.url().to_owned();
     let (path, query) = raw_url.split_once('?').unwrap_or((&raw_url, ""));
     match path {
         "/health" => {
-            let ready = state.ready.load(Ordering::Acquire);
+            let ready = service.ready();
             respond_text(
                 request,
                 if ready { 200 } else { 503 },
@@ -1068,12 +1261,9 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
                     &json!({"error": "method not allowed, use GET"}),
                 );
             }
-            respond_json(request, 200, &metrics(state))
+            respond_json(request, 200, &metrics(service))
         }
         "/impacted_targets" | "/impacted_targets_with_distances" | "/dependency_edges" => {
-            if !state.ready.load(Ordering::Acquire) {
-                return respond_json(request, 503, &json!({"error": "service not ready"}));
-            }
             if request.method() != &Method::Get && request.method() != &Method::Post {
                 return respond_json(
                     request,
@@ -1087,6 +1277,19 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
                     return respond_json(request, 400, &json!({"error": error.to_string()}))
                 }
             };
+            let state = match service.select(inputs.repository.as_deref()) {
+                Ok(state) => state,
+                Err(unknown) => {
+                    return respond_json(
+                        request,
+                        unknown.status,
+                        &json!({"error": unknown.message}),
+                    )
+                }
+            };
+            if !state.ready.load(Ordering::Acquire) {
+                return respond_json(request, 503, &json!({"error": "service not ready"}));
+            }
             let kind = match path {
                 "/dependency_edges" => QueryKind::DepEdges,
                 "/impacted_targets_with_distances" => QueryKind::Distances,
@@ -1183,6 +1386,15 @@ fn cancel_query(
 }
 
 fn parse_query_inputs(request: &mut Request, query: &str) -> Result<QueryInputs> {
+    let params = form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect::<std::collections::HashMap<_, _>>();
+    // `repo` is read from the query string for both methods, so a client can keep one URL per
+    // repository; a POST body's `repo` wins over it.
+    let repository = params
+        .get("repo")
+        .filter(|value| !value.is_empty())
+        .cloned();
     if request.method() == &Method::Post {
         let mut raw = String::new();
         request.as_reader().read_to_string(&mut raw)?;
@@ -1199,6 +1411,7 @@ fn parse_query_inputs(request: &mut Request, query: &str) -> Result<QueryInputs>
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("missing required fields 'from' and 'to'"))?;
         return Ok(QueryInputs {
+            repository: body.repo.filter(|value| !value.is_empty()).or(repository),
             from,
             to,
             target_types: normalized_types(body.target_type),
@@ -1213,9 +1426,6 @@ fn parse_query_inputs(request: &mut Request, query: &str) -> Result<QueryInputs>
             profile: body.profile.unwrap_or(false),
         });
     }
-    let params = form_urlencoded::parse(query.as_bytes())
-        .into_owned()
-        .collect::<std::collections::HashMap<_, _>>();
     let from = params
         .get("from")
         .filter(|value| !value.is_empty())
@@ -1227,6 +1437,7 @@ fn parse_query_inputs(request: &mut Request, query: &str) -> Result<QueryInputs>
         .cloned()
         .ok_or_else(|| anyhow!("missing required query parameters 'from' and 'to'"))?;
     Ok(QueryInputs {
+        repository,
         from,
         to,
         target_types: normalized_types(
@@ -1985,7 +2196,11 @@ fn git_output(state: &State, args: &[String]) -> Result<std::process::Output> {
     state.git().output(args)
 }
 
-fn metrics(state: &State) -> Value {
+/// The instance snapshot. The top-level counters sum over every repository, and `workspaceBusy`
+/// is true while any repository's workspace is held, so a single-repository deployment reads
+/// exactly as it always has; `repositories` breaks the same figures down by repository.
+fn metrics(service: &Service) -> Value {
+    let state = &service.repositories[0];
     let entries = cache_entries(&state.config.cache_dir);
     let total = entries.iter().map(|entry| entry.size).sum::<u64>();
     let (used, max) = memory_usage();
@@ -1993,24 +2208,37 @@ fn metrics(state: &State) -> Value {
         let memory = memory_cache(state);
         (memory.len(), memory.used, memory.budget)
     };
+    let sum = |counter: fn(&State) -> &AtomicUsize| {
+        service
+            .repositories
+            .iter()
+            .map(|state| counter(state).load(Ordering::SeqCst))
+            .sum::<usize>()
+    };
+    let repositories = service
+        .repositories
+        .iter()
+        .map(|state| (state.name.clone(), repository_metrics(state)))
+        .collect::<serde_json::Map<_, _>>();
     json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "uptimeSeconds": state.started.elapsed().as_secs(),
-        "ready": state.ready.load(Ordering::Acquire),
-        "activeQueries": state.active_queries.load(Ordering::SeqCst),
-        "workspaceBusy": state.workspace.is_busy(),
+        "uptimeSeconds": service.started.elapsed().as_secs(),
+        "ready": service.ready(),
+        "activeQueries": sum(|state| &state.active_queries),
+        "workspaceBusy": service.repositories.iter().any(|state| state.workspace.is_busy()),
         "gitEngine": "subprocess",
         "trackDeps": state.config.track_deps,
         "dependencyFingerprint": state.config.dependency_fingerprint,
         "partialGraph": {
             "enabled": state.config.partial_graph,
-            "derived": state.partial_derived.load(Ordering::SeqCst),
-            "fullGenerations": state.partial_rebuilds.load(Ordering::SeqCst),
+            "derived": sum(|state| &state.partial_derived),
+            "fullGenerations": sum(|state| &state.partial_rebuilds),
         },
         "untrackedPackages": {
             "allowed": state.config.allow_untracked_packages,
-            "rejections": state.untracked_package_rejections.load(Ordering::SeqCst),
+            "rejections": sum(|state| &state.untracked_package_rejections),
         },
+        "repositories": repositories,
         "cache": {
             "directory": state.config.cache_dir.to_string_lossy(),
             "remote": state.config.remote_cache,
@@ -2024,6 +2252,23 @@ fn metrics(state: &State) -> Value {
             },
         },
         "jvm": {"usedBytes": used, "maxBytes": max}
+    })
+}
+
+/// One repository's share of `/metrics`: its clone, and the figures that are per workspace.
+fn repository_metrics(state: &State) -> Value {
+    json!({
+        "workspace": state.workspace().to_string_lossy(),
+        "ready": state.ready.load(Ordering::Acquire),
+        "activeQueries": state.active_queries.load(Ordering::SeqCst),
+        "workspaceBusy": state.workspace.is_busy(),
+        "partialGraph": {
+            "derived": state.partial_derived.load(Ordering::SeqCst),
+            "fullGenerations": state.partial_rebuilds.load(Ordering::SeqCst),
+        },
+        "untrackedPackages": {
+            "rejections": state.untracked_package_rejections.load(Ordering::SeqCst),
+        },
     })
 }
 
@@ -2182,6 +2427,7 @@ mod tests {
                 always_affected_tags: HashSet::new(),
                 partial_tree: None,
             },
+            repositories: Vec::new(),
             git_path: PathBuf::from("git"),
             port: 0,
             request_timeout: Duration::ZERO,
@@ -2279,6 +2525,11 @@ mod tests {
         Arc::new(state)
     }
 
+    /// A server answering for `state` alone, as `--workspacePath` starts one.
+    fn service_of(state: &Arc<State>) -> Service {
+        Service::new(vec![Arc::clone(state)])
+    }
+
     /// The full-content cache key `get_hashes_locked` uses for a commit: its tree, not its SHA.
     fn cache_key_for_commit(state: &State, sha: &str) -> String {
         cache_key(state, &resolve_tree(state, sha).unwrap(), &BTreeSet::new())
@@ -2341,6 +2592,10 @@ mod tests {
     }
 
     fn request(state: &Arc<State>, request: &str) -> String {
+        request_service(&service_of(state), request)
+    }
+
+    fn request_service(service: &Service, request: &str) -> String {
         let server = Server::http("127.0.0.1:0").unwrap();
         let address = server.server_addr().to_ip().unwrap();
         let request = request.to_owned();
@@ -2353,8 +2608,215 @@ mod tests {
             response
         });
         let incoming = server.recv().unwrap();
-        route(incoming, state).unwrap();
+        route(incoming, service).unwrap();
         client.join().unwrap()
+    }
+
+    /// `(status, body)` of a request routed to `service`.
+    fn query_service(service: &Service, request: &str) -> (u16, Value) {
+        let response = request_service(service, request);
+        let status = response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .unwrap();
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap();
+        (status, serde_json::from_str(body).unwrap())
+    }
+
+    /// A repository state whose cache tiers are `shared`, without the dependency-fingerprint
+    /// guard, so a pre-written entry is served without a checkout.
+    fn shared_state(name: &str, repo: &Path, cache: &Path, shared: &Shared) -> Arc<State> {
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.to_path_buf();
+        config.hash_options.bazel.bazel = PathBuf::from("/bin/false");
+        config.cache_dir = cache.to_path_buf();
+        let state = State::with_shared(name, config, shared);
+        state.ready.store(true, Ordering::Release);
+        Arc::new(state)
+    }
+
+    /// Writes cache entries for `from` and `to` in which `label` changed, so a query between
+    /// them answers `[label]` from the cache alone.
+    fn write_changed_entry(state: &State, from: &str, to: &str, label: &str) {
+        for (sha, value) in [(from, "before"), (to, "after")] {
+            let data = HashFileData {
+                hashes: std::collections::BTreeMap::from([(
+                    label.to_owned(),
+                    hash("Rule", value, value),
+                )]),
+                ..Default::default()
+            };
+            let key = cache_key_for_commit(state, sha);
+            write_hashes(
+                &state.config.cache_dir.join(format!("{key}.json")),
+                &data,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn repository_names_and_specs_are_validated() {
+        let parsed = Repository::parse("app=/clones/app").unwrap();
+        assert_eq!(parsed.name, "app");
+        assert_eq!(parsed.workspace, PathBuf::from("/clones/app"));
+        // The first `=` splits, so a path may contain one.
+        assert_eq!(
+            Repository::parse("a.b_c-1=/x=y").unwrap().workspace,
+            PathBuf::from("/x=y")
+        );
+        for invalid in ["app", "=/x", "app=", "a b=/x", "a/b=/x"] {
+            assert!(Repository::parse(invalid).is_err(), "{invalid}");
+        }
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = PathBuf::from("/single");
+        let only = repositories(&config).unwrap();
+        assert_eq!(
+            only,
+            vec![Repository {
+                name: DEFAULT_REPOSITORY.to_owned(),
+                workspace: PathBuf::from("/single")
+            }]
+        );
+        config.repositories = vec![
+            Repository::parse("app=/a").unwrap(),
+            Repository::parse("lib=/b").unwrap(),
+        ];
+        assert_eq!(repositories(&config).unwrap(), config.repositories);
+        config
+            .repositories
+            .push(Repository::parse("app=/c").unwrap());
+        assert_eq!(
+            repositories(&config).unwrap_err().to_string(),
+            "repository \"app\" is given more than once"
+        );
+    }
+
+    #[test]
+    fn queries_are_routed_to_the_named_repository() {
+        let (app_repo, app_from, app_to) = initialize_git_repo();
+        let (lib_repo, lib_first, _) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let shared = Shared::new(&test_config(), None);
+        let app = shared_state("app", app_repo.path(), cache.path(), &shared);
+        let lib = shared_state("lib", lib_repo.path(), cache.path(), &shared);
+        // The two clones start identical, and a cache entry is keyed by the tree alone, so
+        // they would share one: give `lib` trees of its own to answer for.
+        assert_eq!(
+            cache_key_for_commit(&app, &app_from),
+            cache_key_for_commit(&lib, &lib_first)
+        );
+        let lib_commit = |content: &str| {
+            fs::write(lib_repo.path().join("lib.txt"), content).unwrap();
+            git_command(lib_repo.path(), &["add", "lib.txt"]);
+            git_command(lib_repo.path(), &["commit", "-q", "-m", content]);
+            git_command(lib_repo.path(), &["rev-parse", "HEAD"])
+        };
+        let lib_from = lib_commit("lib one");
+        let lib_to = lib_commit("lib two");
+        write_changed_entry(&app, &app_from, &app_to, "//app:one");
+        write_changed_entry(&lib, &lib_from, &lib_to, "//lib:one");
+        let service = Service::new(vec![Arc::clone(&app), Arc::clone(&lib)]);
+        let get = |query: &str| {
+            query_service(
+                &service,
+                &format!("GET /impacted_targets?{query} HTTP/1.1\r\nHost: x\r\n\r\n"),
+            )
+        };
+
+        // With several repositories a request must name one, and only a configured one.
+        let (status, body) = get(&format!("from={app_from}&to={app_to}"));
+        assert_eq!(status, 400);
+        assert_eq!(
+            body["error"],
+            "missing required parameter 'repo'; this server serves: app, lib"
+        );
+        let (status, body) = get(&format!("repo=web&from={app_from}&to={app_to}"));
+        assert_eq!(status, 404);
+        assert_eq!(
+            body["error"],
+            "unknown repository \"web\"; this server serves: app, lib"
+        );
+        let (status, body) = get(&format!("repo=app&from={app_from}&to={app_to}"));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["impactedTargets"], json!(["//app:one"]));
+        assert_eq!(body["from"], app_from);
+        let (status, body) = get(&format!("repo=lib&from={lib_from}&to={lib_to}"));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["impactedTargets"], json!(["//lib:one"]));
+        // A revision of one repository is not resolvable in the other.
+        let (status, body) = get(&format!("repo=app&from={lib_from}&to={lib_to}"));
+        assert_eq!(status, 400);
+        assert!(
+            body["error"].as_str().unwrap().contains("missing"),
+            "{body}"
+        );
+
+        // POST: the body's `repo` wins over the query string's.
+        let body = json!({"repo": "lib", "from": lib_from, "to": lib_to}).to_string();
+        let (status, answer) = query_service(
+            &service,
+            &format!(
+                "POST /impacted_targets?repo=app HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(answer["impactedTargets"], json!(["//lib:one"]));
+
+        // Both repositories share the cache tiers, and `/metrics` breaks the figures down.
+        let (status, metrics) = query_service(&service, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(status, 200);
+        assert_eq!(metrics["ready"], true);
+        assert_eq!(metrics["cache"]["entries"], 4);
+        assert_eq!(metrics["cache"]["memory"]["entries"], 4);
+        assert_eq!(
+            metrics["repositories"]["app"]["workspace"],
+            app_repo.path().to_string_lossy().as_ref()
+        );
+        assert_eq!(metrics["repositories"]["lib"]["ready"], true);
+        assert_eq!(metrics["repositories"]["lib"]["activeQueries"], 0);
+
+        // Readiness is per repository for queries and all-or-nothing for the instance.
+        lib.ready.store(false, Ordering::Release);
+        assert!(
+            request_service(&service, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                .starts_with("HTTP/1.1 503")
+        );
+        let (status, _) = get(&format!("repo=lib&from={lib_from}&to={lib_to}"));
+        assert_eq!(status, 503);
+        let (status, _) = get(&format!("repo=app&from={app_from}&to={app_to}"));
+        assert_eq!(status, 200);
+        let (_, metrics) = query_service(&service, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(metrics["ready"], false);
+        assert_eq!(metrics["repositories"]["app"]["ready"], true);
+        assert_eq!(metrics["repositories"]["lib"]["ready"], false);
+
+        // A single-repository server answers whether or not the request names it.
+        let single = service_of(&app);
+        for query in [
+            format!("from={app_from}&to={app_to}"),
+            format!("repo=app&from={app_from}&to={app_to}"),
+        ] {
+            let (status, body) = query_service(
+                &single,
+                &format!("GET /impacted_targets?{query} HTTP/1.1\r\nHost: x\r\n\r\n"),
+            );
+            assert_eq!(status, 200, "{body}");
+        }
+        let (status, body) = query_service(
+            &single,
+            &format!("GET /impacted_targets?repo=lib&from={app_from}&to={app_to} HTTP/1.1\r\nHost: x\r\n\r\n"),
+        );
+        assert_eq!(status, 404);
+        assert_eq!(
+            body["error"],
+            "unknown repository \"lib\"; this server serves: app"
+        );
     }
 
     struct CapturedS3Request {
@@ -2740,7 +3202,10 @@ esac
             fs::read_dir(&cache).unwrap().next().is_none(),
             "a rejected generation must not be cached"
         );
-        assert_eq!(metrics(&strict)["untrackedPackages"]["rejections"], 1);
+        assert_eq!(
+            metrics(&service_of(&strict))["untrackedPackages"]["rejections"],
+            1
+        );
 
         let lenient = state_with(true);
         let retrieval = get_hashes_locked(&lenient, &sha, &BTreeSet::new(), None).unwrap();
@@ -2749,7 +3214,10 @@ esac
             lenient.untracked_package_rejections.load(Ordering::SeqCst),
             0
         );
-        assert_eq!(metrics(&lenient)["untrackedPackages"]["allowed"], true);
+        assert_eq!(
+            metrics(&service_of(&lenient))["untrackedPackages"]["allowed"],
+            true
+        );
     }
 
     /// A repository with the fixed graph above and four commits: `base`; a source and a README
@@ -2947,11 +3415,14 @@ esac
             .unwrap()
             .contains("carries no partial-graph recipes"));
 
-        let snapshot = metrics(&state);
+        let snapshot = metrics(&service_of(&state));
         assert_eq!(snapshot["partialGraph"]["enabled"], true);
         assert_eq!(snapshot["partialGraph"]["derived"], 2);
         assert_eq!(snapshot["partialGraph"]["fullGenerations"], 2);
-        assert_eq!(metrics(&plain)["partialGraph"]["enabled"], false);
+        assert_eq!(
+            metrics(&service_of(&plain))["partialGraph"]["enabled"],
+            false
+        );
     }
 
     #[test]
@@ -3794,11 +4265,14 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         let key = cache_key_for_commit(&state, &sha);
         let path = cache.path().join(format!("{key}.json"));
         write_hashes(&path, &data, false);
-        assert_eq!(metrics(&state)["cache"]["memory"]["entries"], 0);
+        assert_eq!(
+            metrics(&service_of(&state))["cache"]["memory"]["entries"],
+            0
+        );
 
         let first = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
         assert!(first.cache_hit);
-        let memory = metrics(&state)["cache"]["memory"].clone();
+        let memory = metrics(&service_of(&state))["cache"]["memory"].clone();
         assert_eq!(memory["entries"], 1);
         assert_eq!(memory["sizeBytes"], fs::metadata(&path).unwrap().len());
         assert_eq!(memory["maxBytes"], state.config.cache_memory_max);
@@ -3889,6 +4363,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             );
         }
         let inputs = QueryInputs {
+            repository: None,
             from: first,
             to: second.clone(),
             target_types: None,
@@ -4095,7 +4570,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         let cache = tempfile::tempdir().unwrap();
         fs::write(cache.path().join("one.json"), vec![0; 1536]).unwrap();
         let state = state_for_repo(repo.path(), cache.path(), true);
-        let value = metrics(&state);
+        let value = metrics(&service_of(&state));
         assert_eq!(value["ready"], true);
         assert_eq!(value["trackDeps"], true);
         assert_eq!(value["dependencyFingerprint"], true);
@@ -4298,7 +4773,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         let repo = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let state = state_for_repo(repo.path(), cache.path(), false);
-        let idle = metrics(&state);
+        let idle = metrics(&service_of(&state));
         assert_eq!(idle["activeQueries"], 0);
         assert_eq!(idle["workspaceBusy"], false);
         assert!(state.workspace.holder().is_none());
@@ -4307,7 +4782,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
 
         let token = Arc::new(Cancellation::new());
         let guard = state.workspace.acquire(&token).unwrap();
-        assert_eq!(metrics(&state)["workspaceBusy"], true);
+        assert_eq!(metrics(&service_of(&state))["workspaceBusy"], true);
         assert!(Arc::ptr_eq(&state.workspace.holder().unwrap(), &token));
         // Bazel options handed out while the query holds the workspace carry its token, so the
         // subprocesses they spawn are killed with it.
@@ -4321,13 +4796,13 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         );
         assert_eq!(bazel.check_cancelled().unwrap_err().to_string(), CANCELLED);
         drop(guard);
-        assert_eq!(metrics(&state)["workspaceBusy"], false);
+        assert_eq!(metrics(&service_of(&state))["workspaceBusy"], false);
         assert!(state.workspace.holder().is_none());
 
         let counted = ActiveQuery::start(&state);
-        assert_eq!(metrics(&state)["activeQueries"], 1);
+        assert_eq!(metrics(&service_of(&state))["activeQueries"], 1);
         drop(counted);
-        assert_eq!(metrics(&state)["activeQueries"], 0);
+        assert_eq!(metrics(&service_of(&state))["activeQueries"], 0);
     }
 
     #[test]

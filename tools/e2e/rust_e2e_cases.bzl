@@ -52,6 +52,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "core::serve_multiple_repositories",
+                "timeout": "moderate",
+            },
+            {
                 "name": "core::serve_partial_graph_derives_source_edits",
                 "timeout": "moderate",
             },

@@ -62,17 +62,25 @@ enum Commands {
     Fingerprint(FingerprintArgs),
     #[command(about = "Run the HTTP impacted-target query service")]
     Serve(Box<ServeArgs>),
+    #[command(
+        name = "serve-multi",
+        about = "Run the HTTP impacted-target query service for several repositories at once"
+    )]
+    ServeMulti(Box<ServeMultiArgs>),
 }
 
 #[derive(Clone, Debug, Args)]
 struct HashingArgs {
+    /// Required by every command but `serve`, which lifts the requirement (see [`ServeArgs`])
+    /// so `--repo` can name the workspaces instead.
     #[arg(
         short = 'w',
         long = "workspacePath",
         value_parser = parse_normalized_path,
+        required = true,
         help = "Path to the Bazel workspace"
     )]
-    workspace_path: PathBuf,
+    workspace_path: Option<PathBuf>,
 
     #[arg(
         short = 'b',
@@ -373,6 +381,27 @@ struct WarmupArgs {
     fingerprint_output: PathBuf,
 }
 
+/// `serve` for several repositories: every `serve` flag but `--workspacePath`, which `--repo`
+/// replaces. Clap still knows `-w` through the flattened [`HashingArgs`], so it is unrequired
+/// and hidden here rather than removed.
+#[derive(Debug, Args)]
+#[command(mut_arg("workspace_path", |arg| arg.required(false).hide(true)))]
+struct ServeMultiArgs {
+    /// A repository to serve, as NAME=PATH (repeatable). Queries address one with `repo=NAME`.
+    /// Every repository shares the hashing flags, the cache and the port
+    #[arg(
+        long = "repo",
+        value_name = "NAME=PATH",
+        value_parser = parse_repository,
+        required = true,
+        conflicts_with = "workspace_path"
+    )]
+    repositories: Vec<bazel_diff::server::Repository>,
+
+    #[command(flatten)]
+    serve: ServeArgs,
+}
+
 #[derive(Debug, Args)]
 struct ServeArgs {
     #[command(flatten)]
@@ -553,6 +582,22 @@ fn parse_normalized_path(value: &str) -> Result<PathBuf, String> {
     Ok(normalize_path(absolute))
 }
 
+/// `--repo NAME=PATH`, with the path anchored and normalized like `--workspacePath`.
+fn parse_repository(value: &str) -> Result<bazel_diff::server::Repository, String> {
+    let mut repository =
+        bazel_diff::server::Repository::parse(value).map_err(|error| error.to_string())?;
+    repository.workspace = parse_normalized_path(&repository.workspace.to_string_lossy())?;
+    Ok(repository)
+}
+
+impl HashingArgs {
+    /// The workspace clap required, or the empty path for a `serve` started with `--repo`,
+    /// whose config replaces it per repository before anything spawns in it.
+    fn workspace(&self) -> PathBuf {
+        self.workspace_path.clone().unwrap_or_default()
+    }
+}
+
 fn read_lines(path: Option<&Path>) -> Result<BTreeSet<PathBuf>> {
     let Some(path) = path else {
         return Ok(BTreeSet::new());
@@ -593,7 +638,7 @@ fn bazel_options(args: &HashingArgs, verbose: bool) -> Result<BazelOptions> {
         repos.extend(read_string_lines(path)?);
     }
     Ok(BazelOptions {
-        workspace: args.workspace_path.clone(),
+        workspace: args.workspace(),
         bazel: args.bazel_path.clone(),
         startup_options: flatten_options(&args.bazel_startup_options),
         command_options: flatten_options(&args.bazel_command_options),
@@ -808,7 +853,7 @@ fn partial_graph_hashes(
         .iter()
         .map(|pattern| Glob::new(pattern))
         .collect::<Result<Vec<_>>>()?;
-    let git = Git::new(&args.git_path, &args.hashing.workspace_path);
+    let git = Git::new(&args.git_path, args.hashing.workspace());
     // bazel-diff's own files are not part of the revision, wherever the user keeps them.
     let own_files = [
         args.output_path.as_deref(),
@@ -1020,7 +1065,7 @@ fn run_explain(args: &ExplainArgs, verbose: bool) -> Result<()> {
 fn run_fingerprint(args: &FingerprintArgs) -> Result<()> {
     let flags = fingerprint_flags(&args.hashing, args.include_target_type, &args.target_type);
     let inputs = fingerprint::gather(
-        &args.hashing.workspace_path,
+        &args.hashing.workspace(),
         &args.hashing.bazel_path,
         flags.clone(),
     );
@@ -1076,13 +1121,27 @@ fn run_warmup_with(
 
 impl ServeArgs {
     fn to_config(&self, verbose: bool) -> Result<bazel_diff::server::ServerConfig> {
-        self.to_config_with_nexus_password(verbose, std::env::var(NEXUS_PASSWORD_ENV).ok())
+        self.to_config_with_repositories(verbose, Vec::new())
+    }
+
+    /// `serve-multi`: the same config, serving `repositories` instead of `--workspacePath`.
+    fn to_config_with_repositories(
+        &self,
+        verbose: bool,
+        repositories: Vec<bazel_diff::server::Repository>,
+    ) -> Result<bazel_diff::server::ServerConfig> {
+        self.to_config_with_nexus_password(
+            verbose,
+            std::env::var(NEXUS_PASSWORD_ENV).ok(),
+            repositories,
+        )
     }
 
     fn to_config_with_nexus_password(
         &self,
         verbose: bool,
         nexus_password: Option<String>,
+        repositories: Vec<bazel_diff::server::Repository>,
     ) -> Result<bazel_diff::server::ServerConfig> {
         if self.s3_bucket.is_some() && self.s3_endpoint.as_deref().is_some_and(str::is_empty) {
             bail!("--s3Endpoint must not be empty");
@@ -1126,8 +1185,15 @@ impl ServeArgs {
         } else {
             None
         };
+        let mut hash_options = hash_options(&self.hashing, None, None, self.track_deps, verbose)?;
+        if let Some(first) = repositories.first() {
+            // `serve` replaces the workspace per repository; the first stands in for the
+            // validation below, which only reads the shared flags.
+            hash_options.bazel.workspace = first.workspace.clone();
+        }
         let config = bazel_diff::server::ServerConfig {
-            hash_options: hash_options(&self.hashing, None, None, self.track_deps, verbose)?,
+            hash_options,
+            repositories,
             git_path: self.git_path.clone(),
             port: self.port,
             request_timeout: Duration::from_secs(self.request_timeout),
@@ -1172,6 +1238,7 @@ impl ServeArgs {
             nexus_ca_cert: self.nexus_ca_cert.clone(),
         };
         bazel_diff::server::validate_partial_graph(&config)?;
+        bazel_diff::server::repositories(&config)?;
         Ok(config)
     }
 }
@@ -1218,6 +1285,12 @@ fn run() -> Result<()> {
         Commands::Serve(args) => {
             bazel_diff::server::serve(args.to_config(cli.verbose)?)?;
         }
+        Commands::ServeMulti(args) => {
+            bazel_diff::server::serve(
+                args.serve
+                    .to_config_with_repositories(cli.verbose, args.repositories.clone())?,
+            )?;
+        }
     }
     io::stdout().flush()?;
     Ok(())
@@ -1239,7 +1312,7 @@ mod tests {
 
     fn hashing_args(workspace: &Path) -> HashingArgs {
         HashingArgs {
-            workspace_path: workspace.to_path_buf(),
+            workspace_path: Some(workspace.to_path_buf()),
             bazel_path: PathBuf::from("bazel"),
             seed_filepaths: None,
             bazel_startup_options: Vec::new(),
@@ -1635,6 +1708,124 @@ mod tests {
     }
 
     #[test]
+    fn serve_multi_names_the_repositories_it_serves() {
+        let serve_multi = |extra: &[&str]| {
+            let mut argv = vec!["bazel-diff", "serve-multi", "--cacheDir", "/tmp/cache"];
+            argv.extend(extra);
+            Cli::try_parse_from(&argv)
+        };
+        let multi = |cli: Cli| match cli.command {
+            Commands::ServeMulti(args) => args,
+            _ => panic!("expected serve-multi"),
+        };
+        let args = multi(
+            serve_multi(&[
+                "--repo",
+                "app=./app",
+                "--repo",
+                "lib=/clones/lib",
+                "--trackDeps",
+            ])
+            .unwrap(),
+        );
+        assert!(args.serve.hashing.workspace_path.is_none());
+        let names = args
+            .repositories
+            .iter()
+            .map(|repository| repository.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["app", "lib"]);
+        // Anchored to the working directory like --workspacePath.
+        assert_eq!(
+            args.repositories[0].workspace,
+            std::path::absolute("app").unwrap()
+        );
+        assert_eq!(args.repositories[1].workspace, PathBuf::from("/clones/lib"));
+        let config = args
+            .serve
+            .to_config_with_repositories(false, args.repositories.clone())
+            .unwrap();
+        assert_eq!(config.repositories, args.repositories);
+        assert_eq!(
+            config.hash_options.bazel.workspace,
+            args.repositories[0].workspace
+        );
+        assert!(config.track_deps);
+
+        // `serve` is untouched: --workspacePath is required and serves the default repository.
+        let cli = parse(&[
+            "bazel-diff",
+            "serve",
+            "--workspacePath",
+            "/tmp/ws",
+            "--cacheDir",
+            "/tmp/cache",
+        ]);
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve");
+        };
+        let config = args.to_config(false).unwrap();
+        assert!(config.repositories.is_empty());
+        assert_eq!(
+            bazel_diff::server::repositories(&config).unwrap(),
+            vec![bazel_diff::server::Repository {
+                name: bazel_diff::server::DEFAULT_REPOSITORY.to_owned(),
+                workspace: PathBuf::from("/tmp/ws"),
+            }]
+        );
+        assert_eq!(
+            Cli::try_parse_from(["bazel-diff", "serve", "--cacheDir", "/tmp/cache"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            Cli::try_parse_from([
+                "bazel-diff",
+                "serve",
+                "-w",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+                "--repo",
+                "app=/a"
+            ])
+            .unwrap_err()
+            .kind(),
+            clap::error::ErrorKind::UnknownArgument
+        );
+
+        // serve-multi takes --repo, not --workspacePath; names are validated as they are
+        // parsed and for uniqueness once they are all known.
+        assert_eq!(
+            serve_multi(&[]).unwrap_err().kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            serve_multi(&["--workspacePath", "/tmp/ws", "--repo", "app=/a"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            serve_multi(&["--repo", "/a"]).unwrap_err().kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            serve_multi(&["--repo", "my repo=/a"]).unwrap_err().kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        let args = multi(serve_multi(&["--repo", "app=/a", "--repo", "app=/b"]).unwrap());
+        assert_eq!(
+            args.serve
+                .to_config_with_repositories(false, args.repositories.clone())
+                .unwrap_err()
+                .to_string(),
+            "repository \"app\" is given more than once"
+        );
+    }
+
+    #[test]
     fn serve_gcs_bucket_must_not_be_empty() {
         let cli = parse(&[
             "bazel-diff",
@@ -1728,7 +1919,7 @@ mod tests {
         ];
 
         let config = serve_args(&nexus)
-            .to_config_with_nexus_password(false, None)
+            .to_config_with_nexus_password(false, None, Vec::new())
             .unwrap();
         assert_eq!(
             config.remote_cache.as_deref(),
@@ -1746,7 +1937,7 @@ mod tests {
         let mut authenticated = nexus.to_vec();
         authenticated.extend(["--nexusUsername", "svc"]);
         let config = serve_args(&authenticated)
-            .to_config_with_nexus_password(false, Some("s3cret".to_owned()))
+            .to_config_with_nexus_password(false, Some("s3cret".to_owned()), Vec::new())
             .unwrap();
         let credentials = config.nexus_credentials.unwrap();
         assert_eq!(credentials.username, "svc");
@@ -1754,26 +1945,26 @@ mod tests {
 
         // A username without a password, or a password without a username, is a misconfiguration.
         assert!(serve_args(&authenticated)
-            .to_config_with_nexus_password(false, None)
+            .to_config_with_nexus_password(false, None, Vec::new())
             .is_err());
         assert!(serve_args(&nexus)
-            .to_config_with_nexus_password(false, Some("s3cret".to_owned()))
+            .to_config_with_nexus_password(false, Some("s3cret".to_owned()), Vec::new())
             .is_err());
         // The password environment variable is ignored when Nexus is not configured at all.
         assert!(serve_args(&[])
-            .to_config_with_nexus_password(false, Some("s3cret".to_owned()))
+            .to_config_with_nexus_password(false, Some("s3cret".to_owned()), Vec::new())
             .unwrap()
             .remote_cache
             .is_none());
         // URL and repository problems surface at startup, not on the first cache lookup.
         assert!(
             serve_args(&["--nexusUrl", "ftp://host", "--nexusRepository", "cache"])
-                .to_config_with_nexus_password(false, None)
+                .to_config_with_nexus_password(false, None, Vec::new())
                 .is_err()
         );
         assert!(
             serve_args(&["--nexusUrl", "https://host", "--nexusRepository", "a/b"])
-                .to_config_with_nexus_password(false, None)
+                .to_config_with_nexus_password(false, None, Vec::new())
                 .is_err()
         );
     }

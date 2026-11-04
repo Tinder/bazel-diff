@@ -64,7 +64,12 @@ def inject_section(text: str, marker: str, content: str) -> str:
 # ---------------------------------------------------------------------------
 
 def build_cli_help_section(
-    help_root: str, help_gen: str, help_get: str, help_explain: str, help_serve: str
+    help_root: str,
+    help_gen: str,
+    help_get: str,
+    help_explain: str,
+    help_serve: str,
+    help_serve_multi: str,
 ) -> str:
     lines = [
         "## CLI Interface",
@@ -97,6 +102,12 @@ def build_cli_help_section(
         "",
         "```terminal",
         help_serve.rstrip(),
+        "```",
+        "",
+        "### `serve-multi` command",
+        "",
+        "```terminal",
+        help_serve_multi.rstrip(),
         "```",
     ]
     return "\n".join(lines)
@@ -297,6 +308,7 @@ def main() -> None:
     help_get = runfile("tools/help_get_impacted_targets.txt").read_text()
     help_explain = runfile("tools/help_explain.txt").read_text()
     help_serve = runfile("tools/help_serve.txt").read_text()
+    help_serve_multi = runfile("tools/help_serve_multi.txt").read_text()
 
     version = read_module_version(workspace_dir)
     template = template.replace("{{BAZEL_DIFF_VERSION}}", version)
@@ -309,7 +321,7 @@ def main() -> None:
     contributors_section = build_contributors_section(workspace_dir, email_map)
 
     cli_help_section = build_cli_help_section(
-        help_root, help_gen, help_get, help_explain, help_serve
+        help_root, help_gen, help_get, help_explain, help_serve, help_serve_multi
     )
 
     readme = inject_section(template, "cli-help", cli_help_section)

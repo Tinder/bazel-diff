@@ -3,6 +3,7 @@ use crate::bazel::{
     RepositoryInputGroup, RepositoryInputs, ScopedSources,
 };
 use crate::cancel::{self, Cancellation};
+use crate::components::{component_digest, member_digest, Completion, Components, Visit};
 use crate::model::{HashFileData, TargetHash};
 use crate::partial::{self, RecipeRecorder, RuleRecipe, TreeIndex};
 use crate::proto::blaze_query::{target, Rule, Target};
@@ -11,7 +12,7 @@ use buffa::{EncodeSink, Message, SizeCache};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -131,6 +132,11 @@ impl TargetDigestBuilder {
         bytes: impl AsRef<[u8]>,
     ) {
         self.overall.update(bytes);
+        self.dependency(label, canonical);
+    }
+
+    /// Records an edge and its recipe input independently of its digest.
+    fn dependency(&mut self, label: &str, canonical: impl FnOnce() -> String) {
         if self.track_deps {
             self.deps.push(label.to_owned());
         }
@@ -596,11 +602,11 @@ fn hash_targets_with_environment(
         package_bzl_seeds,
         bzl_digests: HashMap::new(),
         always_affected_seed: unique_invocation_seed(),
-        cycle_warnings: HashSet::new(),
+        components: Components::default(),
         recorder,
     };
-    // `--order_output=no` makes the query order arbitrary. Acyclic hashes do not care, but the
-    // digest of a cycle depends on which member is entered first, so fix the traversal order.
+    // `--order_output=no` makes the query order arbitrary. Keep output and fallback resolution
+    // deterministic even though component digests are independent of their entry point.
     hash_targets.sort_by(|left, right| left.label().cmp(right.label()));
     let mut digests = Vec::with_capacity(hash_targets.len());
     for target in hash_targets {
@@ -950,8 +956,7 @@ struct HashContext<'a> {
     package_bzl_seeds: BTreeMap<String, DigestBytes>,
     bzl_digests: HashMap<String, Option<(String, DigestBytes)>>,
     always_affected_seed: DigestBytes,
-    /// Targets already reported as the entry of a cycle, so each is warned about once.
-    cycle_warnings: HashSet<String>,
+    components: Components<Rc<RuleNode>, (TargetDigest, Option<RuleRecipe>)>,
     /// Partial-graph mode: collects every rule's recipe as it is hashed.
     recorder: Option<RecipeRecorder>,
 }
@@ -1022,46 +1027,27 @@ impl HashContext<'_> {
             .rule
             .clone()
             .ok_or_else(|| anyhow!("Unable to find rule {key}"))?;
-        self.node_digest(&rule, path)
+        match self.node_digest(&rule, path)? {
+            Visit::Complete(digest) => Ok(digest),
+            Visit::Pending(_) => unreachable!("a top-level rule completes its component"),
+        }
     }
 
     fn node_digest(
         &mut self,
         rule: &Rc<RuleNode>,
         path: &mut Vec<Rc<RuleNode>>,
-    ) -> Result<TargetDigest> {
+    ) -> Result<Visit<TargetDigest>> {
         if let Some(digest) = rule.digest.get() {
-            return Ok(digest.clone());
+            return Ok(Visit::Complete(digest.clone()));
         }
         let canonical_key = &rule.rule.name;
-        if let Some(index) = path.iter().position(|entry| Rc::ptr_eq(entry, rule)) {
-            // A back edge: the query graph can hold cycles a build never sees (rules_go's
-            // `go_context_data` and the nogo analyzers reference each other through non-dependency
-            // attributes). The target is still being hashed, so stand in with a digest of its own
-            // definition. Which member of the cycle is entered first is fixed by the sorted
-            // traversal in `hash_targets_with_environment`, so the result is deterministic.
-            if self.cycle_warnings.insert(canonical_key.clone()) {
-                let cycle = path[index..]
-                    .iter()
-                    .map(|node| &node.rule.name)
-                    .chain(std::iter::once(canonical_key))
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" -> ");
-                eprintln!(
-                    "[Warn] Circular dependency detected: {cycle}; the back edge to {canonical_key} is hashed from its own definition only"
-                );
-            }
-            let mut hasher = Sha256::new();
-            hasher.update(b"cycle");
-            hasher.update(rule.prepared.definition_digest);
-            let placeholder: DigestBytes = hasher.finalize().into();
-            return Ok(TargetDigest {
-                overall: placeholder,
-                direct: placeholder,
-                deps: None,
-            });
+        if let Some(position) = rule.component.get() {
+            return Ok(Visit::Pending(position.get() - 1));
         }
+        let component_position = self.components.enter(Rc::clone(rule));
+        rule.component
+            .set(NonZeroUsize::new(component_position + 1));
         path.push(Rc::clone(rule));
 
         let mut builder =
@@ -1141,10 +1127,21 @@ impl HashContext<'_> {
                 {
                     let digest =
                         match prior.or_else(|| node.digest.get().map(|digest| digest.overall)) {
-                            Some(digest) => digest,
-                            None => self.node_digest(&node, path)?.overall,
+                            Some(digest) => Some(digest),
+                            None => match self.node_digest(&node, path)? {
+                                Visit::Complete(digest) => Some(digest.overall),
+                                Visit::Pending(dependency) => {
+                                    self.components.reaches(component_position, dependency);
+                                    None
+                                }
+                            },
                         };
-                    builder.transitive(&dependency, || node.rule.name.clone(), digest);
+                    match digest {
+                        Some(digest) => {
+                            builder.transitive(&dependency, || node.rule.name.clone(), digest);
+                        }
+                        None => builder.dependency(&dependency, || node.rule.name.clone()),
+                    }
                 }
                 _ => {
                     if let Some(digest) = self.source_hasher.soft_digest(input_label, &[])? {
@@ -1181,22 +1178,74 @@ impl HashContext<'_> {
                     .completed(package_group)
                     .or_else(|| group.digest.get())
                 {
-                    Some(digest) => digest.overall,
-                    None => self.node_digest(&Rc::clone(group), path)?.overall,
+                    Some(digest) => Some(digest.overall),
+                    None => match self.node_digest(&Rc::clone(group), path)? {
+                        Visit::Complete(digest) => Some(digest.overall),
+                        Visit::Pending(dependency) => {
+                            self.components.reaches(component_position, dependency);
+                            None
+                        }
+                    },
                 };
-                builder.transitive(package_group, || package_group.to_owned(), digest);
+                match digest {
+                    Some(digest) => {
+                        builder.transitive(package_group, || package_group.to_owned(), digest);
+                    }
+                    None => builder.dependency(package_group, || package_group.to_owned()),
+                }
             }
         }
 
         path.pop().expect("rule path contains the current rule");
-        let (digest, recipe) = builder.finish();
+        match self.components.finish(component_position, builder.finish()) {
+            Completion::Pending(lowlink) => Ok(Visit::Pending(lowlink)),
+            Completion::Single(node, (digest, recipe)) => {
+                self.complete_rule(&node, &digest, recipe);
+                Ok(Visit::Complete(digest))
+            }
+            Completion::Cycle(members) => {
+                let component = component_digest(
+                    members
+                        .iter()
+                        .map(|(node, (digest, _))| (node.rule.name.as_str(), digest.overall)),
+                );
+                let count = members.len();
+                let representative = members
+                    .iter()
+                    .map(|(node, _)| node.rule.name.as_str())
+                    .min()
+                    .expect("a cycle has members")
+                    .to_owned();
+                for (node, (mut digest, recipe)) in members {
+                    digest.overall = member_digest(component, &node.rule.name, digest.overall);
+                    self.complete_rule(&node, &digest, recipe);
+                }
+                eprintln!(
+                    "[Warn] Circular dependency detected among {count} rules including {representative}; hashing their contributions together"
+                );
+                Ok(Visit::Complete(
+                    rule.digest
+                        .get()
+                        .expect("the component root is complete")
+                        .clone(),
+                ))
+            }
+        }
+    }
+
+    fn complete_rule(
+        &mut self,
+        rule: &Rc<RuleNode>,
+        digest: &TargetDigest,
+        recipe: Option<RuleRecipe>,
+    ) {
         if let (Some(recorder), Some(recipe)) = (&mut self.recorder, recipe) {
-            recorder.record_rule(canonical_key, recipe);
+            recorder.record_rule(&rule.rule.name, recipe);
         }
         rule.digest
             .set(digest.clone())
             .expect("a completed rule is returned from its node");
-        Ok(digest)
+        rule.component.set(None);
     }
 
     /// The key of the rule a rule input resolves to.
@@ -1286,6 +1335,8 @@ struct RuleNode {
     rule: Rule,
     prepared: PreparedRule,
     digest: OnceCell<TargetDigest>,
+    /// One-based position in the unfinished component stack.
+    component: Cell<Option<NonZeroUsize>>,
     input_positions: Option<Box<[Option<NonZeroUsize>]>>,
 }
 
@@ -1295,6 +1346,7 @@ impl RuleNode {
             rule,
             prepared,
             digest: OnceCell::new(),
+            component: Cell::new(None),
             input_positions: None,
         }
     }
@@ -4058,7 +4110,7 @@ esac
 
     #[test]
     fn cycles_hash_deterministically_and_changes_propagate_through_them() {
-        fn cyclic_targets(a_cmd: &str, b_cmd: &str) -> Vec<Target> {
+        fn cyclic_targets(a_cmd: &str, b_cmd: &str, c_cmd: &str, leaf_cmd: &str) -> Vec<Target> {
             let attribute = |value: &str| Attribute {
                 name: "cmd".into(),
                 r#type: attribute::Discriminator::String,
@@ -4069,13 +4121,13 @@ esac
                 rule_target(Rule {
                     name: "//:consumer".into(),
                     rule_class: "alias".into(),
-                    rule_input: vec!["//:a".into()],
+                    rule_input: vec!["//:b".into()],
                     ..Default::default()
                 }),
                 rule_target(Rule {
                     name: "//:a".into(),
                     rule_class: "genrule".into(),
-                    rule_input: vec!["//:b".into()],
+                    rule_input: vec!["//:b".into(), "//:c".into()],
                     attribute: vec![attribute(a_cmd)],
                     ..Default::default()
                 }),
@@ -4086,6 +4138,19 @@ esac
                     attribute: vec![attribute(b_cmd)],
                     ..Default::default()
                 }),
+                rule_target(Rule {
+                    name: "//:c".into(),
+                    rule_class: "genrule".into(),
+                    rule_input: vec!["//:b".into(), "//:leaf".into()],
+                    attribute: vec![attribute(c_cmd)],
+                    ..Default::default()
+                }),
+                rule_target(Rule {
+                    name: "//:leaf".into(),
+                    rule_class: "genrule".into(),
+                    attribute: vec![attribute(leaf_cmd)],
+                    ..Default::default()
+                }),
             ]
         }
         let workspace = tempfile::tempdir().unwrap();
@@ -4093,28 +4158,133 @@ esac
         fs::create_dir_all(output_base.join("external")).unwrap();
         let options = hash_options(workspace.path());
 
-        let baseline =
-            hash_targets_for_test(&options, cyclic_targets("a", "b"), &output_base).unwrap();
+        let baseline = hash_targets_for_test(
+            &options,
+            cyclic_targets("a", "b", "c", "leaf"),
+            &output_base,
+        )
+        .unwrap();
         // The query order is arbitrary; the hashes must not depend on it.
-        let mut reversed = cyclic_targets("a", "b");
+        let mut reversed = cyclic_targets("a", "b", "c", "leaf");
         reversed.reverse();
         let shuffled = hash_targets_for_test(&options, reversed, &output_base).unwrap();
         assert_eq!(baseline.hashes, shuffled.hashes);
         assert_eq!(baseline.dep_edges, shuffled.dep_edges);
         // The dependency edges inside the cycle survive for distance metrics and `explain`.
-        assert_eq!(baseline.dep_edges["//:a"], ["//:b"]);
+        assert_eq!(baseline.dep_edges["//:a"], ["//:b", "//:c"]);
         assert_eq!(baseline.dep_edges["//:b"], ["//:a"]);
-        assert_eq!(baseline.dep_edges["//:consumer"], ["//:a"]);
+        assert_eq!(baseline.dep_edges["//:c"], ["//:b", "//:leaf"]);
+        assert_eq!(baseline.dep_edges["//:consumer"], ["//:b"]);
 
-        // A change to either member reaches both members and everything downstream.
-        for changed in [cyclic_targets("a2", "b"), cyclic_targets("a", "b2")] {
+        // The overlapping cycles include a completed recursive child reached by another arm.
+        // A change entering through any member reaches the whole component and its consumers.
+        for (name, changed) in [
+            ("a", cyclic_targets("a2", "b", "c", "leaf")),
+            ("b", cyclic_targets("a", "b2", "c", "leaf")),
+            ("c", cyclic_targets("a", "b", "c2", "leaf")),
+            ("leaf", cyclic_targets("a", "b", "c", "leaf2")),
+        ] {
             let hashes = hash_targets_for_test(&options, changed, &output_base)
                 .unwrap()
                 .hashes;
-            for label in ["//:a", "//:b", "//:consumer"] {
-                assert_ne!(hashes[label].hash, baseline.hashes[label].hash, "{label}");
+            for label in ["//:a", "//:b", "//:c", "//:consumer"] {
+                assert_ne!(
+                    hashes[label].hash, baseline.hashes[label].hash,
+                    "{name} -> {label}"
+                );
+            }
+            let direct_label = format!("//:{name}");
+            for label in ["//:a", "//:b", "//:c", "//:consumer", "//:leaf"] {
+                assert_eq!(
+                    hashes[label].direct_hash != baseline.hashes[label].direct_hash,
+                    label == direct_label,
+                    "direct {name} -> {label}"
+                );
             }
         }
+
+        let mut untracked = options.clone();
+        untracked.track_deps = false;
+        for targets in [
+            cyclic_targets("a", "b", "c", "leaf"),
+            cyclic_targets("a", "b", "c", "leaf2"),
+        ] {
+            let tracked = hash_targets_for_test(&options, targets.clone(), &output_base).unwrap();
+            let untracked = hash_targets_for_test(&untracked, targets, &output_base).unwrap();
+            assert_eq!(untracked.hashes, tracked.hashes);
+            assert!(untracked.dep_edges.is_empty());
+        }
+    }
+
+    #[test]
+    fn shallow_wide_cycles_propagate_outside_changes() {
+        fn targets(width: usize, value: &str) -> Vec<Target> {
+            let leaves = (0..width)
+                .map(|index| format!("//:b{index:04}"))
+                .collect::<Vec<_>>();
+            let mut inputs = leaves.clone();
+            inputs.push("//:outside".into());
+            let mut targets = leaves
+                .into_iter()
+                .map(|name| {
+                    rule_target(Rule {
+                        name,
+                        rule_class: "alias".into(),
+                        rule_input: vec!["//:a_root".into()],
+                        ..Default::default()
+                    })
+                })
+                .collect::<Vec<_>>();
+            targets.push(rule_target(Rule {
+                name: "//:a_root".into(),
+                rule_class: "genrule".into(),
+                rule_input: inputs,
+                ..Default::default()
+            }));
+            targets.push(rule_target(Rule {
+                name: "//:outside".into(),
+                rule_class: "genrule".into(),
+                attribute: vec![Attribute {
+                    name: "cmd".into(),
+                    r#type: attribute::Discriminator::String,
+                    string_value: Some(value.into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }));
+            targets.push(rule_target(Rule {
+                name: "//:z_consumer".into(),
+                rule_class: "alias".into(),
+                rule_input: vec![format!("//:b{:04}", width - 1)],
+                ..Default::default()
+            }));
+            targets
+        }
+
+        const WIDTH: usize = 4096;
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        let mut options = hash_options(workspace.path());
+        options.track_deps = false;
+        let before =
+            hash_targets_for_test(&options, targets(WIDTH, "before"), &output_base).unwrap();
+        let after = hash_targets_for_test(&options, targets(WIDTH, "after"), &output_base).unwrap();
+        for label in (0..WIDTH)
+            .map(|index| format!("//:b{index:04}"))
+            .chain(["//:a_root".into(), "//:z_consumer".into()])
+        {
+            assert_ne!(
+                before.hashes[&label].hash, after.hashes[&label].hash,
+                "{label}"
+            );
+            assert_eq!(
+                before.hashes[&label].direct_hash, after.hashes[&label].direct_hash,
+                "{label}"
+            );
+        }
+        assert!(before.dep_edges.is_empty());
+        assert!(after.dep_edges.is_empty());
     }
 
     #[cfg(unix)]

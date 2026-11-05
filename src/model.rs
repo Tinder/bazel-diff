@@ -5,7 +5,7 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -655,54 +655,53 @@ pub fn impacted_types(
         .collect()
 }
 
-fn calculate_distance<'a>(
-    label: &'a str,
-    dep_edges: &'a BTreeMap<String, Vec<String>>,
-    impact_types: &HashMap<String, ImpactType>,
-    memo: &mut HashMap<&'a str, (usize, usize)>,
-    visiting: &mut HashSet<&'a str>,
-) -> (usize, usize) {
-    if let Some(distance) = memo.get(label) {
-        return *distance;
+/// Reverse 0/1 BFS. Unit edge cost gives target hops; package-change cost gives the independent
+/// minimum number of package crossings.
+fn reverse_distances<'a>(
+    dependents: &HashMap<&'a str, Vec<&'a str>>,
+    roots: &[&'a str],
+    edge_cost: impl Fn(&str, &str) -> usize,
+) -> HashMap<&'a str, usize> {
+    let mut distances = roots
+        .iter()
+        .map(|&root| (root, 0_usize))
+        .collect::<HashMap<_, _>>();
+    let mut queue = roots
+        .iter()
+        .map(|&root| (root, 0_usize))
+        .collect::<VecDeque<_>>();
+    while let Some((label, distance)) = queue.pop_front() {
+        if distances.get(label) != Some(&distance) {
+            continue;
+        }
+        for &dependent in dependents.get(label).into_iter().flatten() {
+            let cost = edge_cost(label, dependent);
+            debug_assert!(cost <= 1);
+            let candidate = distance.saturating_add(cost);
+            let improved = match distances.entry(dependent) {
+                Entry::Vacant(entry) => {
+                    entry.insert(candidate);
+                    true
+                }
+                Entry::Occupied(mut entry) => {
+                    if candidate < *entry.get() {
+                        entry.insert(candidate);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if improved {
+                if cost == 0 {
+                    queue.push_front((dependent, candidate));
+                } else {
+                    queue.push_back((dependent, candidate));
+                }
+            }
+        }
     }
-    if impact_types.get(label) == Some(&ImpactType::Direct) {
-        memo.insert(label, (0, 0));
-        return (0, 0);
-    }
-    if !visiting.insert(label) {
-        return (0, 0);
-    }
-    // Labels are borrowed from the impact map and the dep-edges file for the whole walk, so the
-    // memo, the cycle guard and the dependency list allocate no strings.
-    let impacted_deps = dep_edges
-        .get(label)
-        .into_iter()
-        .flatten()
-        .map(String::as_str)
-        .filter(|dep| impact_types.contains_key(*dep))
-        .collect::<Vec<_>>();
-    if impacted_deps.is_empty() {
-        eprintln!(
-            "[Warn] {label} was indirectly impacted, but has no impacted dependencies in the dep-edges file. Falling back to distance 0 -- see https://github.com/Tinder/bazel-diff/issues/268"
-        );
-        visiting.remove(label);
-        memo.insert(label, (0, 0));
-        return (0, 0);
-    }
-    let label_package = label.split(':').next().unwrap_or(label);
-    let mut target_distance = usize::MAX;
-    let mut package_distance = usize::MAX;
-    for dep in impacted_deps {
-        let (dep_target, dep_package) =
-            calculate_distance(dep, dep_edges, impact_types, memo, visiting);
-        target_distance = target_distance.min(dep_target.saturating_add(1));
-        package_distance = package_distance
-            .min(dep_package + usize::from(dep.split(':').next().unwrap_or(dep) != label_package));
-    }
-    visiting.remove(label);
-    let result = (target_distance, package_distance);
-    memo.insert(label, result);
-    result
+    distances
 }
 
 pub fn impacted_targets_with_distances(
@@ -713,16 +712,67 @@ pub fn impacted_targets_with_distances(
     exclude_external: bool,
 ) -> Result<Vec<ImpactedTargetWithDistance>> {
     let impact_types = impacted_types(from, to);
-    let mut memo = HashMap::with_capacity(impact_types.len());
-    // Every walk removes what it adds, so one guard serves all of them.
-    let mut visiting = HashSet::new();
-    for label in impact_types.keys() {
-        calculate_distance(label, dep_edges, &impact_types, &mut memo, &mut visiting);
+    let mut dependents = HashMap::<&str, Vec<&str>>::new();
+    let mut roots = Vec::new();
+    for (label, impact) in &impact_types {
+        if *impact == ImpactType::Direct {
+            roots.push(label.as_str());
+            continue;
+        }
+        let mut has_impacted_dependency = false;
+        for dependency in dep_edges
+            .get(label)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .filter(|dependency| impact_types.contains_key(*dependency))
+        {
+            has_impacted_dependency = true;
+            dependents.entry(dependency).or_default().push(label);
+        }
+        if !has_impacted_dependency {
+            eprintln!(
+                "[Warn] {label} was indirectly impacted, but has no impacted dependencies in the dep-edges file. Falling back to distance 0 -- see https://github.com/Tinder/bazel-diff/issues/268"
+            );
+            roots.push(label.as_str());
+        }
     }
-    let impacted = memo
-        .into_iter()
-        .filter(|(label, _)| !exclude_external || !label.starts_with("//external:"))
-        .filter_map(|(label, (target_distance, package_distance))| {
+    let target_distances = reverse_distances(&dependents, &roots, |_, _| 1);
+    let package_distances = reverse_distances(&dependents, &roots, |dependency, dependent| {
+        usize::from(
+            dependency.split(':').next().unwrap_or(dependency)
+                != dependent.split(':').next().unwrap_or(dependent),
+        )
+    });
+    // An unreached label belongs to or depends on a rootless changed component. The graph
+    // identifies no origin for it, so retain the conservative fallback of distance zero.
+    let unresolved = impact_types
+        .keys()
+        .map(String::as_str)
+        .filter(|label| !target_distances.contains_key(label));
+    let (count, representative) =
+        unresolved.fold((0_usize, None), |(count, representative), label| {
+            (
+                count + 1,
+                Some(representative.map_or(label, |prior: &str| prior.min(label))),
+            )
+        });
+    if let Some(representative) = representative {
+        eprintln!(
+            "[Warn] {count} indirectly impacted targets have no path to a direct change or a target with missing changed dependencies, including {representative}; falling back to distance 0"
+        );
+    }
+    let impacted = impact_types
+        .keys()
+        .map(String::as_str)
+        .filter(|label| !exclude_external || !label.starts_with("//external:"))
+        .filter_map(|label| {
+            let (target_distance, package_distance) =
+                match (target_distances.get(label), package_distances.get(label)) {
+                    (Some(target), Some(package)) => (*target, *package),
+                    (None, None) => (0, 0),
+                    _ => unreachable!("both distance walks use the same graph and origins"),
+                };
             match accepts(label, to, target_types) {
                 Ok(true) => Some(Ok(ImpactedTargetWithDistance {
                     label: label.to_owned(),
@@ -1109,7 +1159,50 @@ mod tests {
             .iter()
             .find(|target| target.label == "//c:cycle")
             .unwrap();
-        assert_eq!((cycle.target_distance, cycle.package_distance), (1, 0));
+        // A rootless component has no attributable origin and conservatively uses zero.
+        assert_eq!((cycle.target_distance, cycle.package_distance), (0, 0));
+    }
+
+    #[test]
+    fn cyclic_distances_follow_origins_in_any_order() {
+        let dependents = HashMap::from([
+            ("//a:leaf", vec!["//a:a"]),
+            ("//a:a", vec!["//a:b"]),
+            ("//a:b", vec!["//a:c"]),
+            ("//a:c", vec!["//a:a", "//a:consumer"]),
+            ("//other:direct", vec!["//a:consumer", "//third:only"]),
+        ]);
+        let target = HashMap::from([
+            ("//a:leaf", 0),
+            ("//a:a", 1),
+            ("//a:b", 2),
+            ("//a:c", 3),
+            ("//a:consumer", 1),
+            ("//other:direct", 0),
+            ("//third:only", 1),
+        ]);
+        let package = HashMap::from([
+            ("//a:leaf", 0),
+            ("//a:a", 0),
+            ("//a:b", 0),
+            ("//a:c", 0),
+            ("//a:consumer", 0),
+            ("//other:direct", 0),
+            ("//third:only", 1),
+        ]);
+        for roots in [
+            ["//a:leaf", "//other:direct"],
+            ["//other:direct", "//a:leaf"],
+        ] {
+            assert_eq!(reverse_distances(&dependents, &roots, |_, _| 1), target);
+            // The consumer's shortest hop path crosses a package; the longer cycle path does not.
+            assert_eq!(
+                reverse_distances(&dependents, &roots, |dependency, dependent| {
+                    usize::from(dependency.split(':').next() != dependent.split(':').next())
+                }),
+                package
+            );
+        }
     }
 
     /// An indirectly impacted target whose dep edges name no impacted dependency (a stale or

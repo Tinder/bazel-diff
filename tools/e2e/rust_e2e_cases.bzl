@@ -252,6 +252,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::ordinary_query_cycles_propagate_outgoing_changes",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::package_group_change_impacts_consumers",
                 "timeout": "moderate",
             },

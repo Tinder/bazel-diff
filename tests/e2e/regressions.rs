@@ -595,6 +595,114 @@ fn external_go_dependencies_appear_in_hashes() {
 
 use std::collections::BTreeMap;
 
+#[test]
+fn ordinary_query_cycles_propagate_outgoing_changes() {
+    let workspace = copy_workspace("ordinary_query_cycle");
+    let output = tempfile::tempdir().unwrap();
+    let from = output.path().join("from.json");
+    let to = output.path().join("to.json");
+    let from_edges = output.path().join("from-edges.json");
+    let to_edges = output.path().join("to-edges.json");
+    for (value, hashes, edges) in [
+        ("before\n", &from, &from_edges),
+        ("after\n", &to, &to_edges),
+    ] {
+        fs::write(workspace.path().join("leaf.txt"), value).unwrap();
+        let build = std::process::Command::new(bazel())
+            .current_dir(workspace.path())
+            .args(["build", "//:consumer"])
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("bazel-bin/consumer.txt")).unwrap(),
+            value
+        );
+        assert!(generate(
+            workspace.path(),
+            hashes,
+            &["--includeTargetType", "-d", edges.to_str().unwrap()],
+        )
+        .status
+        .success());
+    }
+
+    let before = hashes(&from);
+    let after = hashes(&to);
+    for label in ["//:a", "//:b", "//:c", "//:consumer"] {
+        assert_eq!(
+            before[label].rsplit_once('~').unwrap().1,
+            after[label].rsplit_once('~').unwrap().1,
+            "{label} changed directly"
+        );
+    }
+    assert_ne!(
+        before["//:leaf"].rsplit_once('~').unwrap().1,
+        after["//:leaf"].rsplit_once('~').unwrap().1
+    );
+    assert_eq!(before["//:unrelated"], after["//:unrelated"]);
+    let edges = dep_edges(&to_edges);
+    assert_eq!(dep_edges(&from_edges), edges);
+    for (from, to) in [
+        ("//:a", "//:c"),
+        ("//:a", "//:leaf"),
+        ("//:b", "//:a"),
+        ("//:c", "//:b"),
+        ("//:consumer", "//:c"),
+    ] {
+        assert!(edges[from].contains(to), "missing {from} -> {to}");
+    }
+
+    let result = output.path().join("impacted.json");
+    assert!(impacted(
+        workspace.path(),
+        &from,
+        &to,
+        &result,
+        &["-d", to_edges.to_str().unwrap(), "-tt", "Rule"]
+    )
+    .status
+    .success());
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+    let distances: BTreeMap<_, _> = rows
+        .iter()
+        .map(|row| {
+            (
+                row["label"].as_str().unwrap(),
+                (
+                    row["targetDistance"].as_u64().unwrap(),
+                    row["packageDistance"].as_u64().unwrap(),
+                ),
+            )
+        })
+        .filter(|(label, _)| {
+            [
+                "//:leaf",
+                "//:a",
+                "//:b",
+                "//:c",
+                "//:consumer",
+                "//:unrelated",
+            ]
+            .contains(label)
+        })
+        .collect();
+    assert_eq!(
+        distances,
+        BTreeMap::from([
+            ("//:leaf", (0, 0)),
+            ("//:a", (1, 0)),
+            ("//:b", (2, 0)),
+            ("//:c", (3, 0)),
+            ("//:consumer", (4, 0)),
+        ])
+    );
+}
+
 /// Regression test for <https://github.com/Tinder/bazel-diff/issues/512>.
 ///
 /// `deps(//:app)` under cquery contains `//:app` twice: in the default

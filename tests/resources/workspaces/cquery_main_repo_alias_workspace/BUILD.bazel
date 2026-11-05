@@ -1,0 +1,14 @@
+# A main-repository alias in front of the file that changes. `//:wrapper`
+# reaches `bar/baz.txt` only through the alias, so it must be impacted when
+# the file changes.
+alias(
+    name = "tool",
+    actual = "//bar:baz",
+)
+
+genrule(
+    name = "wrapper",
+    srcs = [":tool"],
+    outs = ["wrapper.txt"],
+    cmd = "cat $(SRCS) > $@",
+)

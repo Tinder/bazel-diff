@@ -1532,7 +1532,9 @@ impl BazelOptions {
         };
         if let Some(compatible) = compatible {
             targets.retain(|target| {
-                target_name(target).is_some_and(|name| compatible.contains(target_label(name)))
+                target_name(target).is_some_and(|name| {
+                    compatible.contains(main_repo_label_key(target_label(name)))
+                })
             });
         }
         Ok(targets)
@@ -1552,12 +1554,10 @@ impl BazelOptions {
         if "<alias target" in target_repr:
             # repr() prints a main-repository alias with its apparent label
             # (`//:tool`) even under --consistent_labels, while every other
-            # target is canonical (`@@//:tool`). Normalize so the alias
-            # matches the label it is later looked up by.
-            label = target_repr.split(" ")[2]
-            if label.startswith("//"):
-                label = "@@" + label
-            return label
+            # target comes back as `@@//:tool` under Bzlmod and `@//:tool` in
+            # WORKSPACE mode. The labels are compared through
+            # main_repo_label_key, which puts all three in one form.
+            return target_repr.split(" ")[2]
         return str(target.label)
     return ""
 "#,
@@ -1586,7 +1586,7 @@ impl BazelOptions {
         Ok(String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .map(str::to_owned)
+            .map(|line| main_repo_label_key(line).to_owned())
             .collect())
     }
 
@@ -2944,6 +2944,18 @@ pub fn target_label(key: &str) -> &str {
     split_configured(key).0
 }
 
+/// One spelling of a main-repository label, for comparing labels Bazel printed in
+/// different forms: `@@//pkg:name` (Bzlmod), `@//pkg:name` (WORKSPACE mode) and the
+/// apparent `//pkg:name` that `repr()` gives a main-repository alias all become
+/// `//pkg:name`. Other labels are returned unchanged.
+fn main_repo_label_key(label: &str) -> &str {
+    label
+        .strip_prefix("@@")
+        .or_else(|| label.strip_prefix('@'))
+        .filter(|rest| rest.starts_with("//"))
+        .unwrap_or(label)
+}
+
 pub fn target_name(target: &Target) -> Option<&str> {
     match target.r#type {
         target::Discriminator::Rule => target.rule.as_option().map(|rule| rule.name.as_str()),
@@ -3802,6 +3814,19 @@ mod tests {
             }),
             "//foo:bar"
         );
+    }
+
+    #[test]
+    fn main_repo_label_key_puts_main_repository_labels_in_one_form() {
+        // Bzlmod, WORKSPACE mode and repr() of a main-repository alias.
+        for label in ["@@//pkg:name", "@//pkg:name", "//pkg:name"] {
+            assert_eq!(main_repo_label_key(label), "//pkg:name", "{label}");
+        }
+        assert_eq!(main_repo_label_key("@@//:tool"), "//:tool");
+        // External repositories keep their name, in either spelling.
+        for label in ["@@rules_cc+//cc:defs", "@rules_cc//cc:defs", "@@foo//:bar"] {
+            assert_eq!(main_repo_label_key(label), label, "{label}");
+        }
     }
 
     #[test]

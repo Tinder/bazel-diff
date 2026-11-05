@@ -1,0 +1,4 @@
+# Main-repository labels print as `@//pkg:name` in WORKSPACE mode, unlike the
+# `@@//pkg:name` of Bzlmod; run this fixture in WORKSPACE mode.
+common --noenable_bzlmod
+common --enable_workspace

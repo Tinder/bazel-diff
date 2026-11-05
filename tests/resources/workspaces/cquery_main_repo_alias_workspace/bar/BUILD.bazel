@@ -1,0 +1,5 @@
+filegroup(
+    name = "baz",
+    srcs = ["baz.txt"],
+    visibility = ["//visibility:public"],
+)

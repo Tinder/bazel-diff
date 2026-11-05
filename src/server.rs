@@ -127,7 +127,7 @@ pub struct ServerConfig {
     pub nexus_prefix: String,
     pub nexus_credentials: Option<NexusCredentials>,
     pub nexus_ca_cert: Option<PathBuf>,
-    pub compute_slot_demand_average_window: Duration,
+    pub compute_slot_demand_average_window: Option<Duration>,
 }
 
 /// How long a timed-out request waits for its cancelled query to stop before answering anyway.
@@ -383,12 +383,11 @@ impl State {
 
     fn with_shared(name: &str, config: ServerConfig, shared: &Shared) -> Self {
         let fingerprint = configuration_fingerprint(&config);
-        let metrics = Mutex::new(RuntimeMetrics {
-            compute_slot_demand: 0,
-            compute_slot_demand_average: ComputeSlotDemandAverage::new(
-                config.compute_slot_demand_average_window,
-                Instant::now(),
-            ),
+        let metrics = config.compute_slot_demand_average_window.map(|window| {
+            Mutex::new(RuntimeMetrics {
+                compute_slot_demand: 0,
+                compute_slot_demand_average: ComputeSlotDemandAverage::new(window, Instant::now()),
+            })
         });
         Self {
             name: name.to_owned(),
@@ -439,12 +438,12 @@ impl State {
 struct Workspace {
     holder: Mutex<Option<Arc<Cancellation>>>,
     released: Condvar,
-    metrics: Mutex<RuntimeMetrics>,
+    metrics: Option<Mutex<RuntimeMetrics>>,
 }
 
 impl Workspace {
     fn acquire(&self, token: &Arc<Cancellation>) -> Result<WorkspaceGuard<'_>> {
-        let demand = ComputeSlotDemandGuard::start(&self.metrics);
+        let demand = self.metrics.as_ref().map(ComputeSlotDemandGuard::start);
         let mut holder = self.holder.lock().map_err(|_| poisoned())?;
         while holder.is_some() {
             if token.is_cancelled() {
@@ -490,7 +489,7 @@ fn poisoned() -> anyhow::Error {
 
 struct WorkspaceGuard<'a> {
     workspace: &'a Workspace,
-    _demand: ComputeSlotDemandGuard<'a>,
+    _demand: Option<ComputeSlotDemandGuard<'a>>,
 }
 
 impl Drop for WorkspaceGuard<'_> {
@@ -1426,6 +1425,9 @@ fn route(mut request: Request, service: &Service) -> Result<()> {
             respond_json(request, 200, &metrics(service))
         }
         "/metrics/prometheus" => {
+            if service.repositories[0].workspace.metrics.is_none() {
+                return respond_json(request, 404, &json!({"error": "not found"}));
+            }
             if request.method() != &Method::Get {
                 return respond_json(
                     request,
@@ -2464,13 +2466,15 @@ fn metrics_prometheus(service: &Service) -> String {
     let _ = writeln!(
         body,
         "# HELP bazel_diff_compute_slot_demand_avg Rolling average number of requests either holding or waiting to acquire a workspace lock over the last {} seconds.",
-        state.config.compute_slot_demand_average_window.as_secs()
+        state.config.compute_slot_demand_average_window.expect("metrics enabled").as_secs()
     );
     let _ = writeln!(body, "# TYPE bazel_diff_compute_slot_demand_avg gauge");
     for state in &service.repositories {
         let average = state
             .workspace
             .metrics
+            .as_ref()
+            .expect("metrics enabled")
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .compute_slot_demand_average
@@ -2688,7 +2692,7 @@ mod tests {
             nexus_prefix: String::new(),
             nexus_credentials: None,
             nexus_ca_cert: None,
-            compute_slot_demand_average_window: Duration::from_secs(5),
+            compute_slot_demand_average_window: Some(Duration::from_secs(5)),
         }
     }
 
@@ -4935,6 +4939,9 @@ esac
 
     #[test]
     fn compute_slot_demand_average_tracks_per_repository_workspace_demand() {
+        fn demand_metrics(state: &State) -> &Mutex<RuntimeMetrics> {
+            state.workspace.metrics.as_ref().unwrap()
+        }
         // Deterministic time-weighted average, including startup and window expiry.
         let started = Instant::now();
         let mut average = ComputeSlotDemandAverage::new(Duration::from_secs(20), started);
@@ -4958,16 +4965,16 @@ esac
         let token = Arc::new(Cancellation::new());
         let first_guard = first.workspace.acquire(&token).unwrap();
         assert_eq!(
-            first.workspace.metrics.lock().unwrap().compute_slot_demand,
+            demand_metrics(&first).lock().unwrap().compute_slot_demand,
             1
         );
         assert_eq!(
-            second.workspace.metrics.lock().unwrap().compute_slot_demand,
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
             0
         );
         let second_guard = second.workspace.acquire(&token).unwrap();
         assert_eq!(
-            second.workspace.metrics.lock().unwrap().compute_slot_demand,
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
             1
         );
 
@@ -4976,25 +4983,25 @@ esac
         cancelled.cancel();
         assert!(first.workspace.acquire(&cancelled).is_err());
         assert_eq!(
-            first.workspace.metrics.lock().unwrap().compute_slot_demand,
+            demand_metrics(&first).lock().unwrap().compute_slot_demand,
             1
         );
         assert_eq!(
-            second.workspace.metrics.lock().unwrap().compute_slot_demand,
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
             1
         );
         drop(first_guard);
         assert_eq!(
-            first.workspace.metrics.lock().unwrap().compute_slot_demand,
+            demand_metrics(&first).lock().unwrap().compute_slot_demand,
             0
         );
         assert_eq!(
-            second.workspace.metrics.lock().unwrap().compute_slot_demand,
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
             1
         );
         drop(second_guard);
         assert_eq!(
-            second.workspace.metrics.lock().unwrap().compute_slot_demand,
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
             0
         );
 
@@ -5006,6 +5013,8 @@ esac
             state
                 .workspace
                 .metrics
+                .as_ref()
+                .unwrap()
                 .lock()
                 .unwrap()
                 .compute_slot_demand_average = average;
@@ -5046,6 +5055,41 @@ esac
             "POST /metrics/prometheus HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
         assert!(response.starts_with("HTTP/1.1 405"), "{response}");
+    }
+
+    #[test]
+    fn disabled_prometheus_does_not_track_workspace_demand() {
+        let mut config = test_config();
+        config.compute_slot_demand_average_window = None;
+        let shared = Shared::new(&config, None);
+        let first = Arc::new(State::with_shared("first", config.clone(), &shared));
+        let second = Arc::new(State::with_shared("second", config, &shared));
+        let token = Arc::new(Cancellation::new());
+        for state in [&first, &second] {
+            assert!(state.workspace.metrics.is_none());
+            let guard = state.workspace.acquire(&token).unwrap();
+            assert!(guard._demand.is_none());
+            assert!(state.workspace.is_busy());
+            let cancelled = Arc::new(Cancellation::new());
+            cancelled.cancel();
+            assert!(state.workspace.acquire(&cancelled).is_err());
+            drop(guard);
+            assert!(!state.workspace.is_busy());
+        }
+        for service in [service_of(&first), Service::new(vec![first, second])] {
+            for method in ["GET", "POST"] {
+                let response = request_service(
+                    &service,
+                    &format!("{method} /metrics/prometheus HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                );
+                assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+            }
+            let response = request_service(
+                &service,
+                "GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
     }
 
     #[test]
@@ -5332,7 +5376,16 @@ esac
             );
         }
         assert_eq!(app.active_queries.load(Ordering::SeqCst), 1);
-        assert_eq!(app.workspace.metrics.lock().unwrap().compute_slot_demand, 0);
+        assert_eq!(
+            app.workspace
+                .metrics
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .compute_slot_demand,
+            0
+        );
 
         // Busy is per repository. Missing/false flags still allow the usual queuing.
         for (status, body) in [

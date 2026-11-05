@@ -393,9 +393,10 @@ curl 'http://localhost:8080/metrics'
 
 * `GET /metrics/prometheus` — exposes the Prometheus gauge `bazel_diff_compute_slot_demand_avg`
   with a `repo` label (`default` for `serve`). It is the time-weighted rolling average of operations
-  holding or waiting for that repository's workspace lock, not CPU utilization. Configure the window
-  with `--computeSlotDemandAvgWindow` (default `5s`). The endpoint is available regardless of readiness;
-  the existing JSON `/metrics` is unchanged.
+  holding or waiting for that repository's workspace lock, not CPU utilization. Enable tracking by
+  passing `--computeSlotDemandAvgWindow 5s` (or another positive duration). Without this option,
+  tracking is disabled and the endpoint returns `404`. When enabled it is available regardless of
+  readiness; the existing JSON `/metrics` is unchanged.
 
 ### Serving several repositories
 

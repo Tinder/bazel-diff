@@ -2649,7 +2649,14 @@ pub fn decode_delimited<M: Message>(path: &Path) -> Result<Vec<M>> {
 /// Upper bounds on one decode batch. Batching keeps peak memory proportional to
 /// the batch rather than to the whole query output, which for a large workspace
 /// is gigabytes.
-const DECODE_BATCH_MESSAGES: usize = 8192;
+///
+/// A decoded rule still carries every attribute (implicit ones included, several
+/// hundred bytes each) until the batch transform prehashes and drops them, so the
+/// message bound sets most of the decode peak. On the large perf-proof workload,
+/// 8192 instead of 1024 raised generate-hashes' peak RSS from about 160 to 245 MiB;
+/// below 1024 the peak no longer moves, and each batch stays large enough to decode
+/// in parallel.
+const DECODE_BATCH_MESSAGES: usize = 1024;
 const DECODE_BATCH_BYTES: usize = 32 * 1024 * 1024;
 
 /// Raw, still-encoded messages read off the stream, kept in one contiguous

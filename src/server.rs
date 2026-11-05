@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet, VecDeque};
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -127,6 +127,7 @@ pub struct ServerConfig {
     pub nexus_prefix: String,
     pub nexus_credentials: Option<NexusCredentials>,
     pub nexus_ca_cert: Option<PathBuf>,
+    pub compute_slot_demand_average_window: Option<Duration>,
 }
 
 /// How long a timed-out request waits for its cancelled query to stop before answering anyway.
@@ -180,6 +181,122 @@ impl Shared {
     }
 }
 
+/// Per workspace. Update the count and its time history under one lock so
+/// concurrent arrivals and departures cannot record demand levels out of order.
+struct RuntimeMetrics {
+    compute_slot_demand: usize,
+    compute_slot_demand_average: ComputeSlotDemandAverage,
+}
+
+#[derive(Clone, Copy)]
+struct DemandLevel {
+    at: Instant,
+    value: usize,
+}
+
+struct ComputeSlotDemandAverage {
+    window: Duration,
+    started: Instant,
+    levels: VecDeque<DemandLevel>,
+}
+
+impl ComputeSlotDemandAverage {
+    fn new(window: Duration, started: Instant) -> Self {
+        let mut levels = VecDeque::new();
+        levels.push_back(DemandLevel {
+            at: started,
+            value: 0,
+        });
+        Self {
+            window,
+            started,
+            levels,
+        }
+    }
+
+    fn record(&mut self, value: usize, now: Instant) {
+        self.prune(now);
+        if self.levels.back().is_some_and(|level| level.value == value) {
+            return;
+        }
+        self.levels.push_back(DemandLevel { at: now, value });
+        self.prune(now);
+    }
+
+    fn current_average(&mut self, now: Instant) -> f64 {
+        self.prune(now);
+        let start = self.window_start(now);
+        let span = now.saturating_duration_since(start);
+        if span.is_zero() {
+            return self.levels.back().map_or(0.0, |level| level.value as f64);
+        }
+
+        let mut weighted_value_seconds = 0.0;
+        for index in 0..self.levels.len() {
+            let level = self.levels[index];
+            let segment_start = if level.at < start { start } else { level.at };
+            let segment_end = self
+                .levels
+                .get(index + 1)
+                .map(|next| next.at)
+                .unwrap_or(now);
+            if segment_end > segment_start {
+                weighted_value_seconds +=
+                    level.value as f64 * segment_end.duration_since(segment_start).as_secs_f64();
+            }
+        }
+        weighted_value_seconds / span.as_secs_f64()
+    }
+
+    fn prune(&mut self, now: Instant) {
+        let cutoff = self.window_start(now);
+        while self.levels.len() > 1 && self.levels.get(1).is_some_and(|next| next.at <= cutoff) {
+            self.levels.pop_front();
+        }
+    }
+
+    fn window_start(&self, now: Instant) -> Instant {
+        let start = now.checked_sub(self.window).unwrap_or(self.started);
+        if start < self.started {
+            self.started
+        } else {
+            start
+        }
+    }
+}
+
+/// Starts before waiting for a workspace and ends on release, cancellation or error.
+struct ComputeSlotDemandGuard<'a>(&'a Mutex<RuntimeMetrics>);
+
+impl<'a> ComputeSlotDemandGuard<'a> {
+    fn start(metrics: &'a Mutex<RuntimeMetrics>) -> Self {
+        let mut state = metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.compute_slot_demand += 1;
+        let current = state.compute_slot_demand;
+        state
+            .compute_slot_demand_average
+            .record(current, Instant::now());
+        drop(state);
+        Self(metrics)
+    }
+}
+
+impl Drop for ComputeSlotDemandGuard<'_> {
+    fn drop(&mut self) {
+        let mut metrics = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        metrics.compute_slot_demand -= 1;
+        let current = metrics.compute_slot_demand;
+        metrics
+            .compute_slot_demand_average
+            .record(current, Instant::now());
+    }
+}
+
 /// The in-memory tier: entries already parsed, most recently used last.
 ///
 /// Nearly every request shares its `from` revision (the main branch) with the previous one, and
@@ -220,12 +337,13 @@ impl MemoryCache {
     /// Remembers `data` for `key`, evicting least recently used entries to stay within budget. An
     /// entry larger than the whole budget is not kept.
     fn insert(&mut self, key: &str, bytes: u64, data: &Arc<HashFileData>) {
-        if bytes > self.budget {
-            return;
-        }
         if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
             let previous = self.entries.remove(index).expect("index from position");
             self.used -= previous.bytes;
+        }
+        // A refresh must discard the old value even if the new one cannot fit in memory.
+        if bytes > self.budget {
+            return;
         }
         while self.used + bytes > self.budget {
             let Some(evicted) = self.entries.pop_front() else {
@@ -265,6 +383,12 @@ impl State {
 
     fn with_shared(name: &str, config: ServerConfig, shared: &Shared) -> Self {
         let fingerprint = configuration_fingerprint(&config);
+        let metrics = config.compute_slot_demand_average_window.map(|window| {
+            Mutex::new(RuntimeMetrics {
+                compute_slot_demand: 0,
+                compute_slot_demand_average: ComputeSlotDemandAverage::new(window, Instant::now()),
+            })
+        });
         Self {
             name: name.to_owned(),
             memory: Arc::clone(&shared.memory),
@@ -274,7 +398,11 @@ impl State {
             partial_derived: AtomicUsize::new(0),
             partial_rebuilds: AtomicUsize::new(0),
             untracked_package_rejections: AtomicUsize::new(0),
-            workspace: Workspace::default(),
+            workspace: Workspace {
+                holder: Mutex::new(None),
+                released: Condvar::new(),
+                metrics,
+            },
             active_queries: AtomicUsize::new(0),
             fingerprint,
         }
@@ -307,14 +435,15 @@ impl State {
 /// remembers which operation holds it. That lets `/metrics` report `workspaceBusy`, lets the
 /// subprocesses the holder spawns be killed when its query is cancelled, and lets a query that is
 /// cancelled while queued give up instead of taking the workspace for nothing.
-#[derive(Default)]
 struct Workspace {
     holder: Mutex<Option<Arc<Cancellation>>>,
     released: Condvar,
+    metrics: Option<Mutex<RuntimeMetrics>>,
 }
 
 impl Workspace {
     fn acquire(&self, token: &Arc<Cancellation>) -> Result<WorkspaceGuard<'_>> {
+        let demand = self.metrics.as_ref().map(ComputeSlotDemandGuard::start);
         let mut holder = self.holder.lock().map_err(|_| poisoned())?;
         while holder.is_some() {
             if token.is_cancelled() {
@@ -327,7 +456,10 @@ impl Workspace {
                 .0;
         }
         *holder = Some(Arc::clone(token));
-        Ok(WorkspaceGuard { workspace: self })
+        Ok(WorkspaceGuard {
+            workspace: self,
+            _demand: demand,
+        })
     }
 
     fn holder(&self) -> Option<Arc<Cancellation>> {
@@ -357,6 +489,7 @@ fn poisoned() -> anyhow::Error {
 
 struct WorkspaceGuard<'a> {
     workspace: &'a Workspace,
+    _demand: Option<ComputeSlotDemandGuard<'a>>,
 }
 
 impl Drop for WorkspaceGuard<'_> {
@@ -372,9 +505,18 @@ impl Drop for WorkspaceGuard<'_> {
 struct ActiveQuery(Arc<State>);
 
 impl ActiveQuery {
-    fn start(state: &Arc<State>) -> Self {
-        state.active_queries.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(state))
+    fn start(state: &Arc<State>, reject_when_busy: bool) -> Option<Self> {
+        if reject_when_busy {
+            // Reserve admission atomically, before spawning, so two requests cannot both
+            // observe an idle repository and enqueue themselves.
+            state
+                .active_queries
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .ok()?;
+        } else {
+            state.active_queries.fetch_add(1, Ordering::SeqCst);
+        }
+        Some(Self(Arc::clone(state)))
     }
 }
 
@@ -1024,6 +1166,7 @@ struct QueryBody {
     target_type: Option<Vec<String>>,
     modified_filepaths: Option<Vec<String>>,
     profile: Option<bool>,
+    reject_when_busy: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -1035,6 +1178,7 @@ struct QueryInputs {
     target_types: Option<HashSet<String>>,
     modified_filepaths: BTreeSet<PathBuf>,
     profile: bool,
+    reject_when_busy: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1185,18 +1329,13 @@ fn perform_initial_fetches(states: &[Arc<State>]) {
 }
 
 /// Performs the startup git fetch (unless `--noInitialFetch`) and warmup, then flips `ready`
-/// once the clone is known good. On a fetch failure the server is left running but un-ready
-/// ("lame duck") so `/health` reports 503 and a load balancer removes the instance rather than
-/// us attempting a risky in-place repair; `/metrics` keeps answering with `ready: false`.
+/// once the clone is known good. A failed fetch is retried once after pruning origin, but only
+/// when Git recommends that command. Unrecovered failures leave the server running but un-ready
+/// ("lame duck"): `/health` reports 503 and `/metrics` keeps answering with `ready: false`.
 fn perform_initial_fetch(state: &Arc<State>) {
     let name = &state.name;
     if !state.config.no_initial_fetch {
-        let fetch = [
-            String::from("fetch"),
-            String::from("--all"),
-            String::from("--tags"),
-        ];
-        if let Err(error) = git(state, &fetch) {
+        if let Err(error) = fetch_initial_revisions(state) {
             eprintln!(
                 "[Error] initial git fetch of repository {name} failed; server is lame-ducked (health will report NOT_READY): {error:#}"
             );
@@ -1209,6 +1348,28 @@ fn perform_initial_fetch(state: &Arc<State>) {
         }
     }
     state.ready.store(true, Ordering::Release);
+}
+
+fn fetch_initial_revisions(state: &State) -> Result<()> {
+    let git = state.git();
+    let fetch = ["fetch", "--all", "--tags"];
+    let output = git.output(fetch)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.contains("git remote prune origin") && !stderr.contains("git remote prune origin") {
+        bail!("git fetch --all --tags failed: {stderr}{stdout}");
+    }
+    eprintln!(
+        "[Warn] initial git fetch of repository {} failed: {stderr}{stdout}; Git recommends git remote prune origin; pruning and retrying once",
+        state.name
+    );
+    git.run(["remote", "prune", "origin"])
+        .context("initial fetch recovery: git remote prune origin failed")?;
+    git.run(fetch)
+        .context("initial fetch recovery: fetch still failed after pruning origin")
 }
 
 fn start_cache_pruner(state: &Arc<State>) -> Result<()> {
@@ -1263,6 +1424,24 @@ fn route(mut request: Request, service: &Service) -> Result<()> {
             }
             respond_json(request, 200, &metrics(service))
         }
+        "/metrics/prometheus" => {
+            if service.repositories[0].workspace.metrics.is_none() {
+                return respond_json(request, 404, &json!({"error": "not found"}));
+            }
+            if request.method() != &Method::Get {
+                return respond_json(
+                    request,
+                    405,
+                    &json!({"error": "method not allowed, use GET"}),
+                );
+            }
+            let response = Response::from_string(metrics_prometheus(service)).with_header(
+                Header::from_bytes("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                    .unwrap(),
+            );
+            request.respond(response)?;
+            Ok(())
+        }
         "/impacted_targets" | "/impacted_targets_with_distances" | "/dependency_edges" => {
             if request.method() != &Method::Get && request.method() != &Method::Post {
                 return respond_json(
@@ -1310,7 +1489,13 @@ fn route(mut request: Request, service: &Service) -> Result<()> {
             }
             let timeout = state.config.request_timeout;
             let token = Arc::new(Cancellation::new());
-            let active = ActiveQuery::start(state);
+            let Some(active) = ActiveQuery::start(state, inputs.reject_when_busy) else {
+                return respond_json(
+                    request,
+                    503,
+                    &json!({"error": "server busy: another query is already processing"}),
+                );
+            };
             let state_for_compute = Arc::clone(state);
             let worker_token = Arc::clone(&token);
             let (sender, receiver) = mpsc::sync_channel(1);
@@ -1424,6 +1609,7 @@ fn parse_query_inputs(request: &mut Request, query: &str) -> Result<QueryInputs>
                 .map(PathBuf::from)
                 .collect(),
             profile: body.profile.unwrap_or(false),
+            reject_when_busy: body.reject_when_busy.unwrap_or(false),
         });
     }
     let from = params
@@ -1447,6 +1633,9 @@ fn parse_query_inputs(request: &mut Request, query: &str) -> Result<QueryInputs>
         ),
         modified_filepaths: BTreeSet::new(),
         profile: params.get("profile").is_some_and(|value| value == "true"),
+        reject_when_busy: params
+            .get("rejectWhenBusy")
+            .is_some_and(|value| value == "true"),
     })
 }
 
@@ -1561,7 +1750,8 @@ fn compute_query(
 fn warm_revision(state: &Arc<State>, revision: &str) -> Result<()> {
     let _guard = state.workspace.acquire(&Arc::new(Cancellation::new()))?;
     let sha = resolve_sha(state, revision)?;
-    get_hashes_locked(state, &sha, &BTreeSet::new(), None)?;
+    // Warm Bazel itself and refresh the server's entries, even if a cache tier has a hit.
+    retrieve_hashes_locked(state, &sha, &BTreeSet::new(), None, false)?;
     Ok(())
 }
 
@@ -1664,6 +1854,17 @@ fn get_hashes_locked(
     modified: &BTreeSet<PathBuf>,
     base: Option<(&str, &Arc<HashFileData>)>,
 ) -> Result<Retrieval> {
+    retrieve_hashes_locked(state, sha, modified, base, true)
+}
+
+/// With `read_cache` disabled, generate afresh but still write every configured cache tier.
+fn retrieve_hashes_locked(
+    state: &Arc<State>,
+    sha: &str,
+    modified: &BTreeSet<PathBuf>,
+    base: Option<(&str, &Arc<HashFileData>)>,
+    read_cache: bool,
+) -> Result<Retrieval> {
     // Keyed by the commit's tree, not the commit itself: a rebase, an amended message, or a merge
     // commit that changes no file all point at a tree that was already hashed.
     let tree = resolve_tree(state, sha)?;
@@ -1671,7 +1872,11 @@ fn get_hashes_locked(
     let path = state.config.cache_dir.join(format!("{key}.json"));
     let mut current_dependency_fingerprint = None;
     // Bound first so the tier's lock is released before the (possibly slow) servability check.
-    let remembered = memory_cache(state).get(&key);
+    let remembered = if read_cache {
+        memory_cache(state).get(&key)
+    } else {
+        None
+    };
     if let Some(data) = remembered {
         let read_started = Instant::now();
         if cache_entry_is_servable(
@@ -1688,7 +1893,7 @@ fn get_hashes_locked(
             return Ok(Retrieval::hit(data, read_started));
         }
     }
-    if path.is_file() {
+    if read_cache && path.is_file() {
         let read_started = Instant::now();
         let bytes = fs::read(&path)
             .with_context(|| format!("failed to read hash file {}", path.display()))?;
@@ -1706,7 +1911,7 @@ fn get_hashes_locked(
             return Ok(Retrieval::hit(data, read_started));
         }
     }
-    if let Some(remote) = &state.remote {
+    if let (true, Some(remote)) = (read_cache, &state.remote) {
         let read_started = Instant::now();
         if let Some(bytes) = remote.get(&key) {
             let data = Arc::new(HashFileData::from_slice(&bytes)?);
@@ -2255,6 +2460,35 @@ fn metrics(service: &Service) -> Value {
     })
 }
 
+fn metrics_prometheus(service: &Service) -> String {
+    let state = &service.repositories[0];
+    let mut body = String::new();
+    let _ = writeln!(
+        body,
+        "# HELP bazel_diff_compute_slot_demand_avg Rolling average number of requests either holding or waiting to acquire a workspace lock over the last {} seconds.",
+        state.config.compute_slot_demand_average_window.expect("metrics enabled").as_secs()
+    );
+    let _ = writeln!(body, "# TYPE bazel_diff_compute_slot_demand_avg gauge");
+    for state in &service.repositories {
+        let average = state
+            .workspace
+            .metrics
+            .as_ref()
+            .expect("metrics enabled")
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .compute_slot_demand_average
+            .current_average(Instant::now());
+        // Repository names are validated as ASCII alphanumeric, '.', '_' or '-'.
+        let _ = writeln!(
+            body,
+            "bazel_diff_compute_slot_demand_avg{{repo=\"{}\"}} {average}",
+            state.name
+        );
+    }
+    body
+}
+
 /// One repository's share of `/metrics`: its clone, and the figures that are per workspace.
 fn repository_metrics(state: &State) -> Value {
     json!({
@@ -2458,6 +2692,7 @@ mod tests {
             nexus_prefix: String::new(),
             nexus_credentials: None,
             nexus_ca_cert: None,
+            compute_slot_demand_average_window: Some(Duration::from_secs(5)),
         }
     }
 
@@ -2821,6 +3056,7 @@ mod tests {
 
     struct CapturedS3Request {
         url: String,
+        method: Method,
     }
 
     fn remote_cache_with_responses(
@@ -2840,6 +3076,7 @@ mod tests {
                 sender
                     .send(CapturedS3Request {
                         url: request.url().to_owned(),
+                        method: request.method().clone(),
                     })
                     .unwrap();
                 request
@@ -3267,6 +3504,64 @@ esac
         config.cache_dir = cache.to_path_buf();
         config.partial_graph = partial;
         ready_state(config, None)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_revision_bypasses_server_caches_and_refreshes_entries() {
+        let (root, bazel, [base, _, _, _]) = partial_graph_repo();
+        let repo = root.path().join("repo");
+        for (index, (partial, limited_memory)) in [(false, false), (true, false), (true, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let cache = root.path().join(format!("cache-{index}"));
+            fs::create_dir_all(&cache).unwrap();
+            let mut state = partial_graph_state(&repo, &cache, &bazel, partial);
+            let (remote, requests, handle) =
+                remote_cache_with_responses("warm", vec![(200, Vec::new())]);
+            Arc::get_mut(&mut state).unwrap().remote = Some(Arc::new(remote));
+            let key = cache_key_for_commit(&state, &base);
+            let path = cache.join(format!("{key}.json"));
+            let stale = HashFileData {
+                hashes: std::collections::BTreeMap::from([(
+                    "//stale:cached".to_owned(),
+                    hash("Rule", "old", "old"),
+                )]),
+                ..Default::default()
+            };
+            write_hashes(&path, &stale, true);
+            if limited_memory {
+                memory_cache(&state).budget = fs::metadata(&path).unwrap().len();
+            }
+            let cached = get_hashes_locked(&state, &base, &BTreeSet::new(), None).unwrap();
+            assert!(cached.cache_hit);
+            assert_eq!(memory_cache(&state).len(), 1);
+
+            warm_revision(&state, &base).unwrap();
+
+            // Warmup must query Bazel, not return the stale memory/disk entry or read S3.
+            let request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(request.method, Method::Put);
+            assert_eq!(request.url, format!("/bucket/warm/{key}.json.gz"));
+            handle.join().unwrap();
+            let refreshed = HashFileData::read(&path).unwrap();
+            assert!(!refreshed.hashes.contains_key("//stale:cached"));
+            assert!(refreshed.hashes.contains_key("//pkg:lib"));
+            assert_eq!(refreshed.partial.is_some(), partial);
+            assert_eq!(git_command(&repo, &["rev-parse", "HEAD"]), base);
+            assert_eq!(
+                state.partial_rebuilds.load(Ordering::SeqCst),
+                usize::from(partial)
+            );
+            if limited_memory {
+                assert_eq!(memory_cache(&state).len(), 0);
+            }
+            let next = get_hashes_locked(&state, &base, &BTreeSet::new(), None).unwrap();
+            assert!(next.cache_hit);
+            assert_eq!(next.data.hashes, refreshed.hashes);
+            assert!(!Arc::ptr_eq(&cached.data, &next.data));
+        }
     }
 
     #[cfg(unix)]
@@ -4070,6 +4365,83 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         assert!(skipped.ready.load(Ordering::Acquire));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn initial_fetch_prunes_origin_only_when_recommended_and_checks_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (message, stream, fetch_status, prune_status, retry_status, expected_ready) in [
+            ("try running 'git remote prune origin'", 2, 1, 0, 0, true),
+            ("try running 'git remote prune origin'", 1, 1, 0, 0, true),
+            ("try running 'git remote prune origin'", 2, 1, 1, 0, false),
+            ("try running 'git remote prune origin'", 2, 1, 0, 1, false),
+            ("authentication failed", 2, 1, 0, 0, false),
+            ("git remote prune origin", 2, 0, 0, 0, true),
+        ] {
+            let repo = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let script = repo.path().join("fake-git");
+            fs::write(
+                &script,
+                format!(
+                    r#"#!/bin/sh
+printf '%s\n' "$*" >> commands
+case "$*" in
+  'fetch --all --tags')
+    if [ -f fetched ]; then exit {retry_status}; fi
+    : > fetched
+    printf '%s\n' "{message}" >&{stream}
+    exit {fetch_status}
+    ;;
+  'remote prune origin') exit {prune_status} ;;
+  *) exit 99 ;;
+esac
+"#
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut config = test_config();
+            config.no_initial_fetch = false;
+            config.hash_options.bazel.workspace = repo.path().to_path_buf();
+            config.git_path = script;
+            config.cache_dir = cache.path().to_path_buf();
+            let state = Arc::new(State::new(config, None));
+
+            perform_initial_fetch(&state);
+
+            assert_eq!(state.ready.load(Ordering::Acquire), expected_ready);
+            let mut expected_commands = vec!["fetch --all --tags"];
+            if fetch_status != 0 && message.contains("git remote prune origin") {
+                expected_commands.push("remote prune origin");
+                if prune_status == 0 {
+                    expected_commands.push("fetch --all --tags");
+                }
+            }
+            assert_eq!(
+                fs::read_to_string(repo.path().join("commands"))
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                expected_commands
+            );
+            let health = request(&state, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+            assert!(health.starts_with(if expected_ready {
+                "HTTP/1.1 200"
+            } else {
+                "HTTP/1.1 503"
+            }));
+            assert_eq!(metrics(&service_of(&state))["ready"], expected_ready);
+            if !expected_ready {
+                assert!(request(
+                    &state,
+                    "GET /impacted_targets?from=a&to=b HTTP/1.1\r\nHost: x\r\n\r\n"
+                )
+                .starts_with("HTTP/1.1 503"));
+            }
+        }
+    }
+
     #[test]
     fn git_resolution_checkout_and_errors_use_real_repository() {
         let (repo, first, second) = initialize_git_repo();
@@ -4369,6 +4741,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             target_types: None,
             modified_filepaths: BTreeSet::new(),
             profile: true,
+            reject_when_busy: false,
         };
         let result = compute_query(
             &state,
@@ -4562,6 +4935,161 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
                 "changedSources": 2
             })
         );
+    }
+
+    #[test]
+    fn compute_slot_demand_average_tracks_per_repository_workspace_demand() {
+        fn demand_metrics(state: &State) -> &Mutex<RuntimeMetrics> {
+            state.workspace.metrics.as_ref().unwrap()
+        }
+        // Deterministic time-weighted average, including startup and window expiry.
+        let started = Instant::now();
+        let mut average = ComputeSlotDemandAverage::new(Duration::from_secs(20), started);
+        assert_eq!(average.current_average(started), 0.0);
+        average.record(1, started + Duration::from_secs(5));
+        assert!((average.current_average(started + Duration::from_secs(10)) - 0.5).abs() < 1e-9);
+        average.record(3, started + Duration::from_secs(10));
+        average.record(0, started + Duration::from_secs(15));
+        assert!((average.current_average(started + Duration::from_secs(20)) - 1.0).abs() < 1e-9);
+        assert!((average.current_average(started + Duration::from_secs(30)) - 0.75).abs() < 1e-9);
+        assert_eq!(
+            average.current_average(started + Duration::from_secs(35)),
+            0.0
+        );
+
+        let config = test_config();
+        let shared = Shared::new(&config, None);
+        let first = Arc::new(State::with_shared("first", config.clone(), &shared));
+        let second = Arc::new(State::with_shared("second", config, &shared));
+        let service = Service::new(vec![Arc::clone(&first), Arc::clone(&second)]);
+        let token = Arc::new(Cancellation::new());
+        let first_guard = first.workspace.acquire(&token).unwrap();
+        assert_eq!(
+            demand_metrics(&first).lock().unwrap().compute_slot_demand,
+            1
+        );
+        assert_eq!(
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
+            0
+        );
+        let second_guard = second.workspace.acquire(&token).unwrap();
+        assert_eq!(
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
+            1
+        );
+
+        // A cancelled waiter must not leak demand while another operation holds the lock.
+        let cancelled = Arc::new(Cancellation::new());
+        cancelled.cancel();
+        assert!(first.workspace.acquire(&cancelled).is_err());
+        assert_eq!(
+            demand_metrics(&first).lock().unwrap().compute_slot_demand,
+            1
+        );
+        assert_eq!(
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
+            1
+        );
+        drop(first_guard);
+        assert_eq!(
+            demand_metrics(&first).lock().unwrap().compute_slot_demand,
+            0
+        );
+        assert_eq!(
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
+            1
+        );
+        drop(second_guard);
+        assert_eq!(
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
+            0
+        );
+
+        // Give each repository a deterministic, distinct history without sleeps.
+        let started = Instant::now() - Duration::from_secs(5);
+        for (state, demand) in [(&first, 2), (&second, 0)] {
+            let mut average = ComputeSlotDemandAverage::new(Duration::from_secs(5), started);
+            average.record(demand, started);
+            state
+                .workspace
+                .metrics
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .compute_slot_demand_average = average;
+        }
+
+        // The endpoint works even before readiness, independently of JSON /metrics.
+        let response = request_service(
+            &service,
+            "GET /metrics/prometheus HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("text/plain; version=0.0.4; charset=utf-8"));
+        assert!(response.contains("# TYPE bazel_diff_compute_slot_demand_avg gauge\n"));
+        assert!(response.contains("\nbazel_diff_compute_slot_demand_avg{repo=\"first\"} 2\n"));
+        assert!(response.contains("\nbazel_diff_compute_slot_demand_avg{repo=\"second\"} 0\n"));
+        assert!(!response.contains("\nbazel_diff_compute_slot_demand_avg "));
+        assert_eq!(
+            response
+                .matches("# HELP bazel_diff_compute_slot_demand_avg ")
+                .count(),
+            1
+        );
+        assert_eq!(
+            response
+                .matches("# TYPE bazel_diff_compute_slot_demand_avg ")
+                .count(),
+            1
+        );
+
+        let single = Arc::new(State::new(test_config(), None));
+        let response = request(
+            &single,
+            "GET /metrics/prometheus HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.contains("\nbazel_diff_compute_slot_demand_avg{repo=\"default\"} 0\n"));
+        let response = request_service(
+            &service,
+            "POST /metrics/prometheus HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 405"), "{response}");
+    }
+
+    #[test]
+    fn disabled_prometheus_does_not_track_workspace_demand() {
+        let mut config = test_config();
+        config.compute_slot_demand_average_window = None;
+        let shared = Shared::new(&config, None);
+        let first = Arc::new(State::with_shared("first", config.clone(), &shared));
+        let second = Arc::new(State::with_shared("second", config, &shared));
+        let token = Arc::new(Cancellation::new());
+        for state in [&first, &second] {
+            assert!(state.workspace.metrics.is_none());
+            let guard = state.workspace.acquire(&token).unwrap();
+            assert!(guard._demand.is_none());
+            assert!(state.workspace.is_busy());
+            let cancelled = Arc::new(Cancellation::new());
+            cancelled.cancel();
+            assert!(state.workspace.acquire(&cancelled).is_err());
+            drop(guard);
+            assert!(!state.workspace.is_busy());
+        }
+        for service in [service_of(&first), Service::new(vec![first, second])] {
+            for method in ["GET", "POST"] {
+                let response = request_service(
+                    &service,
+                    &format!("{method} /metrics/prometheus HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                );
+                assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+            }
+            let response = request_service(
+                &service,
+                "GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
     }
 
     #[test]
@@ -4799,10 +5327,107 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         assert_eq!(metrics(&service_of(&state))["workspaceBusy"], false);
         assert!(state.workspace.holder().is_none());
 
-        let counted = ActiveQuery::start(&state);
+        let counted = ActiveQuery::start(&state, false).unwrap();
         assert_eq!(metrics(&service_of(&state))["activeQueries"], 1);
         drop(counted);
         assert_eq!(metrics(&service_of(&state))["activeQueries"], 0);
+    }
+
+    #[test]
+    fn reject_when_busy_is_atomic_and_scoped_to_the_requested_repository() {
+        let (app_repo, from, to) = initialize_git_repo();
+        let (lib_repo, _, _) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let shared = Shared::new(&test_config(), None);
+        let app = shared_state("app", app_repo.path(), cache.path(), &shared);
+        let lib = shared_state("lib", lib_repo.path(), cache.path(), &shared);
+        // Both repositories have the same trees and can use these pre-written entries.
+        write_changed_entry(&app, &from, &to, "//app:one");
+        let service = Service::new(vec![Arc::clone(&app), Arc::clone(&lib)]);
+        let get = |repository: &str, extra: &str| {
+            query_service(
+                &service,
+                &format!(
+                    "GET /impacted_targets?repo={repository}&from=HEAD~1&to=HEAD{extra} HTTP/1.1\r\nHost: x\r\n\r\n"
+                ),
+            )
+        };
+        let post = |extra: &str| {
+            let body = format!(r#"{{"repo":"app","from":"HEAD~1","to":"HEAD"{extra}}}"#);
+            query_service(
+                &service,
+                &format!(
+                    "POST /impacted_targets HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+
+        // Reserve an accepted query without timing-dependent sleeps or running Bazel.
+        let active = ActiveQuery::start(&app, false).unwrap();
+        for (status, body) in [
+            get("app", "&rejectWhenBusy=true"),
+            post(r#", "rejectWhenBusy":true"#),
+        ] {
+            assert_eq!(status, 503, "{body}");
+            assert_eq!(
+                body["error"],
+                "server busy: another query is already processing"
+            );
+        }
+        assert_eq!(app.active_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            app.workspace
+                .metrics
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .compute_slot_demand,
+            0
+        );
+
+        // Busy is per repository. Missing/false flags still allow the usual queuing.
+        for (status, body) in [
+            get("lib", "&rejectWhenBusy=true"),
+            get("app", ""),
+            get("app", "&rejectWhenBusy=false"),
+            get("app", "&rejectWhenBusy=TRUE"),
+            post(""),
+            post(r#", "rejectWhenBusy":false"#),
+        ] {
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(body["impactedTargets"], json!(["//app:one"]));
+        }
+        assert_eq!(app.active_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(lib.active_queries.load(Ordering::SeqCst), 0);
+        drop(active);
+        let (status, body) = get("app", "&rejectWhenBusy=true");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(app.active_queries.load(Ordering::SeqCst), 0);
+
+        // Simultaneous opt-in admissions must have exactly one winner. Keep its guard
+        // alive until both contenders have attempted admission.
+        let barrier = std::sync::Barrier::new(2);
+        let admitted = thread::scope(|scope| {
+            let workers = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let active = ActiveQuery::start(&app, true);
+                        barrier.wait();
+                        active.is_some()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .filter(|admitted| *admitted)
+                .count()
+        });
+        assert_eq!(admitted, 1);
+        assert_eq!(app.active_queries.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -4910,7 +5535,12 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         assert!(response.starts_with("HTTP/1.1 400"));
         assert!(response.contains("\"error\":"));
 
-        for body in ["", "not-json", r#"{"from":"","to":"b"}"#] {
+        for body in [
+            "",
+            "not-json",
+            r#"{"from":"","to":"b"}"#,
+            r#"{"from":"a","to":"b","rejectWhenBusy":"true"}"#,
+        ] {
             let response = request(
                 &state,
                 &format!(

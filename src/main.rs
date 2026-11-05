@@ -418,6 +418,10 @@ struct ServeArgs {
     #[arg(long = "requestTimeout", default_value_t = 0)]
     request_timeout: u64,
 
+    /// Enable Prometheus workspace demand tracking with this rolling window (e.g. 5s)
+    #[arg(long = "computeSlotDemandAvgWindow")]
+    compute_slot_demand_avg_window: Option<String>,
+
     #[arg(long = "cacheDir", value_parser = parse_normalized_path)]
     cache_dir: PathBuf,
 
@@ -1152,6 +1156,14 @@ impl ServeArgs {
         nexus_password: Option<String>,
         repositories: Vec<bazel_diff::server::Repository>,
     ) -> Result<bazel_diff::server::ServerConfig> {
+        let compute_slot_demand_average_window = self
+            .compute_slot_demand_avg_window
+            .as_deref()
+            .map(bazel_diff::server::parse_duration)
+            .transpose()?;
+        if compute_slot_demand_average_window.is_some_and(|window| window.is_zero()) {
+            bail!("--computeSlotDemandAvgWindow must be greater than 0s");
+        }
         if self.s3_bucket.is_some() && self.s3_endpoint.as_deref().is_some_and(str::is_empty) {
             bail!("--s3Endpoint must not be empty");
         }
@@ -1245,6 +1257,7 @@ impl ServeArgs {
             nexus_prefix: self.nexus_prefix.clone(),
             nexus_credentials,
             nexus_ca_cert: self.nexus_ca_cert.clone(),
+            compute_slot_demand_average_window,
         };
         bazel_diff::server::validate_partial_graph(&config)?;
         bazel_diff::server::repositories(&config)?;
@@ -1646,6 +1659,8 @@ mod tests {
             "--dependencyFingerprint",
             "--requestTimeout",
             "30",
+            "--computeSlotDemandAvgWindow",
+            "1m",
             "--cacheMaxAge",
             "7d",
             "--cacheMaxSize",
@@ -1673,6 +1688,10 @@ mod tests {
         assert!(config.track_deps);
         assert!(config.dependency_fingerprint);
         assert_eq!(config.request_timeout, Duration::from_secs(30));
+        assert_eq!(
+            config.compute_slot_demand_average_window,
+            Some(Duration::from_secs(60))
+        );
         assert_eq!(config.cache_max_age, Some(Duration::from_secs(7 * 86_400)));
         assert_eq!(config.cache_max_size, Some(10 * 1024u64.pow(3)));
         assert_eq!(config.cache_max_entries, Some(500));
@@ -2093,6 +2112,12 @@ mod tests {
             args.to_config(false).unwrap()
         };
         assert!(!serve_config(&[]).dependency_fingerprint);
+        assert_eq!(serve_config(&[]).compute_slot_demand_average_window, None);
+        assert_eq!(
+            serve_config(&["--computeSlotDemandAvgWindow", "5s"])
+                .compute_slot_demand_average_window,
+            Some(Duration::from_secs(5))
+        );
         assert!(serve_config(&["--dependencyFingerprint"]).dependency_fingerprint);
         assert!(serve_config(&["--dependencyFingerprint=true"]).dependency_fingerprint);
         assert!(!serve_config(&["--dependencyFingerprint=false"]).dependency_fingerprint);
@@ -2105,6 +2130,8 @@ mod tests {
             ("--cacheMaxAge", "7"),
             ("--cacheMaxSize", "huge"),
             ("--cachePruneInterval", "1hour"),
+            ("--computeSlotDemandAvgWindow", "0s"),
+            ("--computeSlotDemandAvgWindow", "invalid"),
         ] {
             let cli = parse(&[
                 "bazel-diff",

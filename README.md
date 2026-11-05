@@ -356,6 +356,10 @@ curl 'http://localhost:8080/dependency_edges?from=main&to=my-feature-branch'
 }
 ```
 
+Query endpoints accept `rejectWhenBusy=true` in GET query parameters or `"rejectWhenBusy": true`
+in a POST JSON body to return `503` if the selected repository already has an unfinished query.
+Omitting it or setting it to `false` preserves normal queueing; other repositories are unaffected.
+
 * `GET /metrics` — returns a JSON snapshot of the instance so callers and monitoring can see its
   identity, liveness, and cache size usage without scraping logs. Unlike the query endpoints it is
   never gated on readiness, so it still responds on an un-ready or lame-ducked instance (the `ready`
@@ -386,6 +390,12 @@ curl 'http://localhost:8080/metrics'
   "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
 }
 ```
+
+* `GET /metrics/prometheus` — exposes the Prometheus gauge `bazel_diff_compute_slot_demand_avg`
+  with a `repo` label (`default` for `serve`). It is the time-weighted rolling average of operations
+  holding or waiting for that repository's workspace lock, not CPU utilization. Configure the window
+  with `--computeSlotDemandAvgWindow` (default `5s`). The endpoint is available regardless of readiness;
+  the existing JSON `/metrics` is unchanged.
 
 ### Serving several repositories
 

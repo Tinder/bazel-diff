@@ -96,6 +96,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::external_macro_stack_uses_returned_source",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::fine_grained_bzlmod_repo",
                 "timeout": "moderate",
             },

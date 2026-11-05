@@ -762,6 +762,38 @@ fn diff_local(
 }
 
 #[test]
+fn external_macro_stack_uses_returned_source() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let base = copy_workspace("external_macro_stack");
+    let changed = copy_workspace("external_macro_stack");
+    edit(&changed.path().join("defs.bzl"), |text| {
+        text.replace(
+            "right, \"//conditions:default\": left",
+            "left, \"//conditions:default\": right",
+        )
+    });
+    assert_product(base.path(), "//:product", "product.txt", "left");
+    assert_product(changed.path(), "//:product", "product.txt", "right");
+    let impacted = diff_local(
+        base.path(),
+        changed.path(),
+        &[
+            "--fineGrainedHashExternalRepos=@bridge,@macros",
+            "--bazelStartupOptions=--ignore_all_rc_files",
+        ],
+    );
+    let contains = |name| {
+        impacted
+            .iter()
+            .any(|label| label.trim_start_matches('@') == name)
+    };
+    assert!(contains("//:uses_bridge"), "{impacted:?}");
+    assert!(!contains("//:unrelated"), "{impacted:?}");
+}
+
+#[test]
 fn returned_external_source_reaches_consumer() {
     let workspace = copy_workspace("returned_external_source");
     let output = tempfile::tempdir().unwrap();

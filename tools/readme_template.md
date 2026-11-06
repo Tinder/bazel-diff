@@ -674,7 +674,9 @@ A few inputs are normalized or extended on the way in:
 * Outside `--isolatedDependencyRoot`, ordinary query checks native aliases in repositories named
   by `--fineGrainedHashExternalRepos` or `--fineGrainedHashExternalReposFile` when returned inputs
   reach them. On Bazel 8 and later, a metadata query identifies missing `actual` targets and a
-  dependency query adds their dependencies and build files. Targets already returned are reused.
+  dependency query adds their dependencies and build files. Each reached native alias hashes its
+  evaluated `actual` binding, including the destination for each `select()` condition. Acquired
+  library rules also hash the BUILD and Starlark files that define them.
   Earlier Bazel versions skip this alias acquisition. Full source hashing with these repository
   options reads every returned regular external source file from Bazel's output base, including
   files in the primary query. The same read applies when no alias query runs. Partial mode and

@@ -112,6 +112,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::fine_aliases_track_the_selected_destination_with_fixed_inputs",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::fine_grained_bzlmod_repo",
                 "timeout": "moderate",
             },

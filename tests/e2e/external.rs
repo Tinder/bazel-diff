@@ -589,6 +589,95 @@ fn fine_aliases_acquire_hidden_libraries_and_definition_sources() {
 }
 
 #[test]
+fn fine_aliases_track_the_selected_destination_with_fixed_inputs() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    let output = tempfile::tempdir().unwrap();
+    edit(&root.join("library/BUILD.bazel"), |text| {
+        format!("{text}\nexports_files([\"other.txt\"])\n")
+    });
+    edit(&root.join("MODULE.bazel"), |text| {
+        text.replace(
+            r#"use_repo(aliases, "public")"#,
+            r#"use_repo(aliases, "public", "hidden")"#,
+        )
+    });
+    let mut snapshots = [Vec::new(), Vec::new()];
+    let first = "@hidden//:forward";
+    let other = "@library//:other.txt";
+    for (name, default, alternate, sibling, product) in [
+        ("base", first, other, first, "before"),
+        ("sibling", first, other, other, "before"),
+        ("swapped", other, first, other, "other"),
+    ] {
+        fs::write(
+            root.join("public.BUILD"),
+            format!(
+                r#"config_setting(name = "alt", values = {{"define": "choice=alt"}})
+alias(
+    name = "forward",
+    actual = select({{":alt": "{alternate}", "//conditions:default": "{default}"}}),
+    visibility = ["//visibility:public"],
+)
+alias(name = "sibling", actual = "{sibling}")
+"#
+            ),
+        )
+        .unwrap();
+        assert_product(root, "//:consumer", "consumer.txt", product);
+        for (idx, fine) in ["@public", "@public,@hidden,@library"]
+            .into_iter()
+            .enumerate()
+        {
+            let out = output.path().join(format!("{name}-{idx}.json"));
+            let edges = output.path().join(format!("{name}-{idx}-edges.json"));
+            let generated = generate(
+                root,
+                &out,
+                &[
+                    &format!("--fineGrainedHashExternalRepos={fine}"),
+                    "--bazelCommandOptions=--proto:output_rule_attrs=tags",
+                    "-d",
+                    edges.to_str().unwrap(),
+                ],
+            );
+            assert!(
+                generated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&generated.stderr)
+            );
+            let graph = dep_edges(&edges);
+            let key = graph
+                .keys()
+                .find(|k| k.ends_with("public//:forward"))
+                .unwrap();
+            snapshots[idx].push((hashes(&out)[key].clone(), graph[key].clone(), out));
+        }
+    }
+    for (idx, profile) in snapshots.into_iter().enumerate() {
+        let [(before, inputs, first), (unchanged, sibling_inputs, _), (after, swapped_inputs, second)] =
+            profile.as_slice()
+        else {
+            unreachable!()
+        };
+        assert_eq!(inputs, sibling_inputs);
+        assert_eq!(inputs, swapped_inputs);
+        assert_eq!(before.rsplit('~').next(), unchanged.rsplit('~').next());
+        assert_ne!(
+            before.rsplit('~').next(),
+            after.rsplit('~').next(),
+            "fine profile {idx}"
+        );
+        let out = output.path().join("impact.txt");
+        assert!(impacted(root, first, second, &out, &[]).status.success());
+        assert!(read_lines(&out).contains("//:consumer"));
+    }
+}
+
+#[test]
 fn fine_aliases_preserve_partial_rebuilds() {
     if !supports_mod_show_repo() {
         return;

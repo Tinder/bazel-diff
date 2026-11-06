@@ -1118,6 +1118,11 @@ A few inputs are normalized or extended on the way in:
   a `--bazelPath` naming a batch file, or Bazelisk running a workspace's `tools/bazel.bat`
   wrapper -- so on Windows each invocation is given at most 6 KiB of names. Set
   `BAZEL_DIFF_MOD_ARGUMENT_BYTE_BUDGET` to a byte count to change that on any platform.
+* A rule's **Starlark instantiation stack** hashes the `.bzl` and `.scl` files that instantiated it.
+  Absolute workspace paths are normalized to workspace-relative names. During full physical source
+  hashing, a returned and resolved external Starlark source is matched by its path and hashed under
+  its repository label. This preserves macro changes when a `select()` keeps the same input labels
+  but changes their branches. Unknown paths outside the workspace remain ignored.
 * A **dependency cycle** in the query graph (which a build never sees, but which rules_go's
   `go_context_data` and nogo analyzers form through non-dependency attributes) no longer fails
   hashing. The back edge is hashed from the entered target's own definition, with a one-line

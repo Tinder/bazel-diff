@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::num::NonZeroUsize;
@@ -312,7 +312,7 @@ fn hash_targets_with_environment(
     if options.partial_tree.is_some() && options.bazel.use_cquery {
         bail!("partial graph mode does not support --useCquery");
     }
-    let source_hasher = SourceHasher {
+    let mut source_hasher = SourceHasher {
         workspace: &options.bazel.workspace,
         tree: options.partial_tree.as_deref(),
         content_hashes: options.content_hashes.as_ref(),
@@ -341,6 +341,7 @@ fn hash_targets_with_environment(
                 .is_some_and(|rule| !rule.instantiation_stack.is_empty())
     });
     let package_bzl_seeds = if has_instantiation_stacks {
+        source_hasher.record_stack_sources(&targets, options.bazel.use_cquery)?;
         BTreeMap::new()
     } else {
         package_bzl_seeds(&targets, &source_hasher)?
@@ -947,7 +948,7 @@ struct HashContext<'a> {
     repository_input_digests: HashMap<String, (Vec<u8>, Sha256)>,
     seed_hash: DigestBytes,
     package_bzl_seeds: BTreeMap<String, DigestBytes>,
-    bzl_digests: HashMap<String, Option<DigestBytes>>,
+    bzl_digests: HashMap<String, Option<(String, DigestBytes)>>,
     always_affected_seed: DigestBytes,
     /// Targets already reported as the entry of a cycle, so each is warned about once.
     cycle_warnings: HashSet<String>,
@@ -1259,28 +1260,23 @@ impl HashContext<'_> {
         let paths = rule
             .instantiation_stack
             .iter()
-            .filter_map(|frame| frame.split(':').next())
-            .filter(|path| {
-                (path.ends_with(".bzl") || path.ends_with(".scl"))
-                    && !Path::new(path).is_absolute()
-                    && !path.starts_with("external/")
-                    && !path.starts_with('@')
-                    && !path.starts_with("../")
-            })
+            .map(|frame| starlark_stack_path(frame))
+            .filter(|path| path.ends_with(".bzl") || path.ends_with(".scl"))
             .collect::<BTreeSet<_>>();
-        let mut hasher = Sha256::new();
+        let mut sources = BTreeMap::new();
         for path in paths {
-            let digest = if let Some(cached) = self.bzl_digests.get(path) {
-                *cached
-            } else {
-                let digest = self.source_hasher.soft_digest(&format!("//{path}"), &[])?;
-                self.bzl_digests.insert(path.to_owned(), digest);
-                digest
+            let source = match self.bzl_digests.entry(path.to_owned()) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(self.source_hasher.stack_source(path)?),
             };
-            if let Some(digest) = digest {
-                hasher.update(path.as_bytes());
-                hasher.update(digest);
+            if let Some((label, digest)) = source {
+                sources.insert(label.clone(), *digest);
             }
+        }
+        let mut hasher = Sha256::new();
+        for (label, digest) in sources {
+            hasher.update(label.as_bytes());
+            hasher.update(digest);
         }
         Ok(Some(hasher.finalize().into()))
     }
@@ -1327,6 +1323,21 @@ fn source_seed(source: &SourceTarget) -> DigestBytes {
         hasher.update(subinclude.as_bytes());
     }
     hasher.finalize().into()
+}
+
+/// A stack location can omit its column and line; paths can contain colons.
+fn starlark_stack_path(frame: &str) -> &str {
+    let mut path = frame.rsplit_once(": ").map_or(frame, |(path, _)| path);
+    for _ in 0..2 {
+        let Some((prefix, suffix)) = path.rsplit_once(':') else {
+            break;
+        };
+        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            break;
+        }
+        path = prefix;
+    }
+    path
 }
 
 fn hash_seed_files(workspace: &Path, paths: &BTreeSet<PathBuf>) -> Result<DigestBytes> {
@@ -2016,6 +2027,79 @@ impl SourceHasher<'_> {
         self.digest(label, seed).map(Some)
     }
 
+    /// Resolves a Starlark stack path to a stable identifier and the existing source digest.
+    fn stack_source(&self, path: &str) -> Result<Option<(String, DigestBytes)>> {
+        if !Path::new(path).is_absolute() {
+            if path.starts_with("external/") || path.starts_with('@') || path.starts_with("../") {
+                return Ok(None);
+            }
+            return Ok(self
+                .soft_digest(&format!("//{path}"), &[])?
+                .map(|digest| (path.to_owned(), digest)));
+        }
+        if let Some(label) = self.external_resolver.stack_sources.get(Path::new(path)) {
+            let digest = self.digest_source(label, &[], true)?;
+            return Ok((digest != <DigestBytes>::from(Sha256::digest([])))
+                .then(|| (label.clone(), digest)));
+        }
+        let (Ok(absolute), Ok(workspace)) =
+            (fs::canonicalize(path), fs::canonicalize(self.workspace))
+        else {
+            return Ok(None);
+        };
+        let Ok(relative) = absolute.strip_prefix(workspace) else {
+            return Ok(None);
+        };
+        let Some(relative) = relative.to_str() else {
+            return Ok(None);
+        };
+        let relative = relative.replace('\\', "/");
+        Ok(self
+            .soft_digest(&format!("//{relative}"), &[])?
+            .map(|digest| (relative, digest)))
+    }
+
+    /// Binds resolved external stack paths to actual returned source labels.
+    fn record_stack_sources(&mut self, targets: &[Target], configured: bool) -> Result<()> {
+        self.external_resolver.stack_sources.clear();
+        if self.tree.is_some()
+            || self.content_hashes.is_some()
+            || !self.modified_filepaths.is_empty()
+        {
+            return Ok(());
+        }
+        let mut sources = HashMap::new();
+        for source in targets
+            .iter()
+            .filter_map(|target| target.source_file.as_option())
+        {
+            let label = &source.name;
+            if is_main_repo(label) || !(label.ends_with(".bzl") || label.ends_with(".scl")) {
+                continue;
+            }
+            let Some((path, _, _)) = self.resolve(label, configured)? else {
+                continue;
+            };
+            let path = self.workspace.join(path);
+            if !path.is_file() {
+                continue;
+            }
+            let label = self.external_resolver.canonical_source_label(label);
+            match sources.entry(path) {
+                Entry::Occupied(mut entry) => {
+                    if &label < entry.get() {
+                        entry.insert(label);
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(label);
+                }
+            }
+        }
+        self.external_resolver.stack_sources = sources;
+        Ok(())
+    }
+
     fn resolve(
         &self,
         label: &str,
@@ -2148,6 +2232,8 @@ fn metadata_owner_executable(metadata: &fs::Metadata) -> bool {
 #[derive(Clone, Default)]
 struct ExternalRepoResolver {
     scoped_sources: ScopedSources,
+    /// Resolved paths of returned external Starlark source files.
+    stack_sources: HashMap<PathBuf, String>,
     workspace: PathBuf,
     bazel: PathBuf,
     output_base: PathBuf,
@@ -2170,6 +2256,22 @@ struct ExternalRepoResolver {
 }
 
 impl ExternalRepoResolver {
+    fn canonical_source_label(&self, label: &str) -> String {
+        let Some((repo, target)) = label
+            .strip_prefix('@')
+            .and_then(|rest| rest.split_once("//"))
+        else {
+            return label.to_owned();
+        };
+        if repo.starts_with('@') {
+            return label.to_owned();
+        }
+        let Some(canonical) = self.repo_mapping().get(repo) else {
+            return label.to_owned();
+        };
+        format!("@@{canonical}//{target}")
+    }
+
     /// `output_base` is the one the query already got from `bazel info`; without it this asks.
     fn new(
         options: &BazelOptions,
@@ -3064,6 +3166,116 @@ esac
             let message = error.to_string();
             assert!(message.contains(label) && message.contains(loop_path.to_str().unwrap()));
         }
+    }
+
+    #[test]
+    fn starlark_stack_paths_preserve_optional_locations() {
+        for (frame, expected) in [
+            ("tools/defs.bzl:12:4: macro", "tools/defs.bzl"),
+            ("tools/defs.bzl:12: macro", "tools/defs.bzl"),
+            ("tools/defs.bzl: macro", "tools/defs.bzl"),
+            ("tools/defs.bzl", "tools/defs.bzl"),
+            (
+                r"C:\repo\tools\defs.bzl:12:4: macro",
+                r"C:\repo\tools\defs.bzl",
+            ),
+        ] {
+            assert_eq!(starlark_stack_path(frame), expected, "{frame}");
+        }
+    }
+
+    #[test]
+    fn absolute_stack_sources_use_stable_labels() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("tools")).unwrap();
+        let workspace_source = workspace.path().join("tools/defs.bzl");
+        fs::write(&workspace_source, "workspace").unwrap();
+        let external_source = output.path().join("external/dep+/defs.bzl");
+        fs::create_dir_all(external_source.parent().unwrap()).unwrap();
+        fs::write(&external_source, "external").unwrap();
+        let modified = BTreeSet::new();
+        let mut hasher = SourceHasher {
+            tree: None,
+            workspace: workspace.path(),
+            content_hashes: None,
+            modified_filepaths: &modified,
+            fine_grained_external_repos: BTreeSet::from(["dep_alias".to_owned()]),
+            external_resolver: ExternalRepoResolver {
+                output_base: output.path().to_path_buf(),
+                repo_mapping: Arc::new(OnceLock::from(HashMap::from([(
+                    "dep_alias".to_owned(),
+                    "dep+".to_owned(),
+                )]))),
+                ..Default::default()
+            },
+        };
+        let relative = hasher.stack_source("tools/defs.bzl").unwrap().unwrap();
+        assert_eq!(relative.0, "tools/defs.bzl");
+        assert_eq!(
+            relative,
+            hasher
+                .stack_source(workspace_source.to_str().unwrap())
+                .unwrap()
+                .unwrap()
+        );
+        hasher
+            .record_stack_sources(
+                &[
+                    source_target("@dep_alias//:defs.bzl", &[]),
+                    source_target("@@dep+//:defs.bzl", &[]),
+                ],
+                true,
+            )
+            .unwrap();
+        let (label, before) = hasher
+            .stack_source(external_source.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(label, "@@dep+//:defs.bzl");
+        fs::write(&external_source, "changed").unwrap();
+        let (_, after) = hasher
+            .stack_source(external_source.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_ne!(before, after);
+        #[cfg(unix)]
+        {
+            let alias = output.path().join("external/alias+/defs.bzl");
+            fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink("../dep+/defs.bzl", &alias).unwrap();
+            hasher
+                .record_stack_sources(
+                    &[
+                        source_target("@@dep+//:defs.bzl", &[]),
+                        source_target("@@alias+//:defs.bzl", &[]),
+                    ],
+                    true,
+                )
+                .unwrap();
+            assert_eq!(
+                hasher
+                    .stack_source(external_source.to_str().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                after
+            );
+            assert_eq!(
+                hasher
+                    .stack_source(alias.to_str().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                "@@alias+//:defs.bzl"
+            );
+        }
+        let outside = output.path().join("outside.bzl");
+        fs::write(&outside, "outside").unwrap();
+        assert!(hasher
+            .stack_source(outside.to_str().unwrap())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -85,6 +85,7 @@ pub fn configuration_fingerprint(
         hasher.update(b"queryToolchainImplementations=1\0");
     }
     hasher.update(b"stackSourcePaths=1\0");
+    hasher.update(b"localArchiveBuildFile=1\0");
     if let Some(root) = &options.bazel.isolated_dependency_root {
         hasher.update(b"isolatedDependencyRoot=");
         hasher.update(root.as_bytes());

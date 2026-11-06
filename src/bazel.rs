@@ -2391,7 +2391,7 @@ fn lower_repositories(
     workspace: &Path,
     transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>),
 ) -> Vec<Target> {
-    let workspace = RepositoryWorkspace::new(workspace);
+    let workspace = RepositoryWorkspace::from_repositories(workspace, &repositories);
     // A module the root cannot see has no apparent name there; its node is named by canonical
     // name, matching the `apparent_names` fallback below.
     let node_names = |canonical: &str| {
@@ -3097,7 +3097,7 @@ fn prepare_repository(
     // Resolve physical inputs using the original attribute values.
     let files = RepositoryFiles {
         tree_hash: local_repository_content_hash(repository, workspace.path),
-        inputs_hash: repository_local_inputs_hash(repository, workspace.path),
+        inputs_hash: repository_local_inputs_hash(repository, workspace),
     };
     normalize_workspace_attributes(&mut repository.attribute, &workspace.roots);
     files
@@ -3248,16 +3248,26 @@ fn repository_definition_hash(repository: &Repository, files: &RepositoryFiles) 
     hex::encode(hasher.finalize())
 }
 
-/// Hashes the contents of the main-repository files named by `repository`'s attributes, in label
-/// order. `None` when the attributes name no such file that exists in the workspace.
-fn repository_local_inputs_hash(repository: &Repository, workspace: &Path) -> Option<String> {
+/// Hash workspace inputs and the exact file named by a standard http_archive
+/// when Bazel identifies its source repository as a local checkout.
+fn repository_local_inputs_hash(
+    repository: &Repository,
+    workspace: &RepositoryWorkspace<'_>,
+) -> Option<String> {
     let mut hasher = Sha256::new();
     let mut hashed_any = false;
+    let mut record = |label: &str, digest: &[u8]| {
+        hasher.update(label.as_bytes());
+        hasher.update([0]);
+        hasher.update(digest);
+        hasher.update([0]);
+        hashed_any = true;
+    };
     for label in repository_local_input_labels(repository) {
         let Some(path) = crate::hash::main_repo_path(label) else {
             continue;
         };
-        let absolute = workspace.join(path);
+        let absolute = workspace.path.join(path);
         let mut content = Sha256::new();
         if absolute.is_file() {
             content.update(fs::read(&absolute).ok()?);
@@ -3266,16 +3276,15 @@ fn repository_local_inputs_hash(repository: &Repository, workspace: &Path) -> Op
         } else {
             continue;
         }
-        hasher.update(label.as_bytes());
-        hasher.update([0]);
-        hasher.update(content.finalize());
-        hasher.update([0]);
-        hashed_any = true;
+        record(label, &content.finalize());
+    }
+    if let Some((label, digest)) = workspace.archive_build_file(repository) {
+        record(label, &digest);
     }
     hashed_any.then(|| hex::encode(hasher.finalize()))
 }
 
-fn local_repository_content_hash(repository: &Repository, workspace: &Path) -> Option<String> {
+fn local_repository_root(repository: &Repository, workspace: &Path) -> Option<PathBuf> {
     if repository.repo_rule_name.as_deref() != Some("local_repository") {
         return None;
     }
@@ -3284,12 +3293,11 @@ fn local_repository_content_hash(repository: &Repository, workspace: &Path) -> O
         .iter()
         .find(|attribute| attribute.name == "path")
         .and_then(|attribute| attribute.string_value.as_deref())?;
-    let path = PathBuf::from(path);
-    let root = if path.is_absolute() {
-        path
-    } else {
-        workspace.join(path)
-    };
+    Some(workspace.join(path))
+}
+
+fn local_repository_content_hash(repository: &Repository, workspace: &Path) -> Option<String> {
+    let root = local_repository_root(repository, workspace)?;
     if !root.is_dir() {
         return None;
     }
@@ -3314,6 +3322,7 @@ fn local_repository_content_hash(repository: &Repository, workspace: &Path) -> O
 struct RepositoryWorkspace<'a> {
     path: &'a Path,
     roots: Vec<String>,
+    local_repositories: BTreeMap<String, PathBuf>,
 }
 
 impl<'a> RepositoryWorkspace<'a> {
@@ -3321,7 +3330,74 @@ impl<'a> RepositoryWorkspace<'a> {
         Self {
             path,
             roots: workspace_roots(path),
+            local_repositories: BTreeMap::new(),
         }
+    }
+
+    fn from_repositories(path: &'a Path, repositories: &[Repository]) -> Self {
+        let local_root = |repository: &Repository| {
+            use crate::proto::blaze_query::attribute::Discriminator;
+            // A user rule named local_repository need not map targets into path.
+            // Bazel 8.6 through 8.8 omits the bzl label only for native RuleClass keys.
+            if repository
+                .repo_rule_bzl_label
+                .as_deref()
+                .is_some_and(|label| label != "@@bazel_tools//tools/build_defs/repo:local.bzl")
+                || !repository
+                    .attribute
+                    .iter()
+                    .find(|a| a.name == "path")
+                    .is_some_and(|a| a.r#type == Discriminator::String)
+            {
+                return None;
+            }
+            local_repository_root(repository, path)
+        };
+        let mut workspace = Self::new(path);
+        for repository in repositories {
+            if let (Some(name), Some(root)) = (&repository.canonical_name, local_root(repository)) {
+                workspace.local_repositories.insert(name.clone(), root);
+            }
+        }
+        // The survey can return duplicate canonical names. A named input is only
+        // local when every record for its source agrees on the same checkout.
+        for repository in repositories {
+            if let Some(name) = &repository.canonical_name {
+                if workspace
+                    .local_repositories
+                    .get(name)
+                    .is_some_and(|root| local_root(repository).as_ref() != Some(root))
+                {
+                    workspace.local_repositories.remove(name);
+                }
+            }
+        }
+        workspace
+    }
+
+    fn archive_build_file<'r>(&self, repository: &'r Repository) -> Option<(&'r str, [u8; 32])> {
+        use crate::proto::blaze_query::attribute::Discriminator;
+        if repository.repo_rule_name.as_deref() != Some("http_archive")
+            || repository.repo_rule_bzl_label.as_deref()
+                != Some("@@bazel_tools//tools/build_defs/repo:http.bzl")
+        {
+            return None;
+        }
+        let label = repository
+            .attribute
+            .iter()
+            .find(|attr| attr.name == "build_file" && attr.r#type == Discriminator::Label)?
+            .string_value
+            .as_deref()?;
+        let (name, relative) = crate::hash::repository_input_path(label).ok()?;
+        if name.is_empty() {
+            return None;
+        }
+        let file = self.local_repositories.get(name)?.join(relative);
+        if !file.is_file() {
+            return None;
+        }
+        Some((label, Sha256::digest(fs::read(file).ok()?).into()))
     }
 }
 
@@ -4333,6 +4409,87 @@ mod tests {
     }
 
     #[test]
+    fn archive_build_file_hashes_only_its_named_local_repository_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("overlays");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("active"), "first").unwrap();
+        fs::write(source.join("neighbor"), "unrelated").unwrap();
+        let local = Repository {
+            canonical_name: Some("overlays+".into()),
+            repo_rule_name: Some("local_repository".into()),
+            attribute: vec![Attribute {
+                name: "path".into(),
+                r#type: attribute::Discriminator::String,
+                string_value: Some("overlays".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let workspace =
+            RepositoryWorkspace::from_repositories(directory.path(), std::slice::from_ref(&local));
+        let mut archive = Repository {
+            repo_rule_bzl_label: Some("@@bazel_tools//tools/build_defs/repo:http.bzl".into()),
+            repo_rule_name: Some("http_archive".into()),
+            attribute: vec![Attribute {
+                name: "build_file".into(),
+                r#type: attribute::Discriminator::Label,
+                string_value: Some("@@overlays+//:active".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let first = repository_local_inputs_hash(&archive, &workspace).unwrap();
+        fs::write(source.join("neighbor"), "changed").unwrap();
+        assert_eq!(
+            repository_local_inputs_hash(&archive, &workspace).unwrap(),
+            first
+        );
+        fs::write(source.join("active"), "second").unwrap();
+        assert_ne!(
+            repository_local_inputs_hash(&archive, &workspace).unwrap(),
+            first
+        );
+        for conflict in [
+            Repository {
+                repo_rule_bzl_label: Some("@@other+//:local.bzl".into()),
+                ..local.clone()
+            },
+            Repository {
+                attribute: vec![Attribute {
+                    name: "path".into(),
+                    r#type: attribute::Discriminator::String,
+                    string_value: Some("elsewhere".into()),
+                    ..Default::default()
+                }],
+                ..local.clone()
+            },
+            Repository {
+                attribute: vec![Attribute {
+                    name: "path".into(),
+                    r#type: attribute::Discriminator::Label,
+                    string_value: Some("overlays".into()),
+                    ..Default::default()
+                }],
+                ..local.clone()
+            },
+        ] {
+            for records in [
+                [local.clone(), conflict.clone()],
+                [conflict.clone(), local.clone()],
+            ] {
+                let ambiguous = RepositoryWorkspace::from_repositories(directory.path(), &records);
+                assert!(repository_local_inputs_hash(&archive, &ambiguous).is_none());
+            }
+        }
+        archive.attribute[0].r#type = attribute::Discriminator::String;
+        assert!(repository_local_inputs_hash(&archive, &workspace).is_none());
+        archive.attribute[0].r#type = attribute::Discriminator::Label;
+        archive.repo_rule_bzl_label = Some("@@other+//:http.bzl".into());
+        assert!(repository_local_inputs_hash(&archive, &workspace).is_none());
+    }
+
+    #[test]
     fn repository_hash_covers_main_repo_files_named_by_attributes() {
         let workspace = tempfile::tempdir().unwrap();
         fs::create_dir_all(workspace.path().join("third_party/overlay")).unwrap();
@@ -4386,18 +4543,25 @@ mod tests {
                 "//third_party:overlay",
             ])
         );
-        let baseline = repository_local_inputs_hash(&repository, workspace.path()).unwrap();
+        let baseline =
+            repository_local_inputs_hash(&repository, &RepositoryWorkspace::new(workspace.path()))
+                .unwrap();
         assert_eq!(
-            repository_local_inputs_hash(&repository, workspace.path()).unwrap(),
+            repository_local_inputs_hash(&repository, &RepositoryWorkspace::new(workspace.path()))
+                .unwrap(),
             baseline
         );
 
         // Patch content, the build file, and the overlay directory all reach the hash.
         fs::write(workspace.path().join("dep.patch"), "patch v2").unwrap();
-        let patched = repository_local_inputs_hash(&repository, workspace.path()).unwrap();
+        let patched =
+            repository_local_inputs_hash(&repository, &RepositoryWorkspace::new(workspace.path()))
+                .unwrap();
         assert_ne!(patched, baseline);
         fs::write(workspace.path().join("third_party/dep.BUILD"), "build v2").unwrap();
-        let rebuilt = repository_local_inputs_hash(&repository, workspace.path()).unwrap();
+        let rebuilt =
+            repository_local_inputs_hash(&repository, &RepositoryWorkspace::new(workspace.path()))
+                .unwrap();
         assert_ne!(rebuilt, patched);
         fs::write(
             workspace.path().join("third_party/overlay/BUILD.bazel"),
@@ -4405,7 +4569,8 @@ mod tests {
         )
         .unwrap();
         assert_ne!(
-            repository_local_inputs_hash(&repository, workspace.path()).unwrap(),
+            repository_local_inputs_hash(&repository, &RepositoryWorkspace::new(workspace.path()))
+                .unwrap(),
             rebuilt
         );
 
@@ -4433,7 +4598,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(repository_local_inputs_hash(&remote_only, workspace.path()).is_none());
+        assert!(repository_local_inputs_hash(
+            &remote_only,
+            &RepositoryWorkspace::new(workspace.path())
+        )
+        .is_none());
         let target = prepared_target(
             &remote_only,
             "dep",
@@ -4642,7 +4811,11 @@ mod tests {
             ..Default::default()
         };
 
-        let first = repository_local_inputs_hash(&patched("dep+"), workspace.path()).unwrap();
+        let first = repository_local_inputs_hash(
+            &patched("dep+"),
+            &RepositoryWorkspace::new(workspace.path()),
+        )
+        .unwrap();
         let targets = lower_repositories(
             vec![
                 Repository {
@@ -4664,7 +4837,11 @@ mod tests {
                 }
             },
         );
-        let second = repository_local_inputs_hash(&patched("dep+"), workspace.path()).unwrap();
+        let second = repository_local_inputs_hash(
+            &patched("dep+"),
+            &RepositoryWorkspace::new(workspace.path()),
+        )
+        .unwrap();
         assert_ne!(first, second);
         let observed: Vec<_> = targets
             .iter()

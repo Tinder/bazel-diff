@@ -1,0 +1,23 @@
+load(":tools.bzl", "use")
+
+toolchain_type(name = "type")
+
+toolchain(name = "registration", toolchain_type = ":type", toolchain = "@sdk//:implementation")
+
+use(name = "tool_user")
+
+genrule(
+    name = "plain",
+    srcs = ["@sdk//:payload"],
+    outs = ["plain.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+genrule(
+    name = "other",
+    srcs = ["@neighbor//:payload"],
+    outs = ["other.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+filegroup(name = "products", srcs = [":tool_user", ":plain", ":other"])

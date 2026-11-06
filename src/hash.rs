@@ -1444,12 +1444,9 @@ fn hash_directory_tree(hasher: &mut Sha256, root: &Path, strict: bool) -> Result
     Ok(())
 }
 
-/// Repository rules address the label's physical path, even when query calls it an alias.
-fn repository_input_digest(
-    workspace: &Path,
-    output_base: &Path,
-    label: &str,
-) -> Result<DigestBytes> {
+/// Resolve only complete canonical labels. Both ordinary archive overlays and
+/// isolated repository inputs use the physical path denoted by the label.
+pub(crate) fn repository_input_path(label: &str) -> Result<(&str, PathBuf)> {
     let (repo, target) = label
         .strip_prefix("@@")
         .and_then(|s| s.split_once("//"))
@@ -1470,6 +1467,16 @@ fn repository_input_digest(
     {
         bail!("invalid repository input path {label}");
     }
+    Ok((repo, external_label_path(target)))
+}
+
+/// Repository rules address the label's physical path, even when query calls it an alias.
+fn repository_input_digest(
+    workspace: &Path,
+    output_base: &Path,
+    label: &str,
+) -> Result<DigestBytes> {
+    let (repo, relative) = repository_input_path(label)?;
     let root = if repo.is_empty() {
         workspace.to_owned()
     } else {
@@ -1487,7 +1494,7 @@ fn repository_input_digest(
             root.display()
         );
     }
-    let path = root.join(external_label_path(target));
+    let path = root.join(relative);
     let mut digest = Sha256::new();
     match fs::metadata(&path) {
         Ok(metadata) => {

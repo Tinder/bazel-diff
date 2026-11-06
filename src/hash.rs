@@ -4154,13 +4154,7 @@ esac
         let log = workspace.path().join("bazel.log");
         // No mapping at all, as in a WORKSPACE build: the directory is guessed from the
         // apparent name, with no `query` fallback for a guess that exists.
-        let bazel = stub_bazel(workspace.path(), &log, "");
-        let resolver = ExternalRepoResolver {
-            workspace: workspace.path().to_path_buf(),
-            bazel,
-            output_base,
-            ..Default::default()
-        };
+        let resolver = stub_resolver(workspace.path(), output_base, &log, "");
         assert_eq!(
             resolver.resolve("existing").unwrap(),
             external.join("existing+")
@@ -4189,17 +4183,12 @@ esac
         fs::create_dir_all(external.join("dep+")).unwrap();
         fs::create_dir_all(external.join("+_repo_rules+dep")).unwrap();
         let log = workspace.path().join("bazel.log");
-        let bazel = stub_bazel(
+        let resolver = stub_resolver(
             workspace.path(),
+            output_base,
             &log,
             r#"{"dep": "+_repo_rules+dep", "module_dep": "dep+"}"#,
         );
-        let resolver = ExternalRepoResolver {
-            workspace: workspace.path().to_path_buf(),
-            bazel,
-            output_base,
-            ..Default::default()
-        };
         assert_eq!(
             resolver.resolve("dep").unwrap(),
             external.join("+_repo_rules+dep")
@@ -4260,20 +4249,34 @@ esac
         );
     }
 
-    /// A stub `bazel` that appends its argv to `log` and prints `stdout`.
+    /// Invoke the installed shell instead of executing a just-written file while other
+    /// tests are spawning processes. The stub records only arguments sent by the resolver.
     #[cfg(unix)]
-    fn stub_bazel(directory: &Path, log: &Path, stdout: &str) -> PathBuf {
-        let script = directory.join("stub-bazel");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\necho \"$@\" >> {log}\ncat <<'STUB_EOF'\n{stdout}\nSTUB_EOF\n",
-                log = log.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        script
+    fn stub_resolver(
+        workspace: &Path,
+        output_base: PathBuf,
+        log: &Path,
+        stdout: &str,
+    ) -> ExternalRepoResolver {
+        ExternalRepoResolver {
+            workspace: workspace.to_owned(),
+            output_base,
+            bazel: "/bin/sh".into(),
+            startup_options: vec![
+                "-c".to_owned(),
+                r#"log=$1
+stdout=$2
+shift 2
+printf '%s\n' "$*" >> "$log"
+printf '%s\n' "$stdout"
+"#
+                .to_owned(),
+                "stub-bazel".to_owned(),
+                log.to_str().unwrap().to_owned(),
+                stdout.to_owned(),
+            ],
+            ..Default::default()
+        }
     }
 
     #[cfg(unix)]
@@ -4286,17 +4289,12 @@ esac
         let canonical = external.join("rules_req_compile++requirements+pip_deps");
         fs::create_dir_all(&canonical).unwrap();
         let log = workspace.path().join("bazel.log");
-        let bazel = stub_bazel(
+        let resolver = stub_resolver(
             workspace.path(),
+            output_base,
             &log,
             r#"{"pip_deps": "rules_req_compile++requirements+pip_deps"}"#,
         );
-        let resolver = ExternalRepoResolver {
-            workspace: workspace.path().to_path_buf(),
-            bazel,
-            output_base,
-            ..Default::default()
-        };
 
         for _ in 0..5 {
             assert_eq!(resolver.resolve("pip_deps").unwrap(), canonical);
@@ -4320,21 +4318,18 @@ esac
         let log = workspace.path().join("bazel.log");
         // The mapping has no entry for `queried`, so resolution falls through to
         // `bazel query`; the stub answers both with the same location line.
-        let bazel = stub_bazel(
+        let mut resolver = stub_resolver(
             workspace.path(),
+            output_base,
             &log,
             &format!(
                 "{}/queried+1.0/pkg/BUILD:1:1: source file @queried//pkg:BUILD",
                 external.display()
             ),
         );
-        let resolver = ExternalRepoResolver {
-            workspace: workspace.path().to_path_buf(),
-            bazel,
-            output_base,
-            startup_options: vec!["--max_idle_secs=17".to_owned()],
-            ..Default::default()
-        };
+        resolver
+            .startup_options
+            .push("--max_idle_secs=17".to_owned());
 
         for _ in 0..3 {
             assert_eq!(

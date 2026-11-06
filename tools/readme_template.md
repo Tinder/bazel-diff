@@ -558,7 +558,9 @@ Notes and operational guidance:
   the revision's git tree (packages below a tracked symlink or a submodule are not checked);
   otherwise the request fails, the error names the packages, and nothing is cached.
   `--allowUntrackedPackages` turns that into a warning for workspaces that generate `BUILD` files
-  outside git. `/metrics` counts rejections under `untrackedPackages`.
+  outside git. Use `--allowUntrackedPackages=//generated,//other` to allow only those exact
+  packages; other untracked packages still cause a rejection. `/metrics` counts rejections under
+  `untrackedPackages`.
 
 * Dependency fingerprinting (`--dependencyFingerprint`) is opt-in. When enabled, every generated
   cache entry records a fingerprint of the workspace's external-dependency state (the bzlmod module

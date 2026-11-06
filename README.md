@@ -558,7 +558,9 @@ Notes and operational guidance:
   the revision's git tree (packages below a tracked symlink or a submodule are not checked);
   otherwise the request fails, the error names the packages, and nothing is cached.
   `--allowUntrackedPackages` turns that into a warning for workspaces that generate `BUILD` files
-  outside git. `/metrics` counts rejections under `untrackedPackages`.
+  outside git. Use `--allowUntrackedPackages=//generated,//other` to allow only those exact
+  packages; other untracked packages still cause a rejection. `/metrics` counts rejections under
+  `untrackedPackages`.
 
 * Dependency fingerprinting (`--dependencyFingerprint`) is opt-in. When enabled, every generated
   cache entry records a fingerprint of the workspace's external-dependency state (the bzlmod module
@@ -903,8 +905,8 @@ Options:
           Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query` when the diff between them only edits regular source files; every entry then also records the hashing recipes that makes possible. Incompatible with --useCquery and --alwaysAffectedTags [default: false] [possible values: true, false]
       --partialGraphRebuildPattern <PARTIAL_GRAPH_REBUILD_PATTERNS>
           Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file name) of workspace paths whose change always forces a full generation under --partialGraph
-      --allowUntrackedPackages
-          Cache a revision whose bazel query loaded packages its git tree does not contain (untracked or ignored BUILD files in the working tree) instead of failing the request
+      --allowUntrackedPackages[=<ALLOW_UNTRACKED_PACKAGES>]
+          Allow all untracked packages, or only the comma-separated package labels provided
       --no-initial-fetch
           
       --warmupRevision <WARMUP_REVISIONS>
@@ -1013,8 +1015,8 @@ Options:
           Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query` when the diff between them only edits regular source files; every entry then also records the hashing recipes that makes possible. Incompatible with --useCquery and --alwaysAffectedTags [default: false] [possible values: true, false]
       --partialGraphRebuildPattern <PARTIAL_GRAPH_REBUILD_PATTERNS>
           Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file name) of workspace paths whose change always forces a full generation under --partialGraph
-      --allowUntrackedPackages
-          Cache a revision whose bazel query loaded packages its git tree does not contain (untracked or ignored BUILD files in the working tree) instead of failing the request
+      --allowUntrackedPackages[=<ALLOW_UNTRACKED_PACKAGES>]
+          Allow all untracked packages, or only the comma-separated package labels provided
       --no-initial-fetch
           
       --warmupRevision <WARMUP_REVISIONS>

@@ -102,6 +102,8 @@ pub struct ServerConfig {
     /// query loaded it from an untracked or ignored file and the entry would be cached under a
     /// revision it does not describe. With the flag the mismatch is logged and cached anyway.
     pub allow_untracked_packages: bool,
+    /// Exact main-repository packages exempt from the untracked package check.
+    pub allowed_untracked_packages: BTreeSet<String>,
     pub no_initial_fetch: bool,
     pub warmup_revisions: Vec<String>,
     pub cache_max_age: Option<Duration>,
@@ -2334,7 +2336,10 @@ fn check_tracked_packages(
     data: &HashFileData,
     tree: &TreeIndex,
 ) -> Result<()> {
-    let untracked = untracked_packages(data.hashes.keys().map(String::as_str), tree);
+    let untracked = untracked_packages(data.hashes.keys().map(String::as_str), tree)
+        .into_iter()
+        .filter(|package| !state.config.allowed_untracked_packages.contains(package))
+        .collect::<Vec<_>>();
     if untracked.is_empty() {
         return Ok(());
     }
@@ -2671,6 +2676,7 @@ mod tests {
             partial_graph: false,
             partial_graph_rebuild_patterns: Vec::new(),
             allow_untracked_packages: false,
+            allowed_untracked_packages: BTreeSet::new(),
             no_initial_fetch: true,
             warmup_revisions: Vec::new(),
             cache_max_age: None,
@@ -3443,6 +3449,18 @@ esac
             metrics(&service_of(&strict))["untrackedPackages"]["rejections"],
             1
         );
+
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.clone();
+        config.hash_options.bazel.bazel = bazel.clone();
+        config.hash_options.bazel.no_bazelrc = false;
+        config.cache_dir = cache.clone();
+        config.allowed_untracked_packages.insert("other".to_owned());
+        let selective = ready_state(config.clone(), None);
+        assert!(get_hashes_locked(&selective, &sha, &BTreeSet::new(), None).is_err());
+        config.allowed_untracked_packages.insert("pkg".to_owned());
+        let selective = ready_state(config, None);
+        assert!(get_hashes_locked(&selective, &sha, &BTreeSet::new(), None).is_ok());
 
         let lenient = state_with(true);
         let retrieval = get_hashes_locked(&lenient, &sha, &BTreeSet::new(), None).unwrap();

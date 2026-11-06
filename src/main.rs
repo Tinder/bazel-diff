@@ -465,10 +465,9 @@ struct ServeArgs {
     #[arg(long = "partialGraphRebuildPattern", value_delimiter = ',')]
     partial_graph_rebuild_patterns: Vec<String>,
 
-    /// Cache a revision whose bazel query loaded packages its git tree does not contain
-    /// (untracked or ignored BUILD files in the working tree) instead of failing the request
-    #[arg(long = "allowUntrackedPackages")]
-    allow_untracked_packages: bool,
+    /// Allow all untracked packages, or only the comma-separated package labels provided
+    #[arg(long = "allowUntrackedPackages", num_args = 0..=1, require_equals = true, default_missing_value = "*")]
+    allow_untracked_packages: Option<String>,
 
     #[arg(long = "no-initial-fetch")]
     no_initial_fetch: bool,
@@ -1133,6 +1132,29 @@ fn run_warmup_with(
     write_fingerprint(&fingerprint_args)
 }
 
+fn parse_allowed_untracked_packages(
+    value: Option<&str>,
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let mut packages = std::collections::BTreeSet::new();
+    if let Some(value) = value.filter(|value| *value != "*") {
+        for label in value.split(',') {
+            let package = label.strip_prefix("//").ok_or_else(|| {
+                anyhow::anyhow!("expected a package label starting with //: {label}")
+            })?;
+            if package.contains(':')
+                || (!package.is_empty()
+                    && package
+                        .split('/')
+                        .any(|part| part == "." || part == ".." || part.is_empty()))
+            {
+                anyhow::bail!("invalid package label: {label}");
+            }
+            packages.insert(package.to_owned());
+        }
+    }
+    Ok(packages)
+}
+
 impl ServeArgs {
     fn to_config(&self, verbose: bool) -> Result<bazel_diff::server::ServerConfig> {
         self.to_config_with_repositories(verbose, Vec::new())
@@ -1228,7 +1250,10 @@ impl ServeArgs {
                 .iter()
                 .map(|pattern| bazel_diff::partial::Glob::new(pattern))
                 .collect::<Result<Vec<_>>>()?,
-            allow_untracked_packages: self.allow_untracked_packages,
+            allow_untracked_packages: self.allow_untracked_packages.as_deref() == Some("*"),
+            allowed_untracked_packages: parse_allowed_untracked_packages(
+                self.allow_untracked_packages.as_deref(),
+            )?,
             no_initial_fetch: self.no_initial_fetch,
             warmup_revisions: self.warmup_revisions.clone(),
             cache_max_age: self
@@ -2019,12 +2044,32 @@ mod tests {
         assert!(!config.partial_graph);
         assert!(config.partial_graph_rebuild_patterns.is_empty());
         assert!(!config.allow_untracked_packages);
+        assert!(config.allowed_untracked_packages.is_empty());
         assert!(
             serve_args(&["--allowUntrackedPackages"])
                 .to_config(false)
                 .unwrap()
                 .allow_untracked_packages
         );
+
+        let config = serve_args(&["--allowUntrackedPackages=//pkg,//nested/pkg,//"])
+            .to_config(false)
+            .unwrap();
+        assert!(!config.allow_untracked_packages);
+        assert_eq!(
+            config
+                .allowed_untracked_packages
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["", "nested/pkg", "pkg"]
+        );
+        for invalid in ["pkg", "//pkg:target", "//pkg/../other", "//pkg,"] {
+            assert!(
+                serve_args(&[&format!("--allowUntrackedPackages={invalid}")])
+                    .to_config(false)
+                    .is_err()
+            );
+        }
 
         let config = serve_args(&[
             "--partialGraph",

@@ -338,6 +338,25 @@ fn hash_targets_with_environment(
             .collect(),
         external_resolver,
     };
+    if !options.bazel.use_cquery
+        && options.bazel.isolated_dependency_root.is_none()
+        && !options.bazel.fine_grained_external_repos.is_empty()
+        && options.partial_tree.is_none()
+        && options.content_hashes.is_none()
+        && options.modified_filepaths.is_empty()
+    {
+        source_hasher
+            .external_resolver
+            .scoped_sources
+            .queried_files
+            .extend(
+                targets
+                    .iter()
+                    .filter_map(|target| target.source_file.as_option())
+                    .filter(|source| !is_main_repo(&source.name))
+                    .map(|source| source.name.clone()),
+            );
+    }
     let seed_hash = hash_seed_files(&options.bazel.workspace, &options.seed_filepaths)?;
     let has_instantiation_stacks = targets.iter().any(|target| {
         target.r#type == target::Discriminator::Rule
@@ -2175,31 +2194,48 @@ impl SourceHasher<'_> {
                 let key = PathBuf::from("external").join(repo).join(&relative);
                 (relative, key)
             };
-            // A canonical source returned by cquery can be read directly, even when the
-            // repository was not queried as a fine-grained root.
-            if configured_source
-                && canonical
+            // Read physical files for returned dependency targets, including ordinary
+            // aliases whose destinations are outside the fine repository list. Soft labels
+            // and source overrides continue to use their normal resolver.
+            let observed = self
+                .external_resolver
+                .scoped_sources
+                .queried_files
+                .contains(label);
+            if (observed || (configured_source && canonical))
                 && !repo.is_empty()
                 && self.tree.is_none()
                 && self.content_hashes.is_none()
                 && self.modified_filepaths.is_empty()
             {
-                let (_, key) = paths();
-                let path = self.external_resolver.output_base.join(&key);
-                match fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_file() => {
-                        return Ok(Some((path, key.to_string_lossy().into_owned(), true)));
-                    }
-                    Ok(_) => {}
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                        ) => {}
-                    Err(e) => {
-                        return Err(e).with_context(|| {
-                            format!("failed to inspect source {} ({label})", path.display())
-                        })
+                let canonical_repo = if canonical {
+                    Some(repo)
+                } else {
+                    self.external_resolver
+                        .repo_mapping()
+                        .get(repo)
+                        .map(String::as_str)
+                };
+                if let Some(canonical_repo) = canonical_repo {
+                    let key = PathBuf::from("external")
+                        .join(canonical_repo)
+                        .join(external_label_path(target));
+                    let path = self.external_resolver.output_base.join(&key);
+                    match fs::metadata(&path) {
+                        Ok(metadata) if metadata.is_file() => {
+                            return Ok(Some((path, key.to_string_lossy().into_owned(), true)));
+                        }
+                        Ok(_) => {}
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                            ) => {}
+                        Err(e) => {
+                            return Err(e).with_context(|| {
+                                format!("failed to inspect source {} ({label})", path.display())
+                            })
+                        }
                     }
                 }
             }
@@ -2494,7 +2530,7 @@ impl ExternalRepoResolver {
 
 /// Parses `bazel mod dump_repo_mapping` output, one JSON object of apparent ->
 /// canonical repository names per line, into a flat map.
-fn parse_apparent_repo_mapping(text: &str) -> HashMap<String, String> {
+pub(crate) fn parse_apparent_repo_mapping(text: &str) -> HashMap<String, String> {
     let mut mapping = HashMap::new();
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
@@ -2787,12 +2823,20 @@ mod tests {
     #[cfg(unix)]
     fn generation_reuses_discovery_outputs() {
         let graph = r#"{"key":"<root>","name":"root","dependencies":[]}"#;
-        for extension_failure in [false, true] {
+        for (extension_failure, source_repo) in [
+            (false, "tool"),
+            (true, "tool"),
+            (false, "hidden"),
+            (true, "hidden"),
+        ] {
             let workspace = tempfile::tempdir().unwrap();
-            let external = workspace.path().join("external/local_config_tool");
+            let external = workspace
+                .path()
+                .join(format!("external/local_config_{source_repo}"));
             fs::create_dir_all(&external).unwrap();
             fs::write(external.join("input"), "mapped input").unwrap();
-            let target = source_target("@tool//:input", &[]);
+            let label = format!("@{source_repo}//:input");
+            let target = source_target(&label, &[]);
             let mut encoded = Vec::new();
             target.encode_length_delimited(&mut encoded);
             fs::write(workspace.path().join("targets.pb"), encoded).unwrap();
@@ -2809,7 +2853,7 @@ mod tests {
 case "$1 $2" in
   "mod dump_repo_mapping")
     printf '%s\n' mapping >> "$PWD/mapping-calls"
-    printf '%s\n' '{{"tool":"local_config_tool"}}'
+    printf '%s\n' '{{"tool":"local_config_tool","hidden":"local_config_hidden"}}'
     ;;
   "mod graph")
     printf '%s\n' graph >> "$PWD/graph-calls"
@@ -2845,7 +2889,7 @@ esac
             assert_eq!(
                 fs::read_to_string(&calls).unwrap().lines().count(),
                 1,
-                "extension_failure={extension_failure}"
+                "extension_failure={extension_failure}, source_repo={source_repo}"
             );
             assert_eq!(
                 fs::read_to_string(&mapping_calls).unwrap().lines().count(),
@@ -2853,7 +2897,7 @@ esac
                 "the resolver reuses the unfiltered root mapping"
             );
 
-            let direct = hash_targets(&options, vec![target]).unwrap();
+            let direct = hash_targets(&options, vec![target.clone()]).unwrap();
             assert_eq!(direct.hashes, generated.hashes);
             assert_eq!(direct.module_graph_json, generated.module_graph_json);
             assert_eq!(
@@ -2865,6 +2909,12 @@ esac
                 fs::read_to_string(&mapping_calls).unwrap().lines().count(),
                 2,
                 "direct hashing still reads the root mapping"
+            );
+            fs::write(external.join("input"), "changed input").unwrap();
+            let changed = hash_targets(&options, vec![target]).unwrap();
+            assert_ne!(
+                direct.hashes[&label].direct_hash,
+                changed.hashes[&label].direct_hash
             );
         }
     }

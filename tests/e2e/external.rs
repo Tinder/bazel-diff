@@ -433,6 +433,272 @@ fn label_only_extension_bump_does_not_reach_users_of_the_owner_or_its_dependents
     }
 }
 
+#[test]
+fn fine_aliases_acquire_hidden_libraries_and_definition_sources() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    fn external_key<V>(map: &std::collections::BTreeMap<String, V>, suffix: &str) -> String {
+        let keys = map
+            .keys()
+            .filter(|key| key.starts_with('@') && key.ends_with(suffix))
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 1, "expected one {suffix}: {keys:?}");
+        keys[0].as_str().to_owned()
+    }
+    fn direct(hash: &str) -> &str {
+        hash.rsplit_once('~').unwrap().1
+    }
+
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    let out = tempfile::tempdir().unwrap();
+    let build_path = root.join("library/BUILD.bazel");
+    let build = fs::read_to_string(&build_path).unwrap();
+    let implementation_path = root.join("library/defs/library.bzl");
+    let implementation = fs::read_to_string(&implementation_path).unwrap();
+    let unrelated_path = root.join("unrelated/rules.bzl");
+    let unrelated = fs::read_to_string(&unrelated_path).unwrap();
+    let modes: [(&str, &[&str]); 2] = [
+        ("fine", &["--fineGrainedHashExternalRepos=@public"]),
+        (
+            "excluded",
+            &[
+                "--fineGrainedHashExternalRepos=@public",
+                "--excludeExternalTargets",
+            ],
+        ),
+    ];
+    let mut snapshots = std::collections::BTreeMap::new();
+    for (state, data, other, unrelated_edit, product) in [
+        ("base", "before\n", false, false, "before"),
+        ("source", "after\n", false, false, "after"),
+        ("definition", "before\n", true, false, "other"),
+        ("implementation", "before\n", false, false, "other"),
+        ("unrelated", "before\n", false, true, "before"),
+    ] {
+        fs::write(root.join("library/data.txt"), data).unwrap();
+        fs::write(
+            &build_path,
+            if other {
+                build.replace("selected = \"data.txt\"", "selected = \"other.txt\"")
+            } else {
+                build.clone()
+            },
+        )
+        .unwrap();
+        fs::write(
+            &implementation_path,
+            if state == "implementation" {
+                implementation.replace(
+                    "file.basename == ctx.attr.selected",
+                    "file.basename != ctx.attr.selected",
+                )
+            } else {
+                implementation.clone()
+            },
+        )
+        .unwrap();
+        fs::write(
+            &unrelated_path,
+            format!(
+                "{unrelated}{}",
+                if unrelated_edit {
+                    "\n# unrelated edit\n"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .unwrap();
+        assert_product(root, "//:consumer", "consumer.txt", product);
+        for (mode, flags) in modes {
+            let hashes = out.path().join(format!("{state}-{mode}.json"));
+            let edges = out.path().join(format!("{state}-{mode}-edges.json"));
+            let mut args = flags.to_vec();
+            args.extend(["--includeTargetType", "-d", edges.to_str().unwrap()]);
+            let generated = generate(root, &hashes, &args);
+            assert!(
+                generated.status.success(),
+                "{state} {mode}: {}",
+                String::from_utf8_lossy(&generated.stderr)
+            );
+            snapshots.insert((state, mode), (hashes, edges));
+        }
+    }
+    for (mode, _) in modes {
+        for (state, expected) in [
+            ("source", true),
+            ("definition", true),
+            ("implementation", true),
+            ("unrelated", false),
+        ] {
+            let result = out.path().join(format!("{state}-{mode}-impact.txt"));
+            let impact = impacted(
+                root,
+                &snapshots[&("base", mode)].0,
+                &snapshots[&(state, mode)].0,
+                &result,
+                &[],
+            );
+            assert!(
+                impact.status.success(),
+                "{state} {mode}: {}",
+                String::from_utf8_lossy(&impact.stderr)
+            );
+            let selected = read_lines(&result);
+            assert_eq!(
+                selected.contains("//:consumer"),
+                expected,
+                "{state} {mode}: {selected:?}"
+            );
+            if state == "unrelated" {
+                assert!(selected.contains("//unrelated:probe"));
+            }
+        }
+        let base = hashes(&snapshots[&("base", mode)].0);
+        let source = hashes(&snapshots[&("source", mode)].0);
+        let definition = hashes(&snapshots[&("definition", mode)].0);
+        let data = external_key(&base, "library//:data.txt");
+        let other = external_key(&base, "library//:other.txt");
+        let build = external_key(&base, "library//:BUILD.bazel");
+        let library_hash = external_key(&base, "library//:lib");
+        assert_ne!(direct(&base[&data]), direct(&source[&data]));
+        assert_ne!(direct(&base[&library_hash]), direct(&source[&library_hash]));
+        assert_eq!(direct(&base[&other]), direct(&source[&other]));
+        assert_eq!(direct(&base[&build]), direct(&source[&build]));
+        assert_ne!(direct(&base[&build]), direct(&definition[&build]));
+        assert_eq!(direct(&base[&data]), direct(&definition[&data]));
+
+        let implementation = hashes(&snapshots[&("implementation", mode)].0);
+        let bzl = external_key(&base, "library//defs:library.bzl");
+        assert_ne!(direct(&base[&bzl]), direct(&implementation[&bzl]));
+        for file in [&build, &data, &other] {
+            assert_eq!(direct(&base[file]), direct(&implementation[file]));
+        }
+
+        let edges = dep_edges(&snapshots[&("base", mode)].1);
+        let public = external_key(&edges, "public//:forward");
+        let hidden = external_key(&edges, "hidden//:forward");
+        let library = external_key(&edges, "library//:lib");
+        assert!(edges["//:consumer"].contains(&public));
+        assert!(edges[&public].contains(&hidden));
+        assert!(edges[&hidden].contains(&library));
+        external_key(&base, "hidden//:BUILD.bazel");
+    }
+}
+
+#[test]
+fn fine_aliases_preserve_partial_rebuilds() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    assert_product(root, "//:consumer", "consumer.txt", "before");
+    init_git(root);
+    let out = tempfile::tempdir().unwrap();
+    let partial = |name: &str, base: Option<&std::path::Path>| {
+        let hashes = out.path().join(format!("{name}.json"));
+        let edges = out.path().join(format!("{name}-edges.json"));
+        let edge_arg = edges.display().to_string();
+        let base_arg = base.map(|path| path.display().to_string());
+        let mut args = vec![
+            "--fineGrainedHashExternalRepos=@public",
+            "--excludeExternalTargets",
+            "--partialGraph",
+            "-d",
+            &edge_arg,
+        ];
+        if let Some(base) = &base_arg {
+            args.extend(["--baseHashes", base]);
+        }
+        let result = generate(root, &hashes, &args);
+        let log = String::from_utf8_lossy(&result.stderr).into_owned();
+        assert!(result.status.success(), "{name}: {log}");
+        (hashes, edges, log)
+    };
+    partial("warm", None);
+    if !git(root, &["status", "--porcelain"]).is_empty() {
+        commit(root, "settle repository metadata");
+    }
+    let lock_path = root.join("MODULE.bazel.lock");
+    let lock = fs::read(&lock_path).unwrap();
+    let (base, _, _) = partial("base", None);
+    assert_eq!(fs::read(&lock_path).unwrap(), lock);
+    fs::write(root.join("library/data.txt"), "after\n").unwrap();
+    assert_product(root, "//:consumer", "consumer.txt", "after");
+    assert_eq!(fs::read(&lock_path).unwrap(), lock);
+    assert_eq!(git(root, &["diff", "--name-only"]), "library/data.txt");
+    assert!(git(root, &["ls-files", "--others", "--exclude-standard"]).is_empty());
+    let (reused, reused_edges, log) = partial("reused", Some(&base));
+    assert!(
+        log.contains("full generation")
+            && log.contains("read while loading")
+            && log.contains("library"),
+        "{log}"
+    );
+    let (fresh, fresh_edges, _) = partial("fresh", None);
+    assert_eq!(fs::read(&reused).unwrap(), fs::read(&fresh).unwrap());
+    assert_eq!(dep_edges(&reused_edges), dep_edges(&fresh_edges));
+    assert!(dep_edges(&fresh_edges).iter().any(|(label, inputs)| {
+        label.ends_with("hidden//:forward")
+            && inputs.iter().any(|input| input.ends_with("library//:lib"))
+    }));
+    let selected = out.path().join("selected.txt");
+    let result = impacted(root, &base, &reused, &selected, &[]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(read_lines(&selected).contains("//:consumer"));
+}
+
+#[test]
+fn fine_aliases_honor_query_failure_mode() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    edit(&root.join("public.BUILD"), |text| {
+        format!("{text}\nalias(name = \"dangling\", actual = \"@hidden//:missing\")\n")
+    });
+    edit(&root.join("BUILD.bazel"), |text| {
+        format!("{text}\nfilegroup(name = \"uses_dangling\", srcs = [\"@public//:dangling\"])\n")
+    });
+    let out = tempfile::tempdir().unwrap();
+    let strict = out.path().join("strict.json");
+    let flags = [
+        "--fineGrainedHashExternalRepos=@public",
+        "--excludeExternalTargets",
+    ];
+    let result = generate(root, &strict, &flags);
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{error}");
+    assert!(
+        error.contains("failed to acquire ordinary alias inputs") && error.contains("//:missing"),
+        "{error}"
+    );
+    assert!(!strict.exists());
+
+    let kept = out.path().join("kept.json");
+    let edges = out.path().join("kept-edges.json");
+    let mut args = flags.to_vec();
+    args.extend(["--keep_going", "-d", edges.to_str().unwrap()]);
+    let result = generate(root, &kept, &args);
+    let warning = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{warning}");
+    assert!(
+        warning.contains("keeping ordinary repository fallbacks for incomplete alias discovery"),
+        "{warning}"
+    );
+    assert!(!dep_edges(&edges)
+        .keys()
+        .any(|label| label.ends_with("hidden//:forward")));
+}
+
 const ISOLATED_ROOT: &[&str] = &["--isolatedDependencyRoot", "@hub"];
 
 fn assert_product(workspace: &std::path::Path, target: &str, file: &str, expected: &str) {

@@ -1076,6 +1076,16 @@ A few inputs are normalized or extended on the way in:
 
 * A source label that names a **directory** hashes the whole tree (entry names, kinds, file
   contents and executable bits, symlink targets), so an edit inside it impacts its consumers.
+* Outside `--isolatedDependencyRoot`, ordinary query checks native aliases in repositories named
+  by `--fineGrainedHashExternalRepos` or `--fineGrainedHashExternalReposFile` when returned inputs
+  reach them. On Bazel 8 and later, a metadata query identifies missing `actual` targets and a
+  dependency query adds their dependencies and build files. Targets already returned are reused.
+  Earlier Bazel versions skip this alias acquisition. Full source hashing with these repository
+  options reads every returned regular external source file from Bazel's output base, including
+  files in the primary query. The same read applies when no alias query runs. Partial mode and
+  source overrides use repository inputs for files outside the named repositories.
+  A supplemental query failure stops strict generation. With `--keep_going`, generation reports
+  the failure and uses the primary target graph.
 * A **repository rule** (`//external:*`) that pins its download with `sha256` or `integrity` is
   hashed without its `url`/`urls`, since a mirror or registry move cannot change what it fetches.
   The main-repository files its attributes name -- patches, build files, lock files -- are hashed

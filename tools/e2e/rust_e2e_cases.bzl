@@ -100,6 +100,18 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::fine_aliases_acquire_hidden_libraries_and_definition_sources",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_aliases_honor_query_failure_mode",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_aliases_preserve_partial_rebuilds",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::fine_grained_bzlmod_repo",
                 "timeout": "moderate",
             },

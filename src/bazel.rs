@@ -541,6 +541,23 @@ impl BazelOptions {
             }
             scope.connect_external_readers(&loads, &mut targets, &coverage)?;
         }
+        if !self.use_cquery
+            && !self.fine_grained_external_repos.is_empty()
+            && self.isolated_dependency_root.is_none()
+        {
+            if let Err(error) = self.acquire_alias_inputs(
+                &mut targets,
+                root_mapping.as_deref(),
+                version,
+                &mut transform,
+            ) {
+                self.check_cancelled()?;
+                if !self.keep_going {
+                    return Err(error).context("failed to acquire ordinary alias inputs");
+                }
+                eprintln!("[Warn] keeping ordinary repository fallbacks for incomplete alias discovery: {error:#}");
+            }
+        }
         self.check_failed_extension_references(
             &targets,
             &mut failed_extensions,
@@ -561,8 +578,199 @@ impl BazelOptions {
                     .chain(scope.members.iter().cloned())
                     .collect(),
                 repository_inputs: scope.repository_inputs,
+                queried_files: HashSet::new(),
             },
         })
+    }
+
+    /// A fine repository may expose libraries in other repositories through aliases. Follow
+    /// actual targets of aliases used by the ordinary graph, without enrolling more namespaces.
+    fn acquire_alias_inputs(
+        &self,
+        targets: &mut Vec<Target>,
+        root_mapping: Option<&[u8]>,
+        version: Option<BazelVersion>,
+        transform: &mut impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) -> Result<()> {
+        let mapping = root_mapping
+            .map(|raw| crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(raw)))
+            .unwrap_or_default();
+        let fine: HashSet<_> = self
+            .fine_grained_external_repos
+            .iter()
+            .map(|repo| {
+                let name = repo.trim_start_matches('@');
+                if repo.starts_with("@@") {
+                    name
+                } else {
+                    mapping.get(name).map_or(name, String::as_str)
+                }
+            })
+            .collect();
+        let fine_target = |name: &str| {
+            name.strip_prefix('@')
+                .and_then(|name| name.split_once("//"))
+                .is_some_and(|(repo, _)| {
+                    let canonical = repo
+                        .strip_prefix('@')
+                        .unwrap_or_else(|| mapping.get(repo).map_or(repo, String::as_str));
+                    fine.contains(canonical)
+                })
+        };
+        let mut primary = HashSet::new();
+        let mut inside = HashMap::new();
+        let mut queue = Vec::new();
+        for row in targets.iter() {
+            let Some(name) = target_name(row) else {
+                continue;
+            };
+            let id = canonical_query_label(name, &mapping);
+            primary.insert(id.clone());
+            if fine_target(name) {
+                inside.insert(id, row);
+            } else if !main_repo_label_key(name).starts_with("//external:") {
+                queue.extend(target_inputs(row).filter(|s| fine_target(s)));
+            }
+        }
+        let mut walked = HashSet::new();
+        let mut aliases = BTreeSet::new();
+        while let Some(input) = queue.pop() {
+            let id = canonical_query_label(input, &mapping);
+            if !walked.insert(id.clone()) {
+                continue;
+            }
+            let Some(&row) = inside.get(&id) else {
+                continue;
+            };
+            if let Some(rule) = row.rule.as_option().filter(|r| r.rule_class == "alias") {
+                if rule
+                    .rule_input
+                    .iter()
+                    .any(|label| !primary.contains(&canonical_query_label(label, &mapping)))
+                {
+                    aliases.insert(rule.name.clone());
+                }
+            }
+            queue.extend(target_inputs(row).filter(|s| fine_target(s)));
+        }
+        if aliases.is_empty() {
+            return Ok(());
+        }
+        let version = match version {
+            Some(version) => version,
+            None => self.version()?,
+        };
+        // Bazel 7 does not expose the native rule class identity needed to distinguish aliases.
+        if version < BazelVersion(8, 0, 0) {
+            return Ok(());
+        }
+
+        // The caller may exclude actual from the attributes it wants to hash. Inspect this
+        // finite set separately; keep the original rows and their full select-condition inputs.
+        let mut metadata = self.clone();
+        metadata.keep_going = false;
+        metadata.command_options.extend([
+            "--nokeep_going".into(),
+            "--proto:output_rule_attrs=actual".into(),
+            "--proto:rule_classes".into(),
+            "--noproto:flatten_selects".into(),
+        ]);
+        let records = metadata.query_with(
+            &self.with_exclude_filter(query_set(&aliases)?),
+            false,
+            Some(version),
+            &mut |_| {},
+        )?;
+        let mut missing = BTreeSet::new();
+        let mut forwarders = BTreeSet::new();
+        for row in records {
+            let Some(rule) = row.rule.as_option() else {
+                continue;
+            };
+            if rule.rule_class_key.as_deref() != Some("alias") {
+                continue;
+            }
+            let Some(actual) = rule.attribute.iter().find(|attr| attr.name == "actual") else {
+                continue;
+            };
+            let destinations = actual.string_value.iter().chain(
+                actual
+                    .selector_list
+                    .as_option()
+                    .into_iter()
+                    .flat_map(|list| list.elements.iter())
+                    .flat_map(|s| s.entries.iter())
+                    .filter_map(|e| e.string_value.as_ref()),
+            );
+            for label in destinations.filter(|l| !l.is_empty()) {
+                if !primary.contains(&canonical_query_label(label, &mapping)) {
+                    forwarders.insert(rule.name.clone());
+                    missing.insert(label.clone());
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let expression = self.with_exclude_filter(format!(
+            "let needed = deps({}) in $needed + buildfiles($needed) + buildfiles({})",
+            query_set(&missing)?,
+            query_set(&forwarders)?
+        ));
+        let mut strict = self.clone();
+        strict.keep_going = false;
+        strict.command_options.push("--nokeep_going".into());
+        let extra = strict.query_with_filtered(
+            &expression,
+            false,
+            Some(version),
+            &mut |batch| transform(batch, None),
+            |row| {
+                target_name(row)
+                    .is_some_and(|name| !primary.contains(&canonical_query_label(name, &mapping)))
+            },
+        )?;
+        // Only the acquired rules and their forwarding aliases gain the authoritative
+        // definition inputs. Other rules in the workspace keep their existing graph.
+        let first = targets.len();
+        targets.extend(extra);
+        let mut definitions: HashMap<String, Vec<String>> = targets[first..]
+            .iter()
+            .filter_map(|row| row.rule.as_option().map(|r| &r.name))
+            .chain(forwarders.iter())
+            .filter_map(|name| name.rsplit_once(':'))
+            .map(|(package, _)| (package.to_owned(), Vec::new()))
+            .collect();
+        for row in targets.iter() {
+            let Some(source) = row.source_file.as_option() else {
+                continue;
+            };
+            let Some((package, "BUILD" | "BUILD.bazel")) = source.name.rsplit_once(':') else {
+                continue;
+            };
+            if let Some(inputs) = definitions.get_mut(package) {
+                inputs.push(source.name.clone());
+                inputs.extend(source.subinclude.iter().cloned());
+                inputs.sort_unstable();
+                inputs.dedup();
+            }
+        }
+        for (index, row) in targets.iter_mut().enumerate() {
+            let Some(rule) = row.rule.as_option_mut() else {
+                continue;
+            };
+            if index < first && !forwarders.contains(&rule.name) {
+                continue;
+            }
+            if let Some((package, _)) = rule.name.rsplit_once(':') {
+                if let Some(loads) = definitions.get(package) {
+                    rule.rule_input.extend(loads.iter().cloned());
+                    rule.rule_input.sort_unstable();
+                    rule.rule_input.dedup();
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `external_package` is whether `//external` exists, when known; `Some(false)` leaves it out
@@ -1460,6 +1668,17 @@ impl BazelOptions {
         version: Option<BazelVersion>,
         transform: &mut impl FnMut(&mut [Target]),
     ) -> Result<Vec<Target>> {
+        self.query_with_filtered(expression, use_cquery, version, transform, |_| true)
+    }
+
+    fn query_with_filtered(
+        &self,
+        expression: &str,
+        use_cquery: bool,
+        version: Option<BazelVersion>,
+        transform: &mut impl FnMut(&mut [Target]),
+        retain: impl Fn(&Target) -> bool,
+    ) -> Result<Vec<Target>> {
         let version = match version {
             Some(version) => version,
             None => self.version()?,
@@ -1528,7 +1747,7 @@ impl BazelOptions {
         let mut targets = if use_cquery {
             decode_cquery_stream(output_file.path(), streamed_cquery, transform)?
         } else {
-            decode_target_stream(output_file.path(), transform)?
+            decode_target_stream_filtered(output_file.path(), transform, retain)?
         };
         if let Some(compatible) = compatible {
             targets.retain(|target| {
@@ -1752,6 +1971,38 @@ fn query_labels<'a>(labels: impl Iterator<Item = &'a String>) -> Result<String> 
         })
         .collect::<Result<Vec<_>>>()
         .map(|labels| labels.join(" + "))
+}
+
+fn canonical_query_label<'a>(label: &'a str, mapping: &HashMap<String, String>) -> Cow<'a, str> {
+    let label = main_repo_label_key(label);
+    if let Some((repo, target)) = label.strip_prefix('@').and_then(|s| s.split_once("//")) {
+        if let Some(canonical) = mapping.get(repo) {
+            return Cow::Owned(format!("@@{canonical}//{target}"));
+        }
+    }
+    Cow::Borrowed(label)
+}
+
+fn target_inputs(target: &Target) -> impl Iterator<Item = &String> {
+    target
+        .rule
+        .as_option()
+        .into_iter()
+        .flat_map(|r| r.rule_input.iter())
+        .chain(
+            target
+                .generated_file
+                .as_option()
+                .map(|f| &f.generating_rule),
+        )
+}
+
+fn query_set(labels: &BTreeSet<String>) -> Result<String> {
+    let operands = labels
+        .iter()
+        .map(|label| query_labels(std::iter::once(label)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!("set({})", operands.join(" ")))
 }
 
 /// Coverage of the retained primary targets followed by any accepted supplement.
@@ -2258,6 +2509,7 @@ fn mod_argument_byte_budget_from(setting: Option<&str>) -> usize {
 pub(crate) struct ScopedSources {
     pub(crate) repositories: BTreeSet<String>,
     pub(crate) repository_inputs: BTreeSet<String>,
+    pub(crate) queried_files: HashSet<String>,
 }
 
 /// Targets with the accepted module graph and successful unfiltered root mapping from discovery.
@@ -2732,9 +2984,18 @@ fn read_raw_batch(reader: &mut impl BufRead, batch: &mut RawBatch) -> Result<boo
     Ok(!batch.bounds.is_empty())
 }
 
+#[cfg(test)]
 fn decode_target_stream(
     path: &Path,
     transform: &mut impl FnMut(&mut [Target]),
+) -> Result<Vec<Target>> {
+    decode_target_stream_filtered(path, transform, |_| true)
+}
+
+fn decode_target_stream_filtered(
+    path: &Path,
+    transform: &mut impl FnMut(&mut [Target]),
+    retain: impl Fn(&Target) -> bool,
 ) -> Result<Vec<Target>> {
     let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
     let mut targets = Vec::new();
@@ -2752,7 +3013,7 @@ fn decode_target_stream(
         let start = targets.len();
         targets.reserve(decoded.len());
         for lowered in decoded.drain(..) {
-            if let Some(target) = lowered? {
+            if let Some(target) = lowered?.filter(&retain) {
                 targets.push(target);
             }
         }
@@ -3042,7 +3303,9 @@ fn compact_target(target: &mut Target) {
             rule.DEPRECATED_public_by_default = None;
             rule.DEPRECATED_is_skylark = None;
             rule.definition_stack.clear();
-            rule.rule_class_key = None;
+            if rule.rule_class_key.as_deref() != Some("alias") {
+                rule.rule_class_key = None;
+            }
             rule.__buffa_unknown_fields.clear();
         }
         target::Discriminator::SourceFile => {

@@ -1238,6 +1238,31 @@ fn serve_rejects_packages_the_revision_does_not_track() {
         let server = ServerProcess::start(
             workspace.path(),
             cache.path(),
+            &["--allowUntrackedPackages=//keep"],
+        );
+        let (status, body) = server
+            .get(&format!("/impacted_targets?from={from}&to={to}"))
+            .unwrap();
+        assert_ne!(status, 200, "{body}");
+        assert!(body.contains("//keep/StaleTests"), "{body}");
+    }
+    {
+        let cache = tempfile::tempdir().unwrap();
+        let server = ServerProcess::start(
+            workspace.path(),
+            cache.path(),
+            &["--allowUntrackedPackages=//keep/StaleTests"],
+        );
+        let (status, body) = server
+            .get(&format!("/impacted_targets?from={from}&to={to}"))
+            .unwrap();
+        assert_eq!(status, 200, "{body}");
+    }
+    {
+        let cache = tempfile::tempdir().unwrap();
+        let server = ServerProcess::start(
+            workspace.path(),
+            cache.path(),
             &["--allowUntrackedPackages"],
         );
         let (status, body) = server

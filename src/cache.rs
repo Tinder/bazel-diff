@@ -91,7 +91,7 @@ pub fn configuration_fingerprint(
         && !options.bazel.fine_grained_external_repos.is_empty()
         && options.bazel.isolated_dependency_root.is_none()
     {
-        hasher.update(b"fineAliasInputs=1\0");
+        hasher.update(b"fineAliasInputs=2\0");
     }
     if let Some(root) = &options.bazel.isolated_dependency_root {
         hasher.update(b"isolatedDependencyRoot=");

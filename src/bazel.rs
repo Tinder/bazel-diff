@@ -643,13 +643,7 @@ impl BazelOptions {
                 continue;
             };
             if let Some(rule) = row.rule.as_option().filter(|r| r.rule_class == "alias") {
-                if rule
-                    .rule_input
-                    .iter()
-                    .any(|label| !primary.contains(&canonical_query_label(label, &mapping)))
-                {
-                    aliases.insert(rule.name.clone());
-                }
+                aliases.insert(rule.name.clone());
             }
             queue.extend(target_inputs(row).filter(|s| fine_target(s)));
         }
@@ -667,77 +661,90 @@ impl BazelOptions {
 
         // The caller may exclude actual from the attributes it wants to hash. Inspect this
         // finite set separately; keep the original rows and their full select-condition inputs.
-        let mut metadata = self.clone();
-        metadata.keep_going = false;
-        metadata.command_options.extend([
-            "--nokeep_going".into(),
-            "--proto:output_rule_attrs=actual".into(),
-            "--proto:rule_classes".into(),
-            "--noproto:flatten_selects".into(),
-        ]);
-        let records = metadata.query_with(
-            &self.with_exclude_filter(query_set(&aliases)?),
+        let mut bindings = self.alias_actuals(&aliases, version)?;
+        if bindings.is_empty() {
+            return Ok(());
+        }
+        let mut missing = BTreeSet::new();
+        for actual in bindings.values() {
+            for destination in actual
+                .string_value
+                .iter()
+                .chain(
+                    actual
+                        .selector_list
+                        .as_option()
+                        .into_iter()
+                        .flat_map(|list| &list.elements)
+                        .flat_map(|selector| &selector.entries)
+                        .filter_map(|e| e.string_value.as_ref()),
+                )
+                .filter(|label| !label.is_empty())
+            {
+                if !primary.contains(&canonical_query_label(destination, &mapping)) {
+                    missing.insert(destination.clone());
+                }
+            }
+        }
+        let mut strict = self.clone();
+        strict.keep_going = false;
+        strict
+            .command_options
+            .extend(["--nokeep_going".into(), "--proto:rule_classes".into()]);
+        let extra = if missing.is_empty() {
+            Vec::new()
+        } else {
+            let expression = self.with_exclude_filter(format!(
+                "let needed = deps({}) in $needed + buildfiles($needed)",
+                query_set(&missing)?
+            ));
+            strict.query_with_filtered(
+                &expression,
+                false,
+                Some(version),
+                &mut |batch| transform(batch, None),
+                |row| {
+                    target_name(row).is_some_and(|name| {
+                        !primary.contains(&canonical_query_label(name, &mapping))
+                    })
+                },
+            )?
+        };
+        let new_aliases = extra
+            .iter()
+            .filter_map(|target| target.rule.as_option())
+            .filter(|r| r.rule_class_key.as_deref() == Some("alias"))
+            .map(|r| r.name.clone())
+            .collect();
+        bindings.extend(self.alias_actuals(&new_aliases, version)?);
+        // Primary and supplemental rows may have been prehashed, which releases their
+        // projected attributes. Re-read only these native aliases with the original options,
+        // then use their evaluated actual, including the mapping of select keys to labels.
+        let names = bindings.keys().cloned().collect();
+        let mut aliases_with_attrs = strict.query_with(
+            &self.with_exclude_filter(query_set(&names)?),
             false,
             Some(version),
             &mut |_| {},
         )?;
-        let mut missing = BTreeSet::new();
-        let mut forwarders = BTreeSet::new();
-        for row in records {
-            let Some(rule) = row.rule.as_option() else {
-                continue;
-            };
-            if rule.rule_class_key.as_deref() != Some("alias") {
-                continue;
-            }
-            let Some(actual) = rule.attribute.iter().find(|attr| attr.name == "actual") else {
-                continue;
-            };
-            let destinations = actual.string_value.iter().chain(
-                actual
-                    .selector_list
-                    .as_option()
-                    .into_iter()
-                    .flat_map(|list| list.elements.iter())
-                    .flat_map(|s| s.entries.iter())
-                    .filter_map(|e| e.string_value.as_ref()),
-            );
-            for label in destinations.filter(|l| !l.is_empty()) {
-                if !primary.contains(&canonical_query_label(label, &mapping)) {
-                    forwarders.insert(rule.name.clone());
-                    missing.insert(label.clone());
+        let mut alias_attrs = HashMap::new();
+        for row in &mut aliases_with_attrs {
+            if let Some(rule) = row.rule.as_option_mut() {
+                if let Some(actual) = bindings.remove(&rule.name) {
+                    rule.attribute.retain(|attr| attr.name != "actual");
+                    rule.attribute.push(actual);
+                    alias_attrs.insert(rule.name.clone(), std::mem::take(&mut rule.attribute));
                 }
             }
         }
-        if missing.is_empty() {
-            return Ok(());
+        if !bindings.is_empty() {
+            bail!("Bazel did not return all observed forwarding aliases");
         }
-        let expression = self.with_exclude_filter(format!(
-            "let needed = deps({}) in $needed + buildfiles($needed) + buildfiles({})",
-            query_set(&missing)?,
-            query_set(&forwarders)?
-        ));
-        let mut strict = self.clone();
-        strict.keep_going = false;
-        strict.command_options.push("--nokeep_going".into());
-        let extra = strict.query_with_filtered(
-            &expression,
-            false,
-            Some(version),
-            &mut |batch| transform(batch, None),
-            |row| {
-                target_name(row)
-                    .is_some_and(|name| !primary.contains(&canonical_query_label(name, &mapping)))
-            },
-        )?;
-        // Only the acquired rules and their forwarding aliases gain the authoritative
-        // definition inputs. Other rules in the workspace keep their existing graph.
         let first = targets.len();
         targets.extend(extra);
         let mut definitions: HashMap<String, Vec<String>> = targets[first..]
             .iter()
             .filter_map(|row| row.rule.as_option().map(|r| &r.name))
-            .chain(forwarders.iter())
             .filter_map(|name| name.rsplit_once(':'))
             .map(|(package, _)| (package.to_owned(), Vec::new()))
             .collect();
@@ -759,7 +766,13 @@ impl BazelOptions {
             let Some(rule) = row.rule.as_option_mut() else {
                 continue;
             };
-            if index < first && !forwarders.contains(&rule.name) {
+            if let Some(attrs) = alias_attrs.remove(&rule.name) {
+                rule.attribute = attrs;
+                // Hash the alias rule itself. A generated BUILD can define unrelated siblings.
+                transform(std::slice::from_mut(row), None);
+                continue;
+            }
+            if index < first {
                 continue;
             }
             if let Some((package, _)) = rule.name.rsplit_once(':') {
@@ -771,6 +784,41 @@ impl BazelOptions {
             }
         }
         Ok(())
+    }
+
+    fn alias_actuals(
+        &self,
+        aliases: &BTreeSet<String>,
+        version: BazelVersion,
+    ) -> Result<BTreeMap<String, Attribute>> {
+        if aliases.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut metadata = self.clone();
+        metadata.keep_going = false;
+        metadata.command_options.extend([
+            "--nokeep_going".into(),
+            "--proto:output_rule_attrs=actual".into(),
+            "--proto:rule_classes".into(),
+            "--noproto:flatten_selects".into(),
+        ]);
+        let records = metadata.query_with(
+            &self.with_exclude_filter(query_set(aliases)?),
+            false,
+            Some(version),
+            &mut |_| {},
+        )?;
+        Ok(records
+            .into_iter()
+            .filter_map(|target| {
+                let rule = target.rule.into_option()?;
+                if rule.rule_class_key.as_deref() != Some("alias") {
+                    return None;
+                }
+                let actual = rule.attribute.into_iter().find(|a| a.name == "actual")?;
+                Some((rule.name, actual))
+            })
+            .collect())
     }
 
     /// `external_package` is whether `//external` exists, when known; `Some(false)` leaves it out

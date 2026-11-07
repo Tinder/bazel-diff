@@ -617,6 +617,15 @@ impl BazelOptions {
                     fine.contains(canonical)
                 })
         };
+        let ordinary_names: HashSet<_> = targets
+            .iter()
+            .filter_map(|row| row.rule.as_option())
+            .filter(|rule| rule.rule_class == "alias" && !fine_target(&rule.name))
+            .map(|rule| canonical_query_label(&rule.name, &mapping))
+            .collect();
+        let included = |name: &str| {
+            fine_target(name) || ordinary_names.contains(&canonical_query_label(name, &mapping))
+        };
         let mut primary = HashSet::new();
         let mut inside = HashMap::new();
         let mut queue = Vec::new();
@@ -626,14 +635,17 @@ impl BazelOptions {
             };
             let id = canonical_query_label(name, &mapping);
             primary.insert(id.clone());
-            if fine_target(name) {
+            let is_fine = fine_target(name);
+            if is_fine || ordinary_names.contains(&id) {
                 inside.insert(id, row);
-            } else if !main_repo_label_key(name).starts_with("//external:") {
-                queue.extend(target_inputs(row).filter(|s| fine_target(s)));
+            }
+            if !is_fine && !main_repo_label_key(name).starts_with("//external:") {
+                queue.extend(target_inputs(row).filter(|s| included(s)));
             }
         }
         let mut walked = HashSet::new();
         let mut aliases = BTreeSet::new();
+        let mut ordinary_aliases = BTreeSet::new();
         while let Some(input) = queue.pop() {
             let id = canonical_query_label(input, &mapping);
             if !walked.insert(id.clone()) {
@@ -643,9 +655,14 @@ impl BazelOptions {
                 continue;
             };
             if let Some(rule) = row.rule.as_option().filter(|r| r.rule_class == "alias") {
-                aliases.insert(rule.name.clone());
+                if fine_target(&rule.name) {
+                    aliases.insert(rule.name.clone());
+                } else {
+                    ordinary_aliases
+                        .insert(canonical_query_label(&rule.name, &mapping).into_owned());
+                }
             }
-            queue.extend(target_inputs(row).filter(|s| fine_target(s)));
+            queue.extend(target_inputs(row).filter(|s| included(s)));
         }
         if aliases.is_empty() {
             return Ok(());
@@ -667,20 +684,7 @@ impl BazelOptions {
         }
         let mut missing = BTreeSet::new();
         for actual in bindings.values() {
-            for destination in actual
-                .string_value
-                .iter()
-                .chain(
-                    actual
-                        .selector_list
-                        .as_option()
-                        .into_iter()
-                        .flat_map(|list| &list.elements)
-                        .flat_map(|selector| &selector.entries)
-                        .filter_map(|e| e.string_value.as_ref()),
-                )
-                .filter(|label| !label.is_empty())
-            {
+            for destination in alias_actual_values(actual) {
                 if !primary.contains(&canonical_query_label(destination, &mapping)) {
                     missing.insert(destination.clone());
                 }
@@ -691,7 +695,7 @@ impl BazelOptions {
         strict
             .command_options
             .extend(["--nokeep_going".into(), "--proto:rule_classes".into()]);
-        let extra = if missing.is_empty() {
+        let mut extra = if missing.is_empty() {
             Vec::new()
         } else {
             let expression = self.with_exclude_filter(format!(
@@ -710,6 +714,105 @@ impl BazelOptions {
                 },
             )?
         };
+        ordinary_aliases.extend(extra.iter().flat_map(target_inputs).filter_map(|input| {
+            let name = canonical_query_label(input, &mapping);
+            ordinary_names.contains(&name).then(|| name.into_owned())
+        }));
+        if !ordinary_aliases.is_empty() {
+            // Only a Rule row proves its package table was evaluated. buildfiles()
+            // can also return synthetic load-file rows from other packages.
+            let exposed: BTreeSet<_> = extra
+                .iter()
+                .filter_map(|row| row.rule.as_option())
+                .filter(|rule| main_repo_label_key(&rule.name).starts_with('@'))
+                .filter_map(|rule| {
+                    canonical_query_label(&rule.name, &mapping)
+                        .rsplit_once(':')
+                        .map(|(package, _)| package.to_owned())
+                })
+                .collect();
+            let extra_names: HashSet<_> = extra
+                .iter()
+                .filter_map(target_name)
+                .map(|name| canonical_query_label(name, &mapping))
+                .collect();
+            let missing_exposed = |name: &str| {
+                !primary.contains(name)
+                    && !extra_names.contains(name)
+                    && name
+                        .rsplit_once(':')
+                        .is_some_and(|(package, _)| exposed.contains(package))
+            };
+            let inspect = ordinary_aliases
+                .into_iter()
+                .filter(|name| {
+                    inside
+                        .get(name.as_str())
+                        .and_then(|row| row.rule.as_option())
+                        .is_some_and(|rule| {
+                            rule.rule_input.iter().any(|input| {
+                                missing_exposed(&canonical_query_label(input, &mapping))
+                            })
+                        })
+                })
+                .collect();
+            let mut requested = BTreeSet::new();
+            for (name, actual) in self.alias_actuals(&inspect, version)? {
+                requested.extend(alias_actual_values(&actual).filter_map(|child| {
+                    let child = canonical_query_label(child, &mapping);
+                    missing_exposed(&child).then(|| child.into_owned())
+                }));
+                bindings.insert(name, actual);
+            }
+            if !requested.is_empty() {
+                let packages: BTreeSet<_> = requested
+                    .iter()
+                    .filter_map(|name| name.rsplit_once(':').map(|(package, _)| package.to_owned()))
+                    .collect();
+                // A literal all-targets target can shadow the wildcard. Separate siblings
+                // expressions also avoid released Bazel's cross-repository package-path dedup.
+                let expression = packages
+                    .iter()
+                    .map(|package| {
+                        let pattern = format!("{package}:all-targets");
+                        query_labels(std::iter::once(&pattern))
+                            .map(|label| format!("siblings({label})"))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .join(" + ");
+                let records = strict.query_with(
+                    &self.with_exclude_filter(expression),
+                    false,
+                    Some(version),
+                    &mut |_| {},
+                )?;
+                let mut inventory: BTreeMap<_, _> = records
+                    .into_iter()
+                    .filter_map(|row| {
+                        let name = canonical_query_label(target_name(&row)?, &mapping).into_owned();
+                        name.rsplit_once(':')
+                            .is_some_and(|(package, _)| packages.contains(package))
+                            .then_some((name, row))
+                    })
+                    .collect();
+                let mut pending: Vec<_> = requested.into_iter().collect();
+                let mut rows = Vec::new();
+                while let Some(name) = pending.pop() {
+                    let Some(row) = inventory.remove(&name) else {
+                        continue;
+                    };
+                    pending.extend(
+                        target_inputs(&row)
+                            .map(|input| canonical_query_label(input, &mapping).into_owned()),
+                    );
+                    if !primary.contains(name.as_str()) && !extra_names.contains(name.as_str()) {
+                        rows.push(row);
+                    }
+                }
+                transform(&mut rows, None);
+                extra.extend(rows);
+            }
+        }
         let new_aliases = extra
             .iter()
             .filter_map(|target| target.rule.as_option())
@@ -2004,6 +2107,22 @@ struct IsolatedRepoScope {
     aliases: RepoMapping,
     // Typed labels addressed by the usage's repository rules, including non-source targets.
     repository_inputs: BTreeSet<String>,
+}
+
+fn alias_actual_values(actual: &Attribute) -> impl Iterator<Item = &String> {
+    actual
+        .string_value
+        .iter()
+        .chain(
+            actual
+                .selector_list
+                .as_option()
+                .into_iter()
+                .flat_map(|list| &list.elements)
+                .flat_map(|selector| &selector.entries)
+                .filter_map(|entry| entry.string_value.as_ref()),
+        )
+        .filter(|label| !label.is_empty())
 }
 
 fn query_labels<'a>(labels: impl Iterator<Item = &'a String>) -> Result<String> {

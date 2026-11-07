@@ -164,6 +164,14 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::main_alias_reaches_a_library_behind_an_external_alias",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::ordinary_alias_can_use_a_matcher_from_a_reached_external_package",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::remote_proto_bump_impacts_consumer",
                 "timeout": "moderate",
             },

@@ -750,6 +750,23 @@ fn fine_aliases_preserve_partial_rebuilds() {
         "{log}"
     );
     let (fresh, fresh_edges, _) = partial("fresh", None);
+    let saved_source = |path: &std::path::Path| {
+        let data: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let sources = data["metadata"]["partialGraph"]["externalSources"]
+            .as_object()
+            .expect("external source recipes");
+        let (label, digest) = sources
+            .iter()
+            .find(|(label, _)| label.ends_with("library//:data.txt"))
+            .expect("the library source behind the fine alias");
+        let hash = data["hashes"][label].as_str().expect("library source hash");
+        let direct = hash.rsplit_once('~').unwrap().1;
+        (digest.as_str().unwrap().to_owned(), direct.to_owned())
+    };
+    let (base_source, base_direct) = saved_source(&base);
+    let (fresh_source, fresh_direct) = saved_source(&fresh);
+    assert_ne!(base_source, fresh_source);
+    assert_ne!(base_direct, fresh_direct);
     assert_eq!(fs::read(&reused).unwrap(), fs::read(&fresh).unwrap());
     assert_eq!(dep_edges(&reused_edges), dep_edges(&fresh_edges));
     assert!(dep_edges(&fresh_edges).iter().any(|(label, inputs)| {

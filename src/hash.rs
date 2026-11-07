@@ -341,8 +341,7 @@ fn hash_targets_with_environment(
     if !options.bazel.use_cquery
         && options.bazel.isolated_dependency_root.is_none()
         && !options.bazel.fine_grained_external_repos.is_empty()
-        && options.partial_tree.is_none()
-        && options.content_hashes.is_none()
+        && (options.partial_tree.is_some() || options.content_hashes.is_none())
         && options.modified_filepaths.is_empty()
     {
         source_hasher
@@ -2209,12 +2208,12 @@ impl SourceHasher<'_> {
                 .scoped_sources
                 .queried_files
                 .contains(label);
-            if (observed || (configured_source && canonical))
-                && !repo.is_empty()
-                && self.tree.is_none()
-                && self.content_hashes.is_none()
-                && self.modified_filepaths.is_empty()
-            {
+            let read_physical = if self.tree.is_some() {
+                observed
+            } else {
+                self.content_hashes.is_none() && (observed || (configured_source && canonical))
+            };
+            if read_physical && !repo.is_empty() && self.modified_filepaths.is_empty() {
                 let canonical_repo = if canonical {
                     Some(repo)
                 } else {
@@ -2227,21 +2226,30 @@ impl SourceHasher<'_> {
                     let key = PathBuf::from("external")
                         .join(canonical_repo)
                         .join(external_label_path(target));
-                    let path = self.external_resolver.output_base.join(&key);
-                    match fs::metadata(&path) {
-                        Ok(metadata) if metadata.is_file() => {
-                            return Ok(Some((path, key.to_string_lossy().into_owned(), true)));
-                        }
-                        Ok(_) => {}
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                            ) => {}
-                        Err(e) => {
-                            return Err(e).with_context(|| {
-                                format!("failed to inspect source {} ({label})", path.display())
-                            })
+                    // A partial snapshot supplies Git blobs through the content map. Keep
+                    // its existing resolver when either spelling names a tracked content key.
+                    let from_git = self.content_hashes.is_some_and(|hashes| {
+                        hashes.contains_key(key.to_string_lossy().as_ref())
+                            || hashes.contains_key(paths().1.to_string_lossy().as_ref())
+                    });
+                    if !from_git {
+                        let path = self.external_resolver.output_base.join(&key);
+                        match fs::metadata(&path) {
+                            Ok(metadata) if metadata.is_file() => {
+                                return Ok(Some((path, key.to_string_lossy().into_owned(), true)));
+                            }
+                            Ok(_) => {}
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::NotFound
+                                        | std::io::ErrorKind::NotADirectory
+                                ) => {}
+                            Err(e) => {
+                                return Err(e).with_context(|| {
+                                    format!("failed to inspect source {} ({label})", path.display())
+                                })
+                            }
                         }
                     }
                 }

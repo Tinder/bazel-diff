@@ -679,8 +679,9 @@ A few inputs are normalized or extended on the way in:
   library rules also hash the BUILD and Starlark files that define them.
   Earlier Bazel versions skip this alias acquisition. Full source hashing with these repository
   options reads every returned regular external source file from Bazel's output base, including
-  files in the primary query. The same read applies when no alias query runs. Partial mode and
-  source overrides use repository inputs for files outside the named repositories.
+  files in the primary query. The same read applies when no alias query runs. Partial generation
+  records these digests for offline reuse. Source overrides use repository inputs for files
+  outside the named repositories.
   A supplemental query failure stops strict generation. With `--keep_going`, generation reports
   the failure and uses the primary target graph.
 * A **repository rule** (`//external:*`) that pins its download with `sha256` or `integrity` is

@@ -76,6 +76,48 @@ Pass the head edge file and `--toolchainCandidatesFile=possible.json` to `get-im
 
 These observations supplement an existing selection. The file reports `complete: false` even when `unresolved` is empty. Bazel versions differ in which implicit type dependencies they emit, and a registration priority change can switch the selected compiler while every observed target hash stays equal. Absence from this file cannot exclude a job.
 
+## Configured Root Hashing
+
+`--useCquery` normally combines every configured instance of a label into one
+hash. This can select a stable requested target when another root
+uses the same label with a different compiler or `select()` result.
+
+Use `--cqueryRootExpression` to report the instances Bazel selects for the
+requested roots:
+
+```bash
+bazel-diff generate-hashes -w /path/to/workspace -b bazel --useCquery \
+  --cqueryRootExpression='set(//app:test //lib:test)' \
+  --depEdgesFile deps.json final_hashes.json
+```
+
+Bazel resolves `config((expression), target)` separately at each revision;
+`bazel-diff` hashes their dependencies together. Root sets and fine repository
+lists may differ as targets and repositories appear or disappear. Keep different
+build or test profiles in separate comparisons, using their corresponding
+`--cqueryCommandOptions`.
+
+For a large expression, use `--cqueryRootExpressionFile roots.query`. Its UTF-8
+contents feed the same query and cache identity as the inline form. The file
+form keeps the expression out of the process argument list; a literal
+`--universe_scope` still uses that list, so omit it only when Bazel's inferred
+universe describes the intended profile. Both root options require
+`--useCquery` and conflict with `--cqueryExpression` and each other.
+
+The hash JSON contains only resolved bare root labels in `hashes`.
+`metadata.configuredRoots` version 1 stores the mapping from roots to instances
+and configured hashes; the usual flat edge file retains configured dependencies.
+Native impact results remain bare root labels, while distance and `explain`
+walks retain configured causes. Direct JSON consumers need the configured
+metadata and edge file to calculate distances. The edge file keeps its existing
+trusted companion contract. Native commands reject comparisons between legacy
+and configured root hashes.
+
+A verified empty selection produces an empty root artifact. Unresolved root
+identities and ambiguous bare keys fail generation. `bazel-diff` controls the
+cquery serialization needed for this model; other query filters still apply.
+Partial graph mode remains incompatible with cquery.
+
 ## Partial Graph Updates
 
 A full `generate-hashes` pays for a `bazel query` over the whole graph even when the change
@@ -725,6 +767,10 @@ Options:
           Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
+      --cqueryRootExpression <CQUERY_ROOT_EXPRESSION>
+          Hash and report the configured top-level targets in this expression
+      --cqueryRootExpressionFile <CQUERY_ROOT_EXPRESSION_FILE>
+          Read the configured root expression from this file
       --cqueryExpression <CQUERY_EXPRESSION>
           
   -k, --keep_going[=<KEEP_GOING>]
@@ -887,6 +933,10 @@ Options:
           Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
+      --cqueryRootExpression <CQUERY_ROOT_EXPRESSION>
+          Hash and report the configured top-level targets in this expression
+      --cqueryRootExpressionFile <CQUERY_ROOT_EXPRESSION_FILE>
+          Read the configured root expression from this file
       --cqueryExpression <CQUERY_EXPRESSION>
           
   -k, --keep_going[=<KEEP_GOING>]
@@ -997,6 +1047,10 @@ Options:
           Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
+      --cqueryRootExpression <CQUERY_ROOT_EXPRESSION>
+          Hash and report the configured top-level targets in this expression
+      --cqueryRootExpressionFile <CQUERY_ROOT_EXPRESSION_FILE>
+          Read the configured root expression from this file
       --cqueryExpression <CQUERY_EXPRESSION>
           
   -k, --keep_going[=<KEEP_GOING>]

@@ -4,7 +4,7 @@ use crate::bazel::{
 };
 use crate::cancel::{self, Cancellation};
 use crate::components::{component_digest, member_digest, Completion, Components, Visit};
-use crate::model::{HashFileData, TargetHash};
+use crate::model::{ConfiguredRoots, HashFileData, TargetHash};
 use crate::partial::{self, RecipeRecorder, RuleRecipe, TreeIndex};
 use crate::proto::blaze_query::{target, Rule, Target};
 use anyhow::{anyhow, bail, Context, Result};
@@ -229,13 +229,7 @@ fn generate_hashes_timed_with_observations(
     let mut definition_digests = PreparedRules::default();
     let mut digests = Vec::new();
     let query_started = Instant::now();
-    let QueriedTargets {
-        targets,
-        module_graph_json,
-        root_mapping,
-        scoped_sources,
-        output_base,
-    } = options.bazel.query_all_targets_with(|batch, inputs| {
+    let queried = options.bazel.query_all_targets_with(|batch, inputs| {
         let prehash = |target: &mut Target, shared_inputs| {
             let rule = target.rule.as_option_mut()?;
             // Read before `prehash_rule` drops the attributes they come from.
@@ -262,8 +256,8 @@ fn generate_hashes_timed_with_observations(
     })?;
     let observations = if include_toolchain_inputs {
         match options.bazel.observed_toolchains(
-            &targets,
-            root_mapping.as_deref(),
+            &queried.targets,
+            queried.root_mapping.as_deref(),
             options.track_deps,
         ) {
             Ok(index) => Some(index),
@@ -284,15 +278,7 @@ fn generate_hashes_timed_with_observations(
     // The query is the phase worth cancelling; a request abandoned during it stops here instead
     // of hashing targets nobody will read.
     options.bazel.check_cancelled()?;
-    let (mut data, mut timings) = hash_targets_with_digests(
-        options,
-        targets,
-        definition_digests,
-        module_graph_json,
-        root_mapping,
-        scoped_sources,
-        output_base,
-    )?;
+    let (mut data, mut timings) = hash_targets_with_digests(options, queried, definition_digests)?;
     data.observed_toolchains = observations;
     timings.bazel_query_millis = bazel_query_millis;
     Ok((data, timings))
@@ -302,25 +288,32 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
     options.bazel.check_raw_targets_supported()?;
     hash_targets_with_digests(
         options,
-        targets,
+        QueriedTargets {
+            targets,
+            configured_roots: None,
+            module_graph_json: None,
+            root_mapping: None,
+            scoped_sources: ScopedSources::default(),
+            output_base: None,
+        },
         PreparedRules::default(),
-        None,
-        None,
-        ScopedSources::default(),
-        None,
     )
     .map(|(data, _)| data)
 }
 
 fn hash_targets_with_digests(
     options: &HashOptions,
-    targets: Vec<Target>,
+    queried: QueriedTargets,
     definition_digests: PreparedRules,
-    module_graph_json: Option<String>,
-    root_mapping: Option<Vec<u8>>,
-    scoped_sources: ScopedSources,
-    output_base: Option<PathBuf>,
 ) -> Result<(HashFileData, GenerationTimings)> {
+    let QueriedTargets {
+        targets,
+        configured_roots,
+        module_graph_json,
+        root_mapping,
+        scoped_sources,
+        output_base,
+    } = queried;
     let hash_started = Instant::now();
     let mut external_resolver =
         ExternalRepoResolver::new(&options.bazel, root_mapping, output_base)?;
@@ -335,6 +328,7 @@ fn hash_targets_with_digests(
         definition_digests,
         external_resolver,
         module_graph_json,
+        configured_roots,
     )?;
     let timings = GenerationTimings {
         bazel_query_millis: 0,
@@ -350,6 +344,7 @@ fn hash_targets_with_environment(
     definition_digests: PreparedRules,
     external_resolver: ExternalRepoResolver,
     module_graph_json: Option<String>,
+    configured_roots: Option<BTreeMap<String, String>>,
 ) -> Result<HashFileData> {
     if options.partial_tree.is_some() && options.bazel.use_cquery {
         bail!("partial graph mode does not support --useCquery");
@@ -706,7 +701,23 @@ fn hash_targets_with_environment(
     }
     let recorder = context.recorder.take();
     drop(context);
-    let (mut hashes, dep_edges) = aggregate_by_label(digests, options.track_deps);
+    if configured_roots.is_some() != options.bazel.cquery_root_expression.is_some() {
+        bail!("configured-root hashing requires Bazel-resolved roots for the requested mode");
+    }
+    let (mut hashes, dep_edges, configured_roots) = if let Some(roots) = configured_roots {
+        let configured = configured_root_hashes(digests, options.track_deps, &roots)?;
+        (
+            configured.roots,
+            configured.dep_edges,
+            Some(ConfiguredRoots {
+                roots,
+                hashes: configured.instances,
+            }),
+        )
+    } else {
+        let (hashes, dep_edges) = aggregate_by_label(digests, options.track_deps);
+        (hashes, dep_edges, None)
+    };
     let mut partial = None;
     if let (Some(recorder), Some(tree)) = (recorder, &options.partial_tree) {
         // The traversal above only recorded the recipes; the hashes an entry in this mode
@@ -723,6 +734,7 @@ fn hash_targets_with_environment(
     Ok(HashFileData {
         observed_toolchains: None,
         hashes,
+        configured_roots,
         module_graph_json,
         dependency_fingerprint: None,
         dep_edges,
@@ -751,6 +763,61 @@ fn configured_label_instances<'a>(
         keys.sort_unstable();
     }
     instances
+}
+
+struct ConfiguredRootHashes {
+    roots: BTreeMap<String, TargetHash>,
+    instances: BTreeMap<String, TargetHash>,
+    dep_edges: BTreeMap<String, Vec<String>>,
+}
+
+/// Retains configured instances and reports each Bazel-resolved root under its bare label.
+/// A root uses its instance's immediate children, preserving cause distances without a new hop.
+fn configured_root_hashes(
+    digests: Vec<(String, &'static str, TargetDigest)>,
+    track_deps: bool,
+    roots: &BTreeMap<String, String>,
+) -> Result<ConfiguredRootHashes> {
+    let mut instances = BTreeMap::new();
+    let mut dep_edges = BTreeMap::new();
+    for (key, kind, digest) in digests {
+        let hash = TargetHash {
+            kind: kind.to_owned(),
+            hash: digest.overall.into(),
+            direct_hash: digest.direct.into(),
+        };
+        if instances.insert(key.clone(), hash).is_some() {
+            bail!("duplicate configured target key {key}");
+        }
+        if track_deps {
+            dep_edges.insert(
+                key,
+                digest.deps.map(Rc::unwrap_or_clone).unwrap_or_default(),
+            );
+        }
+    }
+    let mut hashes = BTreeMap::new();
+    for (label, key) in roots {
+        let hash = instances
+            .get(key)
+            .with_context(|| format!("configured root {label} was not returned as {key}"))?
+            .clone();
+        if label != key && instances.contains_key(label) {
+            bail!("configured root view collides with target {label}");
+        }
+        hashes.insert(label.clone(), hash);
+        if track_deps && label != key {
+            dep_edges.insert(
+                label.clone(),
+                dep_edges.get(key).cloned().unwrap_or_default(),
+            );
+        }
+    }
+    Ok(ConfiguredRootHashes {
+        roots: hashes,
+        instances,
+        dep_edges,
+    })
 }
 
 /// Folds per-key digests into the per-label hashes the hash file is keyed by.
@@ -2686,6 +2753,7 @@ mod tests {
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -2811,6 +2879,7 @@ mod tests {
                 ..Default::default()
             },
             Some(r#"{"name":"root"}"#.to_owned()),
+            None,
         )
     }
 
@@ -2832,6 +2901,7 @@ mod tests {
                 ..Default::default()
             },
             Some(r#"{"name":"root"}"#.to_owned()),
+            None,
         )?;
         assert_eq!(indexed.hashes, reference.hashes);
         assert_eq!(indexed.dep_edges, reference.dep_edges);
@@ -3251,6 +3321,7 @@ esac
                     ..Default::default()
                 },
                 Some(r#"{"name":"root"}"#.to_owned()),
+                None,
             )
             .unwrap()
         };
@@ -3517,6 +3588,7 @@ esac
                     ..Default::default()
                 },
                 Some(r#"{"name":"root"}"#.to_owned()),
+                None,
             )
             .unwrap()
         };
@@ -3987,6 +4059,7 @@ esac
                 PreparedRules::default(),
                 resolver,
                 Some(r#"{"name":"root"}"#.to_owned()),
+                None,
             )
             .unwrap()
         };
@@ -4216,6 +4289,7 @@ esac
             targets,
             prepared,
             ExternalRepoResolver::default(),
+            None,
             None,
         )
         .unwrap();

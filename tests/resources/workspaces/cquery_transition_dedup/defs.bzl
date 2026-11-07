@@ -40,3 +40,16 @@ helper = rule(
         ),
     },
 )
+
+def _forward_impl(ctx):
+    return [DefaultInfo(files = depset(ctx.files.dep))]
+
+forward = rule(
+    implementation = _forward_impl,
+    attrs = {
+        "dep": attr.label(cfg = _bootstrap),
+        "_allowlist_function_transition": attr.label(
+            default = "@bazel_tools//tools/allowlists/function_transition_allowlist",
+        ),
+    },
+)

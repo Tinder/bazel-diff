@@ -111,6 +111,11 @@ pub fn impacted_with_module_changes(
     })
 }
 
+fn main_label(label: &str) -> Option<&str> {
+    let label = crate::bazel::main_repo_label_key(label);
+    label.starts_with("//").then_some(label)
+}
+
 fn impacted_with_module_query(
     from: &HashFileData,
     to: &HashFileData,
@@ -136,10 +141,15 @@ fn impacted_with_module_query(
     if !can_query {
         return Ok(to.hashes.keys().cloned().collect());
     }
-    let canonical_repos = from
-        .hashes
+    fn repo_inventory(file: &HashFileData) -> &BTreeMap<String, crate::model::TargetHash> {
+        file.configured_roots
+            .as_ref()
+            .map(|view| &view.hashes)
+            .unwrap_or(&file.hashes)
+    }
+    let canonical_repos = repo_inventory(from)
         .keys()
-        .chain(to.hashes.keys())
+        .chain(repo_inventory(to).keys())
         .filter_map(|label| {
             label
                 .strip_prefix("@@")
@@ -167,6 +177,21 @@ fn impacted_with_module_query(
             .join(" + ")
     );
     match query(&expression) {
+        Ok(targets) if to.configured_roots.is_some() => {
+            let dependency_roots: HashSet<_> = targets
+                .iter()
+                .filter_map(target_name)
+                .filter_map(main_label)
+                .collect();
+            impacted.extend(
+                to.hashes
+                    .keys()
+                    .filter(|label| {
+                        main_label(label).is_some_and(|label| dependency_roots.contains(label))
+                    })
+                    .cloned(),
+            );
+        }
         Ok(targets) => {
             impacted.extend(
                 targets
@@ -183,7 +208,13 @@ fn impacted_with_module_query(
             let workspace_targets = to
                 .hashes
                 .keys()
-                .filter(|label| !label.starts_with("@@") && !label.starts_with("//external:"))
+                .filter(|label| {
+                    if to.configured_roots.is_some() {
+                        main_label(label).is_some_and(|label| !label.starts_with("//external:"))
+                    } else {
+                        !label.starts_with("@@") && !label.starts_with("//external:")
+                    }
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             if workspace_targets.is_empty() {

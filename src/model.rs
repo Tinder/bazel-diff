@@ -202,6 +202,7 @@ impl Serialize for SerializedHashes<'_> {
 }
 
 struct SerializedMetadata<'a> {
+    include_target_type: bool,
     data: &'a HashFileData,
     include_deps: bool,
 }
@@ -219,7 +220,8 @@ impl Serialize for SerializedMetadata<'_> {
                 + usize::from(include_dep_edges)
                 + usize::from(self.data.dependency_fingerprint.is_some())
                 + usize::from(self.data.partial.is_some())
-                + usize::from(self.data.tree.is_some()),
+                + usize::from(self.data.tree.is_some())
+                + usize::from(self.data.configured_roots.is_some()),
         )?;
         if let Some(index) = &self.data.observed_toolchains {
             state.serialize_field("observedToolchains", index)?;
@@ -235,6 +237,12 @@ impl Serialize for SerializedMetadata<'_> {
         }
         if let Some(partial) = &self.data.partial {
             state.serialize_field("partialGraph", partial)?;
+        }
+        if let Some(roots) = &self.data.configured_roots {
+            state.serialize_field(
+                "configuredRoots",
+                &roots.serialized(self.include_target_type),
+            )?;
         }
         if let Some(tree) = &self.data.tree {
             state.serialize_field("tree", tree)?;
@@ -262,6 +270,7 @@ impl Serialize for SerializedHashFile<'_> {
             && self.data.module_graph_json.is_none()
             && self.data.dependency_fingerprint.is_none()
             && self.data.partial.is_none()
+            && self.data.configured_roots.is_none()
             && self.data.tree.is_none()
             && (!self.include_deps || self.data.dep_edges.is_empty())
         {
@@ -272,6 +281,7 @@ impl Serialize for SerializedHashFile<'_> {
         state.serialize_field(
             "metadata",
             &SerializedMetadata {
+                include_target_type: self.include_target_type,
                 data: self.data,
                 include_deps: self.include_deps,
             },
@@ -283,6 +293,7 @@ impl Serialize for SerializedHashFile<'_> {
 #[derive(Clone, Debug, Default)]
 pub struct HashFileData {
     pub observed_toolchains: Option<crate::toolchain_candidates::ObservedToolchains>,
+    pub configured_roots: Option<ConfiguredRoots>,
     pub hashes: BTreeMap<String, TargetHash>,
     pub module_graph_json: Option<String>,
     pub dependency_fingerprint: Option<String>,
@@ -292,6 +303,59 @@ pub struct HashFileData {
     /// Partial-graph mode: the id of the git tree the hashes describe, the base of a later
     /// derivation's `git diff`.
     pub tree: Option<String>,
+}
+
+/// An explicitly requested configured-root universe. The public hashes are the scheduled
+/// roots. These additional hashes retain the configured dependency identities for attribution.
+#[derive(Clone, Debug, Default)]
+pub struct ConfiguredRoots {
+    pub roots: BTreeMap<String, String>,
+    pub hashes: BTreeMap<String, TargetHash>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SerializedConfiguredRoots<'a> {
+    version: u32,
+    roots: &'a BTreeMap<String, String>,
+    hashes: SerializedHashes<'a>,
+}
+
+impl ConfiguredRoots {
+    fn serialized(&self, include_target_type: bool) -> SerializedConfiguredRoots<'_> {
+        SerializedConfiguredRoots {
+            version: 1,
+            roots: &self.roots,
+            hashes: SerializedHashes {
+                hashes: &self.hashes,
+                include_target_type,
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfiguredRootsWire {
+    version: u32,
+    roots: BTreeMap<String, String>,
+    hashes: Hashes,
+}
+
+impl<'de> Deserialize<'de> for ConfiguredRoots {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ConfiguredRootsWire::deserialize(deserializer)?;
+        if wire.version != 1 {
+            return Err(de::Error::custom(format!(
+                "unsupported configuredRoots version {}",
+                wire.version
+            )));
+        }
+        Ok(Self {
+            roots: wire.roots,
+            hashes: wire.hashes.0,
+        })
+    }
 }
 
 /// A JSON string borrowed from the input when it has no escapes, copied otherwise. Hash values
@@ -396,6 +460,7 @@ impl<'de> Deserialize<'de> for Hashes {
 #[serde(rename_all = "camelCase")]
 struct Metadata {
     observed_toolchains: Option<crate::toolchain_candidates::ObservedToolchains>,
+    configured_roots: Option<ConfiguredRoots>,
     module_graph_json: Option<String>,
     dependency_fingerprint: Option<String>,
     #[serde(default)]
@@ -437,6 +502,7 @@ impl<'de> Deserialize<'de> for HashFileData {
                             data.module_graph_json = metadata.module_graph_json;
                             data.dependency_fingerprint = metadata.dependency_fingerprint;
                             data.dep_edges = metadata.dep_edges;
+                            data.configured_roots = metadata.configured_roots;
                             data.partial = metadata.partial_graph;
                             data.tree = metadata.tree;
                         }
@@ -452,6 +518,19 @@ impl<'de> Deserialize<'de> for HashFileData {
                 } else {
                     data.hashes.extend(bare);
                 }
+                if let Some(roots) = &data.configured_roots {
+                    if data.partial.is_some()
+                        || roots.roots.len() != data.hashes.len()
+                        || roots.roots.iter().any(|(label, key)| {
+                            match (data.hashes.get(label), roots.hashes.get(key)) {
+                                (Some(root), Some(instance)) => root != instance,
+                                _ => true,
+                            }
+                        })
+                    {
+                        return Err(de::Error::custom("configuredRoots roster does not match the scheduled hashes and their instances"));
+                    }
+                }
                 Ok(data)
             }
         }
@@ -461,6 +540,28 @@ impl<'de> Deserialize<'de> for HashFileData {
 }
 
 impl HashFileData {
+    pub fn ensure_same_root_mode(&self, other: &Self) -> Result<()> {
+        match (&self.configured_roots, &other.configured_roots) {
+            (None, None) => Ok(()),
+            (Some(_), Some(_)) => Ok(()),
+            _ => bail!("incompatible configured-root hash files; generate both in the same mode"),
+        }
+    }
+
+    /// Consume the two domains for explaining a single requested target. A scheduled
+    /// root uses its own endpoint's hash even when its selected configuration changes.
+    pub fn into_explain_hashes(self, target: &str) -> BTreeMap<String, TargetHash> {
+        let Some(roots) = self.configured_roots else {
+            return self.hashes;
+        };
+        let mut graph = roots.hashes;
+        if !self.hashes.contains_key(target) {
+            graph.remove(target);
+        }
+        graph.extend(self.hashes);
+        graph
+    }
+
     pub fn serialized(
         &self,
         include_target_type: bool,
@@ -502,6 +603,7 @@ impl HashFileData {
             && self.module_graph_json.is_none()
             && self.dependency_fingerprint.is_none()
             && self.partial.is_none()
+            && self.configured_roots.is_none()
             && self.tree.is_none()
             && (!include_deps || self.dep_edges.is_empty())
         {
@@ -537,6 +639,13 @@ impl HashFileData {
             metadata.insert(
                 "partialGraph".to_owned(),
                 serde_json::to_value(partial).expect("serializing recipes cannot fail"),
+            );
+        }
+        if let Some(roots) = &self.configured_roots {
+            metadata.insert(
+                "configuredRoots".to_owned(),
+                serde_json::to_value(roots.serialized(include_target_type))
+                    .expect("serializing string map cannot fail"),
             );
         }
         if let Some(tree) = &self.tree {
@@ -728,6 +837,78 @@ pub fn impacted_targets_with_distances(
     exclude_external: bool,
 ) -> Result<Vec<ImpactedTargetWithDistance>> {
     let impact_types = impacted_types(from, to);
+    distances_for_types(
+        from,
+        to,
+        dep_edges,
+        target_types,
+        exclude_external,
+        impact_types,
+        None,
+    )
+}
+
+/// Walk the configured cause graph before selecting the requested outputs. A source
+/// newly listed as a root can already exist as an unchanged child in both graphs.
+pub fn hash_file_distances(
+    from: &HashFileData,
+    to: &HashFileData,
+    dep_edges: &BTreeMap<String, Vec<String>>,
+    module_impacted: Option<&std::collections::BTreeSet<String>>,
+    target_types: Option<&HashSet<String>>,
+    exclude_external: bool,
+) -> Result<Vec<ImpactedTargetWithDistance>> {
+    from.ensure_same_root_mode(to)?;
+    let root_changes = impacted_types(&from.hashes, &to.hashes);
+    let mut forced_direct = HashSet::new();
+    let mut changes = if let (Some(a), Some(b)) = (&from.configured_roots, &to.configured_roots) {
+        let mut inner = impacted_types(&a.hashes, &b.hashes);
+        for (root, state) in root_changes {
+            if b.hashes.contains_key(&root) {
+                if state == ImpactType::Direct {
+                    forced_direct.insert(root);
+                }
+            } else {
+                inner.insert(root, state);
+            }
+        }
+        inner
+    } else {
+        root_changes
+    };
+    for label in module_impacted.into_iter().flatten() {
+        if to.configured_roots.is_some() {
+            if to
+                .hashes
+                .get(label)
+                .is_some_and(|hash| from.hashes.get(label).is_some_and(|old| old.same_as(hash)))
+            {
+                forced_direct.insert(label.clone());
+            }
+        } else if to.hashes.contains_key(label) && !changes.contains_key(label) {
+            changes.insert(label.clone(), ImpactType::Direct);
+        }
+    }
+    distances_for_types(
+        &from.hashes,
+        &to.hashes,
+        dep_edges,
+        target_types,
+        exclude_external,
+        changes,
+        to.configured_roots.as_ref().map(|_| &forced_direct),
+    )
+}
+
+fn distances_for_types(
+    from: &BTreeMap<String, TargetHash>,
+    to: &BTreeMap<String, TargetHash>,
+    dep_edges: &BTreeMap<String, Vec<String>>,
+    target_types: Option<&HashSet<String>>,
+    exclude_external: bool,
+    impact_types: HashMap<String, ImpactType>,
+    root_direct: Option<&HashSet<String>>,
+) -> Result<Vec<ImpactedTargetWithDistance>> {
     let mut dependents = HashMap::<&str, Vec<&str>>::new();
     let mut roots = Vec::new();
     for (label, impact) in &impact_types {
@@ -780,11 +961,26 @@ pub fn impacted_targets_with_distances(
     }
     let impacted = impact_types
         .keys()
+        .chain(
+            root_direct
+                .into_iter()
+                .flatten()
+                .filter(|label| !impact_types.contains_key(*label)),
+        )
+        .filter(|label| {
+            root_direct.is_none_or(|forced| {
+                forced.contains(*label)
+                    || to
+                        .get(*label)
+                        .is_some_and(|hash| !from.get(*label).is_some_and(|old| old.same_as(hash)))
+            })
+        })
         .map(String::as_str)
         .filter(|label| !exclude_external || !label.starts_with("//external:"))
         .filter_map(|label| {
             let (target_distance, package_distance) =
                 match (target_distances.get(label), package_distances.get(label)) {
+                    _ if root_direct.is_some_and(|roots| roots.contains(label)) => (0, 0),
                     (Some(target), Some(package)) => (*target, *package),
                     (None, None) => (0, 0),
                     _ => unreachable!("both distance walks use the same graph and origins"),
@@ -830,6 +1026,74 @@ mod tests {
             hash: hash.into(),
             direct_hash: direct.into(),
         }
+    }
+
+    #[test]
+    fn configured_root_rosters_round_trip_even_when_empty() {
+        let empty = HashFileData::from_slice(
+            br#"{"hashes":{},"metadata":{"configuredRoots":{"version":1,"roots":{},"hashes":{}}}}"#,
+        )
+        .unwrap();
+        let one = HashFileData::from_slice(br#"{"hashes":{"//:a":"Rule#ab~cd"},"metadata":{"configuredRoots":{"version":1,"roots":{"//:a":"//:a|ab"},"hashes":{"//:a|ab":"Rule#ab~cd"}}}}"#).unwrap();
+        for data in [&empty, &one] {
+            let encoded = serde_json::to_vec(&data.serialized(true, false)).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&encoded).unwrap(),
+                data.to_value(true, false)
+            );
+            let decoded = HashFileData::from_slice(&encoded).unwrap();
+            assert_eq!(
+                decoded.configured_roots.unwrap().roots,
+                data.configured_roots.as_ref().unwrap().roots
+            );
+            assert!(data
+                .ensure_same_root_mode(&HashFileData::default())
+                .is_err());
+        }
+        let edges = BTreeMap::new();
+        assert_eq!(
+            hash_file_distances(&empty, &one, &edges, None, None, false).unwrap(),
+            vec![ImpactedTargetWithDistance {
+                label: "//:a".to_owned(),
+                target_distance: 0,
+                package_distance: 0
+            }]
+        );
+        assert!(hash_file_distances(&one, &empty, &edges, None, None, false)
+            .unwrap()
+            .is_empty());
+        let mut child = empty.clone();
+        let source_hash = TargetHash::parse("SourceFile#ab~ab").unwrap();
+        child
+            .configured_roots
+            .as_mut()
+            .unwrap()
+            .hashes
+            .insert("//:source".to_owned(), source_hash.clone());
+        let mut source = child.clone();
+        source.hashes.insert("//:source".to_owned(), source_hash);
+        source
+            .configured_roots
+            .as_mut()
+            .unwrap()
+            .roots
+            .insert("//:source".to_owned(), "//:source".to_owned());
+        assert_eq!(
+            hash_file_distances(&child, &source, &edges, None, None, false).unwrap(),
+            vec![ImpactedTargetWithDistance {
+                label: "//:source".to_owned(),
+                target_distance: 0,
+                package_distance: 0,
+            }]
+        );
+        assert!(
+            hash_file_distances(&source, &child, &edges, None, None, false)
+                .unwrap()
+                .is_empty()
+        );
+        let mut invalid = one.to_value(true, false);
+        invalid["metadata"]["configuredRoots"]["version"] = serde_json::json!(2);
+        assert!(HashFileData::from_slice(&serde_json::to_vec(&invalid).unwrap()).is_err());
     }
 
     #[test]

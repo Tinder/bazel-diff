@@ -1,4 +1,5 @@
 use crate::support::*;
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -762,6 +763,205 @@ fn cquery_keeps_dependencies_of_every_configured_instance() {
         impacted.iter().any(|label| label.ends_with("//:app")),
         "//:app should be impacted through //:helper, got {impacted:?}"
     );
+}
+
+#[test]
+fn cquery_reports_only_requested_configured_roots() {
+    let workspace = copy_workspace("cquery_transition_dedup");
+    let output = tempfile::tempdir().unwrap();
+    let from = output.path().join("from.json");
+    let to = output.path().join("to.json");
+    let from_edges = output.path().join("from-edges.json");
+    let to_edges = output.path().join("to-edges.json");
+    let legacy_from = output.path().join("legacy-from.json");
+    let legacy_to = output.path().join("legacy-to.json");
+    let roots = "set(//:shared //:root_alias //:input.txt)";
+    let roots_file = output.path().join("roots.query");
+    fs::write(&roots_file, roots).unwrap();
+    let closure = format!("deps(config(({roots}), target))");
+    for (value, hashes, edges, legacy, root_flag, root_value) in [
+        (
+            "before\n",
+            &from,
+            &from_edges,
+            &legacy_from,
+            "--cqueryRootExpression",
+            roots,
+        ),
+        (
+            "after\n",
+            &to,
+            &to_edges,
+            &legacy_to,
+            "--cqueryRootExpressionFile",
+            roots_file.to_str().unwrap(),
+        ),
+    ] {
+        fs::write(workspace.path().join("input.txt"), value).unwrap();
+        let build = std::process::Command::new(bazel())
+            .current_dir(workspace.path())
+            .args(["build", "//:shared", "//:root_alias", "//:input.txt"])
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("bazel-bin/shared.out")).unwrap(),
+            "fixed\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("bazel-bin/wrapper.out")).unwrap(),
+            value
+        );
+        let generated = generate(
+            workspace.path(),
+            hashes,
+            &[
+                "--useCquery",
+                root_flag,
+                root_value,
+                "--cqueryCommandOptions=--noproto:include_configurations",
+                "--cqueryCommandOptions=--output=files",
+                "--cqueryCommandOptions=--transitions=none",
+                "--cqueryCommandOptions=--noproto:rule_inputs_and_outputs",
+                "--cqueryCommandOptions=--output_file=/dev/null",
+                "--includeTargetType",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let generated = generate(
+            workspace.path(),
+            legacy,
+            &[
+                "--useCquery",
+                "--cqueryExpression",
+                &closure,
+                "--includeTargetType",
+            ],
+        );
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+    }
+
+    for path in [&from, &to] {
+        let data: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let labels: BTreeSet<_> = data["hashes"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|label| label.trim_start_matches('@'))
+            .collect();
+        assert_eq!(
+            labels,
+            BTreeSet::from(["//:input.txt", "//:root_alias", "//:shared"])
+        );
+        let roster = data["metadata"]["configuredRoots"]["roots"]
+            .as_object()
+            .unwrap();
+        let (label, key) = roster
+            .iter()
+            .find(|(label, _)| label.ends_with("//:input.txt"))
+            .unwrap();
+        assert_eq!(key.as_str().unwrap(), label);
+    }
+    let result = output.path().join("impacted.txt");
+    assert!(impacted(workspace.path(), &from, &to, &result, &[])
+        .status
+        .success());
+    let selected: BTreeSet<_> = read_lines(&result)
+        .into_iter()
+        .map(|label| label.trim_start_matches('@').to_owned())
+        .collect();
+    assert_eq!(
+        selected,
+        BTreeSet::from(["//:input.txt".to_owned(), "//:root_alias".to_owned()])
+    );
+    assert!(
+        impacted(workspace.path(), &legacy_from, &legacy_to, &result, &[])
+            .status
+            .success()
+    );
+    assert!(read_lines(&result)
+        .iter()
+        .any(|label| label.ends_with("//:shared")));
+
+    assert!(impacted(
+        workspace.path(),
+        &from,
+        &to,
+        &result,
+        &["-d", to_edges.to_str().unwrap()]
+    )
+    .status
+    .success());
+    let distances: Vec<Value> = serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+    let distances: BTreeMap<_, _> = distances
+        .iter()
+        .map(|row| {
+            (
+                row["label"].as_str().unwrap().trim_start_matches('@'),
+                (
+                    row["targetDistance"].as_u64().unwrap(),
+                    row["packageDistance"].as_u64().unwrap(),
+                ),
+            )
+        })
+        .collect();
+    assert_eq!(
+        distances,
+        BTreeMap::from([("//:input.txt", (0, 0)), ("//:root_alias", (3, 0))])
+    );
+
+    let empty = output.path().join("empty.json");
+    let generated = generate(
+        workspace.path(),
+        &empty,
+        &[
+            "--useCquery",
+            "--cqueryRootExpression",
+            "set()",
+            "--cqueryCommandOptions=--output=files",
+            "--cqueryCommandOptions=--output_file=/dev/null",
+        ],
+    );
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let data: Value = serde_json::from_slice(&fs::read(&empty).unwrap()).unwrap();
+    assert!(data["hashes"].as_object().unwrap().is_empty());
+    assert!(data["metadata"]["configuredRoots"]["roots"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+
+    let missing = output.path().join("missing.json");
+    let generated = generate(
+        workspace.path(),
+        &missing,
+        &[
+            "--useCquery",
+            "--cqueryRootExpression",
+            "//:missing",
+            "--keep_going",
+            "--cqueryCommandOptions=--output_file=/dev/null",
+        ],
+    );
+    assert!(!generated.status.success());
+    assert!(!missing.exists());
 }
 
 /// Regression for https://github.com/Tinder/bazel-diff/issues/522 and hashbench's

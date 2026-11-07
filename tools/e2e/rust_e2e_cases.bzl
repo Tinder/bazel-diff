@@ -208,6 +208,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::cquery_reports_only_requested_configured_roots",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::cross_file_macro_change_is_scoped",
                 "timeout": "moderate",
             },

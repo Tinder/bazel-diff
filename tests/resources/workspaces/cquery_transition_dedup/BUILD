@@ -1,4 +1,4 @@
-load(":defs.bzl", "bootstrap_flag", "helper", "node")
+load(":defs.bzl", "bootstrap_flag", "forward", "helper", "node")
 
 bootstrap_flag(
     name = "bootstrap",
@@ -23,6 +23,33 @@ node(
 
 helper(
     name = "helper",
-    dep = ":app",
     src = "input.txt",
+    dep = ":app",
+)
+
+genrule(
+    name = "shared",
+    srcs = select({
+        ":bootstrapping": ["input.txt"],
+        "//conditions:default": ["fixed.txt"],
+    }),
+    outs = ["shared.out"],
+    cmd = 'cat "$(SRCS)" > "$@"',
+)
+
+forward(
+    name = "forwarded",
+    dep = ":shared",
+)
+
+genrule(
+    name = "wrapper",
+    srcs = [":forwarded"],
+    outs = ["wrapper.out"],
+    cmd = 'cat "$(SRCS)" > "$@"',
+)
+
+alias(
+    name = "root_alias",
+    actual = ":wrapper",
 )

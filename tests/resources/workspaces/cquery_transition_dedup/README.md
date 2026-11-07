@@ -50,3 +50,15 @@ identity `configured_rule_input` gives each edge, so both `//:app` instances
 are hashed and each edge resolves to the instance it names. The hash file is
 still keyed by label: a label with several instances hashes all of them, and
 its dependency edges are the union of theirs.
+
+## Requested root outputs
+
+`shared` copies `fixed.txt` in the default configuration and `input.txt` when
+bootstrapping. `forwarded` reaches `shared` through the existing bootstrap
+transition, `wrapper` copies that result, and `root_alias` forwards to the
+wrapper. Editing `input.txt` changes the wrapper and alias outputs while the
+requested `shared` output stays fixed.
+
+The default cquery label aggregate selects `shared` because its bootstrap
+instance changed. Configured root mode selects `root_alias` and the requested
+`input.txt` source root while excluding the stable requested `shared` instance.

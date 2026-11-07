@@ -1082,6 +1082,11 @@ A few inputs are normalized or extended on the way in:
   dependency query adds their dependencies and build files. Each reached native alias hashes its
   evaluated `actual` binding, including the destination for each `select()` condition. Acquired
   library rules also hash the BUILD and Starlark files that define them.
+  When that dependency query returns rules from external packages, the same input walk also checks
+  reached ordinary aliases for missing `actual` targets in those packages. One query inventories
+  the matching packages; only the named targets and their dependencies returned by that inventory
+  enter the graph. Newly acquired aliases use the same binding hash, and inputs absent from the
+  inventory retain the existing repository fallback.
   Earlier Bazel versions skip this alias acquisition. Full source hashing with these repository
   options reads every returned regular external source file from Bazel's output base, including
   files in the primary query. The same read applies when no alias query runs. Partial generation

@@ -589,6 +589,222 @@ fn fine_aliases_acquire_hidden_libraries_and_definition_sources() {
 }
 
 #[test]
+fn ordinary_alias_can_use_a_matcher_from_a_reached_external_package() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    fs::write(root.join("before.txt"), "before").unwrap();
+    fs::write(root.join("after.txt"), "after").unwrap();
+    fs::write(
+        root.join("BUILD.bazel"),
+        r#"exports_files(["before.txt", "after.txt"])
+constraint_setting(name = "system", default_constraint_value = ":regular")
+constraint_value(name = "regular", constraint_setting = ":system", visibility = ["//visibility:public"])
+constraint_value(name = "none", constraint_setting = ":system")
+constraint_setting(name = "other_system", default_constraint_value = ":generic")
+constraint_value(name = "generic", constraint_setting = ":other_system")
+constraint_value(name = "special", constraint_setting = ":other_system", visibility = ["//visibility:public"])
+alias(
+    name = "eligible",
+    actual = select({
+        "@library//:first": "@library//:first",
+        "@library//:second": "@library//:second",
+        "//conditions:default": "@library//:first",
+    }),
+)
+genrule(
+    name = "consumer",
+    srcs = select({":eligible": ["before.txt"], "//conditions:default": ["after.txt"]}),
+    outs = ["consumer.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+genrule(
+    name = "probe",
+    srcs = select({"@public//:probe": ["after.txt"], "//conditions:default": ["before.txt"]}),
+    outs = ["probe.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("public.BUILD"),
+        r#"alias(name = "probe", actual = "@library//:second", visibility = ["//visibility:public"])
+"#,
+    )
+    .unwrap();
+    edit(&root.join("library/BUILD.bazel"), |text| {
+        format!(
+            r#"{text}
+config_setting(name = "first", constraint_values = ["@@//:regular"])
+config_setting(name = "second", constraint_values = ["@@//:special"])
+"#
+        )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let snapshot = |name: &str, product: &str| {
+        assert_product(root, "//:consumer", "consumer.txt", product);
+        assert_product(root, "//:probe", "probe.txt", "before");
+        let file = out.path().join(format!("{name}.json"));
+        let edges = out.path().join(format!("{name}.edges.json"));
+        let run = generate(
+            root,
+            &file,
+            &[
+                "--fineGrainedHashExternalRepos=@public",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        (file, edges)
+    };
+    let before = snapshot("before", "before");
+    edit(&root.join("BUILD.bazel"), |text| {
+        text.replace(
+            r#"default_constraint_value = ":regular""#,
+            r#"default_constraint_value = ":none""#,
+        )
+    });
+    let after = snapshot("after", "after");
+    let before_hashes = hashes(&before.0);
+    let after_hashes = hashes(&after.0);
+    fn direct(value: &str) -> &str {
+        value.rsplit_once('~').unwrap().1
+    }
+    assert_ne!(
+        direct(&before_hashes["//:system"]),
+        direct(&after_hashes["//:system"])
+    );
+    assert_eq!(
+        direct(&before_hashes["//:consumer"]),
+        direct(&after_hashes["//:consumer"])
+    );
+    for (name, value) in before_hashes
+        .iter()
+        .filter(|(name, _)| name.starts_with("//external:"))
+    {
+        assert_eq!(direct(value), direct(&after_hashes[name]), "{name}");
+    }
+    let result = out.path().join("impacted.txt");
+    assert!(impacted(root, &before.0, &after.0, &result, &[])
+        .status
+        .success());
+    let labels = read_lines(&result);
+    assert!(labels.contains("//:consumer"), "{labels:?}");
+    assert!(!labels.contains("//:probe"), "{labels:?}");
+    for (_, edges) in [before, after] {
+        let graph = dep_edges(&edges);
+        let public = graph["//:probe"]
+            .iter()
+            .find(|name| name.starts_with('@') && name.ends_with("//:probe"))
+            .unwrap();
+        let second = graph[public]
+            .iter()
+            .find(|name| name.starts_with('@') && name.ends_with("//:second"))
+            .unwrap();
+        let first = format!("{}//:first", second.strip_suffix("//:second").unwrap());
+        assert!(graph["//:eligible"].contains(&first));
+        assert!(graph["//:eligible"].contains(second));
+        assert!(graph[&first].contains("//:regular"));
+    }
+}
+
+#[test]
+fn main_alias_reaches_a_library_behind_an_external_alias() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    edit(&root.join("BUILD.bazel"), |text| {
+        format!(
+            r#"{text}
+exports_files(["deep_payload.txt"])
+alias(name = "main_alias", actual = "@library//:inner_alias")
+genrule(
+    name = "main_consumer",
+    srcs = [":main_alias"],
+    outs = ["main_consumer.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+"#
+        )
+    });
+    edit(&root.join("library/BUILD.bazel"), |text| {
+        format!(
+            r#"{text}
+alias(name = "inner_alias", actual = ":deep_library")
+library(name = "deep_library", srcs = ["deep_leaf.txt"], selected = "deep_leaf.txt")
+genrule(name = "copy_leaf", srcs = ["@@//:deep_payload.txt"], outs = ["deep_leaf.txt"], cmd = "cp $< $@")
+"#
+        )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let snapshot = |value: &str| {
+        fs::write(root.join("deep_payload.txt"), value).unwrap();
+        assert_product(root, "//:main_consumer", "main_consumer.txt", value);
+        assert_product(root, "//:consumer", "consumer.txt", "before");
+        let file = out.path().join(format!("{value}.json"));
+        let edges = out.path().join(format!("{value}-edges.json"));
+        let run = generate(
+            root,
+            &file,
+            &[
+                "--fineGrainedHashExternalRepos=@public",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        (file, edges)
+    };
+    let (before, _) = snapshot("before");
+    let (after, edges) = snapshot("after");
+    let result = out.path().join("impacted.txt");
+    assert!(impacted(root, &before, &after, &result, &[])
+        .status
+        .success());
+    let labels = read_lines(&result);
+    assert!(labels.contains("//:main_consumer"), "{labels:?}");
+    assert!(!labels.contains("//:consumer"), "{labels:?}");
+    let old = hashes(&before);
+    let new = hashes(&after);
+    for (label, value) in old
+        .iter()
+        .filter(|(label, _)| label.starts_with("//external:"))
+    {
+        assert_eq!(
+            value.rsplit_once('~').unwrap().1,
+            new[label].rsplit_once('~').unwrap().1,
+            "{label}"
+        );
+    }
+    let graph = dep_edges(&edges);
+    let package = graph["//:main_alias"]
+        .iter()
+        .find_map(|label| label.strip_suffix(":inner_alias"))
+        .unwrap();
+    for (from, to) in [
+        ("inner_alias", "deep_library"),
+        ("deep_library", "deep_leaf.txt"),
+        ("deep_leaf.txt", "copy_leaf"),
+    ] {
+        assert!(graph[&format!("{package}:{from}")].contains(&format!("{package}:{to}")));
+    }
+}
+
+#[test]
 fn fine_aliases_track_the_selected_destination_with_fixed_inputs() {
     if !supports_mod_show_repo() {
         return;

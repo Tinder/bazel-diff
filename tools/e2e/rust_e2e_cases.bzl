@@ -180,6 +180,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::reports_observed_toolchain_type_references",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::returned_external_source_reaches_consumer",
                 "timeout": "moderate",
             },

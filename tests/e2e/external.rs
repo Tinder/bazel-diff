@@ -1391,6 +1391,105 @@ fn isolated_dependency_root_keeps_hidden_spoke_changes() {
 }
 
 #[test]
+fn reports_observed_toolchain_type_references() {
+    let workspace = copy_workspace("extension_toolchain_through_owner");
+    let root = workspace.path();
+    edit(&root.join("MODULE.bazel"), |text| {
+        format!("{text}\nregister_toolchains(\"//declaration:registration\")\n")
+    });
+    edit(&root.join("declaration/BUILD.bazel"), |text| {
+        let text = text.replace(
+            r#"toolchain_type = "@ext//:toolchain_type""#,
+            r#"toolchain_type = ":public_type""#,
+        );
+        format!("{text}\nalias(name = \"public_type\", actual = \"@ext//:toolchain_type\")\nfilegroup(name = \"type_holder\", srcs = [\"@ext//:toolchain_type\"])\n")
+    });
+    // Stock query exposes ordinary attributes. The action still obtains its
+    // compiler version through the resolved ToolchainInfo.
+    edit(&root.join("ext/defs.bzl"), |text| {
+        text.replace(
+        r#"attrs = {"_wrapper":"#,
+        r#"attrs = {"_declared_type": attr.label(default = "@ext//:toolchain_type"), "_wrapper":"#,
+    )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let before = out.path().join("before.json");
+    let after = out.path().join("after.json");
+    let edges = out.path().join("edges.json");
+    let candidates = out.path().join("candidates.json");
+    let result = out.path().join("ordinary.txt");
+    let options = [
+        "--includeToolchainInputs",
+        "--fineGrainedHashExternalRepos=@ext",
+        "--bazelCommandOptions=--proto:output_rule_attrs=version",
+    ];
+    assert_product(
+        root,
+        "//declaration:consumer",
+        "declaration/consumer.txt",
+        "before",
+    );
+    assert!(generate(root, &before, &options).status.success());
+    edit(&root.join("declaration/BUILD.bazel"), |text| {
+        text.replace("\"before\"", "\"after\"")
+    });
+    assert_product(
+        root,
+        "//declaration:consumer",
+        "declaration/consumer.txt",
+        "after",
+    );
+    let mut tracked = options.to_vec();
+    tracked.extend(["-d", edges.to_str().unwrap()]);
+    assert!(generate(root, &after, &tracked).status.success());
+    assert!(impacted(
+        root,
+        &before,
+        &after,
+        &result,
+        &[
+            "-d",
+            edges.to_str().unwrap(),
+            "--toolchainCandidatesFile",
+            candidates.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+    let ordinary: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+    assert!(
+        ordinary
+            .iter()
+            .all(|row| row["label"] != "//declaration:consumer"),
+        "{ordinary:?}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(candidates).unwrap()).unwrap();
+    assert_eq!(report["complete"], false);
+    assert!(
+        report["possibleTypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "//declaration:public_type"),
+        "{report}"
+    );
+    let readers = report["possibleReaders"].as_array().unwrap();
+    assert!(
+        readers.iter().any(|v| v == "//declaration:consumer"),
+        "{report}"
+    );
+    assert!(
+        readers.iter().any(|v| v == "//declaration:type_holder"),
+        "{report}"
+    );
+    assert!(
+        readers.iter().all(|v| v != "//declaration:other"),
+        "{report}"
+    );
+}
+
+#[test]
 fn toolchain_declarations_follow_their_implementations() {
     let workspace = copy_workspace("extension_toolchain_through_owner");
     let root = workspace.path();

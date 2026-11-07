@@ -15,6 +15,7 @@ pub mod hash;
 pub mod model;
 pub mod module_graph;
 pub mod partial;
+pub mod toolchain_candidates;
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/proto.rs"));

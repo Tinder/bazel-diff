@@ -214,12 +214,16 @@ impl Serialize for SerializedMetadata<'_> {
         let include_dep_edges = self.include_deps && !self.data.dep_edges.is_empty();
         let mut state = serializer.serialize_struct(
             "HashMetadata",
-            usize::from(self.data.module_graph_json.is_some())
+            usize::from(self.data.observed_toolchains.is_some())
+                + usize::from(self.data.module_graph_json.is_some())
                 + usize::from(include_dep_edges)
                 + usize::from(self.data.dependency_fingerprint.is_some())
                 + usize::from(self.data.partial.is_some())
                 + usize::from(self.data.tree.is_some()),
         )?;
+        if let Some(index) = &self.data.observed_toolchains {
+            state.serialize_field("observedToolchains", index)?;
+        }
         if let Some(module_graph_json) = &self.data.module_graph_json {
             state.serialize_field("moduleGraphJson", module_graph_json)?;
         }
@@ -254,7 +258,8 @@ impl Serialize for SerializedHashFile<'_> {
             hashes: &self.data.hashes,
             include_target_type: self.include_target_type,
         };
-        if self.data.module_graph_json.is_none()
+        if self.data.observed_toolchains.is_none()
+            && self.data.module_graph_json.is_none()
             && self.data.dependency_fingerprint.is_none()
             && self.data.partial.is_none()
             && self.data.tree.is_none()
@@ -277,6 +282,7 @@ impl Serialize for SerializedHashFile<'_> {
 
 #[derive(Clone, Debug, Default)]
 pub struct HashFileData {
+    pub observed_toolchains: Option<crate::toolchain_candidates::ObservedToolchains>,
     pub hashes: BTreeMap<String, TargetHash>,
     pub module_graph_json: Option<String>,
     pub dependency_fingerprint: Option<String>,
@@ -389,6 +395,7 @@ impl<'de> Deserialize<'de> for Hashes {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Metadata {
+    observed_toolchains: Option<crate::toolchain_candidates::ObservedToolchains>,
     module_graph_json: Option<String>,
     dependency_fingerprint: Option<String>,
     #[serde(default)]
@@ -426,6 +433,7 @@ impl<'de> Deserialize<'de> for HashFileData {
                         }
                         "metadata" => {
                             let metadata = map.next_value::<Metadata>()?;
+                            data.observed_toolchains = metadata.observed_toolchains;
                             data.module_graph_json = metadata.module_graph_json;
                             data.dependency_fingerprint = metadata.dependency_fingerprint;
                             data.dep_edges = metadata.dep_edges;
@@ -490,7 +498,8 @@ impl HashFileData {
                 )
             })
             .collect::<Map<_, _>>();
-        if self.module_graph_json.is_none()
+        if self.observed_toolchains.is_none()
+            && self.module_graph_json.is_none()
             && self.dependency_fingerprint.is_none()
             && self.partial.is_none()
             && self.tree.is_none()
@@ -499,6 +508,13 @@ impl HashFileData {
             return Value::Object(hashes);
         }
         let mut metadata = Map::new();
+        if let Some(index) = &self.observed_toolchains {
+            metadata.insert(
+                "observedToolchains".into(),
+                serde_json::to_value(index)
+                    .expect("serializing toolchain observations cannot fail"),
+            );
+        }
         if let Some(module_graph_json) = &self.module_graph_json {
             metadata.insert(
                 "moduleGraphJson".to_owned(),

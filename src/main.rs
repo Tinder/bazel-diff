@@ -696,7 +696,8 @@ fn fingerprint_flags(
     args: &HashingArgs,
     include_type: bool,
     types: &[String],
-) -> BTreeMap<String, String> {
+) -> Result<BTreeMap<String, String>> {
+    let fine_grained_repos = bazel_options(args, false)?.fine_grained_external_repos;
     let mut flags = BTreeMap::from([
         (
             "bazelStartupOptions".into(),
@@ -728,11 +729,9 @@ fn fingerprint_flags(
         ),
         (
             "fineGrainedHashExternalRepos".into(),
-            args.fine_grained_hash_external_repos
+            fine_grained_repos
                 .iter()
                 .cloned()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
                 .collect::<Vec<_>>()
                 .join(","),
         ),
@@ -764,10 +763,14 @@ fn fingerprint_flags(
         ("cycleComponents".into(), "1".into()),
         ("stackSourcePaths".into(), "1".into()),
     ]);
+    if !args.use_cquery && !fine_grained_repos.is_empty() && args.isolated_dependency_root.is_none()
+    {
+        flags.insert("fineAliasInputs".into(), "3".into());
+    }
     if let Some(root) = &args.isolated_dependency_root {
         flags.insert("isolatedDependencyRoot".into(), root.clone());
     }
-    flags
+    Ok(flags)
 }
 
 fn write_json_file(file: File, value: &impl Serialize) -> Result<()> {
@@ -1077,7 +1080,7 @@ fn run_explain(args: &ExplainArgs, verbose: bool) -> Result<()> {
 }
 
 fn run_fingerprint(args: &FingerprintArgs) -> Result<()> {
-    let flags = fingerprint_flags(&args.hashing, args.include_target_type, &args.target_type);
+    let flags = fingerprint_flags(&args.hashing, args.include_target_type, &args.target_type)?;
     let inputs = fingerprint::gather(
         &args.hashing.workspace(),
         &args.hashing.bazel_path,
@@ -1635,9 +1638,10 @@ mod tests {
         second.label_only_module_extensions.reverse();
         second.ignored_rule_hashing_attributes.reverse();
 
-        let first_flags = fingerprint_flags(&first, true, &["Rule".into(), "GeneratedFile".into()]);
+        let first_flags =
+            fingerprint_flags(&first, true, &["Rule".into(), "GeneratedFile".into()]).unwrap();
         let second_flags =
-            fingerprint_flags(&second, true, &["GeneratedFile".into(), "Rule".into()]);
+            fingerprint_flags(&second, true, &["GeneratedFile".into(), "Rule".into()]).unwrap();
         assert_eq!(first_flags, second_flags);
         assert_eq!(first_flags["bazelStartupOptions"], "--a --b");
         assert_eq!(first_flags["targetType"], "GeneratedFile,Rule");
@@ -1647,6 +1651,13 @@ mod tests {
             first_flags["labelOnlyModuleExtensions"],
             "@a//:e.bzl%a,@b//:e.bzl%b"
         );
+        let fine_file = directory.path().join("fine-repos");
+        fs::write(&fine_file, "from_file\nabc\n").unwrap();
+        let mut file_only = hashing_args(directory.path());
+        file_only.fine_grained_hash_external_repos_file = Some(fine_file);
+        let file_flags = fingerprint_flags(&file_only, false, &[]).unwrap();
+        assert_eq!(file_flags["fineGrainedHashExternalRepos"], "abc,from_file");
+        assert_eq!(file_flags["fineAliasInputs"], "3");
     }
 
     #[test]

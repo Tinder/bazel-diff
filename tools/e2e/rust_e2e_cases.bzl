@@ -100,6 +100,22 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::fine_aliases_acquire_hidden_libraries_and_definition_sources",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_aliases_honor_query_failure_mode",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_aliases_preserve_partial_rebuilds",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_aliases_track_the_selected_destination_with_fixed_inputs",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::fine_grained_bzlmod_repo",
                 "timeout": "moderate",
             },
@@ -141,6 +157,14 @@ RUST_E2E_SUITES = [
             },
             {
                 "name": "external::label_only_extension_bump_does_not_reach_users_of_the_owner_or_its_dependents",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::main_alias_reaches_a_library_behind_an_external_alias",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::ordinary_alias_can_use_a_matcher_from_a_reached_external_package",
                 "timeout": "moderate",
             },
             {

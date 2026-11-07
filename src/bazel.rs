@@ -3410,6 +3410,102 @@ fn read_raw_batch(reader: &mut impl BufRead, batch: &mut RawBatch) -> Result<boo
     Ok(!batch.bounds.is_empty())
 }
 
+/// Decodes one `bazel query` target, with the rule's attribute vector allocated at its final
+/// size up front.
+///
+/// Bazel prints every attribute of a rule, implicit ones included, so a rule carries dozens of
+/// them, and an `Attribute` is several hundred bytes. Decoded with no capacity hint the vector
+/// grows by doubling, copying every attribute decoded so far at each step and leaving pages of
+/// freed buffers behind. Counting the attribute fields first costs one pass over the rule's
+/// top-level tags, skipping each attribute by its length.
+fn decode_query_target(bytes: &[u8]) -> Result<Target, buffa::DecodeError> {
+    let mut target = Target::default();
+    if let Some(attributes) = rule_attribute_count(bytes).filter(|count| *count > 0) {
+        target
+            .rule
+            .get_or_insert_default()
+            .attribute
+            .reserve_exact(attributes);
+    }
+    target.merge_from_slice(bytes)?;
+    Ok(target)
+}
+
+/// `Target.rule` (field 2) and `Rule.attribute` (field 4), both length-delimited.
+const TARGET_RULE_TAG: u64 = 2 << 3 | 2;
+const RULE_ATTRIBUTE_TAG: u64 = 4 << 3 | 2;
+
+/// The number of `Rule.attribute` entries in an encoded `Target`, summed over every `rule` field
+/// (repeated occurrences of a singular message merge). `None` when the target has no rule or the
+/// bytes do not parse as a sequence of fields, in which case decoding reports the error.
+fn rule_attribute_count(target: &[u8]) -> Option<usize> {
+    let mut found_rule = false;
+    let mut attributes = 0;
+    for field in ProtoFields(target) {
+        let (tag, payload) = field?;
+        if tag == TARGET_RULE_TAG {
+            found_rule = true;
+            for field in ProtoFields(payload?) {
+                let (tag, _) = field?;
+                attributes += usize::from(tag == RULE_ATTRIBUTE_TAG);
+            }
+        }
+    }
+    found_rule.then_some(attributes)
+}
+
+/// Iterates the top-level fields of an encoded message as `(tag, payload)`, where the payload is
+/// `Some` for length-delimited fields. Yields `None` and stops at the first malformed field.
+struct ProtoFields<'a>(&'a [u8]);
+
+impl<'a> ProtoFields<'a> {
+    fn varint(&mut self) -> Option<u64> {
+        let mut value = 0u64;
+        for (index, byte) in self.0.iter().take(10).enumerate() {
+            value |= u64::from(byte & 0x7f) << (7 * index);
+            if byte & 0x80 == 0 {
+                self.0 = &self.0[index + 1..];
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn skip(&mut self, length: usize) -> Option<&'a [u8]> {
+        let (skipped, rest) = (length <= self.0.len()).then(|| self.0.split_at(length))?;
+        self.0 = rest;
+        Some(skipped)
+    }
+}
+
+impl<'a> Iterator for ProtoFields<'a> {
+    type Item = Option<(u64, Option<&'a [u8]>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let field = (|| {
+            let tag = self.varint()?;
+            let payload = match tag & 7 {
+                0 => self.varint().map(|_| None)?,
+                1 => self.skip(8).map(|_| None)?,
+                2 => {
+                    let length = usize::try_from(self.varint()?).ok()?;
+                    Some(self.skip(length)?)
+                }
+                5 => self.skip(4).map(|_| None)?,
+                _ => return None,
+            };
+            Some((tag, payload))
+        })();
+        if field.is_none() {
+            self.0 = &[];
+        }
+        Some(field)
+    }
+}
+
 #[cfg(test)]
 fn decode_target_stream(
     path: &Path,
@@ -3431,7 +3527,7 @@ fn decode_target_stream_filtered(
         batch
             .slices()
             .map(|bytes| {
-                <Target as Message>::decode_from_slice(bytes)
+                decode_query_target(bytes)
                     .map_err(anyhow::Error::from)
                     .map(lower_query_target)
             })
@@ -4892,6 +4988,50 @@ mod tests {
         }
         assert_eq!(expected.len(), 4);
         assert_eq!(decode_delimited::<Repository>(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn query_targets_decode_with_their_attribute_count_reserved() {
+        let attribute = |name: &str| Attribute {
+            name: name.into(),
+            r#type: attribute::Discriminator::String,
+            string_value: Some("v".into()),
+            ..Default::default()
+        };
+        let mut rule = rule_target("//pkg:rule");
+        {
+            let inner = rule.rule.as_option_mut().unwrap();
+            inner.location = Some("pkg/BUILD:1:1".into());
+            inner.attribute = (0..37)
+                .map(|index| attribute(&format!("a{index}")))
+                .collect();
+            inner.rule_input = vec!["//pkg:in".into()];
+        }
+        let source = Target {
+            r#type: target::Discriminator::SourceFile,
+            source_file: buffa::MessageField::some(SourceFile {
+                name: "//pkg:file.txt".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let empty_rule = rule_target("//pkg:empty");
+        for (target, count) in [(&rule, Some(37)), (&source, None), (&empty_rule, Some(0))] {
+            let bytes = target.encode_to_vec();
+            assert_eq!(rule_attribute_count(&bytes), count);
+            let decoded = decode_query_target(&bytes).unwrap();
+            assert_eq!(&decoded, target);
+            assert_eq!(decoded, Target::decode_from_slice(&bytes).unwrap());
+            if let Some(rule) = decoded.rule.as_option() {
+                assert_eq!(rule.attribute.capacity(), rule.attribute.len());
+            }
+        }
+        // Malformed input is left for the decoder to reject.
+        let bytes = rule.encode_to_vec();
+        let truncated = &bytes[..bytes.len() - 3];
+        assert_eq!(rule_attribute_count(truncated), None);
+        assert!(decode_query_target(truncated).is_err());
+        assert_eq!(rule_attribute_count(&[0x0b]), None);
     }
 
     #[test]

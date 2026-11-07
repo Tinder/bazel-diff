@@ -682,6 +682,39 @@ impl BazelOptions {
         if bindings.is_empty() {
             return Ok(());
         }
+        // Follow returned literal aliases until their first missing destination.
+        // Configurable primary aliases retain the existing package boundary.
+        use crate::proto::blaze_query::attribute::Discriminator as Kind;
+        let mut returned_aliases: BTreeSet<_> = bindings
+            .values()
+            .filter(|actual| {
+                actual.r#type == Kind::Label && actual.selector_list.as_option().is_none()
+            })
+            .filter_map(|actual| actual.string_value.as_ref())
+            .filter(|name| ordinary_names.contains(&canonical_query_label(name, &mapping)))
+            .cloned()
+            .collect();
+        let mut inspected = HashSet::new();
+        while !returned_aliases.is_empty() {
+            let names: BTreeSet<_> = std::mem::take(&mut returned_aliases)
+                .into_iter()
+                .filter(|name| inspected.insert(canonical_query_label(name, &mapping).into_owned()))
+                .collect();
+            if names.is_empty() {
+                break;
+            }
+            for (name, actual) in self.alias_actuals(&names, version)? {
+                if actual.r#type != Kind::Label || actual.selector_list.as_option().is_some() {
+                    continue;
+                }
+                if let Some(destination) = actual.string_value.as_ref() {
+                    if ordinary_names.contains(&canonical_query_label(destination, &mapping)) {
+                        returned_aliases.insert(destination.clone());
+                    }
+                    bindings.insert(name, actual);
+                }
+            }
+        }
         let mut missing = BTreeSet::new();
         for actual in bindings.values() {
             for destination in alias_actual_values(actual) {

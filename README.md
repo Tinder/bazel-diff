@@ -1079,9 +1079,13 @@ A few inputs are normalized or extended on the way in:
 * Outside `--isolatedDependencyRoot`, ordinary query checks native aliases in repositories named
   by `--fineGrainedHashExternalRepos` or `--fineGrainedHashExternalReposFile` when returned inputs
   reach them. On Bazel 8 and later, a metadata query identifies missing `actual` targets and a
-  dependency query adds their dependencies and build files. Each reached native alias hashes its
-  evaluated `actual` binding, including the destination for each `select()` condition. Acquired
-  library rules also hash the BUILD and Starlark files that define them.
+  dependency query adds their dependencies and build files. A literal binding on a reached fine
+  alias is followed through literal ordinary aliases already returned by the primary query until
+  the first missing destination.
+  A configurable ordinary alias already in the primary query contributes missing branches only
+  through the package inventory below. Each reached native alias hashes its evaluated `actual`
+  binding, including the destination for each `select()` condition. Acquired library rules also
+  hash the BUILD and Starlark files that define them.
   When that dependency query returns rules from external packages, the same input walk also checks
   reached ordinary aliases for missing `actual` targets in those packages. One query inventories
   the matching packages; only the named targets and their dependencies returned by that inventory

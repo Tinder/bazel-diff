@@ -739,6 +739,54 @@ config_setting(name = "second", constraint_values = ["@@//:special"])
 }
 
 #[test]
+fn fine_alias_follows_already_returned_aliases_to_its_library() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    edit(&root.join("public.BUILD"), |text| {
+        text.replace("@hidden//:forward", "@@//:bridge")
+    });
+    edit(&root.join("BUILD.bazel"), |text| {
+        format!(
+            r#"{text}
+exports_files(["payload.txt"])
+alias(name = "bridge", actual = ":second_bridge", visibility = ["//visibility:public"])
+alias(name = "second_bridge", actual = "@library//:copy")
+"#
+        )
+    });
+    edit(&root.join("library/BUILD.bazel"), |text| {
+        format!(
+            r#"{text}
+genrule(name = "copy", srcs = ["@@//:payload.txt"], outs = ["copied.txt"], cmd = "cp $< $@")
+"#
+        )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let snapshot = |value: &str| {
+        fs::write(root.join("payload.txt"), value).unwrap();
+        assert_product(root, "//:consumer", "consumer.txt", value);
+        let file = out.path().join(format!("{value}.json"));
+        let run = generate(root, &file, &["--fineGrainedHashExternalRepos=@public"]);
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        file
+    };
+    let before = snapshot("before");
+    let after = snapshot("after");
+    let result = out.path().join("impacted.txt");
+    assert!(impacted(root, &before, &after, &result, &[])
+        .status
+        .success());
+    assert!(read_lines(&result).contains("//:consumer"));
+}
+
+#[test]
 fn main_alias_reaches_a_library_behind_an_external_alias() {
     if !supports_mod_show_repo() {
         return;

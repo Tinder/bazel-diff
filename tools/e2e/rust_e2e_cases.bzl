@@ -100,6 +100,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::fine_alias_follows_already_returned_aliases_to_its_library",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::fine_aliases_acquire_hidden_libraries_and_definition_sources",
                 "timeout": "moderate",
             },

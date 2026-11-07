@@ -433,6 +433,28 @@ fn label_only_extension_bump_does_not_reach_users_of_the_owner_or_its_dependents
     }
 }
 
+fn partial_hashes(
+    root: &std::path::Path,
+    out: &std::path::Path,
+    name: &str,
+    base: Option<&std::path::Path>,
+    options: &[&str],
+) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    let hashes = out.join(format!("{name}.json"));
+    let edges = out.join(format!("{name}-edges.json"));
+    let edge_arg = edges.display().to_string();
+    let base_arg = base.map(|path| path.display().to_string());
+    let mut args = options.to_vec();
+    args.extend(["--partialGraph", "-d", &edge_arg]);
+    if let Some(base) = &base_arg {
+        args.extend(["--baseHashes", base]);
+    }
+    let result = generate(root, &hashes, &args);
+    let log = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert!(result.status.success(), "{name}: {log}");
+    (hashes, edges, log)
+}
+
 const ISOLATED_ROOT: &[&str] = &["--isolatedDependencyRoot", "@hub"];
 
 fn assert_product(workspace: &std::path::Path, target: &str, file: &str, expected: &str) {
@@ -452,6 +474,140 @@ fn assert_product(workspace: &std::path::Path, target: &str, file: &str, expecte
             .trim(),
         expected
     );
+}
+
+#[test]
+fn local_archive_build_file_reaches_only_its_own_repository_and_readers() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("local_archive_build_file");
+    let root = workspace.path();
+    let archive = fixture("integration-test-1.zip");
+    edit(&root.join("MODULE.bazel"), |text| {
+        text.replace("ARCHIVE_URL", &format!("file://{}", archive.display()))
+    });
+    let out = tempfile::tempdir().unwrap();
+    let template = fs::read_to_string(root.join("overlays/overlay.tpl")).unwrap();
+    let base = out.path().join("base.json");
+    for (arm, active, neighbor) in [
+        ("base", "A", "A"),
+        ("active", "B", "A"),
+        ("neighbor", "A", "B"),
+    ] {
+        for (file, value) in [("active.rules", active), ("neighbor.rules", neighbor)] {
+            fs::write(
+                root.join("overlays").join(file),
+                template.replace("VALUE", value),
+            )
+            .unwrap();
+        }
+        let hashes = out.path().join(format!("{arm}.json"));
+        let generated = generate(root, &hashes, &[]);
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        // The resolved tool and the direct reader use the same archive output.
+        assert_product(root, "//:products", "tool_user.txt", active);
+        assert_eq!(
+            fs::read_to_string(root.join("bazel-bin/plain.txt"))
+                .unwrap()
+                .trim(),
+            active
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("bazel-bin/other.txt"))
+                .unwrap()
+                .trim(),
+            neighbor
+        );
+        if arm == "base" {
+            continue;
+        }
+        let before: serde_json::Value = serde_json::from_slice(&fs::read(&base).unwrap()).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&hashes).unwrap()).unwrap();
+        for (repo, expected) in [
+            ("//external:sdk", arm == "active"),
+            ("//external:neighbor", arm == "neighbor"),
+        ] {
+            let before = before["hashes"][repo]
+                .as_str()
+                .unwrap()
+                .rsplit_once('~')
+                .unwrap()
+                .1;
+            let after = after["hashes"][repo]
+                .as_str()
+                .unwrap()
+                .rsplit_once('~')
+                .unwrap()
+                .1;
+            assert_eq!(before != after, expected, "{arm}: {repo}");
+        }
+        let affected = out.path().join(format!("{arm}.txt"));
+        let result = impacted(root, &base, &hashes, &affected, &[]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let rows = fs::read_to_string(affected).unwrap();
+        let changed: BTreeSet<_> = rows
+            .lines()
+            .map(|label| label.trim_start_matches('@'))
+            .collect();
+        for (label, expected) in [
+            ("//:registration", arm == "active"),
+            ("//:plain", arm == "active"),
+            ("//:other", arm == "neighbor"),
+        ] {
+            assert_eq!(changed.contains(label), expected, "{arm}: {label}");
+        }
+    }
+
+    init_git(root);
+    let partial = |name: &str, base: Option<&std::path::Path>| {
+        partial_hashes(root, out.path(), name, base, &[])
+    };
+    partial("warm", None);
+    if !git(root, &["status", "--porcelain"]).is_empty() {
+        commit(root, "settle repository metadata");
+    }
+    let lock_path = root.join("MODULE.bazel.lock");
+    let lock = fs::read(&lock_path).unwrap();
+    let (base, _, _) = partial("partial-base", None);
+    assert_eq!(fs::read(&lock_path).unwrap(), lock);
+    fs::write(
+        root.join("overlays/active.rules"),
+        template.replace("VALUE", "B"),
+    )
+    .unwrap();
+    assert_product(root, "//:plain", "plain.txt", "B");
+    assert_eq!(fs::read(&lock_path).unwrap(), lock);
+    assert_eq!(git(root, &["diff", "--name-only"]), "overlays/active.rules");
+    assert!(git(root, &["ls-files", "--others", "--exclude-standard"]).is_empty());
+    let (reused, reused_edges, log) = partial("reused", Some(&base));
+    assert!(
+        log.contains("full generation")
+            && log.contains("read while loading")
+            && log.contains("overlays"),
+        "{log}"
+    );
+    let (fresh, fresh_edges, _) = partial("fresh", None);
+    assert_eq!(fs::read(&reused).unwrap(), fs::read(&fresh).unwrap());
+    assert_eq!(dep_edges(&reused_edges), dep_edges(&fresh_edges));
+    let selected = out.path().join("partial-selected.txt");
+    let result = impacted(root, &base, &reused, &selected, &[]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let selected = read_lines(&selected);
+    assert!(selected.contains("//:plain"), "{selected:?}");
+    assert!(!selected.contains("//:other"), "{selected:?}");
 }
 
 #[test]

@@ -763,6 +763,7 @@ fn fingerprint_flags(
         ("keepGoing".into(), args.keep_going.to_string()),
         ("cycleComponents".into(), "1".into()),
         ("stackSourcePaths".into(), "1".into()),
+        ("localArchiveBuildFile".into(), "1".into()),
     ]);
     if let Some(root) = &args.isolated_dependency_root {
         flags.insert("isolatedDependencyRoot".into(), root.clone());

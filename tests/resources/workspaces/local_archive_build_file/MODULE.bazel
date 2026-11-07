@@ -1,0 +1,19 @@
+module(name = "local_archive_build_file")
+
+bazel_dep(name = "overlays", version = "1.0")
+local_path_override(module_name = "overlays", path = "overlays")
+
+archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+archive(
+    name = "sdk",
+    build_file = "@overlays//:active.rules",
+    sha256 = "f9acf346049358076827b799e95de4b5acf0556fd75991e0dd5363814bc85683",
+    urls = ["ARCHIVE_URL"],
+)
+archive(
+    name = "neighbor",
+    build_file = "@overlays//:neighbor.rules",
+    sha256 = "f9acf346049358076827b799e95de4b5acf0556fd75991e0dd5363814bc85683",
+    urls = ["ARCHIVE_URL"],
+)
+register_toolchains("//:registration")

@@ -7,6 +7,7 @@
 pub mod bazel;
 pub mod cache;
 pub mod cancel;
+mod components;
 pub mod explain;
 pub mod fingerprint;
 pub mod git;

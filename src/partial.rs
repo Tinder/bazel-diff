@@ -28,6 +28,7 @@
 //! A fallback costs speed, never correctness.
 
 use crate::bazel::{attribute_main_repo_labels, target_label};
+use crate::components::{component_digest, member_digest, Completion, Components, Visit};
 use crate::hash::{hash_pool, is_main_repo, label_package, main_repo_path, HashOptions};
 use crate::model::{HashFileData, TargetHash};
 use crate::proto::blaze_query::Rule;
@@ -43,7 +44,7 @@ type DigestBytes = [u8; 32];
 
 /// Bumped when the recipe format or the evaluation formula changes, so an entry an older
 /// release wrote is regenerated rather than evaluated under a formula it was not recorded for.
-pub const RECIPE_VERSION: u32 = 3;
+pub const RECIPE_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------------------------
 // Git tree index
@@ -497,8 +498,7 @@ pub fn normalize_workspace_path(workspace: &Path, value: &str) -> Option<String>
 /// Computes every target's hash from the recipes and the revision's tree.
 ///
 /// `targets` lists every label with its kind (`Rule`, `GeneratedFile`, `SourceFile`); it is
-/// visited in label order, which fixes which member of a dependency cycle is entered first, as
-/// the default traversal does.
+/// visited in label order, as the default traversal does.
 pub fn evaluate(
     recipes: &PartialRecipes,
     targets: &BTreeMap<String, String>,
@@ -545,18 +545,18 @@ pub fn evaluate(
         source_digests,
         soft_digests: HashMap::new(),
         cache: HashMap::new(),
+        components: Components::default(),
     };
     let mut hashes = BTreeMap::new();
-    let mut path = Vec::new();
     for (label, kind) in targets {
         let (overall, direct) = match kind.as_str() {
-            "Rule" => evaluator.rule(label, &mut path)?,
+            "Rule" => evaluator.rule(label)?,
             "GeneratedFile" => {
                 let generating_rule = recipes
                     .generated
                     .get(label)
                     .ok_or_else(|| anyhow!("recipes do not name the rule generating {label}"))?;
-                evaluator.rule(generating_rule, &mut path)?
+                evaluator.rule(generating_rule)?
             }
             "SourceFile" => {
                 let mut hasher = Sha256::new();
@@ -628,13 +628,28 @@ struct Evaluator<'a> {
     tree: &'a TreeIndex,
     source_digests: HashMap<String, DigestBytes>,
     soft_digests: HashMap<String, Option<DigestBytes>>,
-    cache: HashMap<String, (DigestBytes, DigestBytes)>,
+    cache: HashMap<String, EvaluationState>,
+    components: Components<String, (DigestBytes, DigestBytes)>,
+}
+
+enum EvaluationState {
+    Pending(usize),
+    Complete((DigestBytes, DigestBytes)),
 }
 
 impl Evaluator<'_> {
-    fn rule(&mut self, key: &str, path: &mut Vec<String>) -> Result<(DigestBytes, DigestBytes)> {
-        if let Some(digest) = self.cache.get(key) {
-            return Ok(*digest);
+    fn rule(&mut self, key: &str) -> Result<(DigestBytes, DigestBytes)> {
+        match self.visit(key)? {
+            Visit::Complete(digest) => Ok(digest),
+            Visit::Pending(_) => unreachable!("a top-level rule completes its component"),
+        }
+    }
+
+    fn visit(&mut self, key: &str) -> Result<Visit<(DigestBytes, DigestBytes)>> {
+        match self.cache.get(key) {
+            Some(EvaluationState::Complete(digest)) => return Ok(Visit::Complete(*digest)),
+            Some(EvaluationState::Pending(position)) => return Ok(Visit::Pending(*position)),
+            None => {}
         }
         let recipe = self
             .recipes
@@ -642,16 +657,9 @@ impl Evaluator<'_> {
             .get(key)
             .ok_or_else(|| anyhow!("recipes hold no rule {key}"))?;
         let static_digest = recipe.static_digest()?;
-        if path.iter().any(|entry| entry == key) {
-            // A back edge: the rule stands in with a digest of its own definition, uncached,
-            // exactly as the default traversal does.
-            let mut hasher = Sha256::new();
-            hasher.update(b"cycle");
-            hasher.update(static_digest);
-            let placeholder: DigestBytes = hasher.finalize().into();
-            return Ok((placeholder, placeholder));
-        }
-        path.push(key.to_owned());
+        let position = self.components.enter(key.to_owned());
+        self.cache
+            .insert(key.to_owned(), EvaluationState::Pending(position));
         let mut direct = Sha256::new();
         direct.update(static_digest);
         for source in recipe.sources() {
@@ -675,14 +683,35 @@ impl Evaluator<'_> {
         let direct: DigestBytes = direct.finalize().into();
         let mut overall = Sha256::new();
         for dep in recipe.deps() {
-            let (dep_overall, _) = self.rule(dep, path)?;
-            overall.update(dep_overall);
+            match self.visit(dep)? {
+                Visit::Complete((dep_overall, _)) => overall.update(dep_overall),
+                Visit::Pending(dependency) => self.components.reaches(position, dependency),
+            }
         }
         overall.update(direct);
         let digest = (overall.finalize().into(), direct);
-        path.pop();
-        self.cache.insert(key.to_owned(), digest);
-        Ok(digest)
+        match self.components.finish(position, digest) {
+            Completion::Pending(lowlink) => Ok(Visit::Pending(lowlink)),
+            Completion::Single(name, digest) => {
+                self.cache.insert(name, EvaluationState::Complete(digest));
+                Ok(Visit::Complete(digest))
+            }
+            Completion::Cycle(members) => {
+                let component = component_digest(
+                    members
+                        .iter()
+                        .map(|(name, (overall, _))| (name.as_str(), *overall)),
+                );
+                for (name, (overall, direct)) in members {
+                    let digest = (member_digest(component, &name, overall), direct);
+                    self.cache.insert(name, EvaluationState::Complete(digest));
+                }
+                let Some(EvaluationState::Complete(digest)) = self.cache.get(key) else {
+                    unreachable!("the component root is complete");
+                };
+                Ok(Visit::Complete(*digest))
+            }
+        }
     }
 }
 
@@ -1349,6 +1378,57 @@ mod tests {
             evaluate(&no_package_seeds, &targets, &fixture_tree()).unwrap()["//pkg:a.txt"].hash,
             evaluate(&no_package_seeds, &targets, &bzl).unwrap()["//pkg:a.txt"].hash
         );
+    }
+
+    #[test]
+    fn overlapping_cycles_include_outgoing_source_changes() {
+        let mut recipes = recipes();
+        recipes.rules.insert(
+            "//cycle:x".into(),
+            RuleRecipe::new(
+                [3; 32],
+                vec![],
+                vec!["//cycle:y".into(), "//cycle:z".into()],
+            ),
+        );
+        recipes.rules.insert(
+            "//cycle:z".into(),
+            RuleRecipe::new(
+                [5; 32],
+                vec![],
+                vec!["//cycle:y".into(), "//pkg:lib".into()],
+            ),
+        );
+        recipes.rules.insert(
+            "//cycle:consumer".into(),
+            RuleRecipe::new([6; 32], vec![], vec!["//cycle:y".into()]),
+        );
+        let mut targets = targets();
+        targets.insert("//cycle:z".into(), "Rule".into());
+        targets.insert("//cycle:consumer".into(), "Rule".into());
+        let before = evaluate(&recipes, &targets, &fixture_tree()).unwrap();
+        let mut edited = fixture_tree();
+        edited.entries.get_mut("pkg/a.txt").unwrap().object = "a2".into();
+        let after = evaluate(&recipes, &targets, &edited).unwrap();
+        for label in ["//cycle:x", "//cycle:y", "//cycle:z", "//cycle:consumer"] {
+            assert_ne!(before[label].hash, after[label].hash, "{label}");
+            assert_eq!(
+                before[label].direct_hash, after[label].direct_hash,
+                "{label}"
+            );
+        }
+        assert_eq!(before["//other:c.txt"].hash, after["//other:c.txt"].hash);
+
+        // Derivation uses the recipes themselves, without requiring emitted dependency edges.
+        let base = HashFileData {
+            hashes: before,
+            partial: Some(recipes),
+            ..Default::default()
+        };
+        let derived = derive(&base, &edited).unwrap();
+        assert_eq!(derived.hashes, after);
+        assert_eq!(derived.partial, base.partial);
+        assert!(derived.dep_edges.is_empty());
     }
 
     #[test]

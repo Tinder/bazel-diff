@@ -123,6 +123,7 @@ message ConfiguredRuleInput {
   optional string label = 1;
   optional string configuration_checksum = 2;
   optional uint32 configuration_id = 3;
+  optional uint32 aspect_id = 4;
 }
 
 message Rule {

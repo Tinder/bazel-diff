@@ -5,7 +5,7 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
-use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -311,6 +311,10 @@ pub struct HashFileData {
 pub struct ConfiguredRoots {
     pub roots: BTreeMap<String, String>,
     pub hashes: BTreeMap<String, TargetHash>,
+    /// Requested roots whose fresh verification view was completely represented in these hashes,
+    /// mapped to a digest of additional observed context. Absence is the historical format and
+    /// carries no negative authority; the comparator still has to establish equality.
+    pub verified_roots: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Serialize)]
@@ -319,6 +323,8 @@ struct SerializedConfiguredRoots<'a> {
     version: u32,
     roots: &'a BTreeMap<String, String>,
     hashes: SerializedHashes<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_roots: Option<&'a BTreeMap<String, String>>,
 }
 
 impl ConfiguredRoots {
@@ -330,6 +336,7 @@ impl ConfiguredRoots {
                 hashes: &self.hashes,
                 include_target_type,
             },
+            verified_roots: self.verified_roots.as_ref(),
         }
     }
 }
@@ -340,6 +347,8 @@ struct ConfiguredRootsWire {
     version: u32,
     roots: BTreeMap<String, String>,
     hashes: Hashes,
+    #[serde(default)]
+    verified_roots: Option<BTreeMap<String, String>>,
 }
 
 impl<'de> Deserialize<'de> for ConfiguredRoots {
@@ -351,9 +360,21 @@ impl<'de> Deserialize<'de> for ConfiguredRoots {
                 wire.version
             )));
         }
+        if wire.verified_roots.as_ref().is_some_and(|verified| {
+            verified.iter().any(|(label, context)| {
+                !wire.roots.contains_key(label)
+                    || context.len() != 64
+                    || !context.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        }) {
+            return Err(de::Error::custom(
+                "verified configured root has an invalid context or is outside the requested root set",
+            ));
+        }
         Ok(Self {
             roots: wire.roots,
             hashes: wire.hashes.0,
+            verified_roots: wire.verified_roots,
         })
     }
 }
@@ -671,6 +692,44 @@ pub struct ImpactedTargetWithDistance {
     pub package_distance: usize,
 }
 
+/// The native comparison result and the changed graph used to compute its distances.
+/// Read each path's keys in the dependency-edges file supplied to this comparison.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ImpactGraph {
+    pub version: u32,
+    pub targets: Vec<ImpactedTargetWithDistance>,
+    pub paths: Vec<ImpactPath>,
+    /// Roots whose verified configured hash inputs and context are equal in this comparison.
+    /// An absent label remains unknown; caller obligations outside this graph still apply.
+    pub unaffected_roots: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum ImpactPathKind {
+    Ordinary,
+    Configured,
+    Shared,
+    /// An independent MODULE obligation, represented as one distance-zero root.
+    Forced,
+}
+
+/// A set of eligible outputs and the native origins and changed nodes that reach them.
+/// `direct` includes the existing distance-zero fallback for incomplete edge files.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ImpactPath {
+    pub kind: ImpactPathKind,
+    pub changed: BTreeSet<String>,
+    pub direct: BTreeSet<String>,
+    /// Public output label to its key in the supplied head dependency graph.
+    pub roots: BTreeMap<String, String>,
+}
+
 fn kind_rank(hash: Option<&TargetHash>) -> u8 {
     match hash
         .map(|hash| hash.kind.as_str())
@@ -785,7 +844,7 @@ pub fn impacted_types(
 fn reverse_distances<'a>(
     dependents: &HashMap<&'a str, Vec<&'a str>>,
     roots: &[&'a str],
-    edge_cost: impl Fn(&str, &str) -> usize,
+    edge_cost: impl Fn(&str, &str) -> Option<usize>,
 ) -> HashMap<&'a str, usize> {
     let mut distances = roots
         .iter()
@@ -800,7 +859,9 @@ fn reverse_distances<'a>(
             continue;
         }
         for &dependent in dependents.get(label).into_iter().flatten() {
-            let cost = edge_cost(label, dependent);
+            let Some(cost) = edge_cost(label, dependent) else {
+                continue;
+            };
             debug_assert!(cost <= 1);
             let candidate = distance.saturating_add(cost);
             let improved = match distances.entry(dependent) {
@@ -837,15 +898,16 @@ pub fn impacted_targets_with_distances(
     exclude_external: bool,
 ) -> Result<Vec<ImpactedTargetWithDistance>> {
     let impact_types = impacted_types(from, to);
-    distances_for_types(
+    let result = distances_for_types(
         from,
         to,
         dep_edges,
         target_types,
         exclude_external,
         impact_types,
-        None,
-    )
+        DistanceOptions::default(),
+    )?;
+    Ok(result.targets)
 }
 
 /// Walk the configured cause graph before selecting the requested outputs. A source
@@ -858,6 +920,331 @@ pub fn hash_file_distances(
     target_types: Option<&HashSet<String>>,
     exclude_external: bool,
 ) -> Result<Vec<ImpactedTargetWithDistance>> {
+    let result = hash_file_distance_results(
+        from,
+        to,
+        dep_edges,
+        module_impacted,
+        target_types,
+        exclude_external,
+        DistanceRequest::default(),
+    )?;
+    Ok(result.targets)
+}
+
+/// Return the native paths for a standalone ordinary or configured-root comparison.
+/// Enrollment alone does not establish a change for a configured root first requested at the
+/// head. Such a root needs a shared direct change or an independent MODULE obligation.
+pub(crate) fn hash_file_impact_graph(
+    from: &HashFileData,
+    to: &HashFileData,
+    dep_edges: &BTreeMap<String, Vec<String>>,
+    module_forced: &BTreeSet<String>,
+    target_types: Option<&HashSet<String>>,
+    exclude_external: bool,
+) -> Result<ImpactGraph> {
+    let (requested, shared) = from
+        .configured_roots
+        .as_ref()
+        .zip(to.configured_roots.as_ref())
+        .map(|(before, after)| {
+            let requested = before
+                .roots
+                .keys()
+                .map(|label| crate::bazel::main_repo_label_key(label))
+                .collect::<HashSet<_>>();
+            let shared = after
+                .roots
+                .keys()
+                .any(|label| !requested.contains(crate::bazel::main_repo_label_key(label)))
+                .then(|| shared_direct_changes(before, after))
+                .filter(|origins| !origins.is_empty());
+            (Some(requested), shared)
+        })
+        .unwrap_or_default();
+    // MODULE obligations are emitted separately and cannot become path origins for other roots.
+    let mut result = hash_file_distance_results(
+        from,
+        to,
+        dep_edges,
+        None,
+        target_types,
+        exclude_external,
+        DistanceRequest {
+            shared: shared.as_ref(),
+            capture: true,
+        },
+    )?;
+    if let Some(requested) = &requested {
+        result
+            .targets
+            .retain(|target| requested.contains(crate::bazel::main_repo_label_key(&target.label)));
+        result
+            .shared
+            .retain(|target| !requested.contains(crate::bazel::main_repo_label_key(&target.label)));
+    }
+    let trace = result.trace.expect("capture requested");
+    result
+        .targets
+        .retain(|target| trace.changed.contains(&target.label));
+    let graph_roots = result
+        .targets
+        .iter()
+        .map(|target| (target.label.clone(), target.label.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = Vec::new();
+    if !graph_roots.is_empty() {
+        if !trace.direct.is_subset(&trace.changed)
+            || graph_roots.values().any(|key| !trace.changed.contains(key))
+        {
+            bail!("impact path origin or root is outside its changed graph");
+        }
+        paths.push(ImpactPath {
+            kind: if to.configured_roots.is_some() {
+                ImpactPathKind::Configured
+            } else {
+                ImpactPathKind::Ordinary
+            },
+            changed: trace.changed,
+            direct: trace.direct,
+            roots: graph_roots,
+        });
+    }
+    let mut needs_sort = false;
+    if !result.shared.is_empty() {
+        let roots = result
+            .shared
+            .iter()
+            .map(|target| (target.label.clone(), target.label.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if !trace.shared_direct.is_subset(&trace.shared_changed)
+            || roots
+                .values()
+                .any(|key| !trace.shared_changed.contains(key))
+        {
+            bail!("shared impact path origin or root is outside its changed graph");
+        }
+        paths.push(ImpactPath {
+            kind: ImpactPathKind::Shared,
+            changed: trace.shared_changed,
+            direct: trace.shared_direct,
+            roots,
+        });
+        result.targets.extend(result.shared);
+        needs_sort = true;
+    }
+    let mut forced_roots = BTreeMap::new();
+    for label in module_forced {
+        if to.hashes.contains_key(label)
+            && (!exclude_external || !label.starts_with("//external:"))
+            && accepts(label, &to.hashes, target_types)?
+        {
+            forced_roots.insert(label.clone(), label.clone());
+        }
+    }
+    if !forced_roots.is_empty() {
+        let positions = result
+            .targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| (target.label.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let mut updates = Vec::new();
+        let mut additions = Vec::new();
+        for label in forced_roots.keys() {
+            if let Some(index) = positions.get(label.as_str()) {
+                updates.push(*index);
+            } else {
+                additions.push(ImpactedTargetWithDistance {
+                    label: label.clone(),
+                    target_distance: 0,
+                    package_distance: 0,
+                });
+            }
+        }
+        for index in updates {
+            result.targets[index].target_distance = 0;
+            result.targets[index].package_distance = 0;
+        }
+        needs_sort |= !additions.is_empty();
+        result.targets.extend(additions);
+    }
+    for (label, key) in forced_roots {
+        let changed = BTreeSet::from([key.clone()]);
+        paths.push(ImpactPath {
+            kind: ImpactPathKind::Forced,
+            changed: changed.clone(),
+            direct: changed,
+            roots: BTreeMap::from([(label, key)]),
+        });
+    }
+    if needs_sort {
+        let mut ranked = result
+            .targets
+            .into_iter()
+            .map(|target| {
+                let rank = kind_rank(
+                    to.hashes
+                        .get(&target.label)
+                        .or_else(|| from.hashes.get(&target.label)),
+                );
+                (rank, target)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_unstable_by(|(left_rank, left), (right_rank, right)| {
+            left_rank
+                .cmp(right_rank)
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        result.targets = ranked.into_iter().map(|(_, target)| target).collect();
+    }
+    let unaffected_roots =
+        verified_unaffected_roots(from, to, module_forced, &result.targets, target_types);
+    Ok(ImpactGraph {
+        version: 1,
+        targets: result.targets,
+        paths,
+        unaffected_roots,
+    })
+}
+
+fn verified_unaffected_roots(
+    from: &HashFileData,
+    to: &HashFileData,
+    module_forced: &BTreeSet<String>,
+    targets: &[ImpactedTargetWithDistance],
+    target_types: Option<&HashSet<String>>,
+) -> BTreeSet<String> {
+    if from.partial.is_some()
+        || to.partial.is_some()
+        || !from
+            .module_graph_json
+            .as_ref()
+            .zip(to.module_graph_json.as_ref())
+            .is_some_and(|(before, after)| {
+                before == after && crate::module_graph::usable_module_graph(before)
+            })
+    {
+        return BTreeSet::new();
+    }
+    let Some((before, after)) = from
+        .configured_roots
+        .as_ref()
+        .zip(to.configured_roots.as_ref())
+    else {
+        return BTreeSet::new();
+    };
+    let Some((before_verified, after_verified)) = before
+        .verified_roots
+        .as_ref()
+        .zip(after.verified_roots.as_ref())
+    else {
+        return BTreeSet::new();
+    };
+    let positive = targets
+        .iter()
+        .map(|target| target.label.as_str())
+        .chain(module_forced.iter().map(String::as_str))
+        .map(crate::bazel::main_repo_label_key)
+        .collect::<HashSet<_>>();
+    after_verified
+        .iter()
+        .filter(|(label, context)| {
+            let normalized = crate::bazel::main_repo_label_key(label);
+            if !normalized.starts_with("//")
+                || normalized.starts_with("//external:")
+                || before_verified.get(*label) != Some(*context)
+                || positive.contains(normalized)
+                || target_types.is_some_and(|types| {
+                    !to.hashes
+                        .get(*label)
+                        .is_some_and(|hash| types.contains(&hash.kind))
+                })
+            {
+                return false;
+            }
+            let Some(key) = before
+                .roots
+                .get(*label)
+                .zip(after.roots.get(*label))
+                .filter(|(before, after)| before == after)
+                .map(|(_, after)| after)
+            else {
+                return false;
+            };
+            before
+                .hashes
+                .get(key)
+                .zip(after.hashes.get(key))
+                .is_some_and(|(before, after)| before.same_as(after))
+                && from
+                    .hashes
+                    .get(*label)
+                    .zip(to.hashes.get(*label))
+                    .is_some_and(|(before, after)| before.same_as(after))
+        })
+        .map(|(label, _)| label.clone())
+        .collect()
+}
+
+fn shared_direct_changes(before: &ConfiguredRoots, after: &ConfiguredRoots) -> HashSet<String> {
+    let mut changed = after
+        .hashes
+        .iter()
+        .filter(|(key, hash)| {
+            !key.starts_with("//external:")
+                && before
+                    .hashes
+                    .get(*key)
+                    .is_some_and(|old| old.direct_hash != hash.direct_hash)
+        })
+        .map(|(key, _)| key.clone())
+        .collect::<HashSet<_>>();
+    // A root view projects the instance's inputs instead of adding an edge to the instance.
+    // Preserve a direct change on the shared instance itself as a direct root-view origin.
+    for (root, key) in &after.roots {
+        if changed.contains(key) {
+            changed.insert(root.clone());
+        }
+    }
+    changed
+}
+
+struct DistanceResults {
+    targets: Vec<ImpactedTargetWithDistance>,
+    shared: Vec<ImpactedTargetWithDistance>,
+    trace: Option<DistanceTrace>,
+}
+
+struct DistanceTrace {
+    changed: BTreeSet<String>,
+    direct: BTreeSet<String>,
+    shared_changed: BTreeSet<String>,
+    shared_direct: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct DistanceOptions<'a> {
+    root_direct: Option<&'a HashSet<String>>,
+    shared: Option<&'a HashSet<String>>,
+    capture: bool,
+}
+
+#[derive(Default)]
+struct DistanceRequest<'a> {
+    shared: Option<&'a HashSet<String>>,
+    capture: bool,
+}
+
+fn hash_file_distance_results(
+    from: &HashFileData,
+    to: &HashFileData,
+    dep_edges: &BTreeMap<String, Vec<String>>,
+    module_impacted: Option<&BTreeSet<String>>,
+    target_types: Option<&HashSet<String>>,
+    exclude_external: bool,
+    request: DistanceRequest<'_>,
+) -> Result<DistanceResults> {
     from.ensure_same_root_mode(to)?;
     let root_changes = impacted_types(&from.hashes, &to.hashes);
     let mut forced_direct = HashSet::new();
@@ -896,7 +1283,11 @@ pub fn hash_file_distances(
         target_types,
         exclude_external,
         changes,
-        to.configured_roots.as_ref().map(|_| &forced_direct),
+        DistanceOptions {
+            root_direct: to.configured_roots.as_ref().map(|_| &forced_direct),
+            shared: request.shared,
+            capture: request.capture,
+        },
     )
 }
 
@@ -907,14 +1298,21 @@ fn distances_for_types(
     target_types: Option<&HashSet<String>>,
     exclude_external: bool,
     impact_types: HashMap<String, ImpactType>,
-    root_direct: Option<&HashSet<String>>,
-) -> Result<Vec<ImpactedTargetWithDistance>> {
+    options: DistanceOptions<'_>,
+) -> Result<DistanceResults> {
+    let DistanceOptions {
+        root_direct,
+        shared,
+        capture,
+    } = options;
     let mut dependents = HashMap::<&str, Vec<&str>>::new();
     let mut roots = Vec::new();
     for (label, impact) in &impact_types {
         if *impact == ImpactType::Direct {
             roots.push(label.as_str());
-            continue;
+            if shared.is_none() {
+                continue;
+            }
         }
         let mut has_impacted_dependency = false;
         for dependency in dep_edges
@@ -927,19 +1325,44 @@ fn distances_for_types(
             has_impacted_dependency = true;
             dependents.entry(dependency).or_default().push(label);
         }
-        if !has_impacted_dependency {
+        if *impact == ImpactType::Indirect && !has_impacted_dependency {
             eprintln!(
                 "[Warn] {label} was indirectly impacted, but has no impacted dependencies in the dep-edges file. Falling back to distance 0 -- see https://github.com/Tinder/bazel-diff/issues/268"
             );
             roots.push(label.as_str());
         }
     }
-    let target_distances = reverse_distances(&dependents, &roots, |_, _| 1);
+    let target_distances = reverse_distances(&dependents, &roots, |_, _| Some(1));
     let package_distances = reverse_distances(&dependents, &roots, |dependency, dependent| {
-        usize::from(
+        Some(usize::from(
             dependency.split(':').next().unwrap_or(dependency)
                 != dependent.split(':').next().unwrap_or(dependent),
-        )
+        ))
+    });
+    let shared_distances = shared.map(|origins| {
+        let roots = origins
+            .iter()
+            .filter_map(|label| {
+                impact_types
+                    .get_key_value(label)
+                    .map(|(label, _)| label.as_str())
+            })
+            .collect::<Vec<_>>();
+        let concrete = |dependency: &str, dependent: &str| {
+            !dependency.starts_with("//external:") && !dependent.starts_with("//external:")
+        };
+        let target = reverse_distances(&dependents, &roots, |dependency, dependent| {
+            concrete(dependency, dependent).then_some(1)
+        });
+        let package = reverse_distances(&dependents, &roots, |dependency, dependent| {
+            concrete(dependency, dependent).then(|| {
+                usize::from(
+                    dependency.split(':').next().unwrap_or(dependency)
+                        != dependent.split(':').next().unwrap_or(dependent),
+                )
+            })
+        });
+        (target, package)
     });
     // An unreached label belongs to or depends on a rootless changed component. The graph
     // identifies no origin for it, so retain the conservative fallback of distance zero.
@@ -947,8 +1370,12 @@ fn distances_for_types(
         .keys()
         .map(String::as_str)
         .filter(|label| !target_distances.contains_key(label));
+    let mut unresolved_origins = capture.then(Vec::new);
     let (count, representative) =
         unresolved.fold((0_usize, None), |(count, representative), label| {
+            if let Some(origins) = &mut unresolved_origins {
+                origins.push(label);
+            }
             (
                 count + 1,
                 Some(representative.map_or(label, |prior: &str| prior.min(label))),
@@ -959,6 +1386,31 @@ fn distances_for_types(
             "[Warn] {count} indirectly impacted targets have no path to a direct change or a target with missing changed dependencies, including {representative}; falling back to distance 0"
         );
     }
+    let trace = capture.then(|| DistanceTrace {
+        changed: impact_types.keys().cloned().collect(),
+        direct: roots
+            .iter()
+            .copied()
+            .chain(unresolved_origins.into_iter().flatten())
+            .map(str::to_owned)
+            .collect(),
+        shared_changed: shared_distances
+            .as_ref()
+            .into_iter()
+            .flat_map(|(target, _)| target.keys())
+            .map(|key| (*key).to_owned())
+            .collect(),
+        shared_direct: shared
+            .into_iter()
+            .flatten()
+            .filter(|key| {
+                shared_distances
+                    .as_ref()
+                    .is_some_and(|(target, _)| target.contains_key(key.as_str()))
+            })
+            .cloned()
+            .collect(),
+    });
     let impacted = impact_types
         .keys()
         .chain(
@@ -1012,7 +1464,25 @@ fn distances_for_types(
             .cmp(right_rank)
             .then_with(|| left.label.cmp(&right.label))
     });
-    Ok(ranked.into_iter().map(|(_, target)| target).collect())
+    let shared = shared_distances
+        .map(|(target, package)| {
+            ranked
+                .iter()
+                .filter_map(|(_, row)| {
+                    Some(ImpactedTargetWithDistance {
+                        label: row.label.clone(),
+                        target_distance: *target.get(row.label.as_str())?,
+                        package_distance: *package.get(row.label.as_str())?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(DistanceResults {
+        targets: ranked.into_iter().map(|(_, target)| target).collect(),
+        shared,
+        trace,
+    })
 }
 
 #[cfg(test)]
@@ -1474,11 +1944,16 @@ mod tests {
             ["//a:leaf", "//other:direct"],
             ["//other:direct", "//a:leaf"],
         ] {
-            assert_eq!(reverse_distances(&dependents, &roots, |_, _| 1), target);
+            assert_eq!(
+                reverse_distances(&dependents, &roots, |_, _| Some(1)),
+                target
+            );
             // The consumer's shortest hop path crosses a package; the longer cycle path does not.
             assert_eq!(
                 reverse_distances(&dependents, &roots, |dependency, dependent| {
-                    usize::from(dependency.split(':').next() != dependent.split(':').next())
+                    Some(usize::from(
+                        dependency.split(':').next() != dependent.split(':').next(),
+                    ))
                 }),
                 package
             );

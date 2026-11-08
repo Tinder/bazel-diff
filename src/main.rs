@@ -3,11 +3,11 @@ use bazel_diff::bazel::BazelOptions;
 use bazel_diff::explain::{self, ExplainFormat, ExplainLimits};
 use bazel_diff::fingerprint;
 use bazel_diff::git::{self, DerivationPolicy, Git};
-use bazel_diff::hash::{generate_hashes, HashOptions};
+use bazel_diff::hash::{generate_hashes, generate_verified_hashes, HashOptions};
 use bazel_diff::model::{
     dep_edges_from_slice, filter_and_sort_labels, hash_file_distances, HashFileData,
 };
-use bazel_diff::module_graph::{bzlmod_enabled_for, impacted_with_module_changes};
+use bazel_diff::module_graph::{bzlmod_enabled_for, impact_graph, impacted_with_module_changes};
 use bazel_diff::partial::{self, Classification, Glob};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -48,8 +48,11 @@ enum Commands {
         #[command(flatten)]
         args: GenerateHashesArgs,
         /// Preserve observed native declaration bindings and, with -d, ordinary type references.
-        #[arg(long = "includeToolchainInputs")]
+        #[arg(long = "includeToolchainInputs", conflicts_with = "verify_configured_roots")]
         include_toolchain_inputs: bool,
+        /// Verify configured hash input coverage using a fresh full dependency query.
+        #[arg(long = "verifyConfiguredRoots", conflicts_with = "include_toolchain_inputs")]
+        verify_configured_roots: bool,
     },
     #[command(
         name = "get-impacted-targets",
@@ -274,6 +277,10 @@ struct GetImpactedTargetsArgs {
 
     #[arg(short = 'd', long = "depEdgesFile")]
     dep_edges_file: Option<PathBuf>,
+
+    /// Include the native changed graph and origins for downstream path policies.
+    #[arg(long = "reportImpactGraph", requires = "dep_edges_file")]
+    report_impact_graph: bool,
 
     #[arg(long = "targetType", value_delimiter = ',')]
     target_type: Vec<String>,
@@ -843,6 +850,17 @@ fn run_generate(args: &GenerateHashesArgs, verbose: bool) -> Result<HashFileData
     run_generate_with(args, verbose, generate_hashes)
 }
 
+fn run_generate_verified(args: &GenerateHashesArgs, verbose: bool) -> Result<HashFileData> {
+    if args.partial_graph
+        || args.base_hashes.is_some()
+        || args.content_hash_path.is_some()
+        || args.modified_filepaths.is_some()
+    {
+        bail!("--verifyConfiguredRoots requires fresh full physical hashes");
+    }
+    run_generate_with(args, verbose, generate_verified_hashes)
+}
+
 fn run_generate_with(
     args: &GenerateHashesArgs,
     verbose: bool,
@@ -869,6 +887,9 @@ fn run_generate_with(
             roots
                 .roots
                 .retain(|label, _| data.hashes.contains_key(label));
+            if let Some(verified) = &mut roots.verified_roots {
+                verified.retain(|label, _| roots.roots.contains_key(label));
+            }
         }
     }
     // A partial-graph file carries every target's type and its dependency edges, which a
@@ -1055,9 +1076,6 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
         .then(|| args.target_type.iter().cloned().collect::<HashSet<_>>());
     let output = if let Some(dep_edges_file) = &args.dep_edges_file {
         let dep_edges = dep_edges_from_slice(&fs::read(dep_edges_file)?)?;
-        let module_impacted = (from.module_graph_json != to.module_graph_json)
-            .then(|| impacted_with_module_changes(&from, &to, Some(&bazel)))
-            .transpose()?;
         if let Some(path) = &args.toolchain_candidates_file {
             let mut report = bazel_diff::toolchain_candidates::compare(&from, &to);
             bazel_diff::toolchain_candidates::add_returned_readers(&mut report, &to, &dep_edges);
@@ -1073,14 +1091,30 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
             .collect();
             write_json_file(File::create(path)?, &report)?;
         }
-        serde_json::to_string(&hash_file_distances(
-            &from,
-            &to,
-            &dep_edges,
-            module_impacted.as_ref(),
-            target_types.as_ref(),
-            exclude_external,
-        )?)?
+        if args.report_impact_graph {
+            let report = impact_graph(
+                &from,
+                &to,
+                &dep_edges,
+                Some(&bazel),
+                target_types.as_ref(),
+                exclude_external,
+            )?;
+            serde_json::to_string(&report)?
+        } else {
+            let module_impacted = (from.module_graph_json != to.module_graph_json)
+                .then(|| impacted_with_module_changes(&from, &to, Some(&bazel)))
+                .transpose()?;
+            let targets = hash_file_distances(
+                &from,
+                &to,
+                &dep_edges,
+                module_impacted.as_ref(),
+                target_types.as_ref(),
+                exclude_external,
+            )?;
+            serde_json::to_string(&targets)?
+        }
     } else {
         let impacted = impacted_with_module_changes(&from, &to, Some(&bazel))?;
         filter_and_sort_labels(
@@ -1391,8 +1425,11 @@ fn run() -> Result<()> {
         Commands::GenerateHashes {
             args,
             include_toolchain_inputs,
+            verify_configured_roots,
         } => {
-            if *include_toolchain_inputs {
+            if *verify_configured_roots {
+                run_generate_verified(args, cli.verbose)?;
+            } else if *include_toolchain_inputs {
                 if args.partial_graph || args.hashing.use_cquery {
                     bail!("--includeToolchainInputs requires fresh ordinary generation");
                 }
@@ -1426,6 +1463,7 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::io::Read;
 
     fn parse(arguments: &[&str]) -> Cli {
@@ -1513,11 +1551,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let cli = Cli::try_parse_from(normalized).unwrap();
-        let Commands::GenerateHashes {
-            args,
-            include_toolchain_inputs: _,
-        } = cli.command
-        else {
+        let Commands::GenerateHashes { args, .. } = cli.command else {
             panic!("expected generate-hashes");
         };
         assert!(!args.hashing.use_cquery);
@@ -1613,11 +1647,7 @@ mod tests {
             stub_bazel.to_str().unwrap(),
             "hashes.json",
         ]);
-        let Commands::GenerateHashes {
-            args,
-            include_toolchain_inputs: _,
-        } = cli.command
-        else {
+        let Commands::GenerateHashes { args, .. } = cli.command else {
             panic!("expected generate-hashes");
         };
         let options = bazel_options(&args.hashing, false).unwrap();
@@ -2470,6 +2500,7 @@ mod tests {
             starting_hashes: from_path.clone(),
             final_hashes: to_path.clone(),
             dep_edges_file: None,
+            report_impact_graph: false,
             target_type: vec!["Rule".into()],
             output: Some(text_output.clone()),
             workspace_path: workspace.path().to_path_buf(),
@@ -2735,11 +2766,7 @@ mod tests {
             "/opt/git",
             "out.json",
         ]);
-        let Commands::GenerateHashes {
-            args,
-            include_toolchain_inputs: _,
-        } = cli.command
-        else {
+        let Commands::GenerateHashes { args, .. } = cli.command else {
             panic!("expected generate-hashes");
         };
         assert!(args.partial_graph);
@@ -2749,10 +2776,8 @@ mod tests {
         );
         assert_eq!(args.base_hashes, Some(PathBuf::from("base.json")));
         assert_eq!(args.git_path, PathBuf::from("/opt/git"));
-        let Commands::GenerateHashes {
-            args: defaults,
-            include_toolchain_inputs: _,
-        } = parse(&["bazel-diff", "generate-hashes", "-w", "."]).command
+        let Commands::GenerateHashes { args: defaults, .. } =
+            parse(&["bazel-diff", "generate-hashes", "-w", "."]).command
         else {
             panic!("expected generate-hashes");
         };
@@ -2794,6 +2819,34 @@ mod tests {
         assert!(error(&without_mode).contains("--baseHashes needs --partialGraph"));
         // Not a git repository: the snapshot fails before any generation.
         assert!(!error(&partial_generate_args(workspace.path(), &output)).is_empty());
+    }
+
+    #[test]
+    fn verified_generation_requires_fresh_command_specific_inputs() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = workspace.path().join("out.json");
+        let mut args = partial_generate_args(workspace.path(), &output);
+        assert!(run_generate_verified(&args, false)
+            .unwrap_err()
+            .to_string()
+            .contains("fresh full physical hashes"));
+        args.partial_graph = false;
+        args.content_hash_path = Some(workspace.path().join("content.json"));
+        assert!(run_generate_verified(&args, false)
+            .unwrap_err()
+            .to_string()
+            .contains("fresh full physical hashes"));
+        args.content_hash_path = None;
+        args.modified_filepaths = Some(workspace.path().join("modified.txt"));
+        assert!(run_generate_verified(&args, false)
+            .unwrap_err()
+            .to_string()
+            .contains("fresh full physical hashes"));
+        let command = Cli::command();
+        let warmup = command.find_subcommand("warmup").unwrap();
+        assert!(!warmup
+            .get_arguments()
+            .any(|argument| argument.get_long() == Some("verifyConfiguredRoots")));
     }
 
     #[test]
@@ -2974,6 +3027,7 @@ mod tests {
                 starting_hashes: from.clone(),
                 final_hashes: to.clone(),
                 dep_edges_file: Some(deps.clone()),
+                report_impact_graph: false,
                 target_type: Vec::new(),
                 output: None,
                 workspace_path: dir.path().to_path_buf(),

@@ -1,5 +1,7 @@
 use crate::cancel::{self, Cancellation};
-use crate::proto::analysis::{ConfiguredTarget, CqueryResult};
+use crate::proto::analysis::{
+    ConfiguredAspect, ConfiguredAspectResult, ConfiguredTarget, CqueryResult,
+};
 use crate::proto::blaze_query::{
     target, Attribute, ConfiguredRuleInput, PackageGroup, Repository, Rule, Target,
 };
@@ -419,14 +421,32 @@ impl BazelOptions {
                 keep_going: false,
                 ..self.clone()
             }
-            .query_all_targets_inner(transform);
+            .query_all_targets_inner(transform, false);
         }
-        self.query_all_targets_inner(transform)
+        self.query_all_targets_inner(transform, false)
+    }
+
+    pub(crate) fn query_all_targets_verified_with(
+        &self,
+        transform: impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) -> Result<QueriedTargets> {
+        if !self.use_cquery
+            || self.cquery_root_expression.is_none()
+            || self.cquery_expression.is_some()
+        {
+            bail!("--verifyConfiguredRoots requires --useCquery and a configured root expression");
+        }
+        Self {
+            keep_going: false,
+            ..self.clone()
+        }
+        .query_all_targets_inner(transform, true)
     }
 
     fn query_all_targets_inner(
         &self,
         mut transform: impl FnMut(&mut [Target], Option<RepositoryInputs>),
+        verify: bool,
     ) -> Result<QueriedTargets> {
         if let Some(root) = &self.isolated_dependency_root {
             if self.use_cquery {
@@ -499,6 +519,7 @@ impl BazelOptions {
             mut failed_extensions,
             canonical_to_apparent,
             module_graph_json,
+            module_graph_complete,
             root_mapping,
             scope,
         } = bzlmod;
@@ -512,6 +533,7 @@ impl BazelOptions {
             ..self.clone()
         });
         let mut loads = BTreeMap::new();
+        let mut verification = None;
         let mut targets = if configured_roots.as_ref().is_some_and(BTreeMap::is_empty) {
             Vec::new()
         } else {
@@ -529,6 +551,29 @@ impl BazelOptions {
                                 transform(batch, None);
                             },
                         )
+                    } else if verify && use_cquery {
+                        // Keep positive distances on the caller's normal view. The full typed
+                        // view below qualifies coverage without adding positive impact paths.
+                        let targets = self.query_with(expression, true, version, &mut |batch| {
+                            transform(batch, None)
+                        })?;
+                        let graph = self.query_with_capture(
+                            expression,
+                            true,
+                            version,
+                            &mut |_| {},
+                            CqueryCapture::Verification,
+                            |_| true,
+                        );
+                        match graph {
+                            Ok(graph) => verification = graph.into_verified(),
+                            Err(error) => {
+                                eprintln!(
+                                    "[Warn] configured-root verification unavailable: {error:#}"
+                                );
+                            }
+                        }
+                        Ok(targets)
                     } else {
                         self.query_with(expression, use_cquery, version, &mut |batch| {
                             transform(batch, None)
@@ -604,8 +649,10 @@ impl BazelOptions {
         )?;
         Ok(QueriedTargets {
             targets,
+            verification,
             configured_roots,
             module_graph_json,
+            module_graph_complete,
             root_mapping,
             output_base: server_info.output_base,
             scoped_sources: ScopedSources {
@@ -1214,6 +1261,7 @@ impl BazelOptions {
             failed_extensions: failed,
             canonical_to_apparent,
             module_graph_json: module_graph,
+            module_graph_complete: complete_graph,
             root_mapping: retain_root_mapping.then_some(root_mapping),
             scope,
         })
@@ -2131,7 +2179,15 @@ impl BazelOptions {
         transform: &mut impl FnMut(&mut [Target]),
         retain: impl FnMut(&Target) -> bool,
     ) -> Result<Vec<Target>> {
-        self.query_with_roots(expression, use_cquery, version, transform, None, retain)
+        let graph = self.query_with_capture(
+            expression,
+            use_cquery,
+            version,
+            transform,
+            CqueryCapture::Standard,
+            retain,
+        )?;
+        Ok(graph.targets)
     }
 
     fn query_configured_roots(
@@ -2145,12 +2201,12 @@ impl BazelOptions {
         };
         let mut resolved = Vec::new();
         let query = self.with_exclude_filter(Self::configured_root_query(expression));
-        if let Err(error) = self.query_with_roots(
+        if let Err(error) = self.query_with_capture(
             &query,
             true,
             Some(version),
             &mut |_| {},
-            Some(&mut resolved),
+            CqueryCapture::Roots(&mut resolved),
             |_| true,
         ) {
             let selection = self.with_exclude_filter(expression.to_owned());
@@ -2190,21 +2246,26 @@ impl BazelOptions {
         Ok(roots)
     }
 
-    fn query_with_roots(
+    fn query_with_capture(
         &self,
         expression: &str,
         use_cquery: bool,
         version: Option<BazelVersion>,
         transform: &mut impl FnMut(&mut [Target]),
-        mut roots: Option<&mut Vec<(String, String)>>,
+        capture: CqueryCapture<'_>,
         retain: impl Fn(&Target) -> bool,
-    ) -> Result<Vec<Target>> {
+    ) -> Result<QueryGraph> {
+        let (mut roots, verify) = match capture {
+            CqueryCapture::Standard => (None, false),
+            CqueryCapture::Roots(roots) => (Some(roots), false),
+            CqueryCapture::Verification => (None, true),
+        };
         let rooted = use_cquery && self.cquery_root_expression.is_some();
         let version = match version {
             Some(version) => version,
             None => self.version()?,
         };
-        let compatible = if use_cquery {
+        let compatible = if use_cquery && !verify {
             Some(self.query_compatible_labels(expression, version)?)
         } else {
             None
@@ -2233,8 +2294,25 @@ impl BazelOptions {
             command.arg("--keep_going");
         }
         if use_cquery {
+            command.args(&self.cquery_options);
+            if verify {
+                // Verification needs the complete query traversal. These settings affect only
+                // dependency projection; the caller's configuration and repository options stay.
+                command.args([
+                    "--experimental_explicit_aspects",
+                    "--implicit_deps",
+                    "--tool_deps",
+                    "--nodep_deps",
+                    "--include_aspects",
+                    "--proto:output_rule_attrs=all",
+                    "--proto:default_values",
+                    "--proto:definition_stack",
+                    "--proto:rule_classes",
+                    "--proto:locations",
+                    "--norelative_locations",
+                ]);
+            }
             command
-                .args(&self.cquery_options)
                 .arg("--transitions=lite")
                 .arg("--output")
                 .arg(output_format);
@@ -2272,7 +2350,16 @@ impl BazelOptions {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
         }
 
-        let mut targets = if use_cquery {
+        let mut graph = if use_cquery && verify {
+            decode_cquery_graph(
+                output_file.path(),
+                streamed_cquery,
+                transform,
+                roots.as_deref_mut(),
+                compatible.as_ref().filter(|_| rooted),
+                verify,
+            )?
+        } else if use_cquery {
             decode_cquery_stream(
                 output_file.path(),
                 streamed_cquery,
@@ -2280,11 +2367,12 @@ impl BazelOptions {
                 roots.as_deref_mut(),
                 compatible.as_ref().filter(|_| rooted),
             )?
+            .into()
         } else {
-            decode_target_stream_filtered(output_file.path(), transform, retain)?
+            decode_target_stream_filtered(output_file.path(), transform, retain)?.into()
         };
         if let Some(compatible) = compatible.filter(|_| !rooted) {
-            targets.retain(|target| {
+            graph.targets.retain(|target| {
                 target_name(target).is_some_and(|name| {
                     compatible.contains(main_repo_label_key(target_label(name)))
                 })
@@ -2293,7 +2381,7 @@ impl BazelOptions {
                 roots.retain(|(label, _)| compatible.contains(main_repo_label_key(label)));
             }
         }
-        Ok(targets)
+        Ok(graph)
     }
 
     fn query_compatible_labels(
@@ -3093,12 +3181,58 @@ pub(crate) struct ScopedSources {
 /// Targets with the accepted module graph and successful unfiltered root mapping from discovery.
 pub(crate) struct QueriedTargets {
     pub(crate) targets: Vec<Target>,
+    pub(crate) verification: Option<VerifiedQuery>,
     pub(crate) configured_roots: Option<BTreeMap<String, String>>,
     pub(crate) module_graph_json: Option<String>,
+    pub(crate) module_graph_complete: bool,
     pub(crate) root_mapping: Option<Vec<u8>>,
     pub(crate) scoped_sources: ScopedSources,
     /// The output base `bazel info` reported before the query, when it was asked.
     pub(crate) output_base: Option<PathBuf>,
+}
+
+pub(crate) struct VerifiedQuery {
+    pub(crate) targets: Vec<Target>,
+    pub(crate) aspects: Vec<ObservedAspect>,
+    /// Locations from genuine SourceFile rows. A missing or conflicting location is unresolved.
+    pub(crate) source_locations: BTreeMap<String, Option<String>>,
+}
+
+pub(crate) struct ObservedAspect {
+    pub(crate) key: String,
+    pub(crate) inputs: Vec<String>,
+}
+
+struct QueryGraph {
+    targets: Vec<Target>,
+    aspects: Option<Vec<ObservedAspect>>,
+    source_locations: BTreeMap<String, Option<String>>,
+}
+
+impl From<Vec<Target>> for QueryGraph {
+    fn from(targets: Vec<Target>) -> Self {
+        Self {
+            targets,
+            aspects: None,
+            source_locations: BTreeMap::new(),
+        }
+    }
+}
+
+impl QueryGraph {
+    fn into_verified(self) -> Option<VerifiedQuery> {
+        self.aspects.map(|aspects| VerifiedQuery {
+            targets: self.targets,
+            aspects,
+            source_locations: self.source_locations,
+        })
+    }
+}
+
+enum CqueryCapture<'a> {
+    Standard,
+    Roots(&'a mut Vec<(String, String)>),
+    Verification,
 }
 
 /// The repositories `bazel mod` describes for a Bzlmod workspace, lowered to `//external:`
@@ -3113,6 +3247,8 @@ struct BzlmodRepos {
     canonical_to_apparent: BTreeMap<String, Vec<String>>,
     /// The accepted module graph, shared by repository edges and hash-file metadata.
     module_graph_json: Option<String>,
+    /// Only a successful command can support verification; tolerated partial answers cannot.
+    module_graph_complete: bool,
     /// Unfiltered stdout from a successful initial Bzlmod probe, shared with external hashing.
     root_mapping: Option<Vec<u8>>,
 }
@@ -3608,9 +3744,22 @@ fn decode_cquery_stream(
     roots: Option<&mut Vec<(String, String)>>,
     compatible: Option<&HashSet<String>>,
 ) -> Result<Vec<Target>> {
+    let graph = decode_cquery_graph(path, streamed, transform, roots, compatible, false)?;
+    Ok(graph.targets)
+}
+
+fn decode_cquery_graph(
+    path: &Path,
+    streamed: bool,
+    transform: &mut impl FnMut(&mut [Target]),
+    roots: Option<&mut Vec<(String, String)>>,
+    compatible: Option<&HashSet<String>>,
+    verify: bool,
+) -> Result<QueryGraph> {
     let mut decoder = CqueryDecoder {
         root_labels: roots.as_ref().map(|_| Vec::new()),
-        known_null_configurations: compatible.map(|_| HashSet::new()),
+        known_null_configurations: (compatible.is_some() || verify).then(HashSet::new),
+        verify,
         ..CqueryDecoder::default()
     };
     if streamed {
@@ -3640,7 +3789,11 @@ fn decode_cquery_stream(
     if let (Some(roots), Some(resolved)) = (roots, decoder.root_labels) {
         roots.extend(resolved);
     }
-    Ok(decoder.targets)
+    Ok(QueryGraph {
+        targets: decoder.targets,
+        aspects: decoder.observed_aspects,
+        source_locations: decoder.source_locations,
+    })
 }
 
 fn retain_compatible_configured_targets(
@@ -3676,6 +3829,7 @@ fn retain_compatible_configured_targets(
 /// depends on the same label in another configuration, reports a cycle the configured graph
 /// does not have.
 pub const CONFIGURED_SEPARATOR: char = '|';
+const EXPLICIT_ASPECT_PREFIX: &str = "\0aspect:";
 
 /// Bazel reports the null configuration (source files, package groups) with this checksum.
 const NULL_CONFIGURATION_CHECKSUM: &str = "null";
@@ -3700,15 +3854,40 @@ struct CqueryDecoder {
     root_labels: Option<Vec<(String, String)>>,
     known_null_configurations: Option<HashSet<u32>>,
     ambiguous_label: Option<String>,
+    invalid_configuration: Option<u32>,
+    verify: bool,
+    aspect_identities: Vec<ConfiguredAspect>,
+    aspect_results: Vec<ConfiguredAspectResult>,
+    observed_aspects: Option<Vec<ObservedAspect>>,
+    source_locations: BTreeMap<String, Option<String>>,
 }
 
 impl CqueryDecoder {
     fn push(&mut self, result: CqueryResult, transform: &mut impl FnMut(&mut [Target])) {
+        if self.verify {
+            self.aspect_identities.extend(result.aspects);
+            self.aspect_results.extend(result.aspect_results);
+        }
         for configuration in result.configurations {
             if let Some(checksum) = non_null_checksum(&configuration.checksum) {
+                if self.verify
+                    && (self
+                        .configurations
+                        .get(&configuration.id)
+                        .is_some_and(|previous| previous != checksum)
+                        || self
+                            .known_null_configurations
+                            .as_ref()
+                            .is_some_and(|nulls| nulls.contains(&configuration.id)))
+                {
+                    self.invalid_configuration = Some(configuration.id);
+                }
                 self.configurations
                     .insert(configuration.id, checksum.to_owned());
             } else if configuration.checksum == NULL_CONFIGURATION_CHECKSUM {
+                if self.verify && self.configurations.contains_key(&configuration.id) {
+                    self.invalid_configuration = Some(configuration.id);
+                }
                 if let Some(nulls) = &mut self.known_null_configurations {
                     nulls.insert(configuration.id);
                 }
@@ -3724,6 +3903,19 @@ impl CqueryDecoder {
             let Some(target) = target.into_option() else {
                 continue;
             };
+            if self.verify {
+                if let Some(source) = target.source_file.as_option() {
+                    match self.source_locations.entry(source.name.clone()) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(source.location.clone());
+                        }
+                        Entry::Occupied(mut entry) if entry.get() != &source.location => {
+                            entry.insert(None);
+                        }
+                        Entry::Occupied(_) => {}
+                    }
+                }
+            }
             let inline = configuration
                 .as_option()
                 .and_then(|configuration| non_null_checksum(&configuration.checksum))
@@ -3732,6 +3924,32 @@ impl CqueryDecoder {
                 && configuration.as_option().is_some_and(|configuration| {
                     configuration.checksum == NULL_CONFIGURATION_CHECKSUM
                 });
+            if self.verify && configuration_id != 0 {
+                let referenced = self.configurations.get(&configuration_id);
+                if inline
+                    .as_ref()
+                    .zip(referenced)
+                    .is_some_and(|(inline, referenced)| inline != referenced)
+                    || (known_null && referenced.is_some())
+                    || (inline.is_some()
+                        && self
+                            .known_null_configurations
+                            .as_ref()
+                            .is_some_and(|nulls| nulls.contains(&configuration_id)))
+                {
+                    self.invalid_configuration = Some(configuration_id);
+                }
+                if let Some(inline) = &inline {
+                    self.configurations
+                        .entry(configuration_id)
+                        .or_insert_with(|| inline.clone());
+                } else if known_null {
+                    self.known_null_configurations
+                        .as_mut()
+                        .expect("verification tracks null configurations")
+                        .insert(configuration_id);
+                }
+            }
             let checksum = inline.or_else(|| self.configurations.get(&configuration_id).cloned());
             if checksum.is_none() && configuration_id != 0 && !known_null {
                 self.pending.push((target, configuration_id));
@@ -3763,10 +3981,27 @@ impl CqueryDecoder {
                 .map(|(target, _)| target_name(target).map(str::to_owned))
                 .collect::<Vec<_>>()
         });
+        let verify = self.verify;
         self.ready
             .par_drain(..)
             .map(|(target, checksum)| {
-                let mut target = lower_target(target)?;
+                let package_group = verify && target.r#type == target::Discriminator::PackageGroup;
+                let mut target = if verify {
+                    lower_target_without_compaction(target)?
+                } else {
+                    lower_target(target)?
+                };
+                if package_group {
+                    let rule = target.rule.as_option_mut()?;
+                    rule.configured_rule_input = rule
+                        .rule_input
+                        .iter()
+                        .map(|label| ConfiguredRuleInput {
+                            label: Some(label.clone()),
+                            ..Default::default()
+                        })
+                        .collect();
+                }
                 if let Some(checksum) = checksum {
                     configure_target(&mut target, &checksum);
                 }
@@ -3788,6 +4023,9 @@ impl CqueryDecoder {
     }
 
     fn finish(&mut self, transform: &mut impl FnMut(&mut [Target])) -> Result<()> {
+        if let Some(id) = self.invalid_configuration {
+            bail!("explicit cquery returned conflicting configuration {id}");
+        }
         self.flush(transform);
         let pending = std::mem::take(&mut self.pending);
         for (target, configuration_id) in pending {
@@ -3812,8 +4050,203 @@ impl CqueryDecoder {
         if let Some(label) = &self.ambiguous_label {
             bail!("configured target {label} has a bare label ambiguous with the configured-key encoding");
         }
+        if self.verify
+            && (!self.aspect_identities.is_empty()
+                || !self.aspect_results.is_empty()
+                || self.targets.iter().any(|target| {
+                    target.rule.as_option().is_some_and(|rule| {
+                        rule.configured_rule_input
+                            .iter()
+                            .any(|input| input.aspect_id.is_some())
+                    })
+                }))
+        {
+            self.observed_aspects = Some(self.resolve_explicit_aspects()?);
+        }
         Ok(())
     }
+
+    fn resolve_explicit_aspects(&mut self) -> Result<Vec<ObservedAspect>> {
+        let mut identities = BTreeMap::new();
+        for identity in std::mem::take(&mut self.aspect_identities) {
+            if identity.id == 0 || identities.insert(identity.id, identity).is_some() {
+                bail!("explicit cquery returned a duplicate or zero aspect identity");
+            }
+        }
+        let mut resolved = BTreeMap::<u32, (String, String)>::new();
+        let mut identity_digests = HashSet::new();
+        let mut visiting = HashSet::new();
+        for &id in identities.keys() {
+            let mut pending = vec![(id, false)];
+            while let Some((id, complete)) = pending.pop() {
+                if resolved.contains_key(&id) {
+                    continue;
+                }
+                let identity = identities
+                    .get(&id)
+                    .with_context(|| format!("explicit cquery referenced missing aspect {id}"))?;
+                if !complete {
+                    if !visiting.insert(id) {
+                        bail!("explicit cquery aspect identities contain a cycle at {id}");
+                    }
+                    pending.push((id, true));
+                    pending.extend(
+                        identity
+                            .base_aspect_ids
+                            .iter()
+                            .rev()
+                            .map(|&base| (base, false)),
+                    );
+                    continue;
+                }
+                visiting.remove(&id);
+                let descriptor = identity
+                    .aspect_descriptor
+                    .as_option()
+                    .context("explicit cquery aspect has no descriptor")?;
+                if descriptor.name.is_empty() {
+                    bail!("explicit cquery aspect has an empty descriptor name");
+                }
+                let mut parameters = BTreeMap::<&str, Vec<&str>>::new();
+                for parameter in &descriptor.parameters {
+                    parameters
+                        .entry(&parameter.key)
+                        .or_default()
+                        .push(&parameter.value);
+                }
+                let base = identity
+                    .base_target
+                    .as_option()
+                    .context("explicit cquery aspect has no base target")?;
+                if base.aspect_id.is_some() {
+                    bail!("explicit cquery aspect base is not a configured target");
+                }
+                let base = explicit_configured_input(
+                    base,
+                    &self.configurations,
+                    self.known_null_configurations.as_ref(),
+                )?;
+                let predecessors = identity
+                    .base_aspect_ids
+                    .iter()
+                    .map(|id| {
+                        resolved
+                            .get(id)
+                            .map(|(key, _)| key.as_str())
+                            .context("explicit cquery aspect predecessor was not resolved")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let encoded = serde_json::to_vec(&(
+                    &descriptor.name,
+                    parameters,
+                    &base,
+                    &identity.execution_platform,
+                    identity.skips_rule_transition,
+                    predecessors,
+                ))?;
+                let mut digest = Sha256::new();
+                digest.update(b"configuredAspectIdentity=1\0");
+                digest.update(encoded);
+                let digest: [u8; 32] = digest.finalize().into();
+                if !identity_digests.insert(digest) {
+                    bail!("explicit cquery returned an ambiguous aspect identity");
+                }
+                let key = format!("{EXPLICIT_ASPECT_PREFIX}{}", hex::encode(digest));
+                resolved.insert(id, (key, base));
+            }
+        }
+        let input_key = |input: &ConfiguredRuleInput| {
+            let base = explicit_configured_input(
+                input,
+                &self.configurations,
+                self.known_null_configurations.as_ref(),
+            )?;
+            match input.aspect_id {
+                None => Ok(base),
+                Some(0) => bail!("explicit cquery returned a zero aspect reference"),
+                Some(id) => {
+                    let (key, expected_base) = resolved.get(&id).with_context(|| {
+                        format!("explicit cquery referenced missing aspect {id}")
+                    })?;
+                    if expected_base != &base {
+                        bail!("explicit cquery aspect {id} referenced mismatched base {base}");
+                    }
+                    Ok(key.clone())
+                }
+            }
+        };
+        // A streamed identity table can follow the target rows that reference it.
+        // Resolve those query-local IDs only after the complete table has arrived.
+        for target in &mut self.targets {
+            if target_name(target).is_some_and(|name| name.contains('\0')) {
+                bail!("explicit cquery returned a target in the reserved aspect namespace");
+            }
+            if let Some(rule) = target.rule.as_option_mut() {
+                for input in &mut rule.configured_rule_input {
+                    *input = ConfiguredRuleInput {
+                        label: Some(input_key(input)?),
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+        let mut selected = HashSet::new();
+        let mut observed = Vec::with_capacity(self.aspect_results.len());
+        for aspect in std::mem::take(&mut self.aspect_results) {
+            if aspect.aspect_id == 0 || !selected.insert(aspect.aspect_id) {
+                bail!("explicit cquery returned a duplicate or zero selected aspect");
+            }
+            let (key, _) = resolved.get(&aspect.aspect_id).with_context(|| {
+                format!(
+                    "explicit cquery selected missing aspect {}",
+                    aspect.aspect_id
+                )
+            })?;
+            observed.push(ObservedAspect {
+                key: key.clone(),
+                inputs: aspect
+                    .configured_rule_input
+                    .iter()
+                    .map(input_key)
+                    .collect::<Result<_>>()?,
+            });
+        }
+        Ok(observed)
+    }
+}
+
+fn explicit_configured_input(
+    input: &ConfiguredRuleInput,
+    configurations: &HashMap<u32, String>,
+    known_null: Option<&HashSet<u32>>,
+) -> Result<String> {
+    let label = input
+        .label
+        .as_deref()
+        .context("explicit cquery input has no label")?;
+    if label.contains('\0') {
+        bail!("explicit cquery input uses the reserved aspect namespace");
+    }
+    let declared_value = input
+        .configuration_checksum
+        .as_deref()
+        .filter(|checksum| !checksum.is_empty());
+    let declared = declared_value.and_then(non_null_checksum);
+    let referenced = match input.configuration_id.filter(|id| *id != 0) {
+        Some(id) => match configurations.get(&id) {
+            Some(checksum) => Some(Some(checksum.as_str())),
+            None if known_null.is_some_and(|known| known.contains(&id)) => Some(None),
+            None => bail!("explicit cquery input {label} referenced missing configuration {id}"),
+        },
+        None => None,
+    };
+    if declared_value.is_some() && referenced.is_some_and(|referenced| declared != referenced) {
+        bail!("explicit cquery input {label} has mismatched configuration identities");
+    }
+    Ok(declared.or(referenced.flatten()).map_or_else(
+        || label.to_owned(),
+        |checksum| configured_key(label, checksum),
+    ))
 }
 
 fn non_null_checksum(checksum: &str) -> Option<&str> {
@@ -3929,19 +4362,21 @@ fn lower_query_target(mut target: Target) -> Option<Target> {
     lower_target(target)
 }
 
-fn lower_target(mut target: Target) -> Option<Target> {
+fn lower_target(target: Target) -> Option<Target> {
+    let mut target = lower_target_without_compaction(target)?;
+    compact_target(&mut target);
+    Some(target)
+}
+
+fn lower_target_without_compaction(mut target: Target) -> Option<Target> {
     match target.r#type {
         target::Discriminator::Rule
         | target::Discriminator::SourceFile
-        | target::Discriminator::GeneratedFile => {
-            compact_target(&mut target);
-            Some(target)
-        }
+        | target::Discriminator::GeneratedFile => Some(target),
         target::Discriminator::PackageGroup => {
             let group = target.package_group.take()?;
             target.r#type = target::Discriminator::Rule;
             target.rule = buffa::MessageField::some(package_group_rule(&group));
-            compact_target(&mut target);
             Some(target)
         }
         target::Discriminator::EnvironmentGroup => {
@@ -4661,7 +5096,9 @@ pub fn encode_configured_input(input: &ConfiguredRuleInput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::analysis::{Configuration, ConfiguredTarget, CqueryResult};
+    use crate::proto::analysis::{
+        AspectDescriptor, Configuration, ConfiguredTarget, CqueryResult, KeyValuePair,
+    };
     use crate::proto::blaze_query::{
         attribute, EnvironmentGroup, GeneratedFile, LabelDictUnaryEntry, SourceFile,
     };
@@ -8158,6 +8595,117 @@ exit 1
         assert!(error
             .to_string()
             .contains("//a:source|abc has a bare label ambiguous"));
+    }
+
+    #[test]
+    fn explicit_aspects_resolve_query_local_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cquery.pb");
+        let decode = |configuration_id, aspect_id, parameters: &[(&str, &str)]| {
+            let predecessor_id = aspect_id + 10;
+            let input = |label: &str| ConfiguredRuleInput {
+                label: Some(label.to_owned()),
+                configuration_checksum: Some("abc123".to_owned()),
+                configuration_id: Some(configuration_id),
+                ..Default::default()
+            };
+            let mut root = rule_target("//a:root");
+            root.rule.as_option_mut().unwrap().configured_rule_input = vec![ConfiguredRuleInput {
+                aspect_id: Some(aspect_id),
+                ..input("//a:base")
+            }];
+            write_delimited(
+                &path,
+                &[
+                    CqueryResult {
+                        results: vec![
+                            configured(root, Some("abc123"), configuration_id),
+                            configured(rule_target("//a:base"), Some("abc123"), configuration_id),
+                            configured(rule_target("//a:tool"), Some("abc123"), configuration_id),
+                        ],
+                        aspect_results: vec![ConfiguredAspectResult {
+                            aspect_id,
+                            configured_rule_input: vec![
+                                input("//a:tool"),
+                                ConfiguredRuleInput {
+                                    aspect_id: Some(predecessor_id),
+                                    ..input("//a:base")
+                                },
+                            ],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    CqueryResult {
+                        aspects: vec![
+                            ConfiguredAspect {
+                                id: aspect_id,
+                                aspect_descriptor: buffa::MessageField::some(AspectDescriptor {
+                                    name: "//a:defs.bzl%visit".to_owned(),
+                                    parameters: parameters
+                                        .iter()
+                                        .map(|&(key, value)| KeyValuePair {
+                                            key: key.to_owned(),
+                                            value: value.to_owned(),
+                                            ..Default::default()
+                                        })
+                                        .collect(),
+                                    ..Default::default()
+                                }),
+                                base_target: buffa::MessageField::some(input("//a:base")),
+                                base_aspect_ids: vec![predecessor_id],
+                                ..Default::default()
+                            },
+                            ConfiguredAspect {
+                                id: predecessor_id,
+                                aspect_descriptor: buffa::MessageField::some(AspectDescriptor {
+                                    name: "//a:defs.bzl%base".to_owned(),
+                                    ..Default::default()
+                                }),
+                                base_target: buffa::MessageField::some(input("//a:base")),
+                                ..Default::default()
+                            },
+                        ],
+                        configurations: vec![Configuration {
+                            id: configuration_id,
+                            checksum: "abc123".to_owned(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+            );
+            decode_cquery_graph(&path, true, &mut |_| {}, None, None, true)?
+                .into_verified()
+                .context("typed aspect records were returned")
+        };
+        let before = decode(1, 7, &[("z", "one"), ("a", "two")]).unwrap();
+        let after = decode(9, 3, &[("a", "two"), ("z", "one")]).unwrap();
+        assert_eq!(before.aspects.len(), 1);
+        assert_eq!(after.aspects.len(), 1);
+        assert_eq!(before.aspects[0].key, after.aspects[0].key);
+        assert_eq!(before.aspects[0].inputs, after.aspects[0].inputs);
+        assert_eq!(before.aspects[0].inputs[0], "//a:tool|abc123");
+        assert!(before.aspects[0].inputs[1].starts_with(EXPLICIT_ASPECT_PREFIX));
+        for graph in [&before.targets, &after.targets] {
+            let root = graph
+                .iter()
+                .find_map(|target| {
+                    target
+                        .rule
+                        .as_option()
+                        .filter(|rule| rule.name == "//a:root|abc123")
+                })
+                .unwrap();
+            assert_eq!(
+                root.configured_rule_input[0].label.as_deref(),
+                Some(before.aspects[0].key.as_str())
+            );
+            assert_eq!(root.configured_rule_input[0].aspect_id, None);
+        }
+        let changed = decode(9, 3, &[("a", "three"), ("z", "one")]).unwrap();
+        assert_ne!(before.aspects[0].key, changed.aspects[0].key);
+        assert!(decode(1, 0, &[]).is_err());
     }
 
     #[test]

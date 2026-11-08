@@ -1,0 +1,4 @@
+module(
+    name = "dep",
+    version = "2.0",
+)

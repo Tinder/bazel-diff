@@ -2,7 +2,7 @@ use crate::support::*;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn diff_workspaces(
     first: &std::path::Path,
@@ -364,6 +364,315 @@ fn single_version_override_patch_change_reaches_consumer_cquery() {
     ]);
 }
 
+/// A MODULE version change remains an independent obligation for a reader first requested at
+/// the head, even when its configured hash was already present and unchanged at the base.
+#[test]
+fn configured_roots_preserve_module_obligations() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    struct Snapshot {
+        workspace: TestWorkspace,
+        hashes: PathBuf,
+        edges: PathBuf,
+        ordinary: PathBuf,
+        ordinary_edges: PathBuf,
+        data: Value,
+        product: Vec<u8>,
+        overlap_product: Vec<u8>,
+    }
+    let output = tempfile::tempdir().unwrap();
+    let capture = |name: &str, version: &str, change_source: bool, head: bool| {
+        let workspace = copy_workspace("single_version_override_patch");
+        if version != "1.0" {
+            for path in ["MODULE.bazel", "dep_src/MODULE.bazel"] {
+                edit(&workspace.path().join(path), |text| {
+                    text.replace("version = \"1.0\"", &format!("version = \"{version}\""))
+                });
+            }
+        }
+        // Select dep transitively so ordinary query emits its canonical base-repository label,
+        // which is the existing MODULE overlay's repository inventory.
+        edit(&workspace.path().join("MODULE.bazel"), |text| {
+            text.replace(
+                &format!("bazel_dep(name = \"dep\", version = \"{version}\")"),
+                "bazel_dep(name = \"carrier\", version = \"1.0\")\nlocal_path_override(module_name = \"carrier\", path = \"carrier\")",
+            )
+        });
+        if version != "1.0" {
+            edit(&workspace.path().join("carrier/MODULE.bazel"), |text| {
+                text.replace(
+                    "bazel_dep(name = \"dep\", version = \"1.0\")",
+                    &format!("bazel_dep(name = \"dep\", version = \"{version}\")"),
+                )
+            });
+        }
+        edit(&workspace.path().join("BUILD.bazel"), |text| {
+            text.replace("\"@dep//:data\"", "\"@@dep+//:data\"")
+        });
+        if change_source {
+            fs::write(workspace.path().join("control.txt"), "changed\n").unwrap();
+        }
+        write_local_registry_version(workspace.path(), version);
+        let built = std::process::Command::new(bazel())
+            .current_dir(workspace.path())
+            .args(["build", "//:module_wrapper", "//:module_overlap"])
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let product = fs::read(workspace.path().join("bazel-bin/module_product.out")).unwrap();
+        let overlap_product =
+            fs::read(workspace.path().join("bazel-bin/module_overlap.out")).unwrap();
+        let hashes = output.path().join(format!("{name}.json"));
+        let edges = output.path().join(format!("{name}-edges.json"));
+        let roots = if head {
+            "set(//:module_wrapper //:module_overlap //:module_product)"
+        } else {
+            "set(//:module_wrapper //:module_overlap)"
+        };
+        let edges_arg = edges.display().to_string();
+        let mut args = vec![
+            "--useCquery",
+            "--cqueryRootExpression",
+            roots,
+            "--fineGrainedHashExternalRepos",
+            "@@dep+",
+            "--includeTargetType",
+        ];
+        if head {
+            args.extend(["-d", &edges_arg]);
+        }
+        let generated = generate(workspace.path(), &hashes, &args);
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let data = serde_json::from_slice(&fs::read(&hashes).unwrap()).unwrap();
+        let ordinary = output.path().join(format!("{name}-ordinary.json"));
+        let ordinary_edges = output.path().join(format!("{name}-ordinary-edges.json"));
+        let ordinary_edges_arg = ordinary_edges.display().to_string();
+        let mut args = vec![
+            "--fineGrainedHashExternalRepos",
+            "@@dep+",
+            "--excludeTargetsQuery=set(//:module_product //:module_product.out)",
+            "--includeTargetType",
+        ];
+        if head {
+            args.extend(["-d", &ordinary_edges_arg]);
+        }
+        let generated = generate(workspace.path(), &ordinary, &args);
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        Snapshot {
+            workspace,
+            hashes,
+            edges,
+            ordinary,
+            ordinary_edges,
+            data,
+            product,
+            overlap_product,
+        }
+    };
+    let base = capture("base", "1.0", false, false);
+    let module_only = capture("module-only", "2.0", false, true);
+    let changed = capture("module-and-source", "2.0", true, true);
+    assert_eq!(base.product, module_only.product);
+    assert_eq!(base.product, changed.product);
+    assert_eq!(base.overlap_product, module_only.overlap_product);
+    assert_ne!(base.overlap_product, changed.overlap_product);
+    assert!(base.data["metadata"]["moduleGraphJson"].is_string());
+    assert!(module_only.data["metadata"]["moduleGraphJson"].is_string());
+    assert_ne!(
+        base.data["metadata"]["moduleGraphJson"],
+        module_only.data["metadata"]["moduleGraphJson"]
+    );
+    let root_key = |data: &Value, name: &str| {
+        data["metadata"]["configuredRoots"]["roots"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(label, _)| label.ends_with(name))
+            .unwrap()
+            .1
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let product = root_key(&module_only.data, "//:module_product");
+    let base_product = &base.data["metadata"]["configuredRoots"]["hashes"][&product];
+    assert!(!base_product.is_null());
+    assert_eq!(
+        base_product,
+        &module_only.data["metadata"]["configuredRoots"]["hashes"][&product]
+    );
+    let overlap_key = root_key(&base.data, "//:module_overlap");
+    assert_eq!(
+        overlap_key,
+        root_key(&module_only.data, "//:module_overlap")
+    );
+    assert_eq!(overlap_key, root_key(&changed.data, "//:module_overlap"));
+    assert_ne!(
+        base.data["metadata"]["configuredRoots"]["hashes"][&overlap_key],
+        changed.data["metadata"]["configuredRoots"]["hashes"][&overlap_key]
+    );
+    let compare = |head: &Snapshot| {
+        let report_path = output.path().join("module-report.json");
+        let compared = impacted(
+            head.workspace.path(),
+            &base.hashes,
+            &head.hashes,
+            &report_path,
+            &["-d", head.edges.to_str().unwrap(), "--reportImpactGraph"],
+        );
+        assert!(
+            compared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compared.stderr)
+        );
+        let report: Value = serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
+        (
+            report,
+            String::from_utf8_lossy(&compared.stderr).into_owned(),
+        )
+    };
+    let has_path = |report: &Value, kind: &str, name: &str| {
+        report["paths"].as_array().unwrap().iter().any(|path| {
+            path["kind"] == kind
+                && path["roots"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .any(|label| label.ends_with(name))
+        })
+    };
+    let (report, stderr) = compare(&module_only);
+    assert!(!stderr.contains("Unioned rdeps query failed"), "{stderr}");
+    assert!(has_path(&report, "forced", "//:module_product"), "{report}");
+    assert!(!has_path(&report, "shared", "//:module_product"));
+    let product = report["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["label"]
+                .as_str()
+                .unwrap()
+                .ends_with("//:module_product")
+        })
+        .unwrap();
+    assert_eq!(product["targetDistance"], 0);
+    assert_eq!(product["packageDistance"], 0);
+
+    let build_path = module_only.workspace.path().join("BUILD.bazel");
+    let build = fs::read(&build_path).unwrap();
+    fs::write(&build_path, "syntax error !\n").unwrap();
+    let (fallback, stderr) = compare(&module_only);
+    fs::write(build_path, build).unwrap();
+    assert!(stderr.contains("Unioned rdeps query failed"), "{stderr}");
+    assert!(has_path(&fallback, "forced", "//:module_product"));
+
+    let (overlap, stderr) = compare(&changed);
+    assert!(!stderr.contains("Unioned rdeps query failed"), "{stderr}");
+    assert!(has_path(&overlap, "configured", "//:module_overlap"));
+    assert!(has_path(&overlap, "forced", "//:module_overlap"));
+
+    let ordinary_base: Value = serde_json::from_slice(&fs::read(&base.ordinary).unwrap()).unwrap();
+    let ordinary_head: Value =
+        serde_json::from_slice(&fs::read(&changed.ordinary).unwrap()).unwrap();
+    assert!(ordinary_head["hashes"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .any(|label| label.starts_with("@@dep+//")));
+    let consumer = ordinary_head["hashes"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .find(|label| label.ends_with("//:consumer"))
+        .unwrap();
+    assert_eq!(
+        ordinary_base["hashes"][consumer],
+        ordinary_head["hashes"][consumer]
+    );
+    assert!(ordinary_head["hashes"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .all(|label| !label.ends_with("//:module_product")));
+    let queried = std::process::Command::new(bazel())
+        .current_dir(changed.workspace.path())
+        .args(["query", "rdeps(//..., @@dep+//...)", "--output=label"])
+        .output()
+        .unwrap();
+    assert!(
+        queried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&queried.stderr)
+    );
+    assert!(String::from_utf8_lossy(&queried.stdout)
+        .lines()
+        .any(|label| label.ends_with("//:module_product")));
+    for target_type in [false, true] {
+        let report_path = output.path().join("ordinary-module-report.json");
+        let mut args = vec![
+            "-d",
+            changed.ordinary_edges.to_str().unwrap(),
+            "--reportImpactGraph",
+        ];
+        if target_type {
+            args.extend(["--targetType", "Rule"]);
+        }
+        let compared = impacted(
+            changed.workspace.path(),
+            &base.ordinary,
+            &changed.ordinary,
+            &report_path,
+            &args,
+        );
+        assert!(
+            compared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compared.stderr)
+        );
+        let report: Value = serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
+        assert!(report["targets"].as_array().unwrap().iter().all(|row| {
+            !row["label"]
+                .as_str()
+                .unwrap()
+                .ends_with("//:module_product")
+        }));
+        assert!(!has_path(&report, "forced", "//:module_product"));
+        assert!(
+            has_path(&report, "ordinary", "//:module_overlap"),
+            "{report}"
+        );
+        assert!(has_path(&report, "forced", "//:module_overlap"), "{report}");
+        assert!(has_path(&report, "forced", "//:consumer"), "{report}");
+        let ordinary = report["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|path| path["kind"] == "ordinary")
+            .unwrap();
+        for field in ["changed", "direct"] {
+            assert!(ordinary[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|key| { !key.as_str().unwrap().ends_with("//:consumer") }));
+        }
+    }
+}
+
 /// A repository built from a directory in the workspace that its rule names by absolute path, as
 /// `rules_rs` local crates and Gazelle's `local_path` do. Two identical checkouts at different
 /// paths must impact nothing, with or without the repository fine-grained: `//:tool_user` depends
@@ -479,6 +788,10 @@ fn add_registry_patch(workspace: &Path, content: &str) {
 /// integrity depend on the temp path, so neither is checked in) and adds the registry to the
 /// workspace's `.bazelrc` ahead of the BCR, which still serves Bazel's implicit dependencies.
 fn write_local_registry(workspace: &std::path::Path) {
+    write_local_registry_version(workspace, "1.0");
+}
+
+fn write_local_registry_version(workspace: &std::path::Path, version: &str) {
     use sha2::{Digest, Sha256};
     use std::io::Write;
 
@@ -494,7 +807,7 @@ fn write_local_registry(workspace: &std::path::Path) {
     zip.finish().unwrap();
     let digest = Sha256::digest(fs::read(&archive).unwrap());
     fs::write(
-        workspace.join("registry/modules/dep/1.0/source.json"),
+        workspace.join(format!("registry/modules/dep/{version}/source.json")),
         format!(
             "{{\"url\": \"file://{}\", \"integrity\": \"sha256-{}\", \"strip_prefix\": \"dep\"}}\n",
             archive.display(),
@@ -906,8 +1219,8 @@ fn cquery_reports_only_requested_configured_roots() {
     )
     .status
     .success());
-    let distances: Vec<Value> = serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
-    let distances: BTreeMap<_, _> = distances
+    let distance_rows: Vec<Value> = serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+    let distances: BTreeMap<_, _> = distance_rows
         .iter()
         .map(|row| {
             (
@@ -923,6 +1236,137 @@ fn cquery_reports_only_requested_configured_roots() {
         distances,
         BTreeMap::from([("//:input.txt", (0, 0)), ("//:root_alias", (3, 0))])
     );
+
+    assert!(impacted(
+        workspace.path(),
+        &from,
+        &to,
+        &result,
+        &["-d", to_edges.to_str().unwrap(), "--reportImpactGraph"]
+    )
+    .status
+    .success());
+    let report: Value = serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+    assert_eq!(report["targets"], Value::Array(distance_rows));
+    let path = report["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|path| path["kind"] == "configured")
+        .unwrap();
+    assert!(path["roots"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .any(|label| label.ends_with("//:root_alias")));
+
+    // Both new roots were already inputs at the base. The fixed source stays unchanged, while
+    // wrapper's product changes through the shared configured instance. Enrollment alone must
+    // not select the source or hide the wrapper's measured path.
+    let newly_requested = output.path().join("newly-requested.json");
+    let newly_requested_edges = output.path().join("newly-requested-edges.json");
+    let generated = generate(
+        workspace.path(),
+        &newly_requested,
+        &[
+            "--useCquery",
+            "--cqueryRootExpression",
+            "set(//:shared //:root_alias //:input.txt //:fixed.txt //:wrapper)",
+            "--includeTargetType",
+            "-d",
+            newly_requested_edges.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let base_data: Value = serde_json::from_slice(&fs::read(&from).unwrap()).unwrap();
+    let head_data: Value = serde_json::from_slice(&fs::read(&newly_requested).unwrap()).unwrap();
+    let fixed_key = head_data["metadata"]["configuredRoots"]["roots"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(label, _)| label.ends_with("//:fixed.txt"))
+        .unwrap()
+        .1
+        .as_str()
+        .unwrap();
+    let fixed_hash = &base_data["metadata"]["configuredRoots"]["hashes"][fixed_key];
+    assert!(!fixed_hash.is_null());
+    assert_eq!(
+        fixed_hash,
+        &head_data["metadata"]["configuredRoots"]["hashes"][fixed_key]
+    );
+    let wrapper_key = head_data["metadata"]["configuredRoots"]["roots"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(label, _)| label.ends_with("//:wrapper"))
+        .unwrap()
+        .1
+        .as_str()
+        .unwrap();
+    let base_wrapper = base_data["metadata"]["configuredRoots"]["hashes"][wrapper_key]
+        .as_str()
+        .unwrap();
+    let head_wrapper = head_data["metadata"]["configuredRoots"]["hashes"][wrapper_key]
+        .as_str()
+        .unwrap();
+    assert_ne!(base_wrapper, head_wrapper);
+    assert_eq!(
+        base_wrapper.rsplit_once('~').unwrap().1,
+        head_wrapper.rsplit_once('~').unwrap().1
+    );
+    assert!(impacted(
+        workspace.path(),
+        &from,
+        &newly_requested,
+        &result,
+        &["-d", newly_requested_edges.to_str().unwrap()]
+    )
+    .status
+    .success());
+    let legacy: Vec<Value> = serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+    assert!(legacy.iter().any(|row| {
+        row["label"].as_str().unwrap().ends_with("//:fixed.txt") && row["targetDistance"] == 0
+    }));
+    assert!(impacted(
+        workspace.path(),
+        &from,
+        &newly_requested,
+        &result,
+        &[
+            "-d",
+            newly_requested_edges.to_str().unwrap(),
+            "--reportImpactGraph",
+        ]
+    )
+    .status
+    .success());
+    let report: Value = serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+    assert!(report["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| !row["label"].as_str().unwrap().ends_with("//:fixed.txt")));
+    let wrapper = report["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["label"].as_str().unwrap().ends_with("//:wrapper"))
+        .unwrap();
+    assert_eq!(wrapper["targetDistance"], 2);
+    assert_eq!(wrapper["packageDistance"], 0);
+    assert!(report["paths"].as_array().unwrap().iter().any(|path| {
+        path["kind"] == "shared"
+            && path["roots"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|label| label.ends_with("//:wrapper"))
+    }));
 
     let empty = output.path().join("empty.json");
     let generated = generate(
@@ -962,6 +1406,306 @@ fn cquery_reports_only_requested_configured_roots() {
     );
     assert!(!generated.status.success());
     assert!(!missing.exists());
+}
+
+/// A fresh typed view can verify an independent main-source product while leaving a reached
+/// aspect unresolved. The changed product still uses the normal configured source path.
+#[test]
+fn cquery_verifies_covered_configured_roots() {
+    let workspace = copy_workspace("cquery_transition_dedup");
+    let output = tempfile::tempdir().unwrap();
+    let from = output.path().join("B-hashes.json");
+    let to = output.path().join("H-hashes.json");
+    let edges = output.path().join("H-edges.json");
+    let renamed = output.path().join("R-hashes.json");
+    let renamed_edges = output.path().join("R-edges.json");
+    let featured = output.path().join("F-hashes.json");
+    let featured_edges = output.path().join("F-edges.json");
+    let artifacts = std::env::var_os("TEST_UNDECLARED_OUTPUTS_DIR").map(std::path::PathBuf::from);
+    let mut reports = BTreeMap::new();
+    let mut typed = false;
+    for (name, value, hashes, head_edges) in [
+        ("B", "verified-before\n", &from, None),
+        ("H", "verified-after\n", &to, Some(&edges)),
+        ("R", "verified-after\n", &renamed, Some(&renamed_edges)),
+        ("F", "verified-after\n", &featured, Some(&featured_edges)),
+    ] {
+        if name == "R" {
+            fs::rename(
+                workspace.path().join("BUILD"),
+                workspace.path().join("BUILD.bazel"),
+            )
+            .unwrap();
+        } else if name == "F" {
+            let build = workspace.path().join("BUILD.bazel");
+            let contents = fs::read_to_string(&build).unwrap();
+            let updated = contents.replacen(
+                "\nbootstrap_flag(",
+                "\npackage(features = [\"probe\"])\n\nbootstrap_flag(",
+                1,
+            );
+            assert_ne!(updated, contents);
+            fs::write(build, updated).unwrap();
+        }
+        fs::write(workspace.path().join("input.txt"), value).unwrap();
+        let build = std::process::Command::new(bazel())
+            .current_dir(workspace.path())
+            .args(["build", "//:observed", "//:observed_changed"])
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let build_file = if matches!(name, "B" | "H") {
+            "BUILD"
+        } else {
+            "BUILD.bazel"
+        };
+        let feature = if name == "F" { "on" } else { "off" };
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("bazel-bin/observed.out")).unwrap(),
+            format!("{build_file}|{feature}|fixed\n")
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("bazel-bin/observed_changed.out")).unwrap(),
+            format!("{build_file}|{feature}|{value}")
+        );
+        if name == "B" {
+            let capability = std::process::Command::new(bazel())
+                .current_dir(workspace.path())
+                .args([
+                    "cquery",
+                    "deps(config(set(//:observed //:observed_changed), target))",
+                    "--experimental_explicit_aspects",
+                    "--implicit_deps",
+                    "--tool_deps",
+                    "--nodep_deps",
+                    "--include_aspects",
+                    "--transitions=lite",
+                    "--proto:include_configurations",
+                    "--proto:rule_inputs_and_outputs",
+                    "--consistent_labels",
+                    "--output=jsonproto",
+                ])
+                .output()
+                .unwrap();
+            let response = serde_json::from_slice::<Value>(&capability.stdout).ok();
+            typed = capability.status.success()
+                && response.as_ref().is_some_and(|response| {
+                    response["aspects"]
+                        .as_array()
+                        .is_some_and(|rows| !rows.is_empty())
+                        && response["aspectResults"]
+                            .as_array()
+                            .is_some_and(|rows| !rows.is_empty())
+                });
+            if let Some(artifacts) = &artifacts {
+                fs::write(artifacts.join("typed-response"), capability.stdout).unwrap();
+                fs::write(artifacts.join("typed-response.stderr"), capability.stderr).unwrap();
+            }
+        }
+        let mut arguments = vec![
+            "-v",
+            "--useCquery",
+            "--cqueryRootExpression",
+            "set(//:observed //:observed_changed)",
+            "--verifyConfiguredRoots",
+            "--includeTargetType",
+        ];
+        if let Some(edges) = head_edges {
+            arguments.extend(["-d", edges.to_str().unwrap()]);
+        }
+        let generated = generate(workspace.path(), hashes, &arguments);
+        if let Some(artifacts) = &artifacts {
+            fs::write(
+                artifacts.join(format!("{name}-generation.stderr")),
+                &generated.stderr,
+            )
+            .unwrap();
+        }
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        if let Some(artifacts) = &artifacts {
+            fs::copy(hashes, artifacts.join(format!("{name}-hashes.json"))).unwrap();
+        }
+        if let Some(head_edges) = head_edges {
+            let (before, report_name) = match name {
+                "H" => (&from, "report.json"),
+                "R" => (&to, "rename-report.json"),
+                "F" => (&renamed, "feature-report.json"),
+                _ => unreachable!(),
+            };
+            let path = output.path().join(report_name);
+            let compared = impacted(
+                workspace.path(),
+                before,
+                hashes,
+                &path,
+                &["-d", head_edges.to_str().unwrap(), "--reportImpactGraph"],
+            );
+            assert!(
+                compared.status.success(),
+                "{}",
+                String::from_utf8_lossy(&compared.stderr)
+            );
+            if let Some(artifacts) = &artifacts {
+                fs::copy(head_edges, artifacts.join(format!("{name}-edges.json"))).unwrap();
+                fs::copy(&path, artifacts.join(report_name)).unwrap();
+            }
+            let result = serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap();
+            if name == "H" {
+                let standard = output.path().join("standard-H.json");
+                let standard_edges = output.path().join("standard-H-edges.json");
+                let generated = generate(
+                    workspace.path(),
+                    &standard,
+                    &[
+                        "--useCquery",
+                        "--cqueryRootExpression",
+                        "set(//:observed //:observed_changed)",
+                        "--includeTargetType",
+                        "-d",
+                        standard_edges.to_str().unwrap(),
+                    ],
+                );
+                assert!(
+                    generated.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&generated.stderr)
+                );
+                let mut verified: Value =
+                    serde_json::from_slice(&fs::read(hashes).unwrap()).unwrap();
+                verified["metadata"]["configuredRoots"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("verifiedRoots");
+                let standard_data: Value =
+                    serde_json::from_slice(&fs::read(&standard).unwrap()).unwrap();
+                assert_eq!(verified, standard_data);
+                assert_eq!(
+                    fs::read(head_edges).unwrap(),
+                    fs::read(&standard_edges).unwrap()
+                );
+                let one_sided = output.path().join("one-sided-report.json");
+                assert!(impacted(
+                    workspace.path(),
+                    &from,
+                    &standard,
+                    &one_sided,
+                    &[
+                        "-d",
+                        standard_edges.to_str().unwrap(),
+                        "--reportImpactGraph"
+                    ]
+                )
+                .status
+                .success());
+                let one_sided_result: Value =
+                    serde_json::from_slice(&fs::read(&one_sided).unwrap()).unwrap();
+                assert_eq!(one_sided_result["targets"], result["targets"]);
+                assert!(one_sided_result["unaffectedRoots"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty());
+                if let Some(artifacts) = &artifacts {
+                    fs::copy(standard, artifacts.join("standard-H.json")).unwrap();
+                    fs::copy(standard_edges, artifacts.join("standard-H-edges.json")).unwrap();
+                    fs::copy(one_sided, artifacts.join("one-sided-report.json")).unwrap();
+                }
+            }
+            reports.insert(name, result);
+        }
+    }
+    let report = &reports["H"];
+    let selected = report["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["label"].as_str().unwrap().trim_start_matches('@'))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(selected, BTreeSet::from(["//:observed_changed"]));
+    let unaffected = report["unaffectedRoots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|label| label.as_str().unwrap().trim_start_matches('@'))
+        .collect::<BTreeSet<_>>();
+    if typed {
+        assert_eq!(unaffected, BTreeSet::from(["//:observed"]));
+        for hashes in [&from, &to] {
+            let data: Value = serde_json::from_slice(&fs::read(hashes).unwrap()).unwrap();
+            let verified = data["metadata"]["configuredRoots"]["verifiedRoots"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|label| label.trim_start_matches('@'))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(verified, BTreeSet::from(["//:observed"]));
+        }
+    } else {
+        assert!(unaffected.is_empty());
+    }
+
+    let read = |path: &std::path::Path| -> Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    };
+    let observed = |values: &Value| {
+        values
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(label, _)| label.ends_with("//:observed"))
+            .map(|(_, value)| value.clone())
+    };
+    let head = read(&to);
+    let rename = read(&renamed);
+    let feature = read(&featured);
+    if typed {
+        assert_eq!(observed(&head["hashes"]), observed(&rename["hashes"]));
+        assert_eq!(observed(&rename["hashes"]), observed(&feature["hashes"]));
+        assert_ne!(
+            observed(&head["metadata"]["configuredRoots"]["verifiedRoots"]),
+            observed(&rename["metadata"]["configuredRoots"]["verifiedRoots"])
+        );
+        assert!(observed(&feature["metadata"]["configuredRoots"]["verifiedRoots"]).is_none());
+    }
+    for name in ["R", "F"] {
+        let result = &reports[name];
+        assert!(result["unaffectedRoots"].as_array().unwrap().is_empty());
+        if typed {
+            assert!(result["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| { !row["label"].as_str().unwrap().ends_with("//:observed") }));
+        }
+    }
+
+    let malformed_from = output.path().join("malformed-B.json");
+    let malformed_to = output.path().join("malformed-H.json");
+    for (source, destination) in [(&from, &malformed_from), (&to, &malformed_to)] {
+        let mut data = read(source);
+        data["metadata"]["moduleGraphJson"] = Value::String(String::new());
+        fs::write(destination, serde_json::to_vec(&data).unwrap()).unwrap();
+    }
+    let malformed_report = output.path().join("malformed-report.json");
+    assert!(impacted(
+        workspace.path(),
+        &malformed_from,
+        &malformed_to,
+        &malformed_report,
+        &["-d", edges.to_str().unwrap(), "--reportImpactGraph"]
+    )
+    .status
+    .success());
+    let malformed = read(&malformed_report);
+    assert!(malformed["unaffectedRoots"].as_array().unwrap().is_empty());
+    assert_eq!(malformed["targets"], report["targets"]);
 }
 
 /// Regression for https://github.com/Tinder/bazel-diff/issues/522 and hashbench's

@@ -48,6 +48,20 @@ fn parse_modules(json: &str) -> BTreeMap<String, Module> {
     modules
 }
 
+/// A complete successful producer answer must also be a usable snapshot for this module model.
+/// Ordinary comparisons keep their historical tolerance for missing or malformed metadata.
+pub(crate) fn usable_module_graph(json: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(json) else {
+        return false;
+    };
+    value.get("key").and_then(Value::as_str) == Some("<root>")
+        && value.get("root").and_then(Value::as_bool) == Some(true)
+        && ["dependencies", "indirectDependencies", "cycles"]
+            .iter()
+            .all(|field| value.get(*field).is_some_and(Value::is_array))
+        && parse_modules(json).contains_key("<root>")
+}
+
 fn changed_modules(from: &str, to: &str) -> BTreeSet<String> {
     let from = parse_modules(from);
     let to = parse_modules(to);
@@ -111,6 +125,35 @@ pub fn impacted_with_module_changes(
     })
 }
 
+/// Compare one standalone hash pair and retain the native paths and MODULE obligations.
+pub fn impact_graph(
+    from: &HashFileData,
+    to: &HashFileData,
+    dep_edges: &BTreeMap<String, Vec<String>>,
+    bazel: Option<&BazelOptions>,
+    target_types: Option<&HashSet<String>>,
+    exclude_external: bool,
+) -> Result<crate::model::ImpactGraph> {
+    let mut forced = BTreeSet::new();
+    visit_module_overlay(
+        from,
+        to,
+        bazel.is_some(),
+        |expression| bazel.unwrap().query(expression, false),
+        |label| {
+            forced.insert(label);
+        },
+    );
+    crate::model::hash_file_impact_graph(
+        from,
+        to,
+        dep_edges,
+        &forced,
+        target_types,
+        exclude_external,
+    )
+}
+
 fn main_label(label: &str) -> Option<&str> {
     let label = crate::bazel::main_repo_label_key(label);
     label.starts_with("//").then_some(label)
@@ -120,26 +163,42 @@ fn impacted_with_module_query(
     from: &HashFileData,
     to: &HashFileData,
     can_query: bool,
-    mut query: impl FnMut(&str) -> Result<Vec<Target>>,
+    query: impl FnMut(&str) -> Result<Vec<Target>>,
 ) -> Result<BTreeSet<String>> {
     let mut impacted = impacted_targets(&from.hashes, &to.hashes, None, false)?
         .into_iter()
         .collect::<BTreeSet<_>>();
+    visit_module_overlay(from, to, can_query, query, |label| {
+        impacted.insert(label);
+    });
+    Ok(impacted)
+}
+
+fn visit_module_overlay(
+    from: &HashFileData,
+    to: &HashFileData,
+    can_query: bool,
+    mut query: impl FnMut(&str) -> Result<Vec<Target>>,
+    mut emit: impl FnMut(String),
+) {
     if from.module_graph_json == to.module_graph_json {
-        return Ok(impacted);
+        return;
     }
     let (Some(from_graph), Some(to_graph)) = (
         from.module_graph_json.as_deref(),
         to.module_graph_json.as_deref(),
     ) else {
-        return Ok(impacted);
+        return;
     };
     let changed = changed_modules(from_graph, to_graph);
     if changed.is_empty() {
-        return Ok(impacted);
+        return;
     }
     if !can_query {
-        return Ok(to.hashes.keys().cloned().collect());
+        for label in to.hashes.keys() {
+            emit(label.clone());
+        }
+        return;
     }
     fn repo_inventory(file: &HashFileData) -> &BTreeMap<String, crate::model::TargetHash> {
         file.configured_roots
@@ -166,7 +225,7 @@ fn impacted_with_module_query(
         })
         .collect::<BTreeSet<_>>();
     if repos.is_empty() {
-        return Ok(impacted);
+        return;
     }
     let expression = format!(
         "rdeps(//..., {})",
@@ -183,23 +242,20 @@ fn impacted_with_module_query(
                 .filter_map(target_name)
                 .filter_map(main_label)
                 .collect();
-            impacted.extend(
-                to.hashes
-                    .keys()
-                    .filter(|label| {
-                        main_label(label).is_some_and(|label| dependency_roots.contains(label))
-                    })
-                    .cloned(),
-            );
+            for label in to.hashes.keys().filter(|label| {
+                main_label(label).is_some_and(|label| dependency_roots.contains(label))
+            }) {
+                emit(label.clone());
+            }
         }
         Ok(targets) => {
-            impacted.extend(
-                targets
-                    .iter()
-                    .filter_map(target_name)
-                    .filter(|label| !label.starts_with("@@"))
-                    .map(str::to_owned),
-            );
+            for label in targets
+                .iter()
+                .filter_map(target_name)
+                .filter(|label| !label.starts_with("@@"))
+            {
+                emit(label.to_owned());
+            }
         }
         Err(error) => {
             eprintln!(
@@ -218,13 +274,16 @@ fn impacted_with_module_query(
                 .cloned()
                 .collect::<Vec<_>>();
             if workspace_targets.is_empty() {
-                impacted.extend(to.hashes.keys().cloned());
+                for label in to.hashes.keys() {
+                    emit(label.clone());
+                }
             } else {
-                impacted.extend(workspace_targets);
+                for label in workspace_targets {
+                    emit(label);
+                }
             }
         }
     }
-    Ok(impacted)
 }
 
 #[cfg(test)]
@@ -343,6 +402,41 @@ mod tests {
         assert!(!records_bzlmod(&with_graph(None)));
         assert!(!records_bzlmod(&with_graph(Some(""))));
         assert!(!records_bzlmod(&with_graph(Some(" \n"))));
+    }
+
+    #[test]
+    fn verified_module_snapshot_requires_usable_data() {
+        let mut graph = serde_json::json!({
+            "key": "<root>",
+            "name": "root",
+            "version": "",
+            "apparentName": "root",
+            "dependencies": [],
+            "indirectDependencies": [],
+            "cycles": [],
+            "root": true,
+        });
+        assert!(usable_module_graph(&graph.to_string()));
+        for invalid in ["", "{", r#"{"key":"<root>"}"#] {
+            assert!(!usable_module_graph(invalid));
+        }
+        graph["dependencies"] = serde_json::json!([
+            {
+                "key": "ext@_", "name": "ext", "version": "", "apparentName": "ext",
+                "dependencies": [], "indirectDependencies": [], "cycles": []
+            },
+            {
+                "key": "tool@_", "name": "tool", "version": "", "apparentName": "tool",
+                "dependencies": [{
+                    "key": "ext@_", "name": "ext", "version": "", "apparentName": "ext",
+                    "unexpanded": true
+                }],
+                "indirectDependencies": [], "cycles": []
+            }
+        ]);
+        assert!(usable_module_graph(&graph.to_string()));
+        graph["dependencies"] = Value::Null;
+        assert!(!usable_module_graph(&graph.to_string()));
     }
 
     #[test]

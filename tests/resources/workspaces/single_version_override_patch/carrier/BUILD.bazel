@@ -1,0 +1,1 @@
+# Selects dep transitively for the MODULE root-mapping regression.

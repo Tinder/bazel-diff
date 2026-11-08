@@ -118,6 +118,96 @@ identities and ambiguous bare keys fail generation. `bazel-diff` controls the
 cquery serialization needed for this model; other query filters still apply.
 Partial graph mode remains incompatible with cquery.
 
+### Verified Configured Roots
+
+Add `--verifyConfiguredRoots` to both rooted generations when a caller needs to
+distinguish a verified stable configured input graph from an unknown result:
+
+```bash
+bazel-diff generate-hashes -w /path/to/base -b bazel --useCquery \
+  --cqueryRootExpressionFile roots.query --verifyConfiguredRoots \
+  --includeTargetType base_hashes.json
+bazel-diff generate-hashes -w /path/to/head -b bazel --useCquery \
+  --cqueryRootExpressionFile roots.query --verifyConfiguredRoots \
+  --includeTargetType --depEdgesFile deps.json final_hashes.json
+```
+
+This opt-in mode keeps the normal configured hashes and dependency edges. It
+also runs a fresh cquery with the same workspace, startup options and cquery
+options. The verification view enables `implicit_deps`, `tool_deps`,
+`nodep_deps`, and `include_aspects` so a filtered dependency cannot be mistaken
+for an absent one. It requests the full attributes and typed explicit aspect
+serialization needed to check coverage. These extra edges establish coverage;
+they do not become positive impact paths.
+
+Verification requires a Bazel producer with typed explicit aspect records, such
+as [Bazel #32496](https://github.com/bazelbuild/bazel/pull/32496). The current
+format has no capability marker for a response without aspects, so the capture
+must contain an actual typed aspect record. A supported root may be independent of
+that aspect. An unsupported or failed verification query leaves the normal
+hashes available without negative authority.
+
+The initial supported roots are in the main repository and reach no aspect
+application. Each prerequisite in the full view must match the exact input used by
+the normal hash. A source qualifies only when that hash read a real regular file
+in the main workspace at the location Bazel returned. Missing files, directories,
+internal symlinks and external source views remain unknown. Package features and
+SourceFile rows for BUILD files with loads also remain unknown. The verifier
+separately binds the rule class and BUILD filename. A BUILD rename cannot be
+certified stable when the normal hash stays equal.
+
+`metadata.configuredRoots.verifiedRoots` maps covered endpoint roots to opaque
+context digests. The comparator uses these with the normal hashes, full configured
+root identities, and successful usable module snapshots. Historical files have no
+such authority. This mode requires fresh physical hashes and rejects partial/base
+reuse, overrides for content or modified files, ignored attributes, and target
+exclusions. It is available only on `generate-hashes`.
+
+Use the same worker for both captures and each revision's actual workspace and
+build configuration, including consistent repository options for
+supplementary commands. This verification covers the reported configured inputs;
+caller policy must still account for inputs outside that graph, such as
+workspace status action artifacts. A context difference withholds a stable verdict
+and does not claim a measured direct edit.
+
+## Impact Graph Output
+
+Use `--reportImpactGraph` when a caller applies its own policy to dependency
+paths. Supply the same head dependency file used for native distance output:
+
+```bash
+bazel-diff get-impacted-targets -w /path/to/workspace -b bazel \
+  -sh base_hashes.json -fh final_hashes.json --depEdgesFile deps.json \
+  --reportImpactGraph -o impact_graph.json
+```
+
+The version 1 JSON contains `targets`, the eligible labels and their target and
+package distances, and `paths`, the native changed graph for those outputs.
+Each path contains `kind`, `changed`, `direct`, and `roots`. The changed and
+direct values are keys in the supplied head dependency file; `roots` maps each
+public output label to its graph key. Intermediate nodes remain available when
+`--targetType` filters the outputs. Apply a path policy to this adjacency so a
+longer allowed path remains available.
+
+`unaffectedRoots` contains only roots whose covered inputs and context are equal
+in both verified captures for this configuration, with no positive or MODULE
+obligation. An absent label is unknown. A caller may remove an ordinary or
+independent candidate only when that label appears here for the job's own
+configuration; candidates in other profiles remain eligible.
+
+`ordinary` and `configured` paths use the corresponding hash graph. `shared`
+paths use direct changes on configured instances present in both files;
+they can select a root first requested at the head without treating enrollment as
+a change. An omitted head-only root remains unknown, so callers must retain any
+ordinary or independent nomination for it. Keep each build profile's comparison
+and dependency file together.
+
+`forced` paths are independent MODULE obligations. Each contains one root at
+distance zero and must be handled independently of the supplied adjacency. A
+root can also have an ordinary or configured path. For those path kinds, `direct`
+records the origins used by native distance calculation, including its existing
+distance-zero fallback for an incomplete dependency file.
+
 ## Partial Graph Updates
 
 A full `generate-hashes` pays for a `bazel query` over the whole graph even when the change

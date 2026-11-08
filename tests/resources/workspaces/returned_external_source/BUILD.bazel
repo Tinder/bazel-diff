@@ -7,4 +7,11 @@ genrule(
     cmd = "cat $(SRCS) > $@",
 )
 
+genrule(
+    name = "directory_consumer",
+    srcs = ["@bridge//:mirror_dir"],
+    outs = ["directory-child.txt"],
+    cmd = "cat $(location @bridge//:mirror_dir)/child.txt > $@",
+)
+
 filegroup(name = "unrelated")

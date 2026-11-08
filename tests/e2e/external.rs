@@ -953,39 +953,50 @@ fn external_macro_stack_uses_returned_source() {
 fn returned_external_source_reaches_consumer() {
     let workspace = copy_workspace("returned_external_source");
     let output = tempfile::tempdir().unwrap();
-    let before = output.path().join("before.json");
-    let after = output.path().join("after.json");
-    let result = output.path().join("impacted.txt");
-    let args = [
-        "--useCquery",
-        "--cqueryExpression",
-        "deps(set(//:consumer //:unrelated))",
-    ];
-    for (contents, snapshot) in [("before\n", &before), ("after\n", &after)] {
-        fs::write(workspace.path().join("value.txt"), contents).unwrap();
-        assert!(generate(workspace.path(), snapshot, &args).status.success());
-        assert!(std::process::Command::new(bazel())
-            .current_dir(workspace.path())
-            .args(["build", "//:consumer"])
-            .status()
-            .unwrap()
+    for (input, source, consumer, product) in [
+        ("value.txt", "mirror.txt", "consumer", "copied.txt"),
+        (
+            "input_dir/child.txt",
+            "mirror_dir",
+            "directory_consumer",
+            "directory-child.txt",
+        ),
+    ] {
+        let before = output.path().join("before.json");
+        let after = output.path().join("after.json");
+        let result = output.path().join("impacted.txt");
+        let target = format!("//:{consumer}");
+        let expression = format!("deps(set({target} //:unrelated))");
+        let args = ["--useCquery", "--cqueryExpression", &expression];
+        for (contents, snapshot) in [("before\n", &before), ("after\n", &after)] {
+            // Atomic replacement also updates the parent directory, the actual Bazel input.
+            let replacement = workspace.path().join("replacement.txt");
+            fs::write(&replacement, contents).unwrap();
+            fs::rename(replacement, workspace.path().join(input)).unwrap();
+            assert!(generate(workspace.path(), snapshot, &args).status.success());
+            assert!(std::process::Command::new(bazel())
+                .current_dir(workspace.path())
+                .args(["build", &target])
+                .status()
+                .unwrap()
+                .success());
+            assert_eq!(
+                fs::read_to_string(workspace.path().join("bazel-bin").join(product)).unwrap(),
+                contents
+            );
+        }
+        assert!(impacted(workspace.path(), &before, &after, &result, &[])
+            .status
             .success());
-        assert_eq!(
-            fs::read_to_string(workspace.path().join("bazel-bin/copied.txt")).unwrap(),
-            contents
+        let targets = read_lines(&result);
+        assert!(
+            targets.iter().any(|t| t.ends_with(&format!("//:{source}"))),
+            "{targets:?}"
         );
+        assert!(
+            targets.contains(&target) || targets.contains(&format!("@@{target}")),
+            "{targets:?}"
+        );
+        assert!(!targets.contains("@@//:unrelated") && !targets.contains("//:unrelated"));
     }
-    assert!(impacted(workspace.path(), &before, &after, &result, &[])
-        .status
-        .success());
-    let targets = read_lines(&result);
-    assert!(
-        targets.iter().any(|t| t.ends_with("//:mirror.txt")),
-        "{targets:?}"
-    );
-    assert!(
-        targets.contains("@@//:consumer") || targets.contains("//:consumer"),
-        "{targets:?}"
-    );
-    assert!(!targets.contains("@@//:unrelated") && !targets.contains("//:unrelated"));
 }

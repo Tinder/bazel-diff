@@ -95,7 +95,9 @@ Bazel resolves `config((expression), target)` separately at each revision;
 `bazel-diff` hashes their dependencies together. Root sets and fine repository
 lists may differ as targets and repositories appear or disappear. Keep different
 build or test profiles in separate comparisons, using their corresponding
-`--cqueryCommandOptions`.
+`--cqueryCommandOptions`. If Bazel returns distinct targets with the same label
+and configuration checksum, generation fails. This can happen when toolchain
+resolution forces the same implementation onto different execution platforms.
 
 For a large expression, use `--cqueryRootExpressionFile roots.query`. Its UTF-8
 contents feed the same query and cache identity as the inline form. The file
@@ -105,7 +107,7 @@ universe describes the intended profile. Both root options require
 `--useCquery` and conflict with `--cqueryExpression` and each other.
 
 The hash JSON contains only resolved bare root labels in `hashes`.
-`metadata.configuredRoots` version 1 stores the mapping from roots to instances
+`metadata.configuredRoots` version 2 stores the mapping from roots to instances
 and configured hashes; the usual flat edge file retains configured dependencies.
 Native impact results remain bare root labels, while distance and `explain`
 walks retain configured causes. Direct JSON consumers need the configured

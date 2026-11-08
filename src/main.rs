@@ -5,7 +5,8 @@ use bazel_diff::fingerprint;
 use bazel_diff::git::{self, DerivationPolicy, Git};
 use bazel_diff::hash::{generate_hashes, generate_verified_hashes, HashOptions};
 use bazel_diff::model::{
-    dep_edges_from_slice, filter_and_sort_labels, hash_file_distances, HashFileData,
+    dep_edges_from_slice, filter_and_sort_labels, hash_file_distances, ConfiguredRoots,
+    HashFileData,
 };
 use bazel_diff::module_graph::{bzlmod_enabled_for, impact_graph, impacted_with_module_changes};
 use bazel_diff::partial::{self, Classification, Glob};
@@ -816,7 +817,10 @@ fn fingerprint_flags(
     }
     if let Some(expr) = args.root_expression()? {
         flags.insert("cqueryRootExpression".into(), expr);
-        flags.insert("configuredRoots".into(), "1".into());
+        flags.insert(
+            "configuredRoots".into(),
+            ConfiguredRoots::VERSION.to_string(),
+        );
     }
     if let Some(root) = &args.isolated_dependency_root {
         flags.insert("isolatedDependencyRoot".into(), root.clone());
@@ -1778,7 +1782,7 @@ mod tests {
         rooted.use_cquery = true;
         rooted.cquery_root_expression = Some("//app:lib".to_owned());
         let rooted_flags = fingerprint_flags(&rooted, false, &[]).unwrap();
-        assert_eq!(rooted_flags["configuredRoots"], "1");
+        assert_eq!(rooted_flags["configuredRoots"], "2");
         assert_eq!(rooted_flags["cqueryRootExpression"], "//app:lib");
         let expression_file = directory.path().join("roots.query");
         fs::write(&expression_file, "//app:lib").unwrap();

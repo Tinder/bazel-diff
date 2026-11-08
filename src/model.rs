@@ -328,9 +328,12 @@ struct SerializedConfiguredRoots<'a> {
 }
 
 impl ConfiguredRoots {
+    /// Version 1 could combine distinct toolchains with the same public cquery key.
+    pub const VERSION: u32 = 2;
+
     fn serialized(&self, include_target_type: bool) -> SerializedConfiguredRoots<'_> {
         SerializedConfiguredRoots {
-            version: 1,
+            version: Self::VERSION,
             roots: &self.roots,
             hashes: SerializedHashes {
                 hashes: &self.hashes,
@@ -354,7 +357,7 @@ struct ConfiguredRootsWire {
 impl<'de> Deserialize<'de> for ConfiguredRoots {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = ConfiguredRootsWire::deserialize(deserializer)?;
-        if wire.version != 1 {
+        if wire.version != Self::VERSION {
             return Err(de::Error::custom(format!(
                 "unsupported configuredRoots version {}",
                 wire.version
@@ -1501,10 +1504,10 @@ mod tests {
     #[test]
     fn configured_root_rosters_round_trip_even_when_empty() {
         let empty = HashFileData::from_slice(
-            br#"{"hashes":{},"metadata":{"configuredRoots":{"version":1,"roots":{},"hashes":{}}}}"#,
+            br#"{"hashes":{},"metadata":{"configuredRoots":{"version":2,"roots":{},"hashes":{}}}}"#,
         )
         .unwrap();
-        let one = HashFileData::from_slice(br#"{"hashes":{"//:a":"Rule#ab~cd"},"metadata":{"configuredRoots":{"version":1,"roots":{"//:a":"//:a|ab"},"hashes":{"//:a|ab":"Rule#ab~cd"}}}}"#).unwrap();
+        let one = HashFileData::from_slice(br#"{"hashes":{"//:a":"Rule#ab~cd"},"metadata":{"configuredRoots":{"version":2,"roots":{"//:a":"//:a|ab"},"hashes":{"//:a|ab":"Rule#ab~cd"}}}}"#).unwrap();
         for data in [&empty, &one] {
             let encoded = serde_json::to_vec(&data.serialized(true, false)).unwrap();
             assert_eq!(
@@ -1562,7 +1565,7 @@ mod tests {
                 .is_empty()
         );
         let mut invalid = one.to_value(true, false);
-        invalid["metadata"]["configuredRoots"]["version"] = serde_json::json!(2);
+        invalid["metadata"]["configuredRoots"]["version"] = serde_json::json!(1);
         assert!(HashFileData::from_slice(&serde_json::to_vec(&invalid).unwrap()).is_err());
     }
 

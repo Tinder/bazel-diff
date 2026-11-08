@@ -1,0 +1,3 @@
+module(name = "nested_execution_platforms")
+register_execution_platforms("//:platform_x", "//:platform_y")
+register_toolchains("//:outer_reg", "//:inner_reg_x", "//:inner_reg_y")

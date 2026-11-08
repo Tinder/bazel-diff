@@ -212,6 +212,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::cquery_rejects_indistinguishable_toolchain_instances",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::cquery_reports_only_requested_configured_roots",
                 "timeout": "moderate",
             },

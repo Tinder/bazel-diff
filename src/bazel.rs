@@ -3786,6 +3786,17 @@ fn decode_cquery_graph(
         decoder.push(result, transform);
     }
     decoder.finish(transform)?;
+    if roots.is_some() || compatible.is_some() || verify {
+        // Bazel can force the same toolchain onto different execution platforms without
+        // distinguishing those instances in the configured labels on incoming edges.
+        // Catch the collision before repository and query results are deduplicated.
+        let mut seen = HashSet::with_capacity(decoder.targets.len());
+        for key in decoder.targets.iter().filter_map(target_name) {
+            if !seen.insert(key) {
+                bail!("cquery returned multiple targets for configured key {key}");
+            }
+        }
+    }
     if let (Some(roots), Some(resolved)) = (roots, decoder.root_labels) {
         roots.extend(resolved);
     }

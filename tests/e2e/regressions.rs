@@ -1079,6 +1079,77 @@ fn cquery_keeps_dependencies_of_every_configured_instance() {
 }
 
 #[test]
+fn cquery_rejects_indistinguishable_toolchain_instances() {
+    let workspace = copy_workspace("cquery_nested_toolchains");
+    let workspace = workspace.path();
+    let output = tempfile::tempdir().unwrap();
+    let rooted = |root: &str, hashes: &Path| {
+        generate(
+            workspace,
+            hashes,
+            &["--useCquery", "--cqueryRootExpression", root],
+        )
+    };
+
+    for (state, x, y) in [("before", "X1", "Y1"), ("x", "X2", "Y1"), ("y", "X1", "Y2")] {
+        fs::write(workspace.join("x.txt"), x).unwrap();
+        fs::write(workspace.join("y.txt"), y).unwrap();
+        let build = std::process::Command::new(bazel())
+            .current_dir(workspace)
+            .args(["build", "//:joined"])
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("bazel-bin/joined.txt")).unwrap(),
+            format!("{x}{y}")
+        );
+
+        // Either reader alone reaches just one instance of the forwarding toolchain.
+        for (branch, root) in [("x", "//:only_x"), ("y", "//:only_y")] {
+            let hashes = output.path().join(format!("{state}-{branch}.json"));
+            let result = rooted(root, &hashes);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            if state == "before" {
+                continue;
+            }
+            let before = output.path().join(format!("before-{branch}.json"));
+            let labels = output.path().join("impacted.txt");
+            let result = impacted(workspace, &before, &hashes, &labels, &[]);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let selected: Vec<_> = read_lines(&labels)
+                .into_iter()
+                .map(|label| label.trim_start_matches('@').to_owned())
+                .collect();
+            let expected: Vec<_> = (state == branch).then_some(root).into_iter().collect();
+            assert_eq!(selected, expected);
+        }
+    }
+
+    // A union and a single parent both reach two outer_impl rows with the same public key.
+    for root in ["set(//:only_x //:only_y)", "//:joined"] {
+        let result = rooted(root, &output.path().join("ambiguous.json"));
+        assert!(
+            !result.status.success(),
+            "accepted ambiguous configured inputs for {root}"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("//:outer_impl"));
+    }
+}
+
+#[test]
 fn cquery_reports_only_requested_configured_roots() {
     let workspace = copy_workspace("cquery_transition_dedup");
     let output = tempfile::tempdir().unwrap();

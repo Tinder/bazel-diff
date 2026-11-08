@@ -1,0 +1,11 @@
+module(name = "fine_alias_acquisition")
+
+local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+
+local_repository(
+    name = "library",
+    path = "library",
+)
+
+aliases = use_extension("//:aliases.bzl", "aliases")
+use_repo(aliases, "public")

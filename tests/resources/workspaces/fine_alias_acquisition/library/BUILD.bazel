@@ -1,0 +1,12 @@
+load("//defs:library.bzl", "library")
+
+package(default_visibility = ["//visibility:public"])
+
+library(
+    name = "lib",
+    srcs = [
+        "data.txt",
+        "other.txt",
+    ],
+    selected = "data.txt",
+)

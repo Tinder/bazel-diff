@@ -82,7 +82,9 @@ pub fn configuration_fingerprint(
         hasher.update([0]);
     }
     hasher.update(b"cycleComponents=1\0");
-    if !options.bazel.use_cquery {
+    if options.bazel.use_cquery {
+        hasher.update(b"cqueryWorkspaceDirectories=1\0");
+    } else {
         hasher.update(b"queryToolchainImplementations=1\0");
     }
     hasher.update(b"stackSourcePaths=1\0");

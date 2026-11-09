@@ -8789,6 +8789,10 @@ if [ "$1 $2" = "info output_base" ]; then
   exit 0
 fi
 if echo "$args" | grep -q "mod graph --output=json"; then
+  if [ -f module-graph.json ]; then
+    cat module-graph.json
+    exit 0
+  fi
   if [ -f omit-graph-hint ]; then
     echo '{{"key":"<root>","name":"root","dependencies":[{{"key":"rules_go@0.62.0","name":"rules_go","dependencies":[]}}]}}'
   else
@@ -8832,9 +8836,16 @@ if echo "$args" | grep -q "mod show_repo"; then
   cat "{repos}"
   exit 0
 fi
+query="{query}"
+if [ -f metadata-result.pb ] && echo "$args" | grep -q -- "--proto:output_rule_attrs=toolchain,toolchain_type,actual"; then
+  query=metadata-result.pb
+fi
+if [ -f aliases-result.pb ] && echo "$args" | grep -q -- "--proto:output_rule_attrs=actual"; then
+  query=aliases-result.pb
+fi
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--output_file" ]; then
-    cp "{query}" "$2"
+    cp "$query" "$2"
     exit 0
   fi
   shift
@@ -8988,6 +8999,286 @@ exit 1
         let raw = crate::hash::hash_targets(&options, targets).unwrap();
         let streamed = crate::hash::generate_hashes(&options).unwrap();
         assert_eq!(raw.hashes[overlapping], streamed.hashes[overlapping]);
+    }
+
+    /// Exercise the reader/compiler and sibling paths from the capable product tests inside
+    /// the instrumented library target. The query fixture supplies their decoded loading
+    /// relationships; the E2E tests retain responsibility for Bazel's query boundaries.
+    #[test]
+    #[cfg(unix)]
+    fn observed_toolchain_graph_separates_compiler_and_sibling_changes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path();
+        let payload_repo = "rules_python++pip+pypi_312_six";
+        let noise_repo = "rules_python++pip+pypi_312_noise";
+        let payload = "@@rules_python++pip+pypi_312_six//:payload";
+        let repositories = |selected: &str, sibling: &str| {
+            [
+                "rules_go+",
+                "rules_python+",
+                "rules_python++pip+pypi",
+                payload_repo,
+                noise_repo,
+                "rules_go++go_sdk+go_toolchains",
+                "rules_go++go_sdk+go_default_sdk",
+            ]
+            .into_iter()
+            .map(|name| Repository {
+                canonical_name: Some(name.into()),
+                repo_rule_name: Some("http_archive".into()),
+                attribute: vec![Attribute {
+                    name: "sha256".into(),
+                    r#type: attribute::Discriminator::String,
+                    string_value: Some(
+                        match name {
+                            name if name == payload_repo => selected,
+                            name if name == noise_repo => sibling,
+                            _ => "e",
+                        }
+                        .repeat(64),
+                    ),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect::<Vec<_>>()
+        };
+        let script = extension_flow_script(path, &repositories("a", "c"), None);
+        let label = |name: &str, value: &str, nodep: bool| Attribute {
+            name: name.into(),
+            r#type: if nodep {
+                attribute::Discriminator::String
+            } else {
+                attribute::Discriminator::Label
+            },
+            string_value: Some(value.into()),
+            nodep: nodep.then_some(true),
+            ..Default::default()
+        };
+        let rule =
+            |name: &str, class: &str, inputs: &[&str], types: &[&str], attrs: Vec<Attribute>| {
+                let mut rule = Rule {
+                    name: name.into(),
+                    rule_class: class.into(),
+                    rule_class_key: (class != "app_lib").then(|| class.into()),
+                    rule_input: inputs.iter().map(|value| (*value).into()).collect(),
+                    attribute: attrs,
+                    possible_toolchain_types: Some(Default::default()).into(),
+                    ..Default::default()
+                };
+                rule.possible_toolchain_types.as_option_mut().unwrap().label =
+                    types.iter().map(|value| (*value).into()).collect();
+                Target {
+                    r#type: target::Discriminator::Rule,
+                    rule: Some(rule).into(),
+                    ..Default::default()
+                }
+            };
+        let public = rule(
+            "@pypi//:public",
+            "alias",
+            &["@rules_python//:manual"],
+            &[],
+            vec![label("actual", "@rules_python//:manual", false)],
+        );
+        let entry = rule(
+            "//toolchain:entry",
+            "alias",
+            &["//toolchain:registered"],
+            &[],
+            vec![label("actual", "//toolchain:registered", false)],
+        );
+        let type_alias = rule(
+            "//toolchain:type_alias",
+            "alias",
+            &["//toolchain:type"],
+            &[],
+            vec![label("actual", "//toolchain:type", false)],
+        );
+        let registered = rule(
+            "//toolchain:registered",
+            "toolchain",
+            &["//toolchain:type_alias"],
+            &[],
+            vec![
+                label("toolchain", "//toolchain:impl", true),
+                label("toolchain_type", "//toolchain:type_alias", false),
+            ],
+        );
+        let alternate = rule(
+            "//toolchain:alternate",
+            "toolchain",
+            &["//toolchain:type"],
+            &[],
+            vec![
+                label("toolchain", "//toolchain:unused_impl", true),
+                label("toolchain_type", "//toolchain:type", false),
+            ],
+        );
+        let native_type = rule("//toolchain:type", "toolchain_type", &[], &[], vec![]);
+        let metadata = vec![
+            entry.clone(),
+            type_alias.clone(),
+            registered.clone(),
+            alternate.clone(),
+            native_type.clone(),
+        ];
+        write_delimited(&path.join("metadata-result.pb"), &metadata);
+        write_delimited(
+            &path.join("aliases-result.pb"),
+            &[public.clone(), entry.clone(), type_alias.clone()],
+        );
+        let mut primary = vec![
+            public,
+            entry,
+            type_alias,
+            registered,
+            alternate,
+            native_type,
+            rule("@rules_python//:manual", "filegroup", &[], &[], vec![]),
+            rule("//toolchain:impl", "filegroup", &[payload], &[], vec![]),
+            rule("//toolchain:unused_impl", "filegroup", &[], &[], vec![]),
+            rule(
+                "//app:reader",
+                "app_lib",
+                &["@pypi//:public"],
+                &["//toolchain:type_alias"],
+                vec![],
+            ),
+            rule(
+                "//app:consumer",
+                "filegroup",
+                &["//app:reader"],
+                &[],
+                vec![],
+            ),
+            rule(
+                "//app:reference",
+                "filegroup",
+                &["//toolchain:type_alias"],
+                &[],
+                vec![],
+            ),
+        ];
+        primary.push(Target {
+            r#type: target::Discriminator::SourceFile,
+            source_file: Some(SourceFile {
+                name: payload.into(),
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        });
+        let mut bazel = probe_options(path, script);
+        bazel.use_module_toolchain_registrations = true;
+        bazel.fine_grained_external_repos.insert("pypi".into());
+        let options = crate::hash::HashOptions {
+            bazel,
+            content_hashes: None,
+            ignored_attributes: HashSet::new(),
+            seed_filepaths: BTreeSet::new(),
+            modified_filepaths: BTreeSet::new(),
+            track_deps: true,
+            always_affected_tags: HashSet::new(),
+            partial_tree: None,
+        };
+        let capture =
+            |selected: &str, sibling: &str, registrations: &[&str], typed: bool| {
+                write_delimited(&path.join("show-repo.pb"), &repositories(selected, sibling));
+                fs::write(path.join("module-graph.json"), serde_json::json!({
+                "key": "<root>", "name": "root", "dependencies": [
+                    {"key": "rules_go@0.62.0", "name": "rules_go", "dependencies": []},
+                    {"key": "rules_python@1.8.4", "name": "rules_python", "dependencies": []},
+                ], "moduleToolchainRegistrations": registrations,
+            }).to_string()).unwrap();
+                let mut rows = primary.clone();
+                if !typed {
+                    rows.iter_mut()
+                        .filter_map(|target| target.rule.as_option_mut())
+                        .find(|rule| rule.name == "//app:reader")
+                        .unwrap()
+                        .possible_toolchain_types = None.into();
+                }
+                write_delimited(&path.join("query-result.pb"), &rows);
+                crate::hash::generate_hashes(&options).unwrap()
+            };
+        let order = ["//toolchain:entry", "//toolchain:alternate"];
+        let before = capture("a", "c", &order, true);
+        let selected = capture("b", "c", &order, true);
+        let sibling = capture("a", "d", &order, true);
+        let report = |before: &crate::model::HashFileData, after: &crate::model::HashFileData| {
+            crate::module_graph::impact_graph(before, after, &after.dep_edges, None, None, false)
+                .unwrap()
+                .distinguish_repository_memberships(before, after, &after.dep_edges)
+                .unwrap()
+        };
+        let positive = report(&before, &selected);
+        let reader = positive
+            .targets
+            .iter()
+            .find(|row| row.label == "//app:reader")
+            .unwrap();
+        assert_eq!((reader.target_distance, reader.package_distance), (4, 2));
+        assert!(positive
+            .targets
+            .iter()
+            .any(|row| row.label == "//app:consumer"));
+        assert!(!positive
+            .targets
+            .iter()
+            .any(|row| row.label == "//app:reference"));
+        assert!(before.dep_edges["//app:reader"].contains(&"//toolchain:entry".into()));
+        assert!(before.dep_edges["//toolchain:registered"].contains(&"//toolchain:impl".into()));
+        assert!(!before.dep_edges["//toolchain:type"].contains(&"//toolchain:registered".into()));
+        let negative = report(&before, &sibling);
+        assert!(!negative.targets.iter().any(|row| [
+            "//app:reader",
+            "//app:consumer",
+            "//app:reference"
+        ]
+        .contains(&row.label.as_str())));
+        let provisional = negative.provisional_targets.unwrap();
+        assert!(provisional.iter().any(|row| row.label == "//app:reader"));
+        assert!(provisional.iter().any(|row| row.label == "//app:consumer"));
+        assert!(!provisional.iter().any(|row| row.label == "//app:reference"));
+        let same = report(&before, &before);
+        assert!(same.targets.is_empty() && same.provisional_targets.unwrap().is_empty());
+        let reordered = capture(
+            "a",
+            "c",
+            &["//toolchain:alternate", "//toolchain:entry"],
+            true,
+        );
+        assert_ne!(
+            before.hashes["//app:reader"].hash,
+            reordered.hashes["//app:reader"].hash
+        );
+        assert_eq!(
+            before.hashes["//toolchain:impl"].hash,
+            reordered.hashes["//toolchain:impl"].hash
+        );
+        assert_eq!(
+            before.hashes["//app:reference"].hash,
+            reordered.hashes["//app:reference"].hash
+        );
+        let unknown_before = capture("a", "c", &order, false);
+        let unknown_selected = capture("b", "c", &order, false);
+        assert!(unknown_selected
+            .repository_memberships
+            .as_ref()
+            .unwrap()
+            .unresolved
+            .contains("possible toolchain type evidence is incomplete"));
+        let unknown = report(&unknown_before, &unknown_selected);
+        assert!(!unknown
+            .targets
+            .iter()
+            .any(|row| row.label == "//app:reader"));
+        assert!(unknown
+            .provisional_targets
+            .unwrap()
+            .iter()
+            .any(|row| row.label == "//app:reader"));
     }
 
     #[test]

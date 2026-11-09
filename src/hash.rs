@@ -1,6 +1,7 @@
 use crate::bazel::{
-    encode_configured_input, split_configured, target_label, target_name, BazelOptions,
-    QueriedTargets, RepositoryInputGroup, RepositoryInputs, ScopedSources, VerifiedQuery,
+    encode_configured_input, encoded_rule_attributes, split_configured, target_label, target_name,
+    BazelOptions, EncodedAttribute, EncodedTargets, QueriedTargets, RepositoryInputGroup,
+    RepositoryInputs, ScopedSources, VerifiedQuery,
 };
 use crate::cancel::{self, Cancellation};
 use crate::components::{component_digest, member_digest, Completion, Components, Visit};
@@ -273,27 +274,40 @@ fn generate_hashes_timed_inner(
     let mut definition_digests = PreparedRules::default();
     let mut digests = Vec::new();
     let query_started = Instant::now();
-    let mut prepare = |batch: &mut [Target], inputs| {
-        let prehash = |target: &mut Target, shared_inputs| {
+    let mut prepare = |batch: &mut [Target], encoded: &EncodedTargets<'_>, inputs| {
+        let prehash = |target: &mut Target, encoded: &[EncodedAttribute<'_>], shared_inputs| {
             let rule = target.rule.as_option_mut()?;
             // Read before `prehash_rule` drops the attributes they come from.
             let loading_inputs = partial_loading_inputs(options, rule);
             Some((
                 rule.name.clone(),
                 PreparedRule {
-                    definition_digest: prehash_rule(rule, &options.ignored_attributes),
+                    definition_digest: prehash_encoded_rule(
+                        rule,
+                        encoded,
+                        &options.ignored_attributes,
+                    ),
                     shared_inputs,
                     loading_inputs,
                 },
             ))
         };
+        // Attributes the decoder left encoded, read back per target into a reused buffer.
+        let encoded_for = |index: usize| encoded.get(index).copied().unwrap_or_default();
         if let [target] = batch {
-            definition_digests.extend(prehash(target, inputs));
+            let mut attributes = Vec::new();
+            encoded_rule_attributes(encoded_for(0), &mut attributes);
+            definition_digests.extend(prehash(target, &attributes, inputs));
         } else {
             // Keep query order for duplicate names, even when the hashes complete out of order.
             batch
                 .par_iter_mut()
-                .map(|target| prehash(target, inputs.clone()))
+                .enumerate()
+                .map_init(Vec::new, |attributes, (index, target)| {
+                    attributes.clear();
+                    encoded_rule_attributes(encoded_for(index), attributes);
+                    prehash(target, attributes, inputs.clone())
+                })
                 .collect_into_vec(&mut digests);
             definition_digests.extend(digests.drain(..).flatten());
         }
@@ -301,9 +315,11 @@ fn generate_hashes_timed_inner(
     let queried = if verify {
         options
             .bazel
-            .query_all_targets_verified_with(&mut prepare)?
+            .query_all_targets_verified_with(|batch, inputs| prepare(batch, &[], inputs))?
     } else {
-        options.bazel.query_all_targets_with(&mut prepare)?
+        options
+            .bazel
+            .query_all_targets_encoded(true, &mut prepare)?
     };
     let observations = if include_toolchain_inputs {
         match options.bazel.observed_toolchains(
@@ -2325,6 +2341,85 @@ pub(crate) fn without_integrity_pinned_urls(
 }
 
 fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes {
+    rule_definition_digest_encoded(rule, &[], ignored)
+}
+
+/// One of a rule's attributes as the definition digest covers it: its message encoding.
+enum HashedAttribute<'r, 'e> {
+    Decoded(&'r crate::proto::blaze_query::Attribute),
+    Encoded(&'e EncodedAttribute<'e>),
+}
+
+impl HashedAttribute<'_, '_> {
+    fn name(&self) -> &str {
+        match self {
+            Self::Decoded(attribute) => &attribute.name,
+            Self::Encoded(attribute) => attribute.name,
+        }
+    }
+}
+
+/// [`rule_definition_digest`] of the rule that `rule` and `encoded` together describe: `rule`
+/// holds the attributes that were decoded and `encoded` the ones left encoded, each at its
+/// position among all of the rule's attributes (see [`crate::bazel::EncodedAttribute`]). An
+/// encoded attribute hashes Bazel's bytes, which are the bytes re-encoding the decoded attribute
+/// produces, so the digest does not depend on which attributes were decoded.
+fn rule_definition_digest_encoded(
+    rule: &Rule,
+    encoded: &[EncodedAttribute<'_>],
+    ignored: &HashSet<String>,
+) -> DigestBytes {
+    if encoded.is_empty() {
+        return rule_definition_digest_decoded(rule, ignored);
+    }
+    // Encoded attributes only come from rules outside `//external`, so URL skipping and
+    // integrity-pinned stripping (repository rules only) never apply here.
+    debug_assert!(!rule.name.starts_with("//external:"));
+    let mut hasher = Sha256::new();
+    hasher.update(rule.rule_class.as_bytes());
+    hasher.update(target_label(&rule.name).as_bytes());
+    if let Some(environment_hash) = &rule.skylark_environment_hash_code {
+        hasher.update(environment_hash.as_bytes());
+    }
+    let total = rule.attribute.len() + encoded.len();
+    let mut attributes = Vec::with_capacity(total);
+    let mut decoded = rule.attribute.iter();
+    let mut pending = encoded.iter().peekable();
+    for position in 0..total {
+        match pending.next_if(|attribute| attribute.position == position) {
+            Some(attribute) => attributes.push(HashedAttribute::Encoded(attribute)),
+            None => attributes.extend(decoded.next().map(HashedAttribute::Decoded)),
+        }
+    }
+    // Stable, like the decoded path: equal names keep query order.
+    if !attributes
+        .windows(2)
+        .all(|pair| pair[0].name() <= pair[1].name())
+    {
+        attributes.sort_by(|left, right| left.name().cmp(right.name()));
+    }
+    let mut size_cache = SizeCache::new();
+    for attribute in attributes {
+        match attribute {
+            HashedAttribute::Decoded(attribute) => hash_attribute(
+                attribute,
+                ignored,
+                false,
+                None,
+                &mut size_cache,
+                &mut hasher,
+            ),
+            HashedAttribute::Encoded(attribute) => {
+                if attribute.name != "generator_location" && !ignored.contains(attribute.name) {
+                    hasher.update(attribute.bytes);
+                }
+            }
+        }
+    }
+    hasher.finalize().into()
+}
+
+fn rule_definition_digest_decoded(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes {
     let mut hasher = Sha256::new();
     hasher.update(rule.rule_class.as_bytes());
     hasher.update(target_label(&rule.name).as_bytes());
@@ -2369,8 +2464,18 @@ fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes
     hasher.finalize().into()
 }
 
+#[cfg(test)]
 fn prehash_rule(rule: &mut Rule, ignored: &HashSet<String>) -> DigestBytes {
-    let digest = rule_definition_digest(rule, ignored);
+    prehash_encoded_rule(rule, &[], ignored)
+}
+
+/// [`prehash_rule`] for a rule some of whose attributes were left encoded by the query decoder.
+fn prehash_encoded_rule(
+    rule: &mut Rule,
+    encoded: &[EncodedAttribute<'_>],
+    ignored: &HashSet<String>,
+) -> DigestBytes {
+    let digest = rule_definition_digest_encoded(rule, encoded, ignored);
     rule.attribute
         .retain(|attribute| attribute.name == "tags" || attribute.name == "visibility");
     // `retain` keeps the buffer it was decoded into. An `Attribute` is several hundred bytes and a
@@ -3683,6 +3788,91 @@ esac
         assert_ne!(
             rule_definition_digest(&first, &HashSet::new()),
             rule_definition_digest(&second, &HashSet::new())
+        );
+    }
+
+    #[test]
+    fn encoded_attributes_hash_like_decoded_ones() {
+        let string_list = |name: &str, values: &[&str]| Attribute {
+            name: name.into(),
+            r#type: attribute::Discriminator::StringList,
+            string_list_value: values.iter().map(|value| (*value).into()).collect(),
+            ..Default::default()
+        };
+        let full = Rule {
+            name: "//pkg:x".into(),
+            rule_class: "genrule".into(),
+            skylark_environment_hash_code: Some("env".into()),
+            // Unsorted, with an ignored attribute and generator_location, which are skipped.
+            attribute: vec![
+                string_list("srcs", &["a.txt"]),
+                string_list("tags", &["manual"]),
+                string_list("ignored_attr", &["x"]),
+                string_list("generator_location", &["pkg/BUILD:1"]),
+                string_list("visibility", &["//visibility:public"]),
+                Attribute {
+                    name: "cmd".into(),
+                    r#type: attribute::Discriminator::String,
+                    string_value: Some("echo hi".into()),
+                    explicitly_specified: Some(true),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let ignored = HashSet::from(["ignored_attr".to_owned()]);
+        let encodings = full
+            .attribute
+            .iter()
+            .map(|attribute| (attribute.name.clone(), attribute.encode_to_vec()))
+            .collect::<Vec<_>>();
+        let encoded = encodings
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _))| name != "tags" && name != "visibility")
+            .map(|(position, (name, bytes))| EncodedAttribute {
+                position,
+                name,
+                bytes,
+            })
+            .collect::<Vec<_>>();
+        let mut lean = full.clone();
+        lean.attribute
+            .retain(|attribute| attribute.name == "tags" || attribute.name == "visibility");
+
+        let expected = rule_definition_digest(&full, &ignored);
+        assert_eq!(
+            rule_definition_digest_encoded(&lean, &encoded, &ignored),
+            expected
+        );
+        assert_eq!(
+            prehash_encoded_rule(&mut lean, &encoded, &ignored),
+            expected
+        );
+        assert_eq!(
+            lean.attribute
+                .iter()
+                .map(|attribute| attribute.name.as_str())
+                .collect::<Vec<_>>(),
+            ["tags", "visibility"]
+        );
+        // Every attribute encoded gives the same digest too.
+        let all_encoded = encodings
+            .iter()
+            .enumerate()
+            .map(|(position, (name, bytes))| EncodedAttribute {
+                position,
+                name,
+                bytes,
+            })
+            .collect::<Vec<_>>();
+        let bare = Rule {
+            attribute: Vec::new(),
+            ..full.clone()
+        };
+        assert_eq!(
+            rule_definition_digest_encoded(&bare, &all_encoded, &ignored),
+            expected
         );
     }
 

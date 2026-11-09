@@ -819,7 +819,10 @@ fn fingerprint_flags(
     ]);
     if !args.use_cquery && !fine_grained_repos.is_empty() && args.isolated_dependency_root.is_none()
     {
-        flags.insert("fineAliasInputs".into(), "5".into());
+        flags.insert(
+            "fineAliasInputs".into(),
+            bazel_diff::cache::FINE_ALIAS_INPUTS_VERSION.to_string(),
+        );
     }
     if let Some(expr) = args.root_expression()? {
         flags.insert("cqueryRootExpression".into(), expr);
@@ -1783,7 +1786,7 @@ mod tests {
         file_only.fine_grained_hash_external_repos_file = Some(fine_file);
         let file_flags = fingerprint_flags(&file_only, false, &[]).unwrap();
         assert_eq!(file_flags["fineGrainedHashExternalRepos"], "abc,from_file");
-        assert_eq!(file_flags["fineAliasInputs"], "5");
+        assert_eq!(file_flags["fineAliasInputs"], "6");
         let mut rooted = hashing_args(directory.path());
         rooted.use_cquery = true;
         rooted.cquery_root_expression = Some("//app:lib".to_owned());

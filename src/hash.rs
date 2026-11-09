@@ -1981,7 +1981,7 @@ fn hash_seed_files(workspace: &Path, paths: &BTreeSet<PathBuf>) -> Result<Digest
     Ok(hasher.finalize().into())
 }
 
-fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<()> {
+fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<File> {
     // One read buffer per thread, zeroed once. A fresh `[0; FILE_HASH_BUFFER_SIZE]` per call
     // zeroed 64 KiB for every hashed file, and most source files are far smaller than that.
     thread_local! {
@@ -1989,7 +1989,7 @@ fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<()> {
             RefCell::new(vec![0; FILE_HASH_BUFFER_SIZE].into_boxed_slice());
     }
     let mut file = File::open(path)?;
-    BUFFER.with(|buffer| {
+    BUFFER.with(|buffer| -> Result<()> {
         let mut buffer = buffer.borrow_mut();
         loop {
             let read = file.read(&mut buffer)?;
@@ -1998,7 +1998,8 @@ fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<()> {
             }
             hasher.update(&buffer[..read]);
         }
-    })
+    })?;
+    Ok(file)
 }
 
 /// Hashes a directory tree deterministically: every entry's workspace-independent relative path
@@ -2621,10 +2622,19 @@ impl SourceHasher<'_> {
                         .eq(absolute.components())
                 });
             if should_hash {
-                hash_file_into(&mut hasher, &absolute).with_context(|| {
+                let file = hash_file_into(&mut hasher, &absolute).with_context(|| {
                     format!("failed to read source {} ({label})", absolute.display())
                 })?;
                 observed = observation.is_some_and(|(workspace, location)| {
+                    if !is_main_repo(label) {
+                        return self.observed_external_file(
+                            label,
+                            location,
+                            &absolute,
+                            &file,
+                            metadata.as_ref(),
+                        );
+                    }
                     let Ok(relative) = absolute.strip_prefix(self.workspace) else {
                         return false;
                     };
@@ -2632,8 +2642,7 @@ impl SourceHasher<'_> {
                     // Rebuild only that prefix so a symlink inside the workspace stays unknown.
                     let expected = workspace.join(relative);
                     let selected = Path::new(starlark_stack_path(location));
-                    is_main_repo(label)
-                        && (selected == absolute || selected == expected)
+                    (selected == absolute || selected == expected)
                         && fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_file())
                         && fs::canonicalize(&absolute).is_ok_and(|canonical| canonical == expected)
                 });
@@ -2674,6 +2683,88 @@ impl SourceHasher<'_> {
         hasher.update(seed);
         hasher.update(label.as_bytes());
         Ok((hasher.finalize().into(), observed))
+    }
+
+    /// Verify the very file read for the normal digest. Bazel may mount the repository
+    /// itself through a symlink; links below that boundary do not establish a regular source.
+    #[cfg(unix)]
+    fn observed_external_file(
+        &self,
+        label: &str,
+        location: &str,
+        path: &Path,
+        file: &File,
+        before: Option<&fs::Metadata>,
+    ) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let label = self.external_resolver.canonical_source_label(label);
+        let Some((repo, target)) = label
+            .strip_prefix("@@")
+            .and_then(|name| name.split_once("//"))
+        else {
+            return false;
+        };
+        let relative = external_label_path(target);
+        if !matches!(
+            Path::new(repo).components().next(),
+            Some(std::path::Component::Normal(_))
+        ) || repo.contains('/')
+            || relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return false;
+        }
+        let root = self
+            .external_resolver
+            .output_base
+            .join("external")
+            .join(repo);
+        if path != root.join(&relative) {
+            return false;
+        }
+        let (Ok(root), Ok(actual), Ok(current), Ok(opened), Some(before)) = (
+            fs::canonicalize(&root),
+            fs::canonicalize(path),
+            fs::symlink_metadata(path),
+            file.metadata(),
+            before,
+        ) else {
+            return false;
+        };
+        let selected = Path::new(starlark_stack_path(location));
+        let snapshot = |m: &fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.size(),
+                m.mode(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        current.is_file()
+            && opened.is_file()
+            && actual == root.join(relative)
+            && (selected == path || selected == actual)
+            && snapshot(before) == snapshot(&opened)
+            && snapshot(&opened) == snapshot(&current)
+    }
+
+    #[cfg(not(unix))]
+    fn observed_external_file(
+        &self,
+        _label: &str,
+        _location: &str,
+        _path: &Path,
+        _file: &File,
+        _before: Option<&fs::Metadata>,
+    ) -> bool {
+        false
     }
 
     fn soft_digest(&self, label: &str, seed: &[u8]) -> Result<Option<DigestBytes>> {
@@ -5336,6 +5427,87 @@ printf '%s\n' "$stdout"
             .unwrap();
             assert!(!observe("//path/linked:real.txt", "path/linked/real.txt").1);
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn verified_external_regular_file_is_the_file_read_by_the_normal_hash() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(workspace.path()).unwrap();
+        let output_base = canonical.join("output");
+        let mount = output_base.join("external/module++extension+repo");
+        let tree = canonical.join("contents/selected");
+        fs::create_dir_all(tree.join("pkg")).unwrap();
+        fs::create_dir_all(mount.parent().unwrap()).unwrap();
+        symlink(&tree, &mount).unwrap();
+        let file = mount.join("pkg/input");
+        fs::write(&file, "first").unwrap();
+        let modified = BTreeSet::new();
+        let resolver = ExternalRepoResolver {
+            output_base,
+            repo_mapping: Arc::new(OnceLock::from(HashMap::from([(
+                "alias".to_owned(),
+                "module++extension+repo".to_owned(),
+            )]))),
+            ..Default::default()
+        };
+        let hasher = SourceHasher {
+            tree: None,
+            workspace: &canonical,
+            content_hashes: None,
+            modified_filepaths: &modified,
+            fine_grained_external_repos: BTreeSet::new(),
+            external_resolver: resolver,
+        };
+        let observe = |label, selected: &Path| {
+            let location = format!("{}:1:1", selected.display());
+            hasher
+                .digest_source_with_observation(label, b"seed", true, Some((&canonical, &location)))
+                .unwrap()
+        };
+        let label = "@@module++extension+repo//pkg:input";
+        let original = hasher.digest_source(label, b"seed", true).unwrap();
+        assert_eq!(observe(label, &file), (original, true));
+        assert_eq!(observe(label, &tree.join("pkg/input")), (original, true));
+        assert_eq!(observe(label, &tree.join("other")), (original, false));
+        assert!(!observe("@absent//pkg:input", &file).1);
+        // The normal hasher did not read an unenrolled apparent spelling under this projection.
+        assert!(!observe("@alias//pkg:input", &file).1);
+        fs::write(&file, "second").unwrap();
+        let (changed, observed) = observe(label, &file);
+        assert!(observed);
+        assert_ne!(changed, original);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        let (executable, observed) = observe(label, &file);
+        assert!(observed);
+        assert_ne!(executable, changed);
+        let opened = File::open(&file).unwrap();
+        let before = opened.metadata().unwrap();
+        fs::rename(&file, tree.join("saved")).unwrap();
+        fs::write(&file, "second").unwrap();
+        assert!(!hasher.observed_external_file(
+            label,
+            file.to_str().unwrap(),
+            &file,
+            &opened,
+            Some(&before)
+        ));
+        symlink("pkg", mount.join("indirect")).unwrap();
+        assert!(
+            !observe(
+                "@@module++extension+repo//indirect:input",
+                &mount.join("indirect/input")
+            )
+            .1
+        );
+        fs::remove_file(&file).unwrap();
+        symlink("../saved", &file).unwrap();
+        assert!(!observe(label, &file).1);
+        fs::remove_file(&file).unwrap();
+        assert!(!observe(label, &file).1);
+        fs::create_dir(&file).unwrap();
+        assert!(!observe(label, &file).1);
     }
 
     #[test]

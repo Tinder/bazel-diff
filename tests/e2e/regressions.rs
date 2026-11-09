@@ -1493,6 +1493,33 @@ fn cquery_verifies_covered_configured_roots() {
     let featured = output.path().join("F-hashes.json");
     let featured_edges = output.path().join("F-edges.json");
     let artifacts = std::env::var_os("TEST_UNDECLARED_OUTPUTS_DIR").map(std::path::PathBuf::from);
+    // Keep both sources outside the explicit fine-repository list. Separate modules let the
+    // stable product remain independent of the changed module's repository definition.
+    for repo in ["stable_source", "changed_source"] {
+        let dir = workspace.path().join(repo);
+        fs::create_dir(&dir).unwrap();
+        fs::write(
+            dir.join("MODULE.bazel"),
+            format!("module(name = \"{repo}\")\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("BUILD.bazel"),
+            "exports_files([\"payload.txt\"])\n",
+        )
+        .unwrap();
+        fs::write(dir.join("payload.txt"), "fixed external\n").unwrap();
+        let module = workspace.path().join("MODULE.bazel");
+        let text = fs::read_to_string(&module).unwrap();
+        fs::write(&module, format!("{text}\nbazel_dep(name = \"{repo}\")\nlocal_path_override(module_name = \"{repo}\", path = \"{repo}\")\n")).unwrap();
+        let file = workspace.path().join("BUILD");
+        let text = fs::read_to_string(&file).unwrap();
+        fs::write(
+            &file,
+            format!("{text}\nobserved_copy(name = \"{repo}\", src = \"@{repo}//:payload.txt\")\n"),
+        )
+        .unwrap();
+    }
     let mut reports = BTreeMap::new();
     let mut typed = false;
     for (name, value, hashes, head_edges) in [
@@ -1519,9 +1546,16 @@ fn cquery_verifies_covered_configured_roots() {
             fs::write(build, updated).unwrap();
         }
         fs::write(workspace.path().join("input.txt"), value).unwrap();
+        fs::write(workspace.path().join("changed_source/payload.txt"), value).unwrap();
         let build = std::process::Command::new(bazel())
             .current_dir(workspace.path())
-            .args(["build", "//:observed", "//:observed_changed"])
+            .args([
+                "build",
+                "//:observed",
+                "//:observed_changed",
+                "//:stable_source",
+                "//:changed_source",
+            ])
             .output()
             .unwrap();
         assert!(
@@ -1543,12 +1577,22 @@ fn cquery_verifies_covered_configured_roots() {
             fs::read_to_string(workspace.path().join("bazel-bin/observed_changed.out")).unwrap(),
             format!("{build_file}|{feature}|{value}")
         );
+        for (target, input) in [
+            ("stable_source", "fixed external\n"),
+            ("changed_source", value),
+        ] {
+            assert_eq!(
+                fs::read_to_string(workspace.path().join(format!("bazel-bin/{target}.out")))
+                    .unwrap(),
+                format!("{build_file}|{feature}|{input}")
+            );
+        }
         if name == "B" {
             let capability = std::process::Command::new(bazel())
                 .current_dir(workspace.path())
                 .args([
                     "cquery",
-                    "deps(config(set(//:observed //:observed_changed), target))",
+                    "deps(config(set(//:observed //:observed_changed //:stable_source //:changed_source), target))",
                     "--experimental_explicit_aspects",
                     "--implicit_deps",
                     "--tool_deps",
@@ -1581,7 +1625,7 @@ fn cquery_verifies_covered_configured_roots() {
             "-v",
             "--useCquery",
             "--cqueryRootExpression",
-            "set(//:observed //:observed_changed)",
+            "set(//:observed //:observed_changed //:stable_source //:changed_source)",
             "--verifyConfiguredRoots",
             "--includeTargetType",
         ];
@@ -1638,7 +1682,7 @@ fn cquery_verifies_covered_configured_roots() {
                     &[
                         "--useCquery",
                         "--cqueryRootExpression",
-                        "set(//:observed //:observed_changed)",
+                        "set(//:observed //:observed_changed //:stable_source //:changed_source)",
                         "--includeTargetType",
                         "-d",
                         standard_edges.to_str().unwrap(),
@@ -1699,7 +1743,10 @@ fn cquery_verifies_covered_configured_roots() {
         .iter()
         .map(|row| row["label"].as_str().unwrap().trim_start_matches('@'))
         .collect::<BTreeSet<_>>();
-    assert_eq!(selected, BTreeSet::from(["//:observed_changed"]));
+    assert_eq!(
+        selected,
+        BTreeSet::from(["//:observed_changed", "//:changed_source"])
+    );
     let unaffected = report["unaffectedRoots"]
         .as_array()
         .unwrap()
@@ -1707,7 +1754,11 @@ fn cquery_verifies_covered_configured_roots() {
         .map(|label| label.as_str().unwrap().trim_start_matches('@'))
         .collect::<BTreeSet<_>>();
     if typed {
-        assert_eq!(unaffected, BTreeSet::from(["//:observed"]));
+        let mut expected = BTreeSet::from(["//:observed"]);
+        if cfg!(unix) {
+            expected.insert("//:stable_source");
+        }
+        assert_eq!(unaffected, expected);
         for hashes in [&from, &to] {
             let data: Value = serde_json::from_slice(&fs::read(hashes).unwrap()).unwrap();
             let verified = data["metadata"]["configuredRoots"]["verifiedRoots"]
@@ -1716,7 +1767,11 @@ fn cquery_verifies_covered_configured_roots() {
                 .keys()
                 .map(|label| label.trim_start_matches('@'))
                 .collect::<BTreeSet<_>>();
-            assert_eq!(verified, BTreeSet::from(["//:observed"]));
+            let mut expected = BTreeSet::from(["//:observed"]);
+            if cfg!(unix) {
+                expected.extend(["//:stable_source", "//:changed_source"]);
+            }
+            assert_eq!(verified, expected);
         }
     } else {
         assert!(unaffected.is_empty());

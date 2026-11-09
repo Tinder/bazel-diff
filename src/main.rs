@@ -261,7 +261,8 @@ struct GetImpactedTargetsArgs {
     #[arg(short = 'o', long = "output")]
     output: Option<PathBuf>,
 
-    #[arg(short = 'w', long = "workspacePath", value_parser = parse_normalized_path)]
+    /// Directory from which to run Bazel queries; defaults to the current directory.
+    #[arg(short = 'w', long = "workspacePath", default_value = ".", value_parser = parse_normalized_path)]
     workspace_path: PathBuf,
 
     #[arg(short = 'b', long = "bazelPath", default_value = "bazel")]

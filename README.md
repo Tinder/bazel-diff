@@ -758,7 +758,7 @@ Options:
 ```terminal
 Compare two hash files and report impacted targets
 
-Usage: bazel-diff get-impacted-targets [OPTIONS] --startingHashes <STARTING_HASHES> --finalHashes <FINAL_HASHES> --workspacePath <WORKSPACE_PATH>
+Usage: bazel-diff get-impacted-targets [OPTIONS] --startingHashes <STARTING_HASHES> --finalHashes <FINAL_HASHES>
 
 Options:
       --startingHashes <STARTING_HASHES>
@@ -774,7 +774,7 @@ Options:
   -o, --output <OUTPUT>
           
   -w, --workspacePath <WORKSPACE_PATH>
-          
+          Directory from which to run Bazel queries; defaults to the current directory [default: .]
   -b, --bazelPath <BAZEL_PATH>
           [default: bazel]
       --bazelStartupOptions <BAZEL_STARTUP_OPTIONS>

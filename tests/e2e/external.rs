@@ -201,8 +201,42 @@ fn transitive_external_repo_change_reaches_consumer() {
     let first = copy_workspace("bzlmod_transitive_external");
     let second = copy_workspace("bzlmod_transitive_external");
     fs::write(second.path().join("inner/data.txt"), "world\n").unwrap();
-    let impacted = diff_local(first.path(), second.path(), &[]);
-    assert!(impacted.contains("//:consume") || impacted.contains("@@//:consume"));
+    let output = tempfile::tempdir().unwrap();
+    let from = output.path().join("from.json");
+    let to = output.path().join("to.json");
+    let explicit = output.path().join("explicit.txt");
+    let current = output.path().join("current.txt");
+    assert!(generate(first.path(), &from, &[]).status.success());
+    assert!(generate(second.path(), &to, &[]).status.success());
+    for path in [&from, &to] {
+        let data: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(data["metadata"]["moduleGraphJson"]
+            .as_str()
+            .is_some_and(|graph| !graph.is_empty()));
+    }
+    assert!(impacted(second.path(), &from, &to, &explicit, &[])
+        .status
+        .success());
+    let result = std::process::Command::new(binary())
+        .current_dir(second.path())
+        .args(["get-impacted-targets", "-b"])
+        .arg(bazel())
+        .arg("-sh")
+        .arg(&from)
+        .arg("-fh")
+        .arg(&to)
+        .arg("-o")
+        .arg(&current)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read(&current).unwrap(), fs::read(&explicit).unwrap());
+    let changed = read_lines(&current);
+    assert!(changed.contains("//:consume") || changed.contains("@@//:consume"));
 }
 
 /// cquery prints canonical labels (`@@inner+//:data`) where query prints apparent ones

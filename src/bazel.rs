@@ -2431,9 +2431,8 @@ impl BazelOptions {
             .query_formatted(
                 expression,
                 r#"def format(target):
-    if providers(target) == None:
-        return ""
-    if "IncompatiblePlatformProvider" not in providers(target):
+    # Native targets such as package groups can have no provider dictionary.
+    if "IncompatiblePlatformProvider" not in (providers(target) or {}):
         target_repr = repr(target)
         if "<alias target" in target_repr:
             # repr() prints a main-repository alias with its apparent label
@@ -4870,6 +4869,15 @@ fn package_group_rule(group: &PackageGroup) -> Rule {
     };
     rule.attribute.push(packages);
     rule.rule_input = group.included_package_group.clone();
+    // cquery follows configured inputs. Package groups always use the null configuration.
+    rule.configured_rule_input = group
+        .included_package_group
+        .iter()
+        .map(|label| ConfiguredRuleInput {
+            label: Some(label.clone()),
+            ..Default::default()
+        })
+        .collect();
     rule
 }
 

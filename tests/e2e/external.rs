@@ -358,6 +358,86 @@ fn hub_named_by_canonical_name_is_fine_grained_under_its_apparent_name() {
     }
 }
 
+#[test]
+fn fine_alias_to_a_source_tracks_its_contents_and_visibility() {
+    if !supports_mod_show_repo() || !cfg!(unix) {
+        return;
+    }
+    let workspace = copy_workspace("fine_grained_hub_by_canonical_name");
+    let root = workspace.path();
+    // Import the source repository so its synthetic node also reaches the unimported sibling.
+    edit(&root.join("MODULE.bazel"), |m| {
+        format!("{m}\nuse_repo(crates, \"crates__a\")\n")
+    });
+    fs::write(root.join("BUILD.bazel"), r#"
+genrule(name = "uses_source", srcs = ["@crates//:a_source"], outs = ["source.txt"], cmd = "cat $< > $@")
+genrule(name = "reads_build", srcs = ["@crates//:a_build"], outs = ["definition.txt"], cmd = "cat $< > $@")
+"#).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let base = out.path().join("base.json");
+    let result = out.path().join("impacted.txt");
+    let template = root.join("spoke.BUILD");
+    let definition = fs::read_to_string(&template).unwrap();
+    for (state, a, b) in [
+        ("base", "1", "1"),
+        ("payload", "2", "1"),
+        ("sibling", "1", "2"),
+        ("unused", "1", "1"),
+        ("private", "1", "1"),
+    ] {
+        let build = match state {
+            "unused" => format!("{definition}\nfilegroup(name = \"unused\")\n"),
+            "private" => definition.replacen("//visibility:public", "//visibility:private", 1),
+            _ => definition.clone(),
+        };
+        fs::write(&template, &build).unwrap();
+        fs::write(
+            root.join("versions.json"),
+            format!(r#"{{"a":"{a}","b":"{b}"}}"#),
+        )
+        .unwrap();
+        let snapshot = out.path().join(format!("{state}.json"));
+        let output = generate(root, &snapshot, &["--fineGrainedHashExternalRepos=@crates"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_product(root, "//:reads_build", "definition.txt", build.trim());
+        if state == "private" {
+            let build = std::process::Command::new(bazel())
+                .current_dir(root)
+                .args(["build", "//:uses_source"])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&build.stderr);
+            assert!(
+                !build.status.success() && stderr.contains("not visible"),
+                "{stderr}"
+            );
+        } else {
+            assert_product(root, "//:uses_source", "source.txt", a);
+        }
+        assert!(impacted(root, &base, &snapshot, &result, &[])
+            .status
+            .success());
+        let labels = read_lines(&result);
+        let has = |name| {
+            labels
+                .iter()
+                .any(|label| label.trim_start_matches('@') == name)
+        };
+        assert_eq!(
+            has("//:uses_source"),
+            matches!(state, "payload" | "private"),
+            "{state}: {labels:?}"
+        );
+        if matches!(state, "private" | "unused") {
+            assert!(has("//:reads_build"), "{state}: {labels:?}");
+        }
+    }
+}
+
 // Module `ext`'s extension generates the `@crates` hub and its spokes, whose targets use a rule
 // `ext` defines. In query mode `//external:ext` stands in for everything its extensions generate,
 // so a fine-grained spoke target reaching `ext` through it changes whenever any other spoke does.

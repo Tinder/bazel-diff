@@ -649,6 +649,7 @@ impl BazelOptions {
             }
             scope.connect_external_readers(&loads, &mut targets, &coverage)?;
         }
+        let mut alias_sources = HashMap::new();
         if !self.use_cquery
             && !self.fine_grained_external_repos.is_empty()
             && self.isolated_dependency_root.is_none()
@@ -657,6 +658,7 @@ impl BazelOptions {
                 &mut targets,
                 root_mapping.as_deref(),
                 version,
+                &mut alias_sources,
                 &mut |batch, inputs| transform(batch, &[], inputs),
             ) {
                 self.check_cancelled()?;
@@ -690,6 +692,7 @@ impl BazelOptions {
                     .collect(),
                 repository_inputs: scope.repository_inputs,
                 queried_files: HashSet::new(),
+                alias_sources,
             },
         })
     }
@@ -701,6 +704,7 @@ impl BazelOptions {
         targets: &mut Vec<Target>,
         root_mapping: Option<&[u8]>,
         version: Option<BazelVersion>,
+        alias_sources: &mut HashMap<String, AliasSource>,
         transform: &mut impl FnMut(&mut [Target], Option<RepositoryInputs>),
     ) -> Result<()> {
         let mapping = root_mapping
@@ -840,6 +844,7 @@ impl BazelOptions {
             .command_options
             .extend(["--nokeep_going".into(), "--proto:rule_classes".into()]);
         let mut reached_aliases = BTreeSet::new();
+        let mut sources = BTreeMap::new();
         let mut extra = if missing.is_empty() {
             Vec::new()
         } else {
@@ -847,13 +852,49 @@ impl BazelOptions {
                 "let needed = deps({}) in $needed + buildfiles($needed)",
                 query_set(&missing)?
             ));
-            strict.query_with_filtered(
+            let mut closure = strict.clone();
+            closure.command_options.push("--proto:locations".into());
+            closure.query_with_filtered(
                 &expression,
                 false,
                 Some(version),
                 false,
                 &mut |batch, _| transform(batch, None),
                 |row| {
+                    if let Some(source) = row
+                        .source_file
+                        .as_option()
+                        .filter(|s| missing.contains(&s.name))
+                    {
+                        // Visibility labels are evaluated for a real InputFile. A synthetic
+                        // buildfiles() result carries no such declaration.
+                        let witness = source.location.as_ref().and_then(|location| {
+                            if source.visibility_label.is_empty()
+                                || !source.package_group.is_empty()
+                                || source.license.as_option().is_some()
+                            {
+                                return None;
+                            }
+                            let mut visibility = source.visibility_label.clone();
+                            visibility.sort_unstable();
+                            visibility.dedup();
+                            Some(AliasSource {
+                                label: source.name.clone(),
+                                location: location.clone(),
+                                visibility,
+                            })
+                        });
+                        match sources.entry(source.name.clone()) {
+                            Entry::Vacant(entry) => {
+                                entry.insert(witness);
+                            }
+                            Entry::Occupied(mut entry) => {
+                                if entry.get() != &witness {
+                                    entry.insert(None);
+                                }
+                            }
+                        }
+                    }
                     // A dependency can lead back to an alias in the primary query. Keep its
                     // binding even though the existing target row remains authoritative.
                     if let Some(rule) = row
@@ -992,9 +1033,24 @@ impl BazelOptions {
         for row in &mut aliases_with_attrs {
             if let Some(rule) = row.rule.as_option_mut() {
                 if let Some(actual) = bindings.remove(&rule.name) {
+                    let source = if actual.r#type == Kind::Label
+                        && actual.selector_list.as_option().is_none()
+                    {
+                        actual
+                            .string_value
+                            .as_ref()
+                            .and_then(|name| sources.get(name))
+                            .cloned()
+                            .flatten()
+                    } else {
+                        None
+                    };
                     rule.attribute.retain(|attr| attr.name != "actual");
                     rule.attribute.push(actual);
-                    alias_attrs.insert(rule.name.clone(), std::mem::take(&mut rule.attribute));
+                    alias_attrs.insert(
+                        rule.name.clone(),
+                        (std::mem::take(&mut rule.attribute), source),
+                    );
                 }
             }
         }
@@ -1027,8 +1083,11 @@ impl BazelOptions {
             let Some(rule) = row.rule.as_option_mut() else {
                 continue;
             };
-            if let Some(attrs) = alias_attrs.remove(&rule.name) {
+            if let Some((attrs, source)) = alias_attrs.remove(&rule.name) {
                 rule.attribute = attrs;
+                if let Some(source) = source {
+                    alias_sources.insert(rule.name.clone(), source);
+                }
                 // Hash the alias rule itself. A generated BUILD can define unrelated siblings.
                 transform(std::slice::from_mut(row), None);
                 continue;
@@ -3214,6 +3273,15 @@ pub(crate) struct ScopedSources {
     pub(crate) repositories: BTreeSet<String>,
     pub(crate) repository_inputs: BTreeSet<String>,
     pub(crate) queried_files: HashSet<String>,
+    pub(crate) alias_sources: HashMap<String, AliasSource>,
+}
+
+/// Evaluated metadata of a literal native alias destination returned in the strict closure.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct AliasSource {
+    pub(crate) label: String,
+    pub(crate) location: String,
+    pub(crate) visibility: Vec<String>,
 }
 
 /// Targets with the accepted module graph and successful unfiltered root mapping from discovery.
@@ -3885,13 +3953,24 @@ fn decode_target_stream_filtered(
                 .slices()
                 .map(|bytes| {
                     decode_query_target(bytes)
+                        .map(|target| {
+                            if target.r#type == target::Discriminator::SourceFile {
+                                // The finite alias closure observes source location and declared
+                                // visibility before compaction. Other rows still compact in parallel.
+                                Some(target)
+                            } else {
+                                lower_query_target(target)
+                            }
+                        })
                         .map_err(anyhow::Error::from)
-                        .map(lower_query_target)
                 })
                 .collect_into_vec(&mut decoded);
             targets.reserve(decoded.len());
             for lowered in decoded.drain(..) {
-                if let Some(target) = lowered?.filter(&mut retain) {
+                if let Some(mut target) = lowered?.filter(&mut retain) {
+                    if target.r#type == target::Discriminator::SourceFile {
+                        compact_target(&mut target);
+                    }
                     targets.push(target);
                 }
             }

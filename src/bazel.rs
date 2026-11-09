@@ -2253,7 +2253,7 @@ impl BazelOptions {
         version: Option<BazelVersion>,
         transform: &mut impl FnMut(&mut [Target]),
         capture: CqueryCapture<'_>,
-        retain: impl Fn(&Target) -> bool,
+        retain: impl FnMut(&Target) -> bool,
     ) -> Result<QueryGraph> {
         let (mut roots, verify) = match capture {
             CqueryCapture::Standard => (None, false),

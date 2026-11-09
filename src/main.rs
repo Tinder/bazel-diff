@@ -49,10 +49,16 @@ enum Commands {
         #[command(flatten)]
         args: GenerateHashesArgs,
         /// Preserve observed native declaration bindings and, with -d, ordinary type references.
-        #[arg(long = "includeToolchainInputs", conflicts_with = "verify_configured_roots")]
+        #[arg(
+            long = "includeToolchainInputs",
+            conflicts_with = "verify_configured_roots"
+        )]
         include_toolchain_inputs: bool,
         /// Verify configured hash input coverage using a fresh full dependency query.
-        #[arg(long = "verifyConfiguredRoots", conflicts_with = "include_toolchain_inputs")]
+        #[arg(
+            long = "verifyConfiguredRoots",
+            conflicts_with = "include_toolchain_inputs"
+        )]
         verify_configured_roots: bool,
     },
     #[command(

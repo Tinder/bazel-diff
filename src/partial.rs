@@ -731,6 +731,8 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
     let hashes = evaluate(recipes, &targets, tree)?;
     Ok(HashFileData {
         hashes,
+        // Fresh query observations can depend on external definitions outside these recipes.
+        observed_toolchains: None,
         module_graph_json: base.module_graph_json.clone(),
         dependency_fingerprint: base.dependency_fingerprint.clone(),
         dep_edges: base.dep_edges.clone(),
@@ -1475,6 +1477,7 @@ mod tests {
         let targets = targets();
         let mut base = HashFileData {
             hashes: evaluate(&recipes, &targets, &fixture_tree()).unwrap(),
+            observed_toolchains: None,
             module_graph_json: Some("{}".into()),
             dependency_fingerprint: Some("fp".into()),
             dep_edges: BTreeMap::from([("//pkg:bin".to_owned(), vec!["//pkg:lib".to_owned()])]),

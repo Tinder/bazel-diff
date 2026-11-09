@@ -717,7 +717,7 @@ impl BazelOptions {
         }
         let mut missing = BTreeSet::new();
         for actual in bindings.values() {
-            for destination in alias_actual_values(actual) {
+            for destination in scalar_label_values(actual) {
                 if !primary.contains(&canonical_query_label(destination, &mapping)) {
                     missing.insert(destination.clone());
                 }
@@ -791,7 +791,7 @@ impl BazelOptions {
                 .collect();
             let mut requested = BTreeSet::new();
             for (name, actual) in self.alias_actuals(&inspect, version)? {
-                requested.extend(alias_actual_values(&actual).filter_map(|child| {
+                requested.extend(scalar_label_values(&actual).filter_map(|child| {
                     let child = canonical_query_label(child, &mapping);
                     missing_exposed(&child).then(|| child.into_owned())
                 }));
@@ -1841,6 +1841,221 @@ impl BazelOptions {
         }
     }
 
+    pub(crate) fn observed_toolchains(
+        &self,
+        targets: &[Target],
+        root_mapping: Option<&[u8]>,
+        track_readers: bool,
+    ) -> Result<crate::toolchain_candidates::ObservedToolchains> {
+        use crate::toolchain_candidates::{Declaration, ObservedToolchains};
+        let mapping = root_mapping
+            .map(|raw| crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(raw)))
+            .unwrap_or_default();
+        let canon = |s: &str| canonical_query_label(s, &mapping).into_owned();
+        let rows = || {
+            targets
+                .iter()
+                .filter_map(|row| row.rule.as_option())
+                .filter(|r| !main_repo_label_key(&r.name).starts_with("//external:"))
+        };
+        let mut result = ObservedToolchains {
+            version: 1,
+            readers: track_readers.then(BTreeMap::new),
+            ..Default::default()
+        };
+        let names: BTreeSet<_> = rows()
+            .filter(|r| r.rule_class == "toolchain")
+            .map(|r| canon(&r.name))
+            .collect();
+        let mut types: BTreeSet<_> = rows()
+            .filter(|r| r.rule_class == "toolchain_type")
+            .map(|r| canon(&r.name))
+            .collect();
+        let mut metadata = self.clone();
+        metadata.keep_going = false;
+        metadata.command_options.extend([
+            "--nokeep_going".into(),
+            "--consistent_labels".into(),
+            "--proto:rule_classes".into(),
+            "--noproto:flatten_selects".into(),
+            "--proto:output_rule_attrs=toolchain,toolchain_type,actual".into(),
+        ]);
+        let version = if names.is_empty() {
+            None
+        } else {
+            Some(self.version()?)
+        };
+        let read = |labels: &BTreeSet<String>| -> Result<Vec<Target>> {
+            if labels.is_empty() {
+                return Ok(Vec::new());
+            }
+            let names = query_labels(labels.iter())?;
+            let expression = self.with_exclude_filter(names);
+            metadata.query_with(&expression, false, version, &mut |_| {})
+        };
+        for row in read(&names)? {
+            let Some(rule) = row.rule.into_option() else {
+                continue;
+            };
+            let id = canon(&rule.name);
+            if rule.rule_class_key.as_deref() != Some("toolchain") {
+                result.unresolved.insert(id);
+                continue;
+            }
+            let labels = |attribute: &str| {
+                rule.attribute
+                    .iter()
+                    .filter(|a| a.name == attribute)
+                    .flat_map(scalar_label_values)
+                    .filter(|v| v.starts_with("//") || v.starts_with('@'))
+                    .map(|v| canon(v))
+                    .collect::<BTreeSet<_>>()
+            };
+            let declaration = Declaration {
+                types: labels("toolchain_type"),
+                implementations: labels("toolchain"),
+            };
+            if declaration.types.is_empty() || declaration.implementations.is_empty() {
+                result.unresolved.insert(id.clone());
+            }
+            result.declarations.insert(id, declaration);
+        }
+        result.unresolved.extend(
+            names
+                .iter()
+                .filter(|n| !result.declarations.contains_key(*n))
+                .cloned(),
+        );
+        let returned_aliases: HashSet<_> = rows()
+            .filter(|r| r.rule_class == "alias")
+            .map(|r| canon(&r.name))
+            .collect();
+        let returned_types = types.clone();
+        let mut pending: BTreeSet<_> = result
+            .declarations
+            .values()
+            .flat_map(|d| d.types.iter().cloned())
+            .collect();
+        let mut seen = BTreeSet::new();
+        let mut aliases = BTreeMap::new();
+        while !pending.is_empty() {
+            let mut requested = BTreeSet::new();
+            for ty in std::mem::take(&mut pending) {
+                if !seen.insert(ty.clone()) {
+                    continue;
+                }
+                if returned_aliases.contains(&ty) {
+                    requested.insert(ty);
+                } else if !returned_types.contains(&ty) {
+                    result.unresolved.insert(ty);
+                }
+            }
+            let alias_rows = match read(&requested) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    self.check_cancelled()?;
+                    result.unresolved.extend(requested);
+                    eprintln!("[Warn] observed type aliases could not be read: {error:#}");
+                    break;
+                }
+            };
+            for row in alias_rows {
+                let Some(rule) = row.rule.into_option() else {
+                    continue;
+                };
+                if rule.rule_class_key.as_deref() != Some("alias") {
+                    continue;
+                }
+                let actual = rule
+                    .attribute
+                    .iter()
+                    .find(|a| a.name == "actual" && a.selector_list.as_option().is_none())
+                    .and_then(|a| a.string_value.as_ref());
+                if let Some(actual) = actual.filter(|v| v.starts_with("//") || v.starts_with('@')) {
+                    let destination = canon(actual);
+                    pending.insert(destination.clone());
+                    aliases.insert(canon(&rule.name), destination);
+                }
+            }
+            result
+                .unresolved
+                .extend(requested.into_iter().filter(|ty| !aliases.contains_key(ty)));
+        }
+        for declaration in result.declarations.values_mut() {
+            let mut work: Vec<_> = declaration.types.iter().cloned().collect();
+            while let Some(ty) = work.pop() {
+                types.insert(ty.clone());
+                if let Some(next) = aliases.get(&ty) {
+                    if declaration.types.insert(next.clone()) {
+                        work.push(next.clone());
+                    }
+                }
+            }
+            if declaration.types.is_disjoint(&returned_types) {
+                result.unresolved.extend(declaration.types.iter().cloned());
+            }
+        }
+        let needed: BTreeSet<&str> = result
+            .declarations
+            .iter()
+            .flat_map(|(name, d)| {
+                std::iter::once(name)
+                    .chain(&d.implementations)
+                    .chain(&d.types)
+            })
+            .map(String::as_str)
+            .collect();
+        let mut spellings: HashMap<_, _> = types.iter().map(|t| (t.clone(), t)).collect();
+        let mut by_repo: HashMap<&str, Vec<&String>> = HashMap::new();
+        for (apparent, canonical) in &mapping {
+            by_repo.entry(canonical).or_default().push(apparent);
+        }
+        for ty in &types {
+            if ty.starts_with("//") {
+                spellings.insert(format!("@{ty}"), ty);
+                spellings.insert(format!("@@{ty}"), ty);
+            } else if let Some((repo, suffix)) =
+                ty.strip_prefix("@@").and_then(|s| s.split_once("//"))
+            {
+                for apparent in by_repo.get(repo).into_iter().flatten() {
+                    spellings.insert(format!("@{apparent}//{suffix}"), ty);
+                }
+            }
+        }
+        if let Some(readers) = &mut result.readers {
+            readers.extend(types.iter().map(|ty| (ty.clone(), Vec::new())));
+        }
+        for row in targets {
+            let Some(name) = target_name(row) else {
+                continue;
+            };
+            let id = canonical_query_label(name, &mapping);
+            if needed.contains(id.as_ref()) || types.contains(id.as_ref()) {
+                result.hash_labels.insert(id.into_owned(), name.to_owned());
+            }
+            if let Some(readers) = &mut result.readers {
+                for ty in row
+                    .rule
+                    .as_option()
+                    .into_iter()
+                    .flat_map(|r| &r.rule_input)
+                    .filter_map(|v| spellings.get(v))
+                {
+                    if let Some(members) = readers.get_mut(*ty) {
+                        members.push(name.to_owned());
+                    }
+                }
+            }
+        }
+        if let Some(readers) = &mut result.readers {
+            for members in readers.values_mut() {
+                members.sort_unstable();
+                members.dedup();
+            }
+        }
+        Ok(result)
+    }
+
     pub fn query(&self, expression: &str, use_cquery: bool) -> Result<Vec<Target>> {
         self.query_with(expression, use_cquery, None, &mut |_| {})
     }
@@ -2142,7 +2357,7 @@ struct IsolatedRepoScope {
     repository_inputs: BTreeSet<String>,
 }
 
-fn alias_actual_values(actual: &Attribute) -> impl Iterator<Item = &String> {
+fn scalar_label_values(actual: &Attribute) -> impl Iterator<Item = &String> {
     actual
         .string_value
         .iter()
@@ -3503,7 +3718,7 @@ fn compact_target(target: &mut Target) {
             rule.DEPRECATED_public_by_default = None;
             rule.DEPRECATED_is_skylark = None;
             rule.definition_stack.clear();
-            if rule.rule_class_key.as_deref() != Some("alias") {
+            if !matches!(rule.rule_class_key.as_deref(), Some("toolchain" | "alias")) {
                 rule.rule_class_key = None;
             }
             rule.__buffa_unknown_fields.clear();

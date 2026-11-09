@@ -1,10 +1,10 @@
 use crate::bazel::{
-    encode_configured_input, split_configured, target_label, BazelOptions, QueriedTargets,
-    RepositoryInputGroup, RepositoryInputs, ScopedSources,
+    encode_configured_input, split_configured, target_label, target_name, BazelOptions,
+    QueriedTargets, RepositoryInputGroup, RepositoryInputs, ScopedSources, VerifiedQuery,
 };
 use crate::cancel::{self, Cancellation};
 use crate::components::{component_digest, member_digest, Completion, Components, Visit};
-use crate::model::{HashFileData, TargetHash};
+use crate::model::{ConfiguredRoots, HashFileData, TargetHash};
 use crate::partial::{self, RecipeRecorder, RuleRecipe, TreeIndex};
 use crate::proto::blaze_query::{target, Rule, Target};
 use anyhow::{anyhow, bail, Context, Result};
@@ -80,6 +80,8 @@ struct TargetDigestBuilder {
     direct: Sha256,
     deps: Vec<String>,
     track_deps: bool,
+    // Keep verification storage out of every cached normal target digest.
+    verification: Option<Box<Sha256>>,
     /// Partial-graph mode: the recipe under construction. Every direct contribution that is not
     /// a source digest also feeds `static`; source inputs and dependency keys are listed in
     /// contribution order.
@@ -99,6 +101,7 @@ impl TargetDigestBuilder {
             direct: Sha256::new(),
             deps: Vec::new(),
             track_deps,
+            verification: None,
             recipe: record_recipe.then(|| RecipeBuilder {
                 fixed: Sha256::new(),
                 sources: Vec::new(),
@@ -143,6 +146,30 @@ impl TargetDigestBuilder {
         if let Some(recipe) = &mut self.recipe {
             recipe.deps.push(canonical());
         }
+    }
+
+    fn start_verification(&mut self, context: DigestBytes) {
+        let mut verification = Sha256::new();
+        verification.update(b"verified configured context\0");
+        verification.update(context);
+        self.verification = Some(Box::new(verification));
+    }
+
+    fn verification_input(&mut self, label: &str, context: Option<DigestBytes>) {
+        match (&mut self.verification, context) {
+            (Some(verification), Some(context)) => {
+                verification.update((label.len() as u64).to_le_bytes());
+                verification.update(label.as_bytes());
+                verification.update(context);
+            }
+            _ => self.verification = None,
+        }
+    }
+
+    fn finish_verification(&mut self) -> Option<DigestBytes> {
+        self.verification
+            .take()
+            .map(|digest| (*digest).finalize().into())
     }
 
     fn finish(mut self) -> (TargetDigest, Option<RuleRecipe>) {
@@ -204,7 +231,7 @@ pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
 }
 
 pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, GenerationTimings)> {
-    generate_hashes_timed_with_observations(options, false)
+    generate_hashes_timed_inner(options, false, false)
 }
 
 /// Retains supplemental loading-phase facts while generating a fresh ordinary graph.
@@ -212,11 +239,28 @@ pub fn generate_hashes_with_toolchain_inputs(options: &HashOptions) -> Result<Ha
     if options.bazel.use_cquery || options.partial_tree.is_some() {
         anyhow::bail!("--includeToolchainInputs requires fresh ordinary generation");
     }
-    generate_hashes_timed_with_observations(options, true).map(|(file, _)| file)
+    generate_hashes_timed_inner(options, false, true).map(|(file, _)| file)
 }
 
-fn generate_hashes_timed_with_observations(
+/// Captures a fresh configured graph to verify normal input coverage and retain the additional
+/// context needed for a stable comparison. Historical, partial, or caller-overridden source
+/// hashes cannot establish this coverage.
+pub fn generate_verified_hashes(options: &HashOptions) -> Result<HashFileData> {
+    if options.content_hashes.is_some()
+        || !options.modified_filepaths.is_empty()
+        || options.partial_tree.is_some()
+        || !options.ignored_attributes.is_empty()
+        || options.bazel.exclude_targets_query.is_some()
+        || options.bazel.exclude_external_targets
+    {
+        bail!("--verifyConfiguredRoots requires full physical hashes without ignored attributes or excluded targets");
+    }
+    generate_hashes_timed_inner(options, true, false).map(|(data, _)| data)
+}
+
+fn generate_hashes_timed_inner(
     options: &HashOptions,
+    verify: bool,
     include_toolchain_inputs: bool,
 ) -> Result<(HashFileData, GenerationTimings)> {
     if options.bazel.isolated_dependency_root.is_some()
@@ -229,13 +273,7 @@ fn generate_hashes_timed_with_observations(
     let mut definition_digests = PreparedRules::default();
     let mut digests = Vec::new();
     let query_started = Instant::now();
-    let QueriedTargets {
-        targets,
-        module_graph_json,
-        root_mapping,
-        scoped_sources,
-        output_base,
-    } = options.bazel.query_all_targets_with(|batch, inputs| {
+    let mut prepare = |batch: &mut [Target], inputs| {
         let prehash = |target: &mut Target, shared_inputs| {
             let rule = target.rule.as_option_mut()?;
             // Read before `prehash_rule` drops the attributes they come from.
@@ -259,11 +297,18 @@ fn generate_hashes_timed_with_observations(
                 .collect_into_vec(&mut digests);
             definition_digests.extend(digests.drain(..).flatten());
         }
-    })?;
+    };
+    let queried = if verify {
+        options
+            .bazel
+            .query_all_targets_verified_with(&mut prepare)?
+    } else {
+        options.bazel.query_all_targets_with(&mut prepare)?
+    };
     let observations = if include_toolchain_inputs {
         match options.bazel.observed_toolchains(
-            &targets,
-            root_mapping.as_deref(),
+            &queried.targets,
+            queried.root_mapping.as_deref(),
             options.track_deps,
         ) {
             Ok(index) => Some(index),
@@ -284,15 +329,7 @@ fn generate_hashes_timed_with_observations(
     // The query is the phase worth cancelling; a request abandoned during it stops here instead
     // of hashing targets nobody will read.
     options.bazel.check_cancelled()?;
-    let (mut data, mut timings) = hash_targets_with_digests(
-        options,
-        targets,
-        definition_digests,
-        module_graph_json,
-        root_mapping,
-        scoped_sources,
-        output_base,
-    )?;
+    let (mut data, mut timings) = hash_targets_with_digests(options, queried, definition_digests)?;
     data.observed_toolchains = observations;
     timings.bazel_query_millis = bazel_query_millis;
     Ok((data, timings))
@@ -302,31 +339,48 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
     options.bazel.check_raw_targets_supported()?;
     hash_targets_with_digests(
         options,
-        targets,
+        QueriedTargets {
+            targets,
+            verification: None,
+            configured_roots: None,
+            module_graph_json: None,
+            module_graph_complete: false,
+            root_mapping: None,
+            scoped_sources: ScopedSources::default(),
+            output_base: None,
+        },
         PreparedRules::default(),
-        None,
-        None,
-        ScopedSources::default(),
-        None,
     )
     .map(|(data, _)| data)
 }
 
 fn hash_targets_with_digests(
     options: &HashOptions,
-    targets: Vec<Target>,
+    queried: QueriedTargets,
     definition_digests: PreparedRules,
-    module_graph_json: Option<String>,
-    root_mapping: Option<Vec<u8>>,
-    scoped_sources: ScopedSources,
-    output_base: Option<PathBuf>,
 ) -> Result<(HashFileData, GenerationTimings)> {
+    let QueriedTargets {
+        targets,
+        verification,
+        configured_roots,
+        module_graph_json,
+        module_graph_complete,
+        root_mapping,
+        scoped_sources,
+        output_base,
+    } = queried;
     let hash_started = Instant::now();
     let mut external_resolver =
         ExternalRepoResolver::new(&options.bazel, root_mapping, output_base)?;
     external_resolver.scoped_sources = scoped_sources;
     let module_graph_started = Instant::now();
     let module_graph_json = module_graph_json.or_else(|| options.bazel.module_graph_json());
+    let verification = verification.filter(|_| {
+        module_graph_complete
+            && module_graph_json
+                .as_deref()
+                .is_some_and(crate::module_graph::usable_module_graph)
+    });
     options.bazel.check_cancelled()?;
     let module_graph_millis = elapsed_millis(module_graph_started);
     let data = hash_targets_with_environment(
@@ -335,6 +389,8 @@ fn hash_targets_with_digests(
         definition_digests,
         external_resolver,
         module_graph_json,
+        configured_roots,
+        verification,
     )?;
     let timings = GenerationTimings {
         bazel_query_millis: 0,
@@ -350,10 +406,14 @@ fn hash_targets_with_environment(
     definition_digests: PreparedRules,
     external_resolver: ExternalRepoResolver,
     module_graph_json: Option<String>,
+    configured_roots: Option<BTreeMap<String, String>>,
+    verification: Option<VerifiedQuery>,
 ) -> Result<HashFileData> {
     if options.partial_tree.is_some() && options.bazel.use_cquery {
         bail!("partial graph mode does not support --useCquery");
     }
+    let mut verification = verification
+        .map(|query| ConfiguredCoverage::new(query, &targets, &definition_digests, options));
     let mut source_hasher = SourceHasher {
         workspace: &options.bazel.workspace,
         tree: options.partial_tree.as_deref(),
@@ -471,9 +531,20 @@ fn hash_targets_with_environment(
             .into_par_iter()
             .map(|source| {
                 let seed = source_seed(&source);
+                let observation = verification.as_ref().and_then(|coverage| {
+                    Some((
+                        coverage.canonical_workspace.as_deref()?,
+                        coverage.source_locations.get(&source.name)?.as_deref()?,
+                    ))
+                });
                 source_hasher
-                    .digest_source(&source.name, &seed, options.bazel.use_cquery)
-                    .map(|digest| (source.name, digest))
+                    .digest_source_with_observation(
+                        &source.name,
+                        &seed,
+                        options.bazel.use_cquery,
+                        observation,
+                    )
+                    .map(|(digest, observed)| (source.name, digest, observed))
             })
             .collect::<Result<Vec<_>>>()
     })?;
@@ -482,15 +553,53 @@ fn hash_targets_with_environment(
         // repository's files; keep what was read from disk. An unresolved label's empty digest
         // is what evaluation computes anyway, so it is left out.
         let unresolved: DigestBytes = Sha256::digest([]).into();
-        for (label, digest) in &physical {
+        for (label, digest, _) in &physical {
             if !is_main_repo(label) && *digest != unresolved {
                 recorder.record_external_source(label, *digest);
             }
         }
     }
     let mut source_digests = Vec::with_capacity(physical.len());
-    for (label, digest) in physical {
+    for (label, digest, observed) in physical {
+        if observed {
+            if let Some(coverage) = &mut verification {
+                coverage.observed_sources.insert(label.clone());
+            }
+        }
         rules.slot(label).set_source(&mut source_digests, digest);
+    }
+    if options.bazel.verbose {
+        if let Some(coverage) = &verification {
+            let mut gaps = coverage
+                .nodes
+                .iter()
+                .filter(|(key, node)| {
+                    !node.covered
+                        || (matches!(node.kind, CoverageKind::Source)
+                            && !coverage.observed_sources.contains(*key))
+                })
+                .collect::<Vec<_>>();
+            gaps.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            let first = gaps
+                .iter()
+                .take(8)
+                .map(|(key, node)| {
+                    if !node.covered {
+                        format!("{key}: input or context was not verified")
+                    } else {
+                        format!(
+                            "{key}: source location {:?} was not observed",
+                            coverage.source_locations.get(*key)
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "[Info] configured verification has {} direct gaps; first: {:?}",
+                gaps.len(),
+                first
+            );
+        }
     }
     let processed_rules = hash_pool().install(|| {
         decoded_rules
@@ -648,6 +757,7 @@ fn hash_targets_with_environment(
     let mut context = HashContext {
         options,
         source_hasher: &source_hasher,
+        verification: verification.as_ref().map(VerificationState::new),
         source_digests,
         rules,
         label_instances,
@@ -674,6 +784,17 @@ fn hash_targets_with_environment(
                 generating_rule,
             } => {
                 let mut digest = context.rule_digest(&generating_rule, &mut Vec::new())?;
+                if let Some(state) = &mut context.verification {
+                    let verified = state.coverage.resolved_context(
+                        &name,
+                        &name,
+                        &generating_rule,
+                        state.contexts.get(&generating_rule).copied(),
+                    );
+                    if let Some(verified) = verified {
+                        state.contexts.insert(name.clone(), verified);
+                    }
+                }
                 digest.deps = options.track_deps.then(|| Rc::new(vec![generating_rule]));
                 (name, "GeneratedFile", digest)
             }
@@ -691,6 +812,11 @@ fn hash_targets_with_environment(
                     hasher.update(seed);
                 }
                 let digest = hasher.finalize().into();
+                if let Some(state) = &mut context.verification {
+                    if let Some(verified) = state.coverage.source_context(&label) {
+                        state.contexts.insert(label.clone(), verified);
+                    }
+                }
                 (
                     label,
                     "SourceFile",
@@ -705,8 +831,43 @@ fn hash_targets_with_environment(
         digests.push((key, kind, digest));
     }
     let recorder = context.recorder.take();
+    let verified_contexts = context.verification.take().map(|state| {
+        debug_assert!(state.pending.is_empty());
+        state.contexts
+    });
     drop(context);
-    let (mut hashes, dep_edges) = aggregate_by_label(digests, options.track_deps);
+    if configured_roots.is_some() != options.bazel.cquery_root_expression.is_some() {
+        bail!("configured-root hashing requires Bazel-resolved roots for the requested mode");
+    }
+    let (mut hashes, dep_edges, configured_roots) = if let Some(roots) = configured_roots {
+        let verified_roots = verified_contexts.map(|contexts| {
+            roots
+                .iter()
+                .filter(|(label, _)| {
+                    is_main_repo(label)
+                        && !crate::bazel::main_repo_label_key(label).starts_with("//external:")
+                })
+                .filter_map(|(label, key)| {
+                    contexts
+                        .get(key)
+                        .map(|context| (label.clone(), hex::encode(context)))
+                })
+                .collect()
+        });
+        let configured = configured_root_hashes(digests, options.track_deps, &roots)?;
+        (
+            configured.roots,
+            configured.dep_edges,
+            Some(ConfiguredRoots {
+                verified_roots,
+                roots,
+                hashes: configured.instances,
+            }),
+        )
+    } else {
+        let (hashes, dep_edges) = aggregate_by_label(digests, options.track_deps);
+        (hashes, dep_edges, None)
+    };
     let mut partial = None;
     if let (Some(recorder), Some(tree)) = (recorder, &options.partial_tree) {
         // The traversal above only recorded the recipes; the hashes an entry in this mode
@@ -723,6 +884,7 @@ fn hash_targets_with_environment(
     Ok(HashFileData {
         observed_toolchains: None,
         hashes,
+        configured_roots,
         module_graph_json,
         dependency_fingerprint: None,
         dep_edges,
@@ -732,6 +894,243 @@ fn hash_targets_with_environment(
             .as_ref()
             .and_then(|tree| tree.id().map(str::to_owned)),
     })
+}
+
+struct ConfiguredCoverage {
+    nodes: HashMap<String, CoverageNode>,
+    canonical_workspace: Option<PathBuf>,
+    source_locations: BTreeMap<String, Option<String>>,
+    observed_sources: HashSet<String>,
+}
+
+struct VerificationState<'a> {
+    coverage: &'a ConfiguredCoverage,
+    /// Contexts awaiting the normal component traversal's completion.
+    pending: HashMap<String, DigestBytes>,
+    /// Completed contexts, keyed by the exact configured identity.
+    contexts: HashMap<String, DigestBytes>,
+}
+
+impl<'a> VerificationState<'a> {
+    fn new(coverage: &'a ConfiguredCoverage) -> Self {
+        Self {
+            coverage,
+            pending: HashMap::new(),
+            contexts: HashMap::new(),
+        }
+    }
+}
+
+struct CoverageNode {
+    inputs: Vec<String>,
+    covered: bool,
+    kind: CoverageKind,
+}
+
+enum CoverageKind {
+    Rule(Option<DigestBytes>),
+    Generated(String),
+    Source,
+    Unresolved,
+}
+
+impl ConfiguredCoverage {
+    /// Relates every prerequisite in the full verification view to the exact input the normal
+    /// configured hash consumes. Source edges are retained here before hashing folds their bytes
+    /// into the parent and removes those edges from the distance graph.
+    fn new(
+        query: VerifiedQuery,
+        targets: &[Target],
+        prepared: &PreparedRules,
+        options: &HashOptions,
+    ) -> Self {
+        let mut normal = HashMap::new();
+        for target in targets {
+            let Some(key) = target_name(target) else {
+                continue;
+            };
+            match normal.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Some(target));
+                }
+                Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+        let mut nodes = HashMap::with_capacity(query.targets.len() + query.aspects.len());
+        for target in query.targets {
+            let Some(key) = target_name(&target).map(str::to_owned) else {
+                continue;
+            };
+            let normal = normal.get(key.as_str()).copied().flatten();
+            let node = match target.r#type {
+                target::Discriminator::Rule => {
+                    let Some(rule) = target.rule.as_option() else {
+                        continue;
+                    };
+                    let inputs = rule
+                        .configured_rule_input
+                        .iter()
+                        .map(encode_configured_input)
+                        .collect::<Vec<_>>();
+                    let normal_inputs =
+                        normal
+                            .and_then(|target| target.rule.as_option())
+                            .map(|rule| {
+                                rule.configured_rule_input
+                                    .iter()
+                                    .map(encode_configured_input)
+                                    .collect::<HashSet<_>>()
+                            });
+                    let definition = prepared
+                        .ids
+                        .get(&key)
+                        .and_then(|&id| prepared.prepared.get(id))
+                        .and_then(Option::as_ref)
+                        .map(|rule| rule.definition_digest);
+                    // The verification query requests definition stacks. A Starlark rule's
+                    // implementation digest must be among the attributes the normal hash used.
+                    let definition_observed = rule.definition_stack.is_empty()
+                        || rule.attribute.iter().any(|attribute| {
+                            attribute.name == "$rule_implementation_hash"
+                                && attribute.r#type
+                                    == crate::proto::blaze_query::attribute::Discriminator::String
+                                && attribute.string_value.as_ref().is_some_and(|digest| {
+                                    !digest.is_empty()
+                                        && digest.len() % 2 == 0
+                                        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                })
+                        });
+                    let context = verified_rule_context(rule);
+                    CoverageNode {
+                        covered: definition_observed
+                            && rule.default_setting.is_empty()
+                            && context.is_some()
+                            && definition
+                                == Some(rule_definition_digest(rule, &options.ignored_attributes))
+                            && normal_inputs.is_some_and(|normal| {
+                                inputs.iter().all(|input| normal.contains(input))
+                            }),
+                        inputs,
+                        kind: CoverageKind::Rule(context),
+                    }
+                }
+                target::Discriminator::GeneratedFile => {
+                    let Some(file) = target.generated_file.as_option() else {
+                        continue;
+                    };
+                    CoverageNode {
+                        inputs: vec![file.generating_rule.clone()],
+                        covered: normal
+                            .and_then(|target| target.generated_file.as_option())
+                            .is_some_and(|normal| normal.generating_rule == file.generating_rule),
+                        kind: CoverageKind::Generated(file.generating_rule.clone()),
+                    }
+                }
+                target::Discriminator::SourceFile => {
+                    let Some(source) = target.source_file.as_option() else {
+                        continue;
+                    };
+                    CoverageNode {
+                        inputs: Vec::new(),
+                        covered: source.subinclude.is_empty()
+                            && source.feature.is_empty()
+                            && source.package_contains_errors != Some(true)
+                            && normal
+                                .and_then(|target| target.source_file.as_option())
+                                .is_some_and(|normal| normal.subinclude == source.subinclude),
+                        kind: CoverageKind::Source,
+                    }
+                }
+                _ => continue,
+            };
+            let mut node = node;
+            node.inputs.sort_unstable();
+            node.inputs.dedup();
+            match nodes.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(node);
+                }
+                Entry::Occupied(mut entry) => entry.get_mut().covered = false,
+            }
+        }
+        for mut aspect in query.aspects {
+            aspect.inputs.sort_unstable();
+            aspect.inputs.dedup();
+            nodes.insert(
+                aspect.key,
+                CoverageNode {
+                    inputs: aspect.inputs,
+                    covered: false,
+                    kind: CoverageKind::Unresolved,
+                },
+            );
+        }
+        Self {
+            nodes,
+            canonical_workspace: fs::canonicalize(&options.bazel.workspace).ok(),
+            source_locations: query.source_locations,
+            observed_sources: HashSet::new(),
+        }
+    }
+
+    fn rule_context(&self, key: &str) -> Option<DigestBytes> {
+        let node = self.nodes.get(key).filter(|node| node.covered)?;
+        match &node.kind {
+            CoverageKind::Rule(context) => *context,
+            _ => None,
+        }
+    }
+
+    fn requires(&self, parent: &str, input: &str) -> bool {
+        self.nodes.get(parent).is_some_and(|node| {
+            node.inputs
+                .binary_search_by(|key| key.as_str().cmp(input))
+                .is_ok()
+        })
+    }
+
+    fn source_context(&self, key: &str) -> Option<DigestBytes> {
+        (self.observed_sources.contains(key)
+            && self
+                .nodes
+                .get(key)
+                .is_some_and(|node| node.covered && matches!(node.kind, CoverageKind::Source)))
+        .then(|| Sha256::digest(b"verified source context\0").into())
+    }
+
+    fn resolved_context(
+        &self,
+        input: &str,
+        resolved: &str,
+        canonical: &str,
+        context: Option<DigestBytes>,
+    ) -> Option<DigestBytes> {
+        let node = self.nodes.get(input).filter(|node| node.covered)?;
+        let exact = match &node.kind {
+            CoverageKind::Rule(_) => resolved == input && canonical == input,
+            CoverageKind::Generated(generator) => resolved == input && canonical == generator,
+            _ => false,
+        };
+        exact.then_some(context).flatten()
+    }
+}
+
+/// Rule context outside the normal digest. Keeping it separate preserves ordinary comparisons
+/// when only one endpoint has verification data.
+fn verified_rule_context(rule: &Rule) -> Option<DigestBytes> {
+    let location = starlark_stack_path(rule.location.as_deref()?);
+    let build_file = Path::new(location).file_name()?.to_str()?;
+    if !matches!(build_file, "BUILD" | "BUILD.bazel") {
+        return None;
+    }
+    let class = rule
+        .rule_class_key
+        .as_deref()
+        .filter(|key| !key.is_empty())?;
+    let encoded = serde_json::to_vec(&(class, build_file)).ok()?;
+    Some(Sha256::digest(encoded).into())
 }
 
 /// Groups the keys that carry a configuration checksum by label, each group sorted.
@@ -751,6 +1150,61 @@ fn configured_label_instances<'a>(
         keys.sort_unstable();
     }
     instances
+}
+
+struct ConfiguredRootHashes {
+    roots: BTreeMap<String, TargetHash>,
+    instances: BTreeMap<String, TargetHash>,
+    dep_edges: BTreeMap<String, Vec<String>>,
+}
+
+/// Retains configured instances and reports each Bazel-resolved root under its bare label.
+/// A root uses its instance's immediate children, preserving cause distances without a new hop.
+fn configured_root_hashes(
+    digests: Vec<(String, &'static str, TargetDigest)>,
+    track_deps: bool,
+    roots: &BTreeMap<String, String>,
+) -> Result<ConfiguredRootHashes> {
+    let mut instances = BTreeMap::new();
+    let mut dep_edges = BTreeMap::new();
+    for (key, kind, digest) in digests {
+        let hash = TargetHash {
+            kind: kind.to_owned(),
+            hash: digest.overall.into(),
+            direct_hash: digest.direct.into(),
+        };
+        if instances.insert(key.clone(), hash).is_some() {
+            bail!("duplicate configured target key {key}");
+        }
+        if track_deps {
+            dep_edges.insert(
+                key,
+                digest.deps.map(Rc::unwrap_or_clone).unwrap_or_default(),
+            );
+        }
+    }
+    let mut hashes = BTreeMap::new();
+    for (label, key) in roots {
+        let hash = instances
+            .get(key)
+            .with_context(|| format!("configured root {label} was not returned as {key}"))?
+            .clone();
+        if label != key && instances.contains_key(label) {
+            bail!("configured root view collides with target {label}");
+        }
+        hashes.insert(label.clone(), hash);
+        if track_deps && label != key {
+            dep_edges.insert(
+                label.clone(),
+                dep_edges.get(key).cloned().unwrap_or_default(),
+            );
+        }
+    }
+    Ok(ConfiguredRootHashes {
+        roots: hashes,
+        instances,
+        dep_edges,
+    })
 }
 
 /// Folds per-key digests into the per-label hashes the hash file is keyed by.
@@ -999,6 +1453,7 @@ enum Input<'a> {
 struct HashContext<'a> {
     options: &'a HashOptions,
     source_hasher: &'a SourceHasher<'a>,
+    verification: Option<VerificationState<'a>>,
     source_digests: Vec<DigestBytes>,
     rules: Labels,
     /// Keys in `rules` grouped by label, sorted, for configured keys only: the fallback when
@@ -1107,6 +1562,13 @@ impl HashContext<'_> {
 
         let mut builder =
             TargetDigestBuilder::new(self.options.track_deps, self.recorder.is_some());
+        if let Some(context) = self
+            .verification
+            .as_ref()
+            .and_then(|state| state.coverage.rule_context(canonical_key))
+        {
+            builder.start_verification(context);
+        }
         builder.direct(rule.prepared.definition_digest);
         builder.direct(self.seed_hash);
         if let Some(seed) = self.rule_bzl_seed(&rule.rule)? {
@@ -1175,19 +1637,49 @@ impl HashContext<'_> {
                 .and_then(|ids| ids.get(position).copied().flatten());
             builder.direct(encoded_input.as_bytes());
             let input_label = target_label(&encoded_input);
+            let verify_input = builder.verification.is_some()
+                && self
+                    .verification
+                    .as_ref()
+                    .is_some_and(|state| state.coverage.requires(canonical_key, &encoded_input));
             match self.resolve_input(&encoded_input, input_label, input_slot, path) {
-                Some(Input::Source(digest)) => builder.source(input_label, digest),
+                Some(Input::Source(digest)) => {
+                    builder.source(input_label, digest);
+                    if verify_input {
+                        let context = (encoded_input == input_label)
+                            .then(|| {
+                                self.verification
+                                    .as_ref()
+                                    .and_then(|state| state.coverage.source_context(input_label))
+                            })
+                            .flatten();
+                        builder.verification_input(&encoded_input, context);
+                    }
+                }
                 Some(Input::Rule(dependency, node, prior))
                     if dependency.as_ref() != canonical_key =>
                 {
-                    let digest =
-                        match prior.or_else(|| node.digest.get().map(|digest| digest.overall)) {
-                            Some(digest) => Some(digest),
+                    let cached = node.digest.get();
+                    let cached_verified = if verify_input && prior.is_none() && cached.is_some() {
+                        self.verification
+                            .as_ref()
+                            .and_then(|state| state.contexts.get(&node.rule.name).copied())
+                    } else {
+                        None
+                    };
+                    let (digest, verified) =
+                        match prior.or_else(|| cached.map(|digest| digest.overall)) {
+                            Some(digest) => (Some(digest), cached_verified),
                             None => match self.node_digest(&node, path)? {
-                                Visit::Complete(digest) => Some(digest.overall),
+                                Visit::Complete(digest) => {
+                                    let verified = self.verification.as_ref().and_then(|state| {
+                                        state.contexts.get(&node.rule.name).copied()
+                                    });
+                                    (Some(digest.overall), verified)
+                                }
                                 Visit::Pending(dependency) => {
                                     self.components.reaches(component_position, dependency);
-                                    None
+                                    (None, None)
                                 }
                             },
                         };
@@ -1197,8 +1689,22 @@ impl HashContext<'_> {
                         }
                         None => builder.dependency(&dependency, || node.rule.name.clone()),
                     }
+                    if verify_input {
+                        let context = self.verification.as_ref().and_then(|state| {
+                            state.coverage.resolved_context(
+                                &encoded_input,
+                                &dependency,
+                                &node.rule.name,
+                                verified,
+                            )
+                        });
+                        builder.verification_input(&encoded_input, context);
+                    }
                 }
                 _ => {
+                    if verify_input {
+                        builder.verification_input(&encoded_input, None);
+                    }
                     if let Some(digest) = self.source_hasher.soft_digest(input_label, &[])? {
                         self.rules
                             .slot(input_label.to_owned())
@@ -1252,6 +1758,15 @@ impl HashContext<'_> {
         }
 
         path.pop().expect("rule path contains the current rule");
+        // Publish a context only when the normal node completes. A required edge to an
+        // unfinished component has already made its parent unverified.
+        if let Some(verified) = builder.finish_verification() {
+            self.verification
+                .as_mut()
+                .expect("verification context has a capture")
+                .pending
+                .insert(canonical_key.clone(), verified);
+        }
         match self.components.finish(component_position, builder.finish()) {
             Completion::Pending(lowlink) => Ok(Visit::Pending(lowlink)),
             Completion::Single(node, (digest, recipe)) => {
@@ -1294,6 +1809,11 @@ impl HashContext<'_> {
         digest: &TargetDigest,
         recipe: Option<RuleRecipe>,
     ) {
+        if let Some(state) = &mut self.verification {
+            if let Some((key, verified)) = state.pending.remove_entry(&rule.rule.name) {
+                state.contexts.insert(key, verified);
+            }
+        }
         if let (Some(recorder), Some(recipe)) = (&mut self.recorder, recipe) {
             recorder.record_rule(&rule.rule.name, recipe);
         }
@@ -1461,7 +1981,7 @@ fn hash_seed_files(workspace: &Path, paths: &BTreeSet<PathBuf>) -> Result<Digest
     Ok(hasher.finalize().into())
 }
 
-fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<()> {
+fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<File> {
     // One read buffer per thread, zeroed once. A fresh `[0; FILE_HASH_BUFFER_SIZE]` per call
     // zeroed 64 KiB for every hashed file, and most source files are far smaller than that.
     thread_local! {
@@ -1469,7 +1989,7 @@ fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<()> {
             RefCell::new(vec![0; FILE_HASH_BUFFER_SIZE].into_boxed_slice());
     }
     let mut file = File::open(path)?;
-    BUFFER.with(|buffer| {
+    BUFFER.with(|buffer| -> Result<()> {
         let mut buffer = buffer.borrow_mut();
         loop {
             let read = file.read(&mut buffer)?;
@@ -1478,7 +1998,8 @@ fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<()> {
             }
             hasher.update(&buffer[..read]);
         }
-    })
+    })?;
+    Ok(file)
 }
 
 /// Hashes a directory tree deterministically: every entry's workspace-independent relative path
@@ -2056,14 +2577,25 @@ impl SourceHasher<'_> {
         seed: &[u8],
         configured_source: bool,
     ) -> Result<DigestBytes> {
+        self.digest_source_with_observation(label, seed, configured_source, None)
+            .map(|(digest, _)| digest)
+    }
+
+    fn digest_source_with_observation(
+        &self,
+        label: &str,
+        seed: &[u8],
+        configured_source: bool,
+        observation: Option<(&Path, &str)>,
+    ) -> Result<(DigestBytes, bool)> {
         if let Some(tree) = self.tree {
             if is_main_repo(label) {
-                return Ok(partial::source_digest(tree, label, seed));
+                return Ok((partial::source_digest(tree, label, seed), false));
             }
         }
         let Some((path, content_key, materialized)) = self.resolve(label, configured_source)?
         else {
-            return Ok(Sha256::digest([]).into());
+            return Ok((Sha256::digest([]).into(), false));
         };
         let absolute = if path.is_absolute() {
             path
@@ -2073,6 +2605,7 @@ impl SourceHasher<'_> {
         let metadata = fs::metadata(&absolute).ok();
         let executable = metadata.as_ref().is_some_and(metadata_owner_executable);
         let mut hasher = Sha256::new();
+        let mut observed = false;
         if let Some(content_hash) = self
             .content_hashes
             .and_then(|hashes| hashes.get(&content_key))
@@ -2089,9 +2622,30 @@ impl SourceHasher<'_> {
                         .eq(absolute.components())
                 });
             if should_hash {
-                hash_file_into(&mut hasher, &absolute).with_context(|| {
+                let file = hash_file_into(&mut hasher, &absolute).with_context(|| {
                     format!("failed to read source {} ({label})", absolute.display())
                 })?;
+                observed = observation.is_some_and(|(workspace, location)| {
+                    if !is_main_repo(label) {
+                        return self.observed_external_file(
+                            label,
+                            location,
+                            &absolute,
+                            &file,
+                            metadata.as_ref(),
+                        );
+                    }
+                    let Ok(relative) = absolute.strip_prefix(self.workspace) else {
+                        return false;
+                    };
+                    // Bazel canonicalizes the workspace root (for example /var on macOS).
+                    // Rebuild only that prefix so a symlink inside the workspace stays unknown.
+                    let expected = workspace.join(relative);
+                    let selected = Path::new(starlark_stack_path(location));
+                    (selected == absolute || selected == expected)
+                        && fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_file())
+                        && fs::canonicalize(&absolute).is_ok_and(|canonical| canonical == expected)
+                });
             }
             hasher.update([1]);
             hasher.update([u8::from(executable)]);
@@ -2128,7 +2682,89 @@ impl SourceHasher<'_> {
         }
         hasher.update(seed);
         hasher.update(label.as_bytes());
-        Ok(hasher.finalize().into())
+        Ok((hasher.finalize().into(), observed))
+    }
+
+    /// Verify the very file read for the normal digest. Bazel may mount the repository
+    /// itself through a symlink; links below that boundary do not establish a regular source.
+    #[cfg(unix)]
+    fn observed_external_file(
+        &self,
+        label: &str,
+        location: &str,
+        path: &Path,
+        file: &File,
+        before: Option<&fs::Metadata>,
+    ) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let label = self.external_resolver.canonical_source_label(label);
+        let Some((repo, target)) = label
+            .strip_prefix("@@")
+            .and_then(|name| name.split_once("//"))
+        else {
+            return false;
+        };
+        let relative = external_label_path(target);
+        if !matches!(
+            Path::new(repo).components().next(),
+            Some(std::path::Component::Normal(_))
+        ) || repo.contains('/')
+            || relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return false;
+        }
+        let root = self
+            .external_resolver
+            .output_base
+            .join("external")
+            .join(repo);
+        if path != root.join(&relative) {
+            return false;
+        }
+        let (Ok(root), Ok(actual), Ok(current), Ok(opened), Some(before)) = (
+            fs::canonicalize(&root),
+            fs::canonicalize(path),
+            fs::symlink_metadata(path),
+            file.metadata(),
+            before,
+        ) else {
+            return false;
+        };
+        let selected = Path::new(starlark_stack_path(location));
+        let snapshot = |m: &fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.size(),
+                m.mode(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        current.is_file()
+            && opened.is_file()
+            && actual == root.join(relative)
+            && (selected == path || selected == actual)
+            && snapshot(before) == snapshot(&opened)
+            && snapshot(&opened) == snapshot(&current)
+    }
+
+    #[cfg(not(unix))]
+    fn observed_external_file(
+        &self,
+        _label: &str,
+        _location: &str,
+        _path: &Path,
+        _file: &File,
+        _before: Option<&fs::Metadata>,
+    ) -> bool {
+        false
     }
 
     fn soft_digest(&self, label: &str, seed: &[u8]) -> Result<Option<DigestBytes>> {
@@ -2686,6 +3322,7 @@ mod tests {
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -2811,6 +3448,8 @@ mod tests {
                 ..Default::default()
             },
             Some(r#"{"name":"root"}"#.to_owned()),
+            None,
+            None,
         )
     }
 
@@ -2832,6 +3471,8 @@ mod tests {
                 ..Default::default()
             },
             Some(r#"{"name":"root"}"#.to_owned()),
+            None,
+            None,
         )?;
         assert_eq!(indexed.hashes, reference.hashes);
         assert_eq!(indexed.dep_edges, reference.dep_edges);
@@ -3251,6 +3892,8 @@ esac
                     ..Default::default()
                 },
                 Some(r#"{"name":"root"}"#.to_owned()),
+                None,
+                None,
             )
             .unwrap()
         };
@@ -3517,6 +4160,8 @@ esac
                     ..Default::default()
                 },
                 Some(r#"{"name":"root"}"#.to_owned()),
+                None,
+                None,
             )
             .unwrap()
         };
@@ -3987,6 +4632,8 @@ esac
                 PreparedRules::default(),
                 resolver,
                 Some(r#"{"name":"root"}"#.to_owned()),
+                None,
+                None,
             )
             .unwrap()
         };
@@ -4216,6 +4863,8 @@ esac
             targets,
             prepared,
             ExternalRepoResolver::default(),
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -4724,10 +5373,25 @@ printf '%s\n' "$stdout"
             fine_grained_external_repos: BTreeSet::new(),
             external_resolver: resolver,
         };
+        let canonical = fs::canonicalize(workspace.path()).unwrap();
+        let observe = |label: &str, relative: &str| {
+            let location = format!("{}:1:1", canonical.join(relative).display());
+            hasher
+                .digest_source_with_observation(label, b"seed", true, Some((&canonical, &location)))
+                .unwrap()
+        };
         let existing = hasher.digest("//path/to:empty.txt", b"seed").unwrap();
+        assert_eq!(
+            observe("//path/to:empty.txt", "path/to/empty.txt"),
+            (existing, true)
+        );
         fs::remove_file(&file).unwrap();
         let missing = hasher.digest("//path/to:empty.txt", b"seed").unwrap();
         assert_ne!(existing, missing);
+        assert_eq!(
+            observe("//path/to:empty.txt", "path/to/empty.txt"),
+            (missing, false)
+        );
         assert_eq!(
             hasher.digest("@not_a_valid_label", b"seed").unwrap(),
             <DigestBytes>::from(Sha256::digest([]))
@@ -4736,6 +5400,7 @@ printf '%s\n' "$stdout"
             hasher.digest("not-a-bazel-label", b"seed").unwrap(),
             <DigestBytes>::from(Sha256::digest([]))
         );
+        assert!(!observe("not-a-bazel-label", "path/to/empty.txt").1);
         assert!(hasher
             .soft_digest("//path/to:empty.txt", b"seed")
             .unwrap()
@@ -4744,6 +5409,105 @@ printf '%s\n' "$stdout"
             .soft_digest("@repo//:file", b"seed")
             .unwrap()
             .is_none());
+        fs::create_dir(workspace.path().join("path/to/directory")).unwrap();
+        assert!(!observe("//path/to:directory", "path/to/directory").1);
+        #[cfg(unix)]
+        {
+            let referent = workspace.path().join("path/to/real.txt");
+            fs::write(&referent, "").unwrap();
+            std::os::unix::fs::symlink(&referent, &file).unwrap();
+            assert_eq!(
+                observe("//path/to:empty.txt", "path/to/empty.txt"),
+                (existing, false)
+            );
+            std::os::unix::fs::symlink(
+                workspace.path().join("path/to"),
+                workspace.path().join("path/linked"),
+            )
+            .unwrap();
+            assert!(!observe("//path/linked:real.txt", "path/linked/real.txt").1);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn verified_external_regular_file_is_the_file_read_by_the_normal_hash() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(workspace.path()).unwrap();
+        let output_base = canonical.join("output");
+        let mount = output_base.join("external/module++extension+repo");
+        let tree = canonical.join("contents/selected");
+        fs::create_dir_all(tree.join("pkg")).unwrap();
+        fs::create_dir_all(mount.parent().unwrap()).unwrap();
+        symlink(&tree, &mount).unwrap();
+        let file = mount.join("pkg/input");
+        fs::write(&file, "first").unwrap();
+        let modified = BTreeSet::new();
+        let resolver = ExternalRepoResolver {
+            output_base,
+            repo_mapping: Arc::new(OnceLock::from(HashMap::from([(
+                "alias".to_owned(),
+                "module++extension+repo".to_owned(),
+            )]))),
+            ..Default::default()
+        };
+        let hasher = SourceHasher {
+            tree: None,
+            workspace: &canonical,
+            content_hashes: None,
+            modified_filepaths: &modified,
+            fine_grained_external_repos: BTreeSet::new(),
+            external_resolver: resolver,
+        };
+        let observe = |label, selected: &Path| {
+            let location = format!("{}:1:1", selected.display());
+            hasher
+                .digest_source_with_observation(label, b"seed", true, Some((&canonical, &location)))
+                .unwrap()
+        };
+        let label = "@@module++extension+repo//pkg:input";
+        let original = hasher.digest_source(label, b"seed", true).unwrap();
+        assert_eq!(observe(label, &file), (original, true));
+        assert_eq!(observe(label, &tree.join("pkg/input")), (original, true));
+        assert_eq!(observe(label, &tree.join("other")), (original, false));
+        assert!(!observe("@absent//pkg:input", &file).1);
+        // The normal hasher did not read an unenrolled apparent spelling under this projection.
+        assert!(!observe("@alias//pkg:input", &file).1);
+        fs::write(&file, "second").unwrap();
+        let (changed, observed) = observe(label, &file);
+        assert!(observed);
+        assert_ne!(changed, original);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        let (executable, observed) = observe(label, &file);
+        assert!(observed);
+        assert_ne!(executable, changed);
+        let opened = File::open(&file).unwrap();
+        let before = opened.metadata().unwrap();
+        fs::rename(&file, tree.join("saved")).unwrap();
+        fs::write(&file, "second").unwrap();
+        assert!(!hasher.observed_external_file(
+            label,
+            file.to_str().unwrap(),
+            &file,
+            &opened,
+            Some(&before)
+        ));
+        symlink("pkg", mount.join("indirect")).unwrap();
+        assert!(
+            !observe(
+                "@@module++extension+repo//indirect:input",
+                &mount.join("indirect/input")
+            )
+            .1
+        );
+        fs::remove_file(&file).unwrap();
+        symlink("../saved", &file).unwrap();
+        assert!(!observe(label, &file).1);
+        fs::remove_file(&file).unwrap();
+        assert!(!observe(label, &file).1);
+        fs::create_dir(&file).unwrap();
+        assert!(!observe(label, &file).1);
     }
 
     #[test]

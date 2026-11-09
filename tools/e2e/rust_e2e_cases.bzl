@@ -204,7 +204,27 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::configured_roots_preserve_module_obligations",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::cquery_keeps_dependencies_of_every_configured_instance",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::cquery_rejects_indistinguishable_toolchain_instances",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::cquery_reports_only_requested_configured_roots",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::cquery_verifies_aspect_free_selected_toolchain",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::cquery_verifies_covered_configured_roots",
                 "timeout": "moderate",
             },
             {

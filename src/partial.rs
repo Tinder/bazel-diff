@@ -730,6 +730,7 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
         .collect();
     let hashes = evaluate(recipes, &targets, tree)?;
     Ok(HashFileData {
+        configured_roots: None,
         hashes,
         // Fresh query observations can depend on external definitions outside these recipes.
         observed_toolchains: None,
@@ -1476,6 +1477,7 @@ mod tests {
         let recipes = recipes();
         let targets = targets();
         let mut base = HashFileData {
+            configured_roots: None,
             hashes: evaluate(&recipes, &targets, &fixture_tree()).unwrap(),
             observed_toolchains: None,
             module_graph_json: Some("{}".into()),

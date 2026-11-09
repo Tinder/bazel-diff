@@ -1,5 +1,7 @@
 use crate::cancel::{self, Cancellation};
-use crate::proto::analysis::{ConfiguredTarget, CqueryResult};
+use crate::proto::analysis::{
+    ConfiguredAspect, ConfiguredAspectResult, ConfiguredTarget, CqueryResult,
+};
 use crate::proto::blaze_query::{
     target, Attribute, ConfiguredRuleInput, PackageGroup, Repository, Rule, Target,
 };
@@ -8,7 +10,7 @@ use buffa::Message;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -45,6 +47,7 @@ pub struct BazelOptions {
     pub cquery_options: Vec<String>,
     pub use_cquery: bool,
     pub cquery_expression: Option<String>,
+    pub cquery_root_expression: Option<String>,
     pub keep_going: bool,
     pub fine_grained_external_repos: BTreeSet<String>,
     /// Module extensions, as `bazel mod show_extension` names them
@@ -380,6 +383,10 @@ impl BazelOptions {
             })
     }
 
+    fn configured_root_query(expression: &str) -> String {
+        format!("config(({expression}), target)")
+    }
+
     pub fn query_all_targets(&self) -> Result<Vec<Target>> {
         self.check_raw_targets_supported()?;
         Ok(self
@@ -391,12 +398,55 @@ impl BazelOptions {
         if self.isolated_dependency_root.is_some() {
             bail!("--isolatedDependencyRoot requires generate_hashes to retain repository inputs");
         }
+        if self.cquery_root_expression.is_some() {
+            bail!("--cqueryRootExpression requires generate-hashes to retain configured roots");
+        }
         Ok(())
     }
 
     pub(crate) fn query_all_targets_with(
         &self,
+        transform: impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) -> Result<QueriedTargets> {
+        if self.cquery_root_expression.is_some() {
+            if !self.use_cquery {
+                bail!("--cqueryRootExpression requires --useCquery");
+            }
+            if self.cquery_expression.is_some() {
+                bail!("--cqueryRootExpression cannot be combined with --cqueryExpression");
+            }
+            // A configured-root artifact records complete query results, so an empty roster
+            // describes a successful empty selection rather than a partial keep-going result.
+            return Self {
+                keep_going: false,
+                ..self.clone()
+            }
+            .query_all_targets_inner(transform, false);
+        }
+        self.query_all_targets_inner(transform, false)
+    }
+
+    pub(crate) fn query_all_targets_verified_with(
+        &self,
+        transform: impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) -> Result<QueriedTargets> {
+        if !self.use_cquery
+            || self.cquery_root_expression.is_none()
+            || self.cquery_expression.is_some()
+        {
+            bail!("--verifyConfiguredRoots requires --useCquery and a configured root expression");
+        }
+        Self {
+            keep_going: false,
+            ..self.clone()
+        }
+        .query_all_targets_inner(transform, true)
+    }
+
+    fn query_all_targets_inner(
+        &self,
         mut transform: impl FnMut(&mut [Target], Option<RepositoryInputs>),
+        verify: bool,
     ) -> Result<QueriedTargets> {
         if let Some(root) = &self.isolated_dependency_root {
             if self.use_cquery {
@@ -469,35 +519,69 @@ impl BazelOptions {
             mut failed_extensions,
             canonical_to_apparent,
             module_graph_json,
+            module_graph_complete,
             root_mapping,
             scope,
         } = bzlmod;
+        let configured_roots = self
+            .cquery_root_expression
+            .as_deref()
+            .map(|expression| self.query_configured_roots(expression, version))
+            .transpose()?;
         let strict = (!scope.members.is_empty()).then(|| Self {
             keep_going: false,
             ..self.clone()
         });
         let mut loads = BTreeMap::new();
-        let mut targets = self.collect_all_targets(
-            bzlmod_repos,
-            server_info.external_package,
-            |expression, use_cquery| {
-                if let Some(strict) = &strict {
-                    strict.query_with(
-                        &self.with_exclude_filter(scope.expression(expression)),
-                        false,
-                        version,
-                        &mut |batch| {
-                            scope.record_build_loads(batch, &mut loads);
-                            transform(batch, None);
-                        },
-                    )
-                } else {
-                    self.query_with(expression, use_cquery, version, &mut |batch| {
-                        transform(batch, None)
-                    })
-                }
-            },
-        )?;
+        let mut verification = None;
+        let mut targets = if configured_roots.as_ref().is_some_and(BTreeMap::is_empty) {
+            Vec::new()
+        } else {
+            self.collect_all_targets(
+                bzlmod_repos,
+                server_info.external_package,
+                |expression, use_cquery| {
+                    if let Some(strict) = &strict {
+                        strict.query_with(
+                            &self.with_exclude_filter(scope.expression(expression)),
+                            false,
+                            version,
+                            &mut |batch| {
+                                scope.record_build_loads(batch, &mut loads);
+                                transform(batch, None);
+                            },
+                        )
+                    } else if verify && use_cquery {
+                        // Keep positive distances on the caller's normal view. The full typed
+                        // view below qualifies coverage without adding positive impact paths.
+                        let targets = self.query_with(expression, true, version, &mut |batch| {
+                            transform(batch, None)
+                        })?;
+                        let graph = self.query_with_capture(
+                            expression,
+                            true,
+                            version,
+                            &mut |_| {},
+                            CqueryCapture::Verification,
+                            |_| true,
+                        );
+                        match graph {
+                            Ok(graph) => verification = graph.into_verified(),
+                            Err(error) => {
+                                eprintln!(
+                                    "[Warn] configured-root verification unavailable: {error:#}"
+                                );
+                            }
+                        }
+                        Ok(targets)
+                    } else {
+                        self.query_with(expression, use_cquery, version, &mut |batch| {
+                            transform(batch, None)
+                        })
+                    }
+                },
+            )?
+        };
         if let Some(strict) = &strict {
             // Direct users may name a target the hub doesn't export. Ask only about
             // edges actually seen in the ordinary graph, and keep the primary's rows.
@@ -565,7 +649,10 @@ impl BazelOptions {
         )?;
         Ok(QueriedTargets {
             targets,
+            verification,
+            configured_roots,
             module_graph_json,
+            module_graph_complete,
             root_mapping,
             output_base: server_info.output_base,
             scoped_sources: ScopedSources {
@@ -983,8 +1070,10 @@ impl BazelOptions {
         }
         if self.use_cquery {
             let expression = self
-                .cquery_expression
-                .clone()
+                .cquery_root_expression
+                .as_deref()
+                .map(|expression| format!("deps({})", Self::configured_root_query(expression)))
+                .or_else(|| self.cquery_expression.clone())
                 .unwrap_or_else(|| "deps(//...:all-targets)".to_owned());
             let mut targets = query(&self.with_exclude_filter(expression), true)?;
             if include_external {
@@ -1172,6 +1261,7 @@ impl BazelOptions {
             failed_extensions: failed,
             canonical_to_apparent,
             module_graph_json: module_graph,
+            module_graph_complete: complete_graph,
             root_mapping: retain_root_mapping.then_some(root_mapping),
             scope,
         })
@@ -2089,12 +2179,94 @@ impl BazelOptions {
         transform: &mut impl FnMut(&mut [Target]),
         retain: impl FnMut(&Target) -> bool,
     ) -> Result<Vec<Target>> {
+        let graph = self.query_with_capture(
+            expression,
+            use_cquery,
+            version,
+            transform,
+            CqueryCapture::Standard,
+            retain,
+        )?;
+        Ok(graph.targets)
+    }
+
+    fn query_configured_roots(
+        &self,
+        expression: &str,
+        version: Option<BazelVersion>,
+    ) -> Result<BTreeMap<String, String>> {
         let version = match version {
             Some(version) => version,
             None => self.version()?,
         };
-        let compatible = if use_cquery {
-            Some(self.query_compatible_labels(expression)?)
+        let mut resolved = Vec::new();
+        let query = self.with_exclude_filter(Self::configured_root_query(expression));
+        if let Err(error) = self.query_with_capture(
+            &query,
+            true,
+            Some(version),
+            &mut |_| {},
+            CqueryCapture::Roots(&mut resolved),
+            |_| true,
+        ) {
+            let selection = self.with_exclude_filter(expression.to_owned());
+            let output = self
+                .query_formatted(
+                    &selection,
+                    "def format(target):\n    return str(target.label)\n",
+                    version,
+                )
+                .with_context(|| format!("configured root query failed: {error:#}"))?;
+            if !output.status.success() {
+                bail!(
+                    "configured root query failed ({error:#}); root selection check failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            if output.stdout.iter().all(u8::is_ascii_whitespace) {
+                return Ok(BTreeMap::new());
+            }
+            return Err(error);
+        }
+        let mut roots = BTreeMap::new();
+        for (label, key) in resolved {
+            match roots.entry(label) {
+                Entry::Vacant(entry) => {
+                    entry.insert(key);
+                }
+                Entry::Occupied(entry) if entry.get() != &key => {
+                    bail!(
+                        "configured root {} resolved to multiple configurations",
+                        entry.key()
+                    );
+                }
+                Entry::Occupied(_) => {}
+            }
+        }
+        Ok(roots)
+    }
+
+    fn query_with_capture(
+        &self,
+        expression: &str,
+        use_cquery: bool,
+        version: Option<BazelVersion>,
+        transform: &mut impl FnMut(&mut [Target]),
+        capture: CqueryCapture<'_>,
+        retain: impl FnMut(&Target) -> bool,
+    ) -> Result<QueryGraph> {
+        let (mut roots, verify) = match capture {
+            CqueryCapture::Standard => (None, false),
+            CqueryCapture::Roots(roots) => (Some(roots), false),
+            CqueryCapture::Verification => (None, true),
+        };
+        let rooted = use_cquery && self.cquery_root_expression.is_some();
+        let version = match version {
+            Some(version) => version,
+            None => self.version()?,
+        };
+        let compatible = if use_cquery && !verify {
+            Some(self.query_compatible_labels(expression, version)?)
         } else {
             None
         };
@@ -2103,20 +2275,18 @@ impl BazelOptions {
         let output_file = NamedTempFile::new().context("create query output file")?;
         let streamed_cquery = version >= BazelVersion(7, 0, 0);
         let supports_output_file = version >= BazelVersion(8, 2, 0);
+        let output_format = if use_cquery && !streamed_cquery {
+            "proto"
+        } else {
+            "streamed_proto"
+        };
 
         let mut command = self.command();
         command.arg(if use_cquery { "cquery" } else { "query" });
-        if use_cquery {
-            command.arg("--transitions=lite");
+        if !use_cquery {
+            command.arg("--output").arg(output_format);
         }
-        command
-            .arg("--output")
-            .arg(if use_cquery && !streamed_cquery {
-                "proto"
-            } else {
-                "streamed_proto"
-            })
-            .arg("--proto:instantiation_stack");
+        command.arg("--proto:instantiation_stack");
         if !use_cquery {
             command.arg("--order_output=no");
         }
@@ -2124,9 +2294,35 @@ impl BazelOptions {
             command.arg("--keep_going");
         }
         if use_cquery {
+            command.args(&self.cquery_options);
+            if verify {
+                // Verification needs the complete query traversal. These settings affect only
+                // dependency projection; the caller's configuration and repository options stay.
+                command.args([
+                    "--experimental_explicit_aspects",
+                    "--implicit_deps",
+                    "--tool_deps",
+                    "--nodep_deps",
+                    "--include_aspects",
+                    "--proto:output_rule_attrs=all",
+                    "--proto:default_values",
+                    "--proto:definition_stack",
+                    "--proto:rule_classes",
+                    "--proto:locations",
+                    "--norelative_locations",
+                ]);
+            }
             command
-                .args(&self.cquery_options)
-                .arg("--consistent_labels");
+                .arg("--transitions=lite")
+                .arg("--output")
+                .arg(output_format);
+            if rooted {
+                // These fields carry configured identities and the existing repository inputs.
+                command
+                    .arg("--proto:include_configurations")
+                    .arg("--proto:rule_inputs_and_outputs");
+            }
+            command.arg("--consistent_labels");
         } else {
             command.args(&self.command_options);
         }
@@ -2146,7 +2342,10 @@ impl BazelOptions {
             .run_configured(&mut command)
             .context("failed to execute Bazel query")?;
         let code = output.status.code().unwrap_or(-1);
-        if code != 0 && !(self.keep_going && code == 3) {
+        // A formatter can emit its completion marker before a keep-going query returns 3.
+        // Verification requires command success; ordinary partial positives keep their policy.
+        let partial = self.keep_going && code == 3 && !verify;
+        if code != 0 && !partial {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("Bazel query failed, exit code {code}: {stderr}");
         }
@@ -2154,28 +2353,50 @@ impl BazelOptions {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
         }
 
-        let mut targets = if use_cquery {
-            decode_cquery_stream(output_file.path(), streamed_cquery, transform)?
+        let mut graph = if use_cquery && verify {
+            decode_cquery_graph(
+                output_file.path(),
+                streamed_cquery,
+                transform,
+                roots.as_deref_mut(),
+                compatible.as_ref().filter(|_| rooted),
+                verify,
+                verify && rooted,
+            )?
+        } else if use_cquery {
+            decode_cquery_stream(
+                output_file.path(),
+                streamed_cquery,
+                transform,
+                roots.as_deref_mut(),
+                compatible.as_ref().filter(|_| rooted),
+            )?
+            .into()
         } else {
-            decode_target_stream_filtered(output_file.path(), transform, retain)?
+            decode_target_stream_filtered(output_file.path(), transform, retain)?.into()
         };
-        if let Some(compatible) = compatible {
-            targets.retain(|target| {
+        if let Some(compatible) = compatible.filter(|_| !rooted) {
+            graph.targets.retain(|target| {
                 target_name(target).is_some_and(|name| {
                     compatible.contains(main_repo_label_key(target_label(name)))
                 })
             });
+            if let Some(roots) = roots {
+                roots.retain(|(label, _)| compatible.contains(main_repo_label_key(label)));
+            }
         }
-        Ok(targets)
+        Ok(graph)
     }
 
-    fn query_compatible_labels(&self, expression: &str) -> Result<HashSet<String>> {
-        let query_file = NamedTempFile::new().context("create query file")?;
-        fs::write(query_file.path(), expression)?;
-        let starlark_file = NamedTempFile::new().context("create cquery formatter")?;
-        fs::write(
-            starlark_file.path(),
-            r#"def format(target):
+    fn query_compatible_labels(
+        &self,
+        expression: &str,
+        version: BazelVersion,
+    ) -> Result<HashSet<String>> {
+        let output = self
+            .query_formatted(
+                expression,
+                r#"def format(target):
     if providers(target) == None:
         return ""
     if "IncompatiblePlatformProvider" not in providers(target):
@@ -2190,21 +2411,8 @@ impl BazelOptions {
         return str(target.label)
     return ""
 "#,
-        )?;
-        let mut command = self.command();
-        command
-            .arg("cquery")
-            .arg("--output")
-            .arg("starlark")
-            .arg("--starlark:file")
-            .arg(starlark_file.path())
-            .args(&self.cquery_options)
-            .arg("--consistent_labels")
-            .arg("--query_file")
-            .arg(query_file.path())
-            .stdin(Stdio::null());
-        let output = self
-            .run(&mut command)
+                version,
+            )
             .context("execute compatible-target cquery")?;
         if !output.status.success() {
             bail!(
@@ -2217,6 +2425,42 @@ impl BazelOptions {
             .filter(|line| !line.trim().is_empty())
             .map(|line| main_repo_label_key(line).to_owned())
             .collect())
+    }
+
+    fn query_formatted(
+        &self,
+        expression: &str,
+        formatter: &str,
+        version: BazelVersion,
+    ) -> Result<Output> {
+        let query_file = NamedTempFile::new().context("create query file")?;
+        fs::write(query_file.path(), expression)?;
+        let starlark_file = NamedTempFile::new().context("create cquery formatter")?;
+        fs::write(starlark_file.path(), formatter)?;
+        let output_file = (version >= BazelVersion(8, 2, 0))
+            .then(NamedTempFile::new)
+            .transpose()
+            .context("create cquery output file")?;
+        let mut command = self.command();
+        command
+            .arg("cquery")
+            .args(&self.cquery_options)
+            .arg("--output")
+            .arg("starlark")
+            .arg("--starlark:file")
+            .arg(starlark_file.path())
+            .arg("--consistent_labels")
+            .arg("--query_file")
+            .arg(query_file.path())
+            .stdin(Stdio::null());
+        if let Some(file) = &output_file {
+            command.arg("--output_file").arg(file.path());
+        }
+        let mut output = self.run(&mut command)?;
+        if let Some(file) = output_file {
+            output.stdout = fs::read(file.path())?;
+        }
+        Ok(output)
     }
 
     fn canonical_bzlmod_repo_names(&self) -> Result<Vec<String>> {
@@ -2941,11 +3185,58 @@ pub(crate) struct ScopedSources {
 /// Targets with the accepted module graph and successful unfiltered root mapping from discovery.
 pub(crate) struct QueriedTargets {
     pub(crate) targets: Vec<Target>,
+    pub(crate) verification: Option<VerifiedQuery>,
+    pub(crate) configured_roots: Option<BTreeMap<String, String>>,
     pub(crate) module_graph_json: Option<String>,
+    pub(crate) module_graph_complete: bool,
     pub(crate) root_mapping: Option<Vec<u8>>,
     pub(crate) scoped_sources: ScopedSources,
     /// The output base `bazel info` reported before the query, when it was asked.
     pub(crate) output_base: Option<PathBuf>,
+}
+
+pub(crate) struct VerifiedQuery {
+    pub(crate) targets: Vec<Target>,
+    pub(crate) aspects: Vec<ObservedAspect>,
+    /// Locations from genuine SourceFile rows. A missing or conflicting location is unresolved.
+    pub(crate) source_locations: BTreeMap<String, Option<String>>,
+}
+
+pub(crate) struct ObservedAspect {
+    pub(crate) key: String,
+    pub(crate) inputs: Vec<String>,
+}
+
+struct QueryGraph {
+    targets: Vec<Target>,
+    aspects: Option<Vec<ObservedAspect>>,
+    source_locations: BTreeMap<String, Option<String>>,
+}
+
+impl From<Vec<Target>> for QueryGraph {
+    fn from(targets: Vec<Target>) -> Self {
+        Self {
+            targets,
+            aspects: None,
+            source_locations: BTreeMap::new(),
+        }
+    }
+}
+
+impl QueryGraph {
+    fn into_verified(self) -> Option<VerifiedQuery> {
+        self.aspects.map(|aspects| VerifiedQuery {
+            targets: self.targets,
+            aspects,
+            source_locations: self.source_locations,
+        })
+    }
+}
+
+enum CqueryCapture<'a> {
+    Standard,
+    Roots(&'a mut Vec<(String, String)>),
+    Verification,
 }
 
 /// The repositories `bazel mod` describes for a Bzlmod workspace, lowered to `//external:`
@@ -2960,6 +3251,8 @@ struct BzlmodRepos {
     canonical_to_apparent: BTreeMap<String, Vec<String>>,
     /// The accepted module graph, shared by repository edges and hash-file metadata.
     module_graph_json: Option<String>,
+    /// Only a successful command can support verification; tolerated partial answers cannot.
+    module_graph_complete: bool,
     /// Unfiltered stdout from a successful initial Bzlmod probe, shared with external hashing.
     root_mapping: Option<Vec<u8>>,
 }
@@ -3452,8 +3745,30 @@ fn decode_cquery_stream(
     path: &Path,
     streamed: bool,
     transform: &mut impl FnMut(&mut [Target]),
+    roots: Option<&mut Vec<(String, String)>>,
+    compatible: Option<&HashSet<String>>,
 ) -> Result<Vec<Target>> {
-    let mut decoder = CqueryDecoder::default();
+    let graph = decode_cquery_graph(path, streamed, transform, roots, compatible, false, false)?;
+    Ok(graph.targets)
+}
+
+fn decode_cquery_graph(
+    path: &Path,
+    streamed: bool,
+    transform: &mut impl FnMut(&mut [Target]),
+    roots: Option<&mut Vec<(String, String)>>,
+    compatible: Option<&HashSet<String>>,
+    verify: bool,
+    marker_expected: bool,
+) -> Result<QueryGraph> {
+    let mut decoder = CqueryDecoder {
+        root_labels: roots.as_ref().map(|_| Vec::new()),
+        known_null_configurations: (compatible.is_some() || verify).then(HashSet::new),
+        verify,
+        ..CqueryDecoder::default()
+    };
+    let mut marker = false;
+    let mut invalid_marker = false;
     if streamed {
         // Results decode in parallel, a raw batch at a time; naming them stays in stream order
         // because a result's configuration may be defined by an earlier message.
@@ -3463,17 +3778,77 @@ fn decode_cquery_stream(
         while read_raw_batch(&mut reader, &mut batch)? {
             batch
                 .slices()
-                .map(|bytes| CqueryResult::decode_from_slice(bytes).map_err(anyhow::Error::from))
+                .map(|bytes| {
+                    CqueryResult::decode_from_slice(bytes)
+                        // The producer writes field 5 = true in its own terminal frame.
+                        .map(|result| (result, bytes == [0x28, 0x01]))
+                        .map_err(anyhow::Error::from)
+                })
                 .collect_into_vec(&mut decoded);
             for result in decoded.drain(..) {
-                decoder.push(result?, transform);
+                let (mut result, marker_only) = result?;
+                if marker {
+                    invalid_marker = true;
+                }
+                if result.explicit_aspect_inputs {
+                    marker = true;
+                    invalid_marker |= !marker_expected || !marker_only;
+                }
+                retain_compatible_configured_targets(&mut result, compatible, roots.is_some());
+                decoder.push(result, transform);
             }
         }
     } else {
         let bytes = fs::read(path)?;
-        decoder.push(CqueryResult::decode_from_slice(&bytes)?, transform);
+        let mut result = CqueryResult::decode_from_slice(&bytes)?;
+        marker = result.explicit_aspect_inputs;
+        invalid_marker = marker && !marker_expected;
+        retain_compatible_configured_targets(&mut result, compatible, roots.is_some());
+        decoder.push(result, transform);
     }
-    Ok(decoder.finish(transform))
+    decoder.explicit_aspect_inputs = marker_expected && marker && !invalid_marker;
+    decoder.invalid_explicit_aspect_marker = invalid_marker;
+    decoder.finish(transform)?;
+    if roots.is_some() || compatible.is_some() || verify {
+        // Bazel can force the same toolchain onto different execution platforms without
+        // distinguishing those instances in the configured labels on incoming edges.
+        // Catch the collision before repository and query results are deduplicated.
+        let mut seen = HashSet::with_capacity(decoder.targets.len());
+        for key in decoder.targets.iter().filter_map(target_name) {
+            if !seen.insert(key) {
+                bail!("cquery returned multiple targets for configured key {key}");
+            }
+        }
+    }
+    if let (Some(roots), Some(resolved)) = (roots, decoder.root_labels) {
+        roots.extend(resolved);
+    }
+    Ok(QueryGraph {
+        targets: decoder.targets,
+        aspects: decoder.observed_aspects,
+        source_locations: decoder.source_locations,
+    })
+}
+
+fn retain_compatible_configured_targets(
+    result: &mut CqueryResult,
+    compatible: Option<&HashSet<String>>,
+    requested_roots: bool,
+) {
+    let Some(compatible) = compatible else {
+        return;
+    };
+    result.results.retain(|configured| {
+        configured.target.as_option().is_some_and(|target| {
+            (requested_roots
+                && matches!(
+                    target.r#type,
+                    target::Discriminator::SourceFile | target::Discriminator::PackageGroup
+                ))
+                || target_name(target)
+                    .is_some_and(|label| compatible.contains(main_repo_label_key(label)))
+        })
+    });
 }
 
 /// Separator between a label and the checksum of the configuration a target was analyzed in.
@@ -3488,6 +3863,7 @@ fn decode_cquery_stream(
 /// depends on the same label in another configuration, reports a cycle the configured graph
 /// does not have.
 pub const CONFIGURED_SEPARATOR: char = '|';
+const EXPLICIT_ASPECT_PREFIX: &str = "\0aspect:";
 
 /// Bazel reports the null configuration (source files, package groups) with this checksum.
 const NULL_CONFIGURATION_CHECKSUM: &str = "null";
@@ -3509,14 +3885,48 @@ struct CqueryDecoder {
     pending: Vec<(Target, u32)>,
     ready: Vec<(Target, Option<String>)>,
     lowered: Vec<Option<Target>>,
+    root_labels: Option<Vec<(String, String)>>,
+    known_null_configurations: Option<HashSet<u32>>,
+    ambiguous_label: Option<String>,
+    invalid_configuration: Option<u32>,
+    verify: bool,
+    aspect_identities: Vec<ConfiguredAspect>,
+    aspect_results: Vec<ConfiguredAspectResult>,
+    observed_aspects: Option<Vec<ObservedAspect>>,
+    explicit_aspect_inputs: bool,
+    invalid_explicit_aspect_marker: bool,
+    source_locations: BTreeMap<String, Option<String>>,
 }
 
 impl CqueryDecoder {
     fn push(&mut self, result: CqueryResult, transform: &mut impl FnMut(&mut [Target])) {
+        if self.verify {
+            self.aspect_identities.extend(result.aspects);
+            self.aspect_results.extend(result.aspect_results);
+        }
         for configuration in result.configurations {
             if let Some(checksum) = non_null_checksum(&configuration.checksum) {
+                if self.verify
+                    && (self
+                        .configurations
+                        .get(&configuration.id)
+                        .is_some_and(|previous| previous != checksum)
+                        || self
+                            .known_null_configurations
+                            .as_ref()
+                            .is_some_and(|nulls| nulls.contains(&configuration.id)))
+                {
+                    self.invalid_configuration = Some(configuration.id);
+                }
                 self.configurations
                     .insert(configuration.id, checksum.to_owned());
+            } else if configuration.checksum == NULL_CONFIGURATION_CHECKSUM {
+                if self.verify && self.configurations.contains_key(&configuration.id) {
+                    self.invalid_configuration = Some(configuration.id);
+                }
+                if let Some(nulls) = &mut self.known_null_configurations {
+                    nulls.insert(configuration.id);
+                }
             }
         }
         for configured in result.results {
@@ -3529,12 +3939,55 @@ impl CqueryDecoder {
             let Some(target) = target.into_option() else {
                 continue;
             };
+            if self.verify {
+                if let Some(source) = target.source_file.as_option() {
+                    match self.source_locations.entry(source.name.clone()) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(source.location.clone());
+                        }
+                        Entry::Occupied(mut entry) if entry.get() != &source.location => {
+                            entry.insert(None);
+                        }
+                        Entry::Occupied(_) => {}
+                    }
+                }
+            }
             let inline = configuration
                 .as_option()
                 .and_then(|configuration| non_null_checksum(&configuration.checksum))
                 .map(str::to_owned);
+            let known_null = self.known_null_configurations.is_some()
+                && configuration.as_option().is_some_and(|configuration| {
+                    configuration.checksum == NULL_CONFIGURATION_CHECKSUM
+                });
+            if self.verify && configuration_id != 0 {
+                let referenced = self.configurations.get(&configuration_id);
+                if inline
+                    .as_ref()
+                    .zip(referenced)
+                    .is_some_and(|(inline, referenced)| inline != referenced)
+                    || (known_null && referenced.is_some())
+                    || (inline.is_some()
+                        && self
+                            .known_null_configurations
+                            .as_ref()
+                            .is_some_and(|nulls| nulls.contains(&configuration_id)))
+                {
+                    self.invalid_configuration = Some(configuration_id);
+                }
+                if let Some(inline) = &inline {
+                    self.configurations
+                        .entry(configuration_id)
+                        .or_insert_with(|| inline.clone());
+                } else if known_null {
+                    self.known_null_configurations
+                        .as_mut()
+                        .expect("verification tracks null configurations")
+                        .insert(configuration_id);
+                }
+            }
             let checksum = inline.or_else(|| self.configurations.get(&configuration_id).cloned());
-            if checksum.is_none() && configuration_id != 0 {
+            if checksum.is_none() && configuration_id != 0 && !known_null {
                 self.pending.push((target, configuration_id));
                 continue;
             }
@@ -3549,16 +4002,55 @@ impl CqueryDecoder {
         if self.ready.is_empty() {
             return;
         }
+        if self.known_null_configurations.is_some() && self.ambiguous_label.is_none() {
+            self.ambiguous_label = self.ready.iter().find_map(|(target, checksum)| {
+                let bare = target.r#type == target::Discriminator::SourceFile
+                    || (checksum.is_none()
+                        && target.r#type != target::Discriminator::EnvironmentGroup);
+                let label = target_name(target)?;
+                (bare && target_label(label) != label).then(|| label.to_owned())
+            });
+        }
+        let labels = self.root_labels.as_ref().map(|_| {
+            self.ready
+                .iter()
+                .map(|(target, _)| target_name(target).map(str::to_owned))
+                .collect::<Vec<_>>()
+        });
+        let verify = self.verify;
         self.ready
             .par_drain(..)
             .map(|(target, checksum)| {
-                let mut target = lower_target(target)?;
+                let package_group = verify && target.r#type == target::Discriminator::PackageGroup;
+                let mut target = if verify {
+                    lower_target_without_compaction(target)?
+                } else {
+                    lower_target(target)?
+                };
+                if package_group {
+                    let rule = target.rule.as_option_mut()?;
+                    rule.configured_rule_input = rule
+                        .rule_input
+                        .iter()
+                        .map(|label| ConfiguredRuleInput {
+                            label: Some(label.clone()),
+                            ..Default::default()
+                        })
+                        .collect();
+                }
                 if let Some(checksum) = checksum {
                     configure_target(&mut target, &checksum);
                 }
                 Some(target)
             })
             .collect_into_vec(&mut self.lowered);
+        if let (Some(labels), Some(roots)) = (labels, self.root_labels.as_mut()) {
+            for (label, target) in labels.into_iter().zip(&self.lowered) {
+                if let (Some(label), Some(key)) = (label, target.as_ref().and_then(target_name)) {
+                    roots.push((label, key.to_owned()));
+                }
+            }
+        }
         let start = self.targets.len();
         self.targets.extend(self.lowered.drain(..).flatten());
         if self.targets.len() > start {
@@ -3566,19 +4058,233 @@ impl CqueryDecoder {
         }
     }
 
-    fn finish(mut self, transform: &mut impl FnMut(&mut [Target])) -> Vec<Target> {
+    fn finish(&mut self, transform: &mut impl FnMut(&mut [Target])) -> Result<()> {
+        if let Some(id) = self.invalid_configuration {
+            bail!("explicit cquery returned conflicting configuration {id}");
+        }
         self.flush(transform);
         let pending = std::mem::take(&mut self.pending);
         for (target, configuration_id) in pending {
             let checksum = self.configurations.get(&configuration_id).cloned();
+            if checksum.is_none()
+                && self
+                    .known_null_configurations
+                    .as_ref()
+                    .is_some_and(|nulls| !nulls.contains(&configuration_id))
+            {
+                bail!(
+                    "configured target {} referenced missing configuration {configuration_id}",
+                    target_name(&target).unwrap_or("<unknown>")
+                );
+            }
             self.ready.push((target, checksum));
             if self.ready.len() >= DECODE_BATCH_MESSAGES {
                 self.flush(transform);
             }
         }
         self.flush(transform);
-        self.targets
+        if let Some(label) = &self.ambiguous_label {
+            bail!("configured target {label} has a bare label ambiguous with the configured-key encoding");
+        }
+        if self.verify
+            && !self.invalid_explicit_aspect_marker
+            && (self.explicit_aspect_inputs
+                || !self.aspect_identities.is_empty()
+                || !self.aspect_results.is_empty()
+                || self.targets.iter().any(|target| {
+                    target.rule.as_option().is_some_and(|rule| {
+                        rule.configured_rule_input
+                            .iter()
+                            .any(|input| input.aspect_id.is_some())
+                    })
+                }))
+        {
+            self.observed_aspects = Some(self.resolve_explicit_aspects()?);
+        }
+        Ok(())
     }
+
+    fn resolve_explicit_aspects(&mut self) -> Result<Vec<ObservedAspect>> {
+        let mut identities = BTreeMap::new();
+        for identity in std::mem::take(&mut self.aspect_identities) {
+            if identity.id == 0 || identities.insert(identity.id, identity).is_some() {
+                bail!("explicit cquery returned a duplicate or zero aspect identity");
+            }
+        }
+        let mut resolved = BTreeMap::<u32, (String, String)>::new();
+        let mut identity_digests = HashSet::new();
+        let mut visiting = HashSet::new();
+        for &id in identities.keys() {
+            let mut pending = vec![(id, false)];
+            while let Some((id, complete)) = pending.pop() {
+                if resolved.contains_key(&id) {
+                    continue;
+                }
+                let identity = identities
+                    .get(&id)
+                    .with_context(|| format!("explicit cquery referenced missing aspect {id}"))?;
+                if !complete {
+                    if !visiting.insert(id) {
+                        bail!("explicit cquery aspect identities contain a cycle at {id}");
+                    }
+                    pending.push((id, true));
+                    pending.extend(
+                        identity
+                            .base_aspect_ids
+                            .iter()
+                            .rev()
+                            .map(|&base| (base, false)),
+                    );
+                    continue;
+                }
+                visiting.remove(&id);
+                let descriptor = identity
+                    .aspect_descriptor
+                    .as_option()
+                    .context("explicit cquery aspect has no descriptor")?;
+                if descriptor.name.is_empty() {
+                    bail!("explicit cquery aspect has an empty descriptor name");
+                }
+                let mut parameters = BTreeMap::<&str, Vec<&str>>::new();
+                for parameter in &descriptor.parameters {
+                    parameters
+                        .entry(&parameter.key)
+                        .or_default()
+                        .push(&parameter.value);
+                }
+                let base = identity
+                    .base_target
+                    .as_option()
+                    .context("explicit cquery aspect has no base target")?;
+                if base.aspect_id.is_some() {
+                    bail!("explicit cquery aspect base is not a configured target");
+                }
+                let base = explicit_configured_input(
+                    base,
+                    &self.configurations,
+                    self.known_null_configurations.as_ref(),
+                )?;
+                let predecessors = identity
+                    .base_aspect_ids
+                    .iter()
+                    .map(|id| {
+                        resolved
+                            .get(id)
+                            .map(|(key, _)| key.as_str())
+                            .context("explicit cquery aspect predecessor was not resolved")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let encoded = serde_json::to_vec(&(
+                    &descriptor.name,
+                    parameters,
+                    &base,
+                    &identity.execution_platform,
+                    identity.skips_rule_transition,
+                    predecessors,
+                ))?;
+                let mut digest = Sha256::new();
+                digest.update(b"configuredAspectIdentity=1\0");
+                digest.update(encoded);
+                let digest: [u8; 32] = digest.finalize().into();
+                if !identity_digests.insert(digest) {
+                    bail!("explicit cquery returned an ambiguous aspect identity");
+                }
+                let key = format!("{EXPLICIT_ASPECT_PREFIX}{}", hex::encode(digest));
+                resolved.insert(id, (key, base));
+            }
+        }
+        let input_key = |input: &ConfiguredRuleInput| {
+            let base = explicit_configured_input(
+                input,
+                &self.configurations,
+                self.known_null_configurations.as_ref(),
+            )?;
+            match input.aspect_id {
+                None => Ok(base),
+                Some(0) => bail!("explicit cquery returned a zero aspect reference"),
+                Some(id) => {
+                    let (key, expected_base) = resolved.get(&id).with_context(|| {
+                        format!("explicit cquery referenced missing aspect {id}")
+                    })?;
+                    if expected_base != &base {
+                        bail!("explicit cquery aspect {id} referenced mismatched base {base}");
+                    }
+                    Ok(key.clone())
+                }
+            }
+        };
+        // A streamed identity table can follow the target rows that reference it.
+        // Resolve those query-local IDs only after the complete table has arrived.
+        for target in &mut self.targets {
+            if target_name(target).is_some_and(|name| name.contains('\0')) {
+                bail!("explicit cquery returned a target in the reserved aspect namespace");
+            }
+            if let Some(rule) = target.rule.as_option_mut() {
+                for input in &mut rule.configured_rule_input {
+                    *input = ConfiguredRuleInput {
+                        label: Some(input_key(input)?),
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+        let mut selected = HashSet::new();
+        let mut observed = Vec::with_capacity(self.aspect_results.len());
+        for aspect in std::mem::take(&mut self.aspect_results) {
+            if aspect.aspect_id == 0 || !selected.insert(aspect.aspect_id) {
+                bail!("explicit cquery returned a duplicate or zero selected aspect");
+            }
+            let (key, _) = resolved.get(&aspect.aspect_id).with_context(|| {
+                format!(
+                    "explicit cquery selected missing aspect {}",
+                    aspect.aspect_id
+                )
+            })?;
+            observed.push(ObservedAspect {
+                key: key.clone(),
+                inputs: aspect
+                    .configured_rule_input
+                    .iter()
+                    .map(input_key)
+                    .collect::<Result<_>>()?,
+            });
+        }
+        Ok(observed)
+    }
+}
+
+fn explicit_configured_input(
+    input: &ConfiguredRuleInput,
+    configurations: &HashMap<u32, String>,
+    known_null: Option<&HashSet<u32>>,
+) -> Result<String> {
+    let label = input
+        .label
+        .as_deref()
+        .context("explicit cquery input has no label")?;
+    if label.contains('\0') {
+        bail!("explicit cquery input uses the reserved aspect namespace");
+    }
+    let declared_value = input
+        .configuration_checksum
+        .as_deref()
+        .filter(|checksum| !checksum.is_empty());
+    let declared = declared_value.and_then(non_null_checksum);
+    let referenced = match input.configuration_id.filter(|id| *id != 0) {
+        Some(id) => match configurations.get(&id) {
+            Some(checksum) => Some(Some(checksum.as_str())),
+            None if known_null.is_some_and(|known| known.contains(&id)) => Some(None),
+            None => bail!("explicit cquery input {label} referenced missing configuration {id}"),
+        },
+        None => None,
+    };
+    if declared_value.is_some() && referenced.is_some_and(|referenced| declared != referenced) {
+        bail!("explicit cquery input {label} has mismatched configuration identities");
+    }
+    Ok(declared.or(referenced.flatten()).map_or_else(
+        || label.to_owned(),
+        |checksum| configured_key(label, checksum),
+    ))
 }
 
 fn non_null_checksum(checksum: &str) -> Option<&str> {
@@ -3635,7 +4341,7 @@ pub fn target_label(key: &str) -> &str {
 /// different forms: `@@//pkg:name` (Bzlmod), `@//pkg:name` (WORKSPACE mode) and the
 /// apparent `//pkg:name` that `repr()` gives a main-repository alias all become
 /// `//pkg:name`. Other labels are returned unchanged.
-fn main_repo_label_key(label: &str) -> &str {
+pub(crate) fn main_repo_label_key(label: &str) -> &str {
     label
         .strip_prefix("@@")
         .or_else(|| label.strip_prefix('@'))
@@ -3694,19 +4400,21 @@ fn lower_query_target(mut target: Target) -> Option<Target> {
     lower_target(target)
 }
 
-fn lower_target(mut target: Target) -> Option<Target> {
+fn lower_target(target: Target) -> Option<Target> {
+    let mut target = lower_target_without_compaction(target)?;
+    compact_target(&mut target);
+    Some(target)
+}
+
+fn lower_target_without_compaction(mut target: Target) -> Option<Target> {
     match target.r#type {
         target::Discriminator::Rule
         | target::Discriminator::SourceFile
-        | target::Discriminator::GeneratedFile => {
-            compact_target(&mut target);
-            Some(target)
-        }
+        | target::Discriminator::GeneratedFile => Some(target),
         target::Discriminator::PackageGroup => {
             let group = target.package_group.take()?;
             target.r#type = target::Discriminator::Rule;
             target.rule = buffa::MessageField::some(package_group_rule(&group));
-            compact_target(&mut target);
             Some(target)
         }
         target::Discriminator::EnvironmentGroup => {
@@ -4426,7 +5134,9 @@ pub fn encode_configured_input(input: &ConfiguredRuleInput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::analysis::{Configuration, ConfiguredTarget, CqueryResult};
+    use crate::proto::analysis::{
+        AspectDescriptor, Configuration, ConfiguredTarget, CqueryResult, KeyValuePair,
+    };
     use crate::proto::blaze_query::{
         attribute, EnvironmentGroup, GeneratedFile, LabelDictUnaryEntry, SourceFile,
     };
@@ -4683,6 +5393,7 @@ mod tests {
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -4801,14 +5512,18 @@ mod tests {
         let streamed = directory.path().join("cquery-stream.pb");
         write_delimited(&streamed, std::slice::from_ref(&result));
         assert_eq!(
-            target_name(&decode_cquery_stream(&streamed, true, &mut |_| {}).unwrap()[0]),
+            target_name(
+                &decode_cquery_stream(&streamed, true, &mut |_| {}, None, None).unwrap()[0]
+            ),
             Some("//c:c")
         );
 
         let non_streamed = directory.path().join("cquery.pb");
         fs::write(&non_streamed, result.encode_to_vec()).unwrap();
         assert_eq!(
-            target_name(&decode_cquery_stream(&non_streamed, false, &mut |_| {}).unwrap()[0]),
+            target_name(
+                &decode_cquery_stream(&non_streamed, false, &mut |_| {}, None, None).unwrap()[0]
+            ),
             Some("//c:c")
         );
     }
@@ -5328,6 +6043,7 @@ mod tests {
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -5357,6 +6073,7 @@ mod tests {
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::from(["@repo".to_owned()]),
             label_only_module_extensions: BTreeSet::new(),
@@ -5403,6 +6120,7 @@ mod tests {
             cquery_options: Vec::new(),
             use_cquery: true,
             cquery_expression: Some("deps(//app:lib)".into()),
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -5846,6 +6564,7 @@ exit 1
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -6053,6 +6772,7 @@ exit 1
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -6103,6 +6823,7 @@ exit 1
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -6974,6 +7695,7 @@ exit 1
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -7193,6 +7915,7 @@ exit 1
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -7294,6 +8017,7 @@ exit 1
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -7364,6 +8088,7 @@ exit 1
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -7421,6 +8146,7 @@ exit 1
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -7672,7 +8398,7 @@ exit 1
         assert_eq!(query_calls(workspace.path()), calls);
 
         let disabled = tempfile::tempdir().unwrap();
-        let script = query_script(disabled.path(), "8.7.0", &[], 0);
+        let script = query_script(disabled.path(), "8.7.0", &[], 0, 0);
         let mut options = probe_options(disabled.path(), script);
         options.isolated_dependency_root = Some("@hub".into());
         refuses(&options, "Bzlmod repository discovery is unavailable");
@@ -7792,13 +8518,19 @@ exit 1
         let streamed = directory.path().join("cquery-stream.pb");
         write_delimited(&streamed, &messages);
         let mut seen = Vec::new();
-        let targets = decode_cquery_stream(&streamed, true, &mut |batch| {
-            seen.extend(
-                batch
-                    .iter()
-                    .map(|target| target_name(target).unwrap().to_owned()),
-            )
-        })
+        let targets = decode_cquery_stream(
+            &streamed,
+            true,
+            &mut |batch| {
+                seen.extend(
+                    batch
+                        .iter()
+                        .map(|target| target_name(target).unwrap().to_owned()),
+                )
+            },
+            None,
+            None,
+        )
         .unwrap();
         let names = targets.iter().filter_map(target_name).collect::<Vec<_>>();
         assert_eq!(
@@ -7829,8 +8561,240 @@ exit 1
             ..Default::default()
         }];
         fs::write(&non_streamed, combined.encode_to_vec()).unwrap();
-        let targets = decode_cquery_stream(&non_streamed, false, &mut |_| {}).unwrap();
+        let targets = decode_cquery_stream(&non_streamed, false, &mut |_| {}, None, None).unwrap();
         assert_eq!(target_name(&targets[0]), Some("//a:a|def456"));
+    }
+
+    #[test]
+    fn configured_root_decoding_requires_unambiguous_configurations() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cquery.pb");
+        let source = |name: &str| Target {
+            r#type: target::Discriminator::SourceFile,
+            source_file: buffa::MessageField::some(SourceFile {
+                name: name.to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let compatible = HashSet::from(["//a:missing".to_owned(), "//a:source|abc".to_owned()]);
+        write_delimited(
+            &path,
+            &[
+                results(vec![configured(source("//a:source.txt"), None, 7)]),
+                CqueryResult {
+                    configurations: vec![Configuration {
+                        id: 7,
+                        checksum: "null".to_owned(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        );
+        let mut roots = Vec::new();
+        decode_cquery_stream(
+            &path,
+            true,
+            &mut |_| {},
+            Some(&mut roots),
+            Some(&compatible),
+        )
+        .unwrap();
+        assert_eq!(
+            roots,
+            [("//a:source.txt".to_owned(), "//a:source.txt".to_owned())]
+        );
+
+        write_delimited(
+            &path,
+            &[results(vec![configured(
+                rule_target("//a:missing"),
+                None,
+                7,
+            )])],
+        );
+        let error =
+            decode_cquery_stream(&path, true, &mut |_| {}, None, Some(&compatible)).unwrap_err();
+        assert!(error.to_string().contains("missing configuration 7"));
+        let legacy = decode_cquery_stream(&path, true, &mut |_| {}, None, None).unwrap();
+        assert_eq!(target_name(&legacy[0]), Some("//a:missing"));
+
+        write_delimited(
+            &path,
+            &[results(vec![configured(
+                source("//a:source|abc"),
+                Some("null"),
+                0,
+            )])],
+        );
+        let error =
+            decode_cquery_stream(&path, true, &mut |_| {}, None, Some(&compatible)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("//a:source|abc has a bare label ambiguous"));
+    }
+
+    #[test]
+    fn explicit_aspect_completion_requires_requested_terminal_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cquery.pb");
+        let row = results(vec![configured(rule_target("//a:root"), Some("abc123"), 0)]);
+        let marker = CqueryResult {
+            explicit_aspect_inputs: true,
+            ..Default::default()
+        };
+        let verified = |frames: &[CqueryResult], expected| {
+            write_delimited(&path, frames);
+            decode_cquery_graph(&path, true, &mut |_| {}, None, None, true, expected)
+                .unwrap()
+                .into_verified()
+                .is_some()
+        };
+        assert!(!verified(std::slice::from_ref(&row), true));
+        assert!(verified(&[row.clone(), marker.clone()], true));
+        assert!(!verified(&[row.clone(), marker.clone()], false));
+        assert!(!verified(&[marker.clone(), row.clone()], true));
+        assert!(!verified(
+            &[row.clone(), marker.clone(), CqueryResult::default()],
+            true
+        ));
+        let mut combined = row.clone();
+        combined.explicit_aspect_inputs = true;
+        assert!(!verified(std::slice::from_ref(&combined), true));
+
+        fs::write(&path, combined.encode_to_vec()).unwrap();
+        assert!(
+            decode_cquery_graph(&path, false, &mut |_| {}, None, None, true, true)
+                .unwrap()
+                .into_verified()
+                .is_some()
+        );
+        assert!(
+            decode_cquery_graph(&path, false, &mut |_| {}, None, None, true, false)
+                .unwrap()
+                .into_verified()
+                .is_none()
+        );
+
+        write_delimited(&path, &[row, marker]);
+        let ordinary = decode_cquery_stream(&path, true, &mut |_| {}, None, None).unwrap();
+        assert_eq!(target_name(&ordinary[0]), Some("//a:root|abc123"));
+        let mut truncated = fs::read(&path).unwrap();
+        truncated.pop();
+        fs::write(&path, truncated).unwrap();
+        assert!(decode_cquery_graph(&path, true, &mut |_| {}, None, None, true, true).is_err());
+    }
+
+    #[test]
+    fn explicit_aspects_resolve_query_local_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cquery.pb");
+        let decode = |configuration_id, aspect_id, parameters: &[(&str, &str)]| {
+            let predecessor_id = aspect_id + 10;
+            let input = |label: &str| ConfiguredRuleInput {
+                label: Some(label.to_owned()),
+                configuration_checksum: Some("abc123".to_owned()),
+                configuration_id: Some(configuration_id),
+                ..Default::default()
+            };
+            let mut root = rule_target("//a:root");
+            root.rule.as_option_mut().unwrap().configured_rule_input = vec![ConfiguredRuleInput {
+                aspect_id: Some(aspect_id),
+                ..input("//a:base")
+            }];
+            write_delimited(
+                &path,
+                &[
+                    CqueryResult {
+                        results: vec![
+                            configured(root, Some("abc123"), configuration_id),
+                            configured(rule_target("//a:base"), Some("abc123"), configuration_id),
+                            configured(rule_target("//a:tool"), Some("abc123"), configuration_id),
+                        ],
+                        aspect_results: vec![ConfiguredAspectResult {
+                            aspect_id,
+                            configured_rule_input: vec![
+                                input("//a:tool"),
+                                ConfiguredRuleInput {
+                                    aspect_id: Some(predecessor_id),
+                                    ..input("//a:base")
+                                },
+                            ],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    CqueryResult {
+                        aspects: vec![
+                            ConfiguredAspect {
+                                id: aspect_id,
+                                aspect_descriptor: buffa::MessageField::some(AspectDescriptor {
+                                    name: "//a:defs.bzl%visit".to_owned(),
+                                    parameters: parameters
+                                        .iter()
+                                        .map(|&(key, value)| KeyValuePair {
+                                            key: key.to_owned(),
+                                            value: value.to_owned(),
+                                            ..Default::default()
+                                        })
+                                        .collect(),
+                                    ..Default::default()
+                                }),
+                                base_target: buffa::MessageField::some(input("//a:base")),
+                                base_aspect_ids: vec![predecessor_id],
+                                ..Default::default()
+                            },
+                            ConfiguredAspect {
+                                id: predecessor_id,
+                                aspect_descriptor: buffa::MessageField::some(AspectDescriptor {
+                                    name: "//a:defs.bzl%base".to_owned(),
+                                    ..Default::default()
+                                }),
+                                base_target: buffa::MessageField::some(input("//a:base")),
+                                ..Default::default()
+                            },
+                        ],
+                        configurations: vec![Configuration {
+                            id: configuration_id,
+                            checksum: "abc123".to_owned(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+            );
+            decode_cquery_graph(&path, true, &mut |_| {}, None, None, true, false)?
+                .into_verified()
+                .context("typed aspect records were returned")
+        };
+        let before = decode(1, 7, &[("z", "one"), ("a", "two")]).unwrap();
+        let after = decode(9, 3, &[("a", "two"), ("z", "one")]).unwrap();
+        assert_eq!(before.aspects.len(), 1);
+        assert_eq!(after.aspects.len(), 1);
+        assert_eq!(before.aspects[0].key, after.aspects[0].key);
+        assert_eq!(before.aspects[0].inputs, after.aspects[0].inputs);
+        assert_eq!(before.aspects[0].inputs[0], "//a:tool|abc123");
+        assert!(before.aspects[0].inputs[1].starts_with(EXPLICIT_ASPECT_PREFIX));
+        for graph in [&before.targets, &after.targets] {
+            let root = graph
+                .iter()
+                .find_map(|target| {
+                    target
+                        .rule
+                        .as_option()
+                        .filter(|rule| rule.name == "//a:root|abc123")
+                })
+                .unwrap();
+            assert_eq!(
+                root.configured_rule_input[0].label.as_deref(),
+                Some(before.aspects[0].key.as_str())
+            );
+            assert_eq!(root.configured_rule_input[0].aspect_id, None);
+        }
+        let changed = decode(9, 3, &[("a", "three"), ("z", "one")]).unwrap();
+        assert_ne!(before.aspects[0].key, changed.aspects[0].key);
+        assert!(decode(1, 0, &[]).is_err());
     }
 
     #[test]
@@ -7852,7 +8816,8 @@ exit 1
     /// compatible-target cquery (`--output starlark`) lists `compatible`, one per line, with a
     /// blank line that the runner must ignore; the proto cquery copies `cquery_proto` to its
     /// `--output_file`, or prints it when the runner redirects stdout instead (a Bazel older
-    /// than 8.2); `query` copies `query_proto` the same way and exits with `query_exit`,
+    /// than 8.2), then exits with `cquery_exit`; `query` copies `query_proto` the same way and
+    /// exits with `query_exit`,
     /// reporting on stderr when that is non-zero. Every invocation is appended to `calls.log`.
     #[cfg(unix)]
     fn query_script(
@@ -7860,6 +8825,7 @@ exit 1
         version: &str,
         compatible: &[&str],
         query_exit: i32,
+        cquery_exit: i32,
     ) -> PathBuf {
         let result = results(vec![
             configured(rule_target("//app:lib"), Some("abc123"), 1),
@@ -7872,6 +8838,16 @@ exit 1
         fs::write(&proto, result.encode_to_vec()).unwrap();
         let query_proto = workspace.join("query-result.pb");
         write_delimited(&query_proto, &[rule_target("//app:lib")]);
+        let compatible_file = workspace.join("compatible.txt");
+        fs::write(
+            &compatible_file,
+            compatible
+                .iter()
+                .map(|label| format!("{label}\n"))
+                .collect::<String>()
+                .replacen('\n', "\n\n", 1),
+        )
+        .unwrap();
         let script = workspace.join("fake-bazel.sh");
         let body = format!(
             r#"#!/bin/sh
@@ -7889,7 +8865,7 @@ if [ "$1" = version ]; then
 fi
 if [ "$1" = cquery ]; then
   if echo "$*" | grep -q -- "--output starlark"; then
-    printf '{compatible}'
+    copy_or_print "{compatible}" "$@"
     exit 0
   fi
   if echo "$*" | grep -q -- "--output proto"; then
@@ -7897,7 +8873,7 @@ if [ "$1" = cquery ]; then
   else
     copy_or_print "{streamed}" "$@"
   fi
-  exit 0
+  exit {cquery_exit}
 fi
 if [ "$1" = query ]; then
   copy_or_print "{query}" "$@"
@@ -7909,11 +8885,7 @@ fi
 exit 1
 "#,
             calls = workspace.join("calls.log").display(),
-            compatible = compatible
-                .iter()
-                .map(|label| format!("{label}\n"))
-                .collect::<String>()
-                .replacen('\n', "\n\n", 1),
+            compatible = compatible_file.display(),
             streamed = streamed_proto.display(),
             proto = proto.display(),
             query = query_proto.display(),
@@ -7945,7 +8917,13 @@ exit 1
             ("6.5.0", "proto", false),
         ] {
             let workspace = tempfile::tempdir().unwrap();
-            let script = query_script(workspace.path(), version, &["//app:lib", "//app:tool"], 0);
+            let script = query_script(
+                workspace.path(),
+                version,
+                &["//app:lib", "//app:tool"],
+                0,
+                0,
+            );
             let mut options = probe_options(workspace.path(), script);
             options.use_cquery = true;
             options.cquery_options = vec!["--define=flavor=test".into()];
@@ -7964,18 +8942,24 @@ exit 1
             assert_eq!(calls[0], "version");
             let compatible = &calls[1];
             assert!(
-                compatible.starts_with("cquery --output starlark --starlark:file "),
+                compatible
+                    .starts_with("cquery --define=flavor=test --output starlark --starlark:file "),
                 "{compatible}"
             );
             assert!(
-                compatible.contains("--define=flavor=test --consistent_labels --query_file"),
+                compatible.contains("--consistent_labels --query_file"),
                 "{compatible}"
             );
             assert!(!compatible.contains("--query-only"), "{compatible}");
+            assert_eq!(
+                compatible.contains("--output_file"),
+                output_file,
+                "Bazel {version}: {compatible}"
+            );
             let streamed = &calls[2];
             assert!(
                 streamed.starts_with(&format!(
-                    "cquery --transitions=lite --output {output} --proto:instantiation_stack --define=flavor=test --consistent_labels --query_file "
+                    "cquery --proto:instantiation_stack --define=flavor=test --transitions=lite --output {output} --consistent_labels --query_file "
                 )),
                 "Bazel {version}: {streamed}"
             );
@@ -7989,15 +8973,63 @@ exit 1
         }
     }
 
-    /// A failed compatible-target cquery stops the query instead of silently keeping every
-    /// target, and a plain `query` that exits non-zero is an error that quotes Bazel's stderr --
-    /// unless `--keep_going` was asked for and Bazel exited 3, the code it uses for a partial
-    /// answer, in which case the output it did produce is used.
+    /// A completion marker does not upgrade a partial command result to verified coverage.
+    #[test]
+    #[cfg(unix)]
+    fn verification_rejects_partial_query_even_with_completion_marker() {
+        let workspace = tempfile::tempdir().unwrap();
+        let script = query_script(workspace.path(), "8.7.0", &["//app:lib"], 0, 3);
+        write_delimited(
+            &workspace.path().join("cquery-stream.pb"),
+            &[
+                results(vec![configured(
+                    rule_target("//app:lib"),
+                    Some("abc123"),
+                    0,
+                )]),
+                CqueryResult {
+                    explicit_aspect_inputs: true,
+                    ..Default::default()
+                },
+            ],
+        );
+        let mut options = probe_options(workspace.path(), script);
+        options.use_cquery = true;
+        options.keep_going = true;
+        options.cquery_root_expression = Some("//app:lib".into());
+        let ordinary = options
+            .query_with_capture(
+                "deps(config(//app:lib, target))",
+                true,
+                Some(BazelVersion(8, 7, 0)),
+                &mut |_| {},
+                CqueryCapture::Standard,
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(target_name(&ordinary.targets[0]), Some("//app:lib|abc123"));
+        let error = options
+            .query_with_capture(
+                "deps(config(//app:lib, target))",
+                true,
+                Some(BazelVersion(8, 7, 0)),
+                &mut |_| {},
+                CqueryCapture::Verification,
+                |_| true,
+            )
+            .err()
+            .expect("partial verification must be unavailable");
+        assert!(error
+            .to_string()
+            .contains("Bazel query failed, exit code 3"));
+    }
+
+    /// Ordinary query accepts only exit 3 under keep-going; other failures retain their stderr.
     #[test]
     #[cfg(unix)]
     fn query_surfaces_bazel_failures_and_tolerates_partial_answers_with_keep_going() {
         let workspace = tempfile::tempdir().unwrap();
-        let script = query_script(workspace.path(), "8.7.0", &[], 1);
+        let script = query_script(workspace.path(), "8.7.0", &[], 1, 0);
         let mut options = probe_options(workspace.path(), script);
         options.command_options = vec!["--noimplicit_deps".into()];
 
@@ -8027,7 +9059,7 @@ exit 1
         );
 
         let partial = tempfile::tempdir().unwrap();
-        let script = query_script(partial.path(), "8.7.0", &[], 3);
+        let script = query_script(partial.path(), "8.7.0", &[], 3, 0);
         let mut options = probe_options(partial.path(), script);
         let error = options.query("//app:all", false).unwrap_err().to_string();
         assert!(error.contains("Bazel query failed, exit code 3"), "{error}");

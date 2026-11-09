@@ -76,6 +76,141 @@ Pass the head edge file and `--toolchainCandidatesFile=possible.json` to `get-im
 
 These observations supplement an existing selection. The file reports `complete: false` even when `unresolved` is empty. Bazel versions differ in which implicit type dependencies they emit, and a registration priority change can switch the selected compiler while every observed target hash stays equal. Absence from this file cannot exclude a job.
 
+## Configured Root Hashing
+
+`--useCquery` normally combines every configured instance of a label into one
+hash. This can select a stable requested target when another root
+uses the same label with a different compiler or `select()` result.
+
+Use `--cqueryRootExpression` to report the instances Bazel selects for the
+requested roots:
+
+```bash
+bazel-diff generate-hashes -w /path/to/workspace -b bazel --useCquery \
+  --cqueryRootExpression='set(//app:test //lib:test)' \
+  --depEdgesFile deps.json final_hashes.json
+```
+
+Bazel resolves `config((expression), target)` separately at each revision;
+`bazel-diff` hashes their dependencies together. Root sets and fine repository
+lists may differ as targets and repositories appear or disappear. Keep different
+build or test profiles in separate comparisons, using their corresponding
+`--cqueryCommandOptions`. If Bazel returns distinct targets with the same label
+and configuration checksum, generation fails. This can happen when toolchain
+resolution forces the same implementation onto different execution platforms.
+
+For a large expression, use `--cqueryRootExpressionFile roots.query`. Its UTF-8
+contents feed the same query and cache identity as the inline form. The file
+form keeps the expression out of the process argument list; a literal
+`--universe_scope` still uses that list, so omit it only when Bazel's inferred
+universe describes the intended profile. Both root options require
+`--useCquery` and conflict with `--cqueryExpression` and each other.
+
+The hash JSON contains only resolved bare root labels in `hashes`.
+`metadata.configuredRoots` version 2 stores the mapping from roots to instances
+and configured hashes; the usual flat edge file retains configured dependencies.
+Native impact results remain bare root labels, while distance and `explain`
+walks retain configured causes. Direct JSON consumers need the configured
+metadata and edge file to calculate distances. The edge file keeps its existing
+trusted companion contract. Native commands reject comparisons between legacy
+and configured root hashes.
+
+A verified empty selection produces an empty root artifact. Unresolved root
+identities and ambiguous bare keys fail generation. `bazel-diff` controls the
+cquery serialization needed for this model; other query filters still apply.
+Partial graph mode remains incompatible with cquery.
+
+### Verified Configured Roots
+
+Add `--verifyConfiguredRoots` to both rooted generations when a caller needs to
+distinguish a verified stable configured input graph from an unknown result:
+
+```bash
+bazel-diff generate-hashes -w /path/to/base -b bazel --useCquery \
+  --cqueryRootExpressionFile roots.query --verifyConfiguredRoots \
+  --includeTargetType base_hashes.json
+bazel-diff generate-hashes -w /path/to/head -b bazel --useCquery \
+  --cqueryRootExpressionFile roots.query --verifyConfiguredRoots \
+  --includeTargetType --depEdgesFile deps.json final_hashes.json
+```
+
+This opt-in mode keeps the normal configured hashes and dependency edges. It
+also runs a fresh cquery with the same workspace, startup options and cquery
+options. The verification view enables `implicit_deps`, `tool_deps`,
+`nodep_deps`, and `include_aspects` so a filtered dependency cannot be mistaken
+for an absent one. It requests the full attributes and typed explicit aspect
+serialization needed to check coverage. These extra edges establish coverage;
+they do not become positive impact paths.
+
+Verification requires a Bazel producer with typed explicit aspect output, such
+as [Bazel #32496](https://github.com/bazelbuild/bazel/pull/32496). Its completion
+marker can establish that the requested view contains no aspects; streamed output
+must end with the separate marker frame. Older output still requires an actual
+typed aspect record, which may be independent of a supported root. Verification
+also requires a successful query: partial or failed output leaves the normal
+hashes available without negative authority, even when it contains a marker.
+
+The initial supported roots are in the main repository and reach no aspect
+application. Each prerequisite in the full view must match the exact input used by
+the normal hash. A source qualifies only when that hash read a real regular file
+in the main workspace at the location Bazel returned. Missing files, directories,
+internal symlinks and external source views remain unknown. Package features and
+SourceFile rows for BUILD files with loads also remain unknown. The verifier
+separately binds the rule class and BUILD filename. A BUILD rename cannot be
+certified stable when the normal hash stays equal.
+
+`metadata.configuredRoots.verifiedRoots` maps covered endpoint roots to opaque
+context digests. The comparator uses these with the normal hashes, full configured
+root identities, and successful usable module snapshots. Historical files have no
+such authority. This mode requires fresh physical hashes and rejects partial/base
+reuse, overrides for content or modified files, ignored attributes, and target
+exclusions. It is available only on `generate-hashes`.
+
+Use the same worker for both captures and each revision's actual workspace and
+build configuration, including consistent repository options for
+supplementary commands. This verification covers the reported configured inputs;
+caller policy must still account for inputs outside that graph, such as
+workspace status action artifacts. A context difference withholds a stable verdict
+and does not claim a measured direct edit.
+
+## Impact Graph Output
+
+Use `--reportImpactGraph` when a caller applies its own policy to dependency
+paths. Supply the same head dependency file used for native distance output:
+
+```bash
+bazel-diff get-impacted-targets -w /path/to/workspace -b bazel \
+  -sh base_hashes.json -fh final_hashes.json --depEdgesFile deps.json \
+  --reportImpactGraph -o impact_graph.json
+```
+
+The version 1 JSON contains `targets`, the eligible labels and their target and
+package distances, and `paths`, the native changed graph for those outputs.
+Each path contains `kind`, `changed`, `direct`, and `roots`. The changed and
+direct values are keys in the supplied head dependency file; `roots` maps each
+public output label to its graph key. Intermediate nodes remain available when
+`--targetType` filters the outputs. Apply a path policy to this adjacency so a
+longer allowed path remains available.
+
+`unaffectedRoots` contains only roots whose covered inputs and context are equal
+in both verified captures for this configuration, with no positive or MODULE
+obligation. An absent label is unknown. A caller may remove an ordinary or
+independent candidate only when that label appears here for the job's own
+configuration; candidates in other profiles remain eligible.
+
+`ordinary` and `configured` paths use the corresponding hash graph. `shared`
+paths use direct changes on configured instances present in both files;
+they can select a root first requested at the head without treating enrollment as
+a change. An omitted head-only root remains unknown, so callers must retain any
+ordinary or independent nomination for it. Keep each build profile's comparison
+and dependency file together.
+
+`forced` paths are independent MODULE obligations. Each contains one root at
+distance zero and must be handled independently of the supplied adjacency. A
+root can also have an ordinary or configured path. For those path kinds, `direct`
+records the origins used by native distance calculation, including its existing
+distance-zero fallback for an incomplete dependency file.
+
 ## Partial Graph Updates
 
 A full `generate-hashes` pays for a `bazel query` over the whole graph even when the change

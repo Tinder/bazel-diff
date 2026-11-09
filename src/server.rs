@@ -3,9 +3,7 @@ use crate::cache;
 use crate::cancel::{Cancellation, CANCELLED};
 use crate::git::{self, DerivationPolicy, Git};
 use crate::hash::{generate_hashes_timed, HashOptions};
-use crate::model::{
-    filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
-};
+use crate::model::{filter_and_sort_labels, hash_file_distances, HashFileData};
 use crate::module_graph::{bzlmod_enabled_for, impacted_with_module_changes};
 use crate::partial::{self, Classification, Glob, TreeIndex, TreeKind};
 use crate::web_identity::WebIdentitySessions;
@@ -1690,19 +1688,14 @@ fn compute_query(
     checkout(state, &to_sha)?;
     let bazel = state.bazel_options();
     let exclude_external = bzlmod_enabled_for(&to, &bazel);
+    from.ensure_same_root_mode(&to)?;
     let impacted = impacted_with_module_changes(&from, &to, Some(&bazel))?;
     let impacted_value = if matches!(kind, QueryKind::Distances) {
-        let hash_impacted = impacted_targets(&from.hashes, &to.hashes, None, false)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let mut distance_from = from.hashes.clone();
-        for label in impacted.difference(&hash_impacted) {
-            distance_from.remove(label);
-        }
-        serde_json::to_value(impacted_targets_with_distances(
-            &distance_from,
-            &to.hashes,
+        serde_json::to_value(hash_file_distances(
+            &from,
+            &to,
             &to.dep_edges,
+            Some(&impacted),
             inputs.target_types.as_ref(),
             exclude_external,
         )?)?
@@ -2629,7 +2622,7 @@ fn respond_text(request: Request, status: u16, body: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::bazel::BazelOptions;
-    use crate::model::TargetHash;
+    use crate::model::{impacted_targets, TargetHash};
     use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -2648,6 +2641,7 @@ mod tests {
                     cquery_options: Vec::new(),
                     use_cquery: false,
                     cquery_expression: None,
+                    cquery_root_expression: None,
                     keep_going: false,
                     fine_grained_external_repos: BTreeSet::new(),
                     label_only_module_extensions: BTreeSet::new(),

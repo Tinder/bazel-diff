@@ -7,6 +7,7 @@
 //! it.
 
 use crate::hash::HashOptions;
+use crate::model::ConfiguredRoots;
 use crate::partial;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -82,6 +83,11 @@ pub fn configuration_fingerprint(
         hasher.update([0]);
     }
     hasher.update(b"cycleComponents=1\0");
+    if let Some(expr) = &options.bazel.cquery_root_expression {
+        hasher.update(format!("configuredRoots={}\0", ConfiguredRoots::VERSION));
+        hasher.update(expr.as_bytes());
+        hasher.update([0]);
+    }
     if !options.bazel.use_cquery {
         hasher.update(b"queryToolchainImplementations=1\0");
     }
@@ -136,6 +142,7 @@ mod tests {
                 cquery_options: Vec::new(),
                 use_cquery: false,
                 cquery_expression: None,
+                cquery_root_expression: None,
                 keep_going: false,
                 fine_grained_external_repos: BTreeSet::new(),
                 label_only_module_extensions: BTreeSet::new(),
@@ -165,6 +172,12 @@ mod tests {
         let mut cquery = options();
         cquery.bazel.use_cquery = true;
         assert_ne!(configuration_fingerprint(&cquery, false, false), base);
+        let cquery_fingerprint = configuration_fingerprint(&cquery, false, false);
+        cquery.bazel.cquery_root_expression = Some("//app:lib".to_owned());
+        let rooted = configuration_fingerprint(&cquery, false, false);
+        assert_ne!(rooted, cquery_fingerprint);
+        cquery.bazel.cquery_root_expression = Some("//app:other".to_owned());
+        assert_ne!(configuration_fingerprint(&cquery, false, false), rooted);
         let mut seeded = options();
         seeded.seed_filepaths.insert(PathBuf::from("seed"));
         assert_ne!(configuration_fingerprint(&seeded, false, false), base);

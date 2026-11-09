@@ -1,4 +1,12 @@
-load(":defs.bzl", "bootstrap_flag", "helper", "node")
+load(
+    ":defs.bzl",
+    "bootstrap_flag",
+    "forward",
+    "helper",
+    "node",
+    "observed_aspect_copy",
+    "observed_copy",
+)
 
 bootstrap_flag(
     name = "bootstrap",
@@ -23,6 +31,48 @@ node(
 
 helper(
     name = "helper",
-    dep = ":app",
     src = "input.txt",
+    dep = ":app",
+)
+
+genrule(
+    name = "shared",
+    srcs = select({
+        ":bootstrapping": ["input.txt"],
+        "//conditions:default": ["fixed.txt"],
+    }),
+    outs = ["shared.out"],
+    cmd = 'cat "$(SRCS)" > "$@"',
+)
+
+forward(
+    name = "forwarded",
+    dep = ":shared",
+)
+
+genrule(
+    name = "wrapper",
+    srcs = [":forwarded"],
+    outs = ["wrapper.out"],
+    cmd = 'cat "$(SRCS)" > "$@"',
+)
+
+alias(
+    name = "root_alias",
+    actual = ":wrapper",
+)
+
+observed_copy(
+    name = "observed",
+    src = "fixed.txt",
+)
+
+filegroup(
+    name = "observed_changed_input",
+    srcs = ["input.txt"],
+)
+
+observed_aspect_copy(
+    name = "observed_changed",
+    src = ":observed_changed_input",
 )

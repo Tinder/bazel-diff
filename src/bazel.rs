@@ -2969,6 +2969,8 @@ impl BazelOptions {
             && unrecognized_option(&output, "--proto:possible_toolchain_types")
         {
             let mut ordinary = self.clone();
+            // The tagged acquisition requires a successful retry.
+            ordinary.keep_going = false;
             ordinary.use_module_toolchain_registrations = false;
             return ordinary.query_with_capture(
                 expression,
@@ -10204,6 +10206,48 @@ exit 1
             )
             .err()
             .expect("partial verification must be unavailable");
+        assert!(error
+            .to_string()
+            .contains("Bazel query failed, exit code 3"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unsupported_toolchain_retry_rejects_partial_query() {
+        let workspace = tempfile::tempdir().unwrap();
+        let calls = workspace.path().join("retry-calls.log");
+        let script = workspace.path().join("retry.sh");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+for arg do
+  if [ "$arg" = "--proto:possible_toolchain_types" ]; then
+    echo typed >> "{calls}"
+    echo "ERROR: Unrecognized option: --proto:possible_toolchain_types" >&2
+    exit 2
+  fi
+done
+echo ordinary >> "{calls}"
+exit 3
+"#,
+                calls = calls.display()
+            ),
+        )
+        .unwrap();
+        let mut options = probe_options(workspace.path(), script);
+        options.keep_going = true;
+        options.use_module_toolchain_registrations = true;
+        let result = options.query_with_capture(
+            "//app:lib",
+            false,
+            Some(BazelVersion(8, 7, 0)),
+            &mut |_| {},
+            CqueryCapture::Standard(QueryInputMode::Hash),
+            |_| true,
+        );
+        assert_eq!(fs::read_to_string(calls).unwrap(), "typed\nordinary\n");
+        let error = result.err().expect("partial retry must be rejected");
         assert!(error
             .to_string()
             .contains("Bazel query failed, exit code 3"));

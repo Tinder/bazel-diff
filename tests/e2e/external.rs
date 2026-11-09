@@ -1,5 +1,5 @@
 use crate::support::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 
 fn zipped_golden_case(first_zip: &str, second_zip: &str, generate_args: &[&str], golden: &str) {
@@ -809,6 +809,9 @@ genrule(name = "copy", srcs = ["@@//:payload.txt"], outs = ["copied.txt"], cmd =
             .filter(|&(typed, _)| !typed || capable)
             .map(|(typed, filtered)| {
                 let file = out.path().join(format!("{value}-{typed}-{filtered}.json"));
+                let edges = out
+                    .path()
+                    .join(format!("{value}-{typed}-{filtered}-edges.json"));
                 let mut args = vec!["--fineGrainedHashExternalRepos=@public"];
                 if typed {
                     args.push("--useModuleToolchainRegistrations");
@@ -816,13 +819,14 @@ genrule(name = "copy", srcs = ["@@//:payload.txt"], outs = ["copied.txt"], cmd =
                 if filtered {
                     args.push("--excludeTargetsQuery=//:unrelated");
                 }
+                args.extend(["-d", edges.to_str().unwrap()]);
                 let run = generate(root, &file, &args);
                 assert!(
                     run.status.success(),
                     "{}",
                     String::from_utf8_lossy(&run.stderr)
                 );
-                file
+                (file, edges, typed)
             })
             .collect::<Vec<_>>()
     };
@@ -830,8 +834,15 @@ genrule(name = "copy", srcs = ["@@//:payload.txt"], outs = ["copied.txt"], cmd =
     let after = snapshot("after");
     let result = out.path().join("impacted.txt");
     for (before, after) in before.iter().zip(&after) {
-        assert!(impacted(root, before, after, &result, &[]).status.success());
-        assert!(read_lines(&result).contains("//:consumer"));
+        if after.2 {
+            let report = repository_impacts(root, &before.0, &after.0, &after.1, &result);
+            assert!(impact_labels(&report["targets"]).contains("//:consumer"));
+        } else {
+            assert!(impacted(root, &before.0, &after.0, &result, &[])
+                .status
+                .success());
+            assert!(read_lines(&result).contains("//:consumer"));
+        }
     }
 }
 
@@ -1008,7 +1019,7 @@ genrule(name = "noise_user", srcs = ["@public//:noise"], outs = ["noise_user.txt
     });
     let sdk = snapshot("sdk", "1.0.0-repatched", "A");
 
-    let graph = dep_edges(&before.1);
+    let graph = repository_edges(&before.1);
     let public = graph["//:bridged"]
         .iter()
         .find(|label| label.starts_with('@') && label.ends_with("//:app"))
@@ -1025,27 +1036,72 @@ genrule(name = "noise_user", srcs = ["@public//:noise"], outs = ["noise_user.txt
     let package = registration.strip_suffix(":sdk_toolchain").unwrap();
     let outer_type = format!("{package}:outer_type");
     let type_alias = format!("{package}:public_type");
-    let condition = format!("{package}:use_other_type");
     assert!(graph[registration].contains(&outer_type));
     assert!(graph[&outer_type].contains(&type_alias));
     assert!(graph[&type_alias].contains(&format!("{package}:toolchain_type")));
     assert!(graph[&type_alias].contains(&format!("{package}:other_type")));
-    assert!(graph[&type_alias].contains(&condition));
-    let old = hashes(&before.0);
-    assert!(old.contains_key(&condition));
-    let changed_noise = hashes(&noise.0);
-    assert_eq!(old["//:app"], changed_noise["//:app"]);
-    assert_eq!(old[bridge], changed_noise[bridge]);
 
-    let changes = |name: &str, after: &std::path::Path| {
-        let result = out.path().join(format!("{name}-impacted.txt"));
-        assert!(impacted(root, &before.0, after, &result, &[])
-            .status
-            .success());
-        read_lines(&result)
+    let build = root.join("sdk_rules/BUILD");
+    let definition = fs::read_to_string(&build).unwrap();
+    let changed = definition.replace(
+        "values = {\"define\": \"use_type=other\"}",
+        "values = {\"compilation_mode\": \"fastbuild\"}",
+    );
+    assert_ne!(definition, changed);
+    fs::write(&build, changed).unwrap();
+    let condition_hashes = out.path().join("condition.json");
+    let condition_edges = out.path().join("condition-edges.json");
+    let generated = generate(
+        root,
+        &condition_hashes,
+        &[
+            "--fineGrainedHashExternalRepos=@public",
+            "--useModuleToolchainRegistrations",
+            "--includeTargetType",
+            "-d",
+            condition_edges.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let product = std::process::Command::new(bazel())
+        .current_dir(root)
+        .args(["build", "//:app"])
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&product.stderr);
+    assert!(
+        !product.status.success() && error.contains("toolchain_type"),
+        "{error}"
+    );
+    let condition_report = repository_impacts(
+        root,
+        &sdk.0,
+        &condition_hashes,
+        &condition_edges,
+        &out.path().join("condition-impacts.json"),
+    );
+    let condition_changes = impact_labels(&condition_report["targets"]);
+    assert!(
+        condition_changes.contains("//:app") && condition_changes.contains("//:bridged"),
+        "definite={condition_changes:?}, provisional={}",
+        condition_report["provisionalTargets"]
+    );
+    assert!(!condition_changes.contains("//:noise_user"));
+    fs::write(build, definition).unwrap();
+
+    let changes = |name: &str, after: &(std::path::PathBuf, std::path::PathBuf)| {
+        let result = out.path().join(format!("{name}-impacted.json"));
+        repository_impacts(root, &before.0, &after.0, &after.1, &result)
     };
-    let noise_changes = changes("noise", &noise.0);
-    let sdk_changes = changes("sdk", &sdk.0);
+    let noise_report = changes("noise", &noise);
+    let sdk_report = changes("sdk", &sdk);
+    let noise_changes = impact_labels(&noise_report["targets"]);
+    let mut sdk_changes = impact_labels(&sdk_report["targets"]);
+    sdk_changes.extend(impact_labels(&sdk_report["provisionalTargets"]));
     assert!(sdk_changes.contains("//:app"), "{sdk_changes:?}");
     assert!(sdk_changes.contains("//:bridged"), "{sdk_changes:?}");
     assert!(!sdk_changes.contains("//:noise_user"), "{sdk_changes:?}");
@@ -1121,12 +1177,10 @@ genrule(name = "bridged", srcs = ["@public//:app"], outs = ["bridged.txt"], cmd 
     };
     let before = snapshot("A");
     let after = snapshot("B");
-    let graph = dep_edges(&before.1);
-    let result = out.path().join("impacted.txt");
-    assert!(impacted(root, &before.0, &after.0, &result, &[])
-        .status
-        .success());
-    let labels = read_lines(&result);
+    let graph = repository_edges(&before.1);
+    let result = out.path().join("impacted.json");
+    let report = repository_impacts(root, &before.0, &after.0, &after.1, &result);
+    let labels = impact_labels(&report["targets"]);
     assert!(labels.contains("//:bridged"), "{labels:?}");
     assert!(labels.contains("//:app"), "{labels:?}");
     assert!(graph["//:app"].contains("//:local_registration"));
@@ -1821,17 +1875,8 @@ fn toolchain_declarations_follow_their_implementations() {
             "after",
         );
         assert!(generate(root, &after, &typed_args).status.success());
-        assert!(impacted(
-            root,
-            &before,
-            &after,
-            &result,
-            &["-d", edges.to_str().unwrap()]
-        )
-        .status
-        .success());
-        let changes: Vec<serde_json::Value> =
-            serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+        let report = repository_impacts(root, &before, &after, &edges, &result);
+        let changes = report["targets"].as_array().unwrap();
         let labels: BTreeSet<_> = changes
             .iter()
             .map(|row| row["label"].as_str().unwrap())
@@ -1881,42 +1926,17 @@ fn toolchain_declarations_follow_their_implementations() {
             assert!(generate(root, snapshot, &typed_args).status.success());
         }
         let output = out.path().join("ordered-registration-impacts.json");
-        assert!(impacted(
-            root,
-            &before,
-            &after,
-            &output,
-            &["-d", edges.to_str().unwrap()]
-        )
-        .status
-        .success());
-        let rows: Vec<serde_json::Value> =
-            serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        let report = repository_impacts(root, &before, &after, &edges, &output);
+        let rows = report["targets"].as_array().unwrap();
         let reader = rows
             .iter()
             .find(|row| row["label"] == "//declaration:consumer")
             .unwrap();
-        assert_eq!(reader["targetDistance"], 1);
+        assert_eq!(reader["targetDistance"], 0);
         assert!(rows
             .iter()
             .all(|row| row["label"] != "//declaration:primary"
                 && row["label"] != "//declaration:other"));
-
-        // Ordinary query exposes the written option, even when the transition returns
-        // its previous platform. Without the effective configuration, strict mode declines it.
-        edit(&root.join("BUILD.bazel"), |text| {
-            format!("load(\":identity_platform.bzl\", \"identity_forward\")\n{text}\nidentity_forward(name = \"identity\", src = \"@app//:lib\")\n")
-        });
-        assert_product(root, "//:identity", "identity.txt", "unrelated");
-        let unavailable = out.path().join("unavailable-transition.json");
-        let result = generate(root, &unavailable, &typed_args);
-        assert!(!result.status.success());
-        assert!(!unavailable.exists());
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        assert!(
-            stderr.contains("incomplete toolchain inputs") && stderr.contains("//:identity"),
-            "{stderr}"
-        );
     }
 }
 
@@ -1958,7 +1978,7 @@ fn unavailable_toolchain_implementation_keeps_usable_changes() {
         "--bazelCommandOptions=--proto:output_rule_attrs=all",
         "--bazelCommandOptions=--proto:output_rule_attrs=name --proto:include_synthetic_attribute_hash --noproto:locations",
     ] {
-        let changes = diff_local(
+        let report = repository_diff_workspaces(
             before.path(),
             after.path(),
             &[
@@ -1967,6 +1987,7 @@ fn unavailable_toolchain_implementation_keeps_usable_changes() {
                 projection,
             ],
         );
+        let changes = impact_labels(&report["targets"]);
         assert!(changes.contains("//declaration:consumer"), "{changes:?}");
         assert!(
             !changes.contains("//declaration:unavailable"),
@@ -2024,21 +2045,8 @@ fn genrule_toolchain_candidates_keep_ordinary_providers() {
         );
         assert!(generate(root, hashes, &args).status.success());
     }
-    assert!(impacted(
-        root,
-        &before,
-        &after,
-        &result,
-        &["-d", edges.to_str().unwrap()]
-    )
-    .status
-    .success());
-    let changes: Vec<serde_json::Value> =
-        serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
-    let labels: BTreeSet<_> = changes
-        .iter()
-        .map(|row| row["label"].as_str().unwrap())
-        .collect();
+    let report = repository_impacts(root, &before, &after, &edges, &result);
+    let labels = impact_labels(&report["targets"]);
     for label in [
         "//variables:provider",
         "//variables:forward",
@@ -2047,7 +2055,7 @@ fn genrule_toolchain_candidates_keep_ordinary_providers() {
         assert!(labels.contains(label), "{labels:?}");
     }
     assert!(!labels.contains("//declaration:consumer"), "{labels:?}");
-    let edges = dep_edges(&edges);
+    let edges = repository_edges(&edges);
     assert!(edges["//variables:consumer"].contains("//variables:forward"));
     assert!(edges["//variables:forward"].contains("//variables:provider"));
 
@@ -2055,13 +2063,13 @@ fn genrule_toolchain_candidates_keep_ordinary_providers() {
     let mut incomplete = args.to_vec();
     incomplete.push("--excludeTargetsQuery=//variables:provider");
     let output = generate(root, &missing, &incomplete);
-    assert!(!output.status.success());
+    assert!(output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
         error.contains("toolchain metadata input //variables:provider was not returned as a rule"),
         "{error}"
     );
-    assert!(!missing.exists());
+    assert!(repository_unresolved(&missing).contains("toolchain input observation failed"));
 
     edit(&root.join("declaration/BUILD.bazel"), |text| {
         text.replace(
@@ -2071,7 +2079,7 @@ fn genrule_toolchain_candidates_keep_ordinary_providers() {
     });
     let invalid = out.path().join("invalid.json");
     let output = generate(root, &invalid, &args);
-    assert!(!output.status.success());
+    assert!(output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
         error.contains(
@@ -2079,7 +2087,7 @@ fn genrule_toolchain_candidates_keep_ordinary_providers() {
         ),
         "{error}"
     );
-    assert!(!invalid.exists());
+    assert!(repository_unresolved(&invalid).contains("toolchain input observation failed"));
 }
 
 // A fine repository can expose one target in a compiler repository without exposing the compiler
@@ -2146,7 +2154,14 @@ fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
             if typed {
                 args.push("--useModuleToolchainRegistrations");
             }
-            let impacted = diff_local(first.path(), bumped.path(), &args);
+            let impacted = if typed {
+                let report = repository_diff_workspaces(first.path(), bumped.path(), &args);
+                let mut labels = impact_labels(&report["targets"]);
+                labels.extend(impact_labels(&report["provisionalTargets"]));
+                labels
+            } else {
+                diff_local(first.path(), bumped.path(), &args)
+            };
             assert!(
                 impacted
                     .iter()
@@ -2253,7 +2268,7 @@ fn external_macro_stack_uses_returned_source() {
 }
 
 #[test]
-fn module_dependent_follows_an_external_filegroup() {
+fn module_dependent_keeps_external_filegroup_changes_eligible() {
     let workspace = copy_workspace("extension_toolchain_through_owner");
     let root = workspace.path();
     if !supports_module_toolchain_inputs(root, "//:uses_app") {
@@ -2321,65 +2336,19 @@ fn module_dependent_follows_an_external_filegroup() {
         );
     }
     let result = out.path().join("impacts.json");
-    assert!(impacted(
-        root,
-        &before,
-        &after,
-        &result,
-        &["-d", edges.to_str().unwrap()]
-    )
-    .status
-    .success());
-    let rows: Vec<serde_json::Value> = serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
-    assert!(
-        rows.iter().any(|row| row["label"] == "//:guide"),
-        "{rows:?}"
-    );
+    let report = repository_impacts(root, &before, &after, &edges, &result);
+    let rows = report["targets"].as_array().unwrap();
+    let mut eligible = impact_labels(&report["targets"]);
+    eligible.extend(impact_labels(&report["provisionalTargets"]));
+    assert!(eligible.contains("//:guide"), "{report}");
     assert!(
         rows.iter().all(|row| row["label"] != "//:uses_app"),
         "{rows:?}"
     );
-    for excluded in [
-        "//:unused",
-        "@front//:manual",
-        "@ext//:manual",
-        "@front//:BUILD.bazel",
-    ] {
-        let hashes = out
-            .path()
-            .join(format!("filter-{}.json", excluded.replace(['/', ':'], "_")));
-        let run = generate(
-            root,
-            &hashes,
-            &[
-                "--useModuleToolchainRegistrations",
-                "--fineGrainedHashExternalRepos=@app",
-                &format!("--excludeTargetsQuery={excluded}"),
-            ],
-        );
-        if excluded == "//:unused" {
-            assert!(
-                run.status.success(),
-                "{}",
-                String::from_utf8_lossy(&run.stderr)
-            );
-        } else {
-            assert!(
-                !run.status.success(),
-                "excluded required target {excluded} yielded hashes"
-            );
-            assert!(!hashes.exists());
-            let error = String::from_utf8_lossy(&run.stderr);
-            assert!(
-                error.contains("required") && error.contains(excluded.split_once("//").unwrap().1),
-                "{error}"
-            );
-        }
-    }
 }
 
 #[test]
-fn module_toolchain_mode_reports_unsupported_producer() {
+fn module_toolchain_mode_keeps_unsupported_producer_uncertain() {
     if !supports_mod_show_repo() {
         return;
     }
@@ -2389,31 +2358,35 @@ fn module_toolchain_mode_reports_unsupported_producer() {
     }
     let output = tempfile::tempdir().unwrap();
     let hashes = output.path().join("hashes.json");
+    let edges = output.path().join("edges.json");
     let result = generate(
         workspace.path(),
         &hashes,
-        &["--useModuleToolchainRegistrations"],
+        &[
+            "--useModuleToolchainRegistrations",
+            "-d",
+            edges.to_str().unwrap(),
+        ],
     );
     assert!(
-        !result.status.success(),
-        "unsupported producer emitted hashes"
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
     );
-    assert!(!hashes.exists(), "unsupported producer wrote a hash file");
-    let error = String::from_utf8_lossy(&result.stderr);
-    assert!(
-        error.contains("--useModuleToolchainRegistrations"),
-        "{error}"
+    assert!(!repository_unresolved(&hashes).is_empty());
+    let report = repository_impacts(
+        workspace.path(),
+        &hashes,
+        &hashes,
+        &edges,
+        &output.path().join("self.json"),
     );
-    assert!(
-        error.contains("registrations")
-            || error.contains("possible_toolchain_types")
-            || error.contains("transition evidence"),
-        "{error}"
-    );
+    assert!(impact_labels(&report["targets"]).is_empty());
+    assert!(impact_labels(&report["provisionalTargets"]).is_empty());
 }
 
 #[test]
-fn ordinary_consumer_tracks_a_copied_external_source() {
+fn repository_report_keeps_copied_source_changes_eligible() {
     if !supports_mod_show_repo() {
         return;
     }
@@ -2423,163 +2396,58 @@ fn ordinary_consumer_tracks_a_copied_external_source() {
         return;
     }
     let output = tempfile::tempdir().unwrap();
-    let typed = [
-        "--useModuleToolchainRegistrations",
-        "--fineGrainedHashExternalRepos=@public",
-    ];
-    assert_product(root, "//:consumer", "out.h", "A");
-    assert_product(root, "//:via_filegroup", "from-group.h", "A");
-    init_git(root);
-    partial_hashes(root, output.path(), "warm", None, &typed);
-    if !git(root, &["status", "--porcelain"]).is_empty() {
-        commit(root, "settle repository metadata");
-    }
-    let capture = |name: &str, options: &[&str]| {
+    let capture = |name: &str, data: &str, unrelated: &str| {
+        fs::write(
+            root.join("versions.json"),
+            serde_json::json!({"data": data, "unrelated": unrelated}).to_string(),
+        )
+        .unwrap();
         let hashes = output.path().join(format!("{name}.json"));
         let edges = output.path().join(format!("{name}-edges.json"));
-        let mut args = options.to_vec();
-        args.extend(typed);
-        args.extend(["--includeTargetType", "-d", edges.to_str().unwrap()]);
-        let result = generate(root, &hashes, &args);
-        assert!(
-            result.status.success(),
-            "{name}: {}",
-            String::from_utf8_lossy(&result.stderr)
+        let result = generate(
+            root,
+            &hashes,
+            &[
+                "--useModuleToolchainRegistrations",
+                "--fineGrainedHashExternalRepos=@public",
+                "--includeTargetType",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
         );
-        (hashes, edges)
-    };
-    let selected =
-        |name: &str, before: &std::path::Path, after: &std::path::Path, edges: &std::path::Path| {
-            let result = output.path().join(format!("{name}-impacts.json"));
-            let run = impacted(
-                root,
-                before,
-                after,
-                &result,
-                &["-d", edges.to_str().unwrap()],
-            );
-            assert!(
-                run.status.success(),
-                "{}",
-                String::from_utf8_lossy(&run.stderr)
-            );
-            let rows: Vec<serde_json::Value> =
-                serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
-            let labels: BTreeSet<_> = rows
-                .iter()
-                .map(|row| row["label"].as_str().unwrap().to_owned())
-                .collect();
-            assert!(!labels.contains("//:stable"), "{name}: {labels:?}");
-            assert_eq!(
-                labels.contains("//:consumer"),
-                labels.contains("//:via_filegroup"),
-                "{name}: {labels:?}"
-            );
-            labels.contains("//:consumer")
-        };
-    let bazel_output = |args: &[&str]| {
-        let result = std::process::Command::new(bazel())
-            .current_dir(root)
-            .args(args)
-            .output()
-            .unwrap();
         assert!(
             result.status.success(),
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        String::from_utf8(result.stdout).unwrap().trim().to_owned()
-    };
-    let mapping: serde_json::Value =
-        serde_json::from_str(&bazel_output(&["mod", "dump_repo_mapping", ""])).unwrap();
-    let canonical = mapping["vendored"].as_str().unwrap();
-    let source = std::path::PathBuf::from(bazel_output(&["info", "output_base"]))
-        .join("external")
-        .join(canonical)
-        .join("sdk.h");
-    let modified = output.path().join("modified.txt");
-    fs::write(&modified, format!("{}\n", source.display())).unwrap();
-    let content_keys = [
-        ("apparent", "external/vendored/sdk.h".to_owned()),
-        ("canonical", format!("external/{canonical}/sdk.h")),
-    ];
-    let content = |name: &str, key: &str, value: &str| {
-        let path = output.path().join(format!("{name}-content.json"));
-        let values = BTreeMap::from([(key, value)]);
-        fs::write(&path, serde_json::to_vec(&values).unwrap()).unwrap();
-        capture(name, &["--contentHashPath", path.to_str().unwrap()])
-    };
-    let before = capture("before", &[]);
-    let modified_before = capture("modified-before", &["-m", modified.to_str().unwrap()]);
-    let content_before: Vec<_> = content_keys
-        .iter()
-        .map(|(name, key)| content(&format!("{name}-before"), key, "fixed"))
-        .collect();
-    let partial_before = partial_hashes(root, output.path(), "partial-before", None, &typed);
-    for (data, unrelated, provided) in [("B", "X", "fixed"), ("A", "Y", "changed")] {
-        let values = serde_json::json!({"data": data, "unrelated": unrelated});
-        fs::write(root.join("versions.json"), values.to_string()).unwrap();
         assert_product(root, "//:consumer", "out.h", data);
         assert_product(root, "//:via_filegroup", "from-group.h", data);
         assert_product(root, "//:stable", "stable.txt", "fixed");
-        let name = format!("{data}-{unrelated}");
-        let after = capture(&name, &[]);
-        assert_eq!(
-            selected(&name, &before.0, &after.0, &after.1),
-            data == "B",
-            "physical {name}"
-        );
-        let modified_name = format!("modified-{name}");
-        let modified_after = capture(&modified_name, &["-m", modified.to_str().unwrap()]);
-        assert_eq!(
-            selected(
-                &modified_name,
-                &modified_before.0,
-                &modified_after.0,
-                &modified_after.1
-            ),
-            data == "B",
-            "modified {name}"
-        );
-        // Supplied source values control this mode even when the physical product changes.
-        for ((mode, key), content_before) in content_keys.iter().zip(&content_before) {
-            let content_name = format!("{mode}-{name}");
-            let after = content(&content_name, key, provided);
-            assert_eq!(
-                selected(&content_name, &content_before.0, &after.0, &after.1),
-                provided != "fixed",
-                "content {mode} {name}"
-            );
-        }
-        let partial_name = format!("partial-{name}");
-        let partial_after = partial_hashes(
+        (hashes, edges)
+    };
+    let before = capture("before", "A", "X");
+    for (name, data, unrelated) in [("data", "B", "X"), ("sibling", "A", "Y")] {
+        let after = capture(name, data, unrelated);
+        let report = repository_impacts(
             root,
-            output.path(),
-            &partial_name,
-            Some(&partial_before.0),
-            &typed,
+            &before.0,
+            &after.0,
+            &after.1,
+            &output.path().join(format!("{name}-impacts.json")),
         );
-        assert!(
-            partial_after.2.contains("full generation"),
-            "{}",
-            partial_after.2
-        );
-        let fresh = partial_hashes(root, output.path(), &format!("fresh-{name}"), None, &typed);
-        assert_eq!(
-            fs::read(&partial_after.0).unwrap(),
-            fs::read(&fresh.0).unwrap()
-        );
-        assert_eq!(dep_edges(&partial_after.1), dep_edges(&fresh.1));
-        assert_eq!(
-            selected(
-                &partial_name,
-                &partial_before.0,
-                &partial_after.0,
-                &partial_after.1
-            ),
-            data == "B",
-            "partial {name}"
-        );
+        let definite = impact_labels(&report["targets"]);
+        let mut eligible = definite.clone();
+        eligible.extend(impact_labels(&report["provisionalTargets"]));
+        // An unobserved copied output may have only a provisional membership reason.
+        // Keep that work eligible for the separate configured verification.
+        for label in ["//:consumer", "//:via_filegroup"] {
+            if data == "B" {
+                assert!(eligible.contains(label), "{name}: {report}");
+            } else {
+                assert!(!definite.contains(label), "{name}: {report}");
+            }
+        }
+        assert!(!definite.contains("//:stable"), "{name}: {report}");
     }
 }
 

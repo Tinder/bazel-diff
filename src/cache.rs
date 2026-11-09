@@ -108,13 +108,7 @@ pub fn configuration_fingerprint(
         hasher.update([0]);
     }
     if partial_graph {
-        hasher.update(
-            format!(
-                "partialGraph={}",
-                partial::recipe_version(options.bazel.use_module_toolchain_registrations)
-            )
-            .as_bytes(),
-        );
+        hasher.update(format!("partialGraph={}", partial::RECIPE_VERSION).as_bytes());
         hasher.update([0]);
     }
     hex::encode(hasher.finalize())[..12].to_owned()

@@ -180,11 +180,11 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
-                "name": "external::module_dependent_follows_an_external_filegroup",
+                "name": "external::module_dependent_keeps_external_filegroup_changes_eligible",
                 "timeout": "moderate",
             },
             {
-                "name": "external::module_toolchain_mode_reports_unsupported_producer",
+                "name": "external::module_toolchain_mode_keeps_unsupported_producer_uncertain",
                 "timeout": "moderate",
             },
             {
@@ -196,15 +196,15 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
-                "name": "external::ordinary_consumer_tracks_a_copied_external_source",
-                "timeout": "moderate",
-            },
-            {
                 "name": "external::remote_proto_bump_impacts_consumer",
                 "timeout": "moderate",
             },
             {
                 "name": "external::reports_observed_toolchain_type_references",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::repository_report_keeps_copied_source_changes_eligible",
                 "timeout": "moderate",
             },
             {

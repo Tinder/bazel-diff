@@ -60,8 +60,10 @@ pub struct BazelOptions {
     pub cquery_root_expression: Option<String>,
     pub keep_going: bool,
     pub fine_grained_external_repos: BTreeSet<String>,
-    /// Module extensions whose repositories are used only through labels, so their owner need
-    /// not carry the generated repositories as conservative dependencies.
+    /// Module extensions, as `bazel mod show_extension` names them
+    /// (`@rules_rs//rs:extensions.bzl%crate`), whose repositories use each other only through
+    /// labels: no target resolves a toolchain from one of them. The module that owns such an
+    /// extension then does not stand in for its repositories (see `lower_repositories`).
     pub label_only_module_extensions: BTreeSet<String>,
     /// A root-isolated extension import whose external consumers are discoverable through
     /// ordinary target inputs and BUILD loads.
@@ -680,7 +682,6 @@ impl BazelOptions {
                             &mut |_| {},
                             CqueryCapture::Verification,
                             |_| true,
-                            QueryInputMode::Hash,
                         );
                         match graph {
                             Ok(graph) => verification = graph.into_verified(),
@@ -2776,9 +2777,8 @@ impl BazelOptions {
             use_cquery,
             version,
             transform,
-            CqueryCapture::Standard,
+            CqueryCapture::Standard(query_inputs),
             retain,
-            query_inputs,
         )?;
         Ok(graph.targets)
     }
@@ -2801,7 +2801,6 @@ impl BazelOptions {
             &mut |_| {},
             CqueryCapture::Roots(&mut resolved),
             |_| true,
-            QueryInputMode::Hash,
         ) {
             let selection = self.with_exclude_filter(expression.to_owned());
             let output = self
@@ -2848,12 +2847,11 @@ impl BazelOptions {
         transform: &mut impl FnMut(&mut [Target]),
         capture: CqueryCapture<'_>,
         retain: impl FnMut(&Target) -> bool,
-        query_inputs: QueryInputMode,
     ) -> Result<QueryGraph> {
-        let (mut roots, verify) = match capture {
-            CqueryCapture::Standard => (None, false),
-            CqueryCapture::Roots(roots) => (Some(roots), false),
-            CqueryCapture::Verification => (None, true),
+        let (mut roots, verify, query_inputs) = match capture {
+            CqueryCapture::Standard(inputs) => (None, false, inputs),
+            CqueryCapture::Roots(roots) => (Some(roots), false, QueryInputMode::Hash),
+            CqueryCapture::Verification => (None, true, QueryInputMode::Hash),
         };
         let rooted = use_cquery && self.cquery_root_expression.is_some();
         let version = match version {
@@ -2977,9 +2975,8 @@ impl BazelOptions {
                 false,
                 Some(version),
                 transform,
-                CqueryCapture::Standard,
+                CqueryCapture::Standard(query_inputs),
                 retain,
-                query_inputs,
             );
         }
         let code = output.status.code().unwrap_or(-1);
@@ -4009,7 +4006,7 @@ impl QueryGraph {
 }
 
 enum CqueryCapture<'a> {
-    Standard,
+    Standard(QueryInputMode),
     Roots(&'a mut Vec<(String, String)>),
     Verification,
 }
@@ -4027,7 +4024,7 @@ struct BzlmodRepos {
     canonical_to_apparent: BTreeMap<String, Vec<String>>,
     /// The accepted module graph, shared by repository edges and hash-file metadata.
     module_graph_json: Option<String>,
-    /// Strict evaluated MODULE registration labels for the explicit ordinary mode.
+    /// Evaluated MODULE registration labels when returned by the producer.
     module_toolchain_registrations: Option<Vec<String>>,
     /// Only a successful command can support verification; tolerated partial answers cannot.
     module_graph_complete: bool,
@@ -10191,9 +10188,8 @@ exit 1
                 true,
                 Some(BazelVersion(8, 7, 0)),
                 &mut |_| {},
-                CqueryCapture::Standard,
+                CqueryCapture::Standard(QueryInputMode::Hash),
                 |_| true,
-                QueryInputMode::Hash,
             )
             .unwrap();
         assert_eq!(target_name(&ordinary.targets[0]), Some("//app:lib|abc123"));
@@ -10205,7 +10201,6 @@ exit 1
                 &mut |_| {},
                 CqueryCapture::Verification,
                 |_| true,
-                QueryInputMode::Hash,
             )
             .err()
             .expect("partial verification must be unavailable");

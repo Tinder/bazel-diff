@@ -861,7 +861,7 @@ Options:
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
       --useModuleToolchainRegistrations
-          Use evaluated MODULE registrations for ordinary toolchain inputs. Replace inferred repository membership for extension usages named by --fineGrainedHashExternalRepos. Requires typed producer output and a MODULE-default top-level toolchain profile
+          Record observed MODULE toolchain inputs and distinguish inferred repository memberships. Writes tagged files for --reportImpactGraph; missing producer data stays unresolved
       --cqueryRootExpression <CQUERY_ROOT_EXPRESSION>
           Hash and report the configured top-level targets in this expression
       --cqueryRootExpressionFile <CQUERY_ROOT_EXPRESSION_FILE>
@@ -940,6 +940,8 @@ Options:
           [possible values: true, false]
       --toolchainCandidatesFile <TOOLCHAIN_CANDIDATES_FILE>
           Write positive toolchain reader observations. Absence cannot exclude a scheduled target
+      --repositoryOriginRoots <REPOSITORY_ORIGIN_ROOTS>
+          JSON array of requested roots whose repository causes should be included in the report
   -h, --help
           Print help
   -V, --version
@@ -1033,7 +1035,7 @@ Options:
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
       --useModuleToolchainRegistrations
-          Use evaluated MODULE registrations for ordinary toolchain inputs. Replace inferred repository membership for extension usages named by --fineGrainedHashExternalRepos. Requires typed producer output and a MODULE-default top-level toolchain profile
+          Record observed MODULE toolchain inputs and distinguish inferred repository memberships. Writes tagged files for --reportImpactGraph; missing producer data stays unresolved
       --cqueryRootExpression <CQUERY_ROOT_EXPRESSION>
           Hash and report the configured top-level targets in this expression
       --cqueryRootExpressionFile <CQUERY_ROOT_EXPRESSION_FILE>
@@ -1149,7 +1151,7 @@ Options:
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
       --useModuleToolchainRegistrations
-          Use evaluated MODULE registrations for ordinary toolchain inputs. Replace inferred repository membership for extension usages named by --fineGrainedHashExternalRepos. Requires typed producer output and a MODULE-default top-level toolchain profile
+          Record observed MODULE toolchain inputs and distinguish inferred repository memberships. Writes tagged files for --reportImpactGraph; missing producer data stays unresolved
       --cqueryRootExpression <CQUERY_ROOT_EXPRESSION>
           Hash and report the configured top-level targets in this expression
       --cqueryRootExpressionFile <CQUERY_ROOT_EXPRESSION_FILE>
@@ -1288,24 +1290,24 @@ A few inputs are normalized or extended on the way in:
   module also exports is reported and ignored, since Bazel tells their repositories apart only by
   a numeric suffix.
   With `--useModuleToolchainRegistrations`, the repositories named by
-  `--fineGrainedHashExternalRepos` identify the extension usages for which ordinary query
-  replaces these inferred dependencies. Naming an imported hub is sufficient. Bazel-diff
-  resolves its apparent name through the root repository mapping, or accepts its canonical
-  name. Other imports from the same usage are covered. Other usages keep their existing
-  repository dependencies, including those defined by the same module.
-  The opt-in follows ordinary target inputs and build files, as well as matching toolchain
-  declarations, aliases, and implementation dependencies for the native types a rule may use.
-  Registrations retain their relative MODULE priority within each type. This includes possible
-  implementations that a particular platform would skip.
-  Use the option only when the top-level toolchain profile comes from MODULE registrations,
-  including the settings in your rc files. It requires a Bazel producer that reports evaluated
-  registrations, possible toolchain types, and transition effects. No released Bazel version
-  currently supplies all three. Generation fails when Bazel cannot load a required dependency
-  or its definition, when the caller excludes one, or when a returned transition may change
-  toolchain resolution through
-  platforms, extra toolchains, execution configuration, or an unknown transition factory.
-  A transition that writes its existing platform can also be reported this way. The ordinary
-  built-in execution transition remains supported.
+  `--fineGrainedHashExternalRepos` identify the extension usages whose inferred owner and hub
+  memberships are recorded separately from ordinary dependencies. Naming an imported hub is
+  sufficient; Bazel-diff resolves it through the root repository mapping. Other usages and
+  genuine dependency overlaps keep their ordinary behavior.
+  This mode writes tagged hash and edge files for `get-impacted-targets --reportImpactGraph`.
+  `targets` and ordinary paths use returned ordinary inputs and positively observed toolchain
+  registration relations. `provisionalTargets` and provisional paths may also use the selected
+  memberships. A membership alone never makes a target definite.
+  When Bazel returns evaluated MODULE registrations and possible native toolchain types, the
+  mode connects observed readers to matching declarations and their implementation labels,
+  and records registration order. These declarations are candidates for the observed types;
+  the mode does not traverse missing implementation bodies. With stock Bazel, membership
+  recording works but `unresolved` reports incomplete compiler nomination because the complete
+  producer interface is unavailable. Absence cannot exclude a change visible only through a toolchain.
+  Use fresh full ordinary queries with the profile defined by MODULE registrations, including rc settings.
+  Partial generation, cached services, configured query, isolated roots, and explicit custom
+  toolchain profiles are unsupported. A caller must retain provisional work until separate
+  configured evidence explicitly clears the matching request; scoped clearance remains pending.
   `--isolatedDependencyRoot=@crates` asserts that every outside consumer of this
   root-isolated usage reaches a member through a target input or a BUILD load in the ordinary
   query. Do not enable it for usages that supply an implicitly selected toolchain, or whose

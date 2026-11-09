@@ -169,7 +169,7 @@ struct HashingArgs {
     use_cquery: bool,
 
     /// Record observed MODULE toolchain inputs and distinguish inferred repository memberships.
-    /// Requires typed producer output and writes tagged files for --reportImpactGraph.
+    /// Writes tagged files for --reportImpactGraph; missing producer data stays unresolved.
     #[arg(long = "useModuleToolchainRegistrations")]
     use_module_toolchain_registrations: bool,
 
@@ -991,7 +991,6 @@ fn partial_graph_hashes(
     generate: impl FnOnce(&HashOptions) -> Result<HashFileData>,
 ) -> Result<HashFileData> {
     partial::validate_hash_options(options)?;
-    let recipe_version = partial::recipe_version(options.bazel.use_module_toolchain_registrations);
     if args.content_hash_path.is_some() {
         bail!("--partialGraph does not support --contentHashPath: source content is read from the git tree");
     }
@@ -1034,11 +1033,11 @@ fn partial_graph_hashes(
                 (None, _) => {
                     format!("{} carries no partial-graph recipes", path.display())
                 }
-                (Some(recipes), _) if recipes.version != recipe_version => format!(
+                (Some(recipes), _) if recipes.version != partial::RECIPE_VERSION => format!(
                     "{} carries partial-graph recipe version {}, expected {}",
                     path.display(),
                     recipes.version,
-                    recipe_version
+                    partial::RECIPE_VERSION
                 ),
                 (_, _)
                     if args.dep_edges_file.is_some()

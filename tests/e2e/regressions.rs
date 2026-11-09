@@ -1983,7 +1983,14 @@ fn extension_repo_patch_edit_impacts_toolchain_user() {
         } else {
             &[]
         };
-        let impacted = diff_workspaces(first.path(), second.path(), args);
+        let impacted = if typed {
+            let report = repository_diff_workspaces(first.path(), second.path(), args);
+            let mut labels = impact_labels(&report["targets"]);
+            labels.extend(impact_labels(&report["provisionalTargets"]));
+            labels
+        } else {
+            diff_workspaces(first.path(), second.path(), args)
+        };
         assert!(
             impacted
                 .iter()

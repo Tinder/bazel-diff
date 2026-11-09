@@ -397,8 +397,10 @@ fn hash_targets_with_digests(
         external_resolver,
         module_graph_json,
         repository_memberships,
-        configured_roots,
-        verification,
+        ConfiguredHashEnvironment {
+            roots: configured_roots,
+            verification,
+        },
     )?;
     let timings = GenerationTimings {
         bazel_query_millis: 0,
@@ -408,6 +410,12 @@ fn hash_targets_with_digests(
     Ok((data, timings))
 }
 
+#[derive(Default)]
+struct ConfiguredHashEnvironment {
+    roots: Option<BTreeMap<String, String>>,
+    verification: Option<VerifiedQuery>,
+}
+
 fn hash_targets_with_environment(
     options: &HashOptions,
     targets: Vec<Target>,
@@ -415,13 +423,14 @@ fn hash_targets_with_environment(
     external_resolver: ExternalRepoResolver,
     module_graph_json: Option<String>,
     repository_memberships: Option<RepositoryMemberships>,
-    configured_roots: Option<BTreeMap<String, String>>,
-    verification: Option<VerifiedQuery>,
+    configured: ConfiguredHashEnvironment,
 ) -> Result<HashFileData> {
     if options.partial_tree.is_some() && options.bazel.use_cquery {
         bail!("partial graph mode does not support --useCquery");
     }
-    let mut verification = verification
+    let configured_roots = configured.roots;
+    let mut verification = configured
+        .verification
         .map(|query| ConfiguredCoverage::new(query, &targets, &definition_digests, options));
     let mut source_hasher = SourceHasher {
         workspace: &options.bazel.workspace,
@@ -475,13 +484,10 @@ fn hash_targets_with_environment(
     } else {
         package_bzl_seeds(&targets, &source_hasher)?
     };
-    let mut recorder = options.partial_tree.is_some().then(|| {
-        RecipeRecorder::new(
-            seed_hash,
-            !has_instantiation_stacks,
-            options.bazel.use_module_toolchain_registrations,
-        )
-    });
+    let mut recorder = options
+        .partial_tree
+        .is_some()
+        .then(|| RecipeRecorder::new(seed_hash, !has_instantiation_stacks));
 
     let PreparedRules {
         mut ids,
@@ -3583,8 +3589,7 @@ mod tests {
             },
             Some(r#"{"name":"root"}"#.to_owned()),
             None,
-            None,
-            None,
+            ConfiguredHashEnvironment::default(),
         )
     }
 
@@ -3607,8 +3612,7 @@ mod tests {
             },
             Some(r#"{"name":"root"}"#.to_owned()),
             None,
-            None,
-            None,
+            ConfiguredHashEnvironment::default(),
         )?;
         assert_eq!(indexed.hashes, reference.hashes);
         assert_eq!(indexed.dep_edges, reference.dep_edges);
@@ -4029,8 +4033,7 @@ esac
                 },
                 Some(r#"{"name":"root"}"#.to_owned()),
                 None,
-                None,
-                None,
+                ConfiguredHashEnvironment::default(),
             )
             .unwrap()
         };
@@ -4298,8 +4301,7 @@ esac
                 },
                 Some(r#"{"name":"root"}"#.to_owned()),
                 None,
-                None,
-                None,
+                ConfiguredHashEnvironment::default(),
             )
             .unwrap()
         };
@@ -4771,8 +4773,7 @@ esac
                 resolver,
                 Some(r#"{"name":"root"}"#.to_owned()),
                 None,
-                None,
-                None,
+                ConfiguredHashEnvironment::default(),
             )
             .unwrap()
         };
@@ -5004,8 +5005,7 @@ esac
             ExternalRepoResolver::default(),
             None,
             None,
-            None,
-            None,
+            ConfiguredHashEnvironment::default(),
         )
         .unwrap();
         assert_eq!(actual.hashes, expected.hashes);

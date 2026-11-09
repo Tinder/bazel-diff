@@ -925,6 +925,10 @@ fn fine_aliases_track_the_selected_destination_with_fixed_inputs() {
             r#"use_repo(aliases, "public", "hidden")"#,
         )
     });
+    // The missing filegroup leads back into the already queried public package.
+    edit(&root.join("hidden.BUILD"), |text| {
+        format!("{text}\nfilegroup(name = \"round_trip\", srcs = [\"@public//:back\"], visibility = [\"//visibility:public\"])\n")
+    });
     let mut snapshots = [Vec::new(), Vec::new()];
     let first = "@hidden//:forward";
     let other = "@library//:other.txt";
@@ -937,8 +941,9 @@ fn fine_aliases_track_the_selected_destination_with_fixed_inputs() {
             root.join("public.BUILD"),
             format!(
                 r#"config_setting(name = "alt", values = {{"define": "choice=alt"}})
+alias(name = "forward", actual = "@hidden//:round_trip", visibility = ["//visibility:public"])
 alias(
-    name = "forward",
+    name = "back",
     actual = select({{":alt": "{alternate}", "//conditions:default": "{default}"}}),
     visibility = ["//visibility:public"],
 )
@@ -970,10 +975,7 @@ alias(name = "sibling", actual = "{sibling}")
                 String::from_utf8_lossy(&generated.stderr)
             );
             let graph = dep_edges(&edges);
-            let key = graph
-                .keys()
-                .find(|k| k.ends_with("public//:forward"))
-                .unwrap();
+            let key = graph.keys().find(|k| k.ends_with("public//:back")).unwrap();
             snapshots[idx].push((hashes(&out)[key].clone(), graph[key].clone(), out));
         }
     }

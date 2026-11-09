@@ -12,7 +12,7 @@ use buffa::{EncodeSink, Message, SizeCache};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -1462,15 +1462,23 @@ fn hash_seed_files(workspace: &Path, paths: &BTreeSet<PathBuf>) -> Result<Digest
 }
 
 fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<()> {
-    let mut file = File::open(path)?;
-    let mut buffer = [0; FILE_HASH_BUFFER_SIZE];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(());
-        }
-        hasher.update(&buffer[..read]);
+    // One read buffer per thread, zeroed once. A fresh `[0; FILE_HASH_BUFFER_SIZE]` per call
+    // zeroed 64 KiB for every hashed file, and most source files are far smaller than that.
+    thread_local! {
+        static BUFFER: RefCell<Box<[u8]>> =
+            RefCell::new(vec![0; FILE_HASH_BUFFER_SIZE].into_boxed_slice());
     }
+    let mut file = File::open(path)?;
+    BUFFER.with(|buffer| {
+        let mut buffer = buffer.borrow_mut();
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(());
+            }
+            hasher.update(&buffer[..read]);
+        }
+    })
 }
 
 /// Hashes a directory tree deterministically: every entry's workspace-independent relative path
@@ -3635,6 +3643,28 @@ esac
         assert_eq!(label_package("//pkg:file"), "//pkg");
         assert_eq!(label_package("//pkg"), "//pkg");
         assert!(!owner_executable(Path::new("/definitely/missing/file")));
+    }
+
+    #[test]
+    fn file_hashing_reuses_its_buffer_across_files_of_any_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let large: Vec<u8> = (0..FILE_HASH_BUFFER_SIZE * 2 + 7)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let cases: [&[u8]; 4] = [&large, b"short", b"", &large[..FILE_HASH_BUFFER_SIZE]];
+        for (index, content) in cases.into_iter().enumerate() {
+            let path = directory.path().join(format!("file{index}"));
+            fs::write(&path, content).unwrap();
+            let mut hasher = Sha256::new();
+            hash_file_into(&mut hasher, &path).unwrap();
+            assert_eq!(
+                <[u8; 32]>::from(hasher.finalize()),
+                <[u8; 32]>::from(Sha256::digest(content)),
+                "file {index}"
+            );
+        }
+        let mut hasher = Sha256::new();
+        assert!(hash_file_into(&mut hasher, &directory.path().join("missing")).is_err());
     }
 
     #[test]

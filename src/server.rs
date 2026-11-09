@@ -1260,6 +1260,11 @@ pub fn validate_partial_graph(config: &ServerConfig) -> Result<()> {
 }
 
 pub fn serve(config: ServerConfig) -> Result<()> {
+    if config.hash_options.bazel.use_module_toolchain_registrations {
+        bail!(
+            "serve does not support --useModuleToolchainRegistrations; use fresh generate-hashes"
+        );
+    }
     if let Some(root) = &config.hash_options.bazel.isolated_dependency_root {
         bail!("serve does not support --isolatedDependencyRoot={root}");
     }
@@ -2640,6 +2645,7 @@ mod tests {
                     command_options: Vec::new(),
                     cquery_options: Vec::new(),
                     use_cquery: false,
+                    use_module_toolchain_registrations: false,
                     cquery_expression: None,
                     cquery_root_expression: None,
                     keep_going: false,
@@ -3237,7 +3243,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_rejects_isolated_root_before_cache_setup() {
+    fn serve_rejects_unsupported_modes_before_cache_setup() {
         let cache = tempfile::NamedTempFile::new().unwrap();
         fs::write(cache.path(), b"preserved").unwrap();
         let mut config = test_config();
@@ -3247,6 +3253,14 @@ mod tests {
         assert_eq!(
             serve(config).unwrap_err().to_string(),
             "serve does not support --isolatedDependencyRoot=@hub"
+        );
+        assert_eq!(fs::read(cache.path()).unwrap(), b"preserved");
+        let mut config = test_config();
+        config.cache_dir = cache.path().to_path_buf();
+        config.hash_options.bazel.use_module_toolchain_registrations = true;
+        assert_eq!(
+            serve(config).unwrap_err().to_string(),
+            "serve does not support --useModuleToolchainRegistrations; use fresh generate-hashes"
         );
         assert_eq!(fs::read(cache.path()).unwrap(), b"preserved");
     }

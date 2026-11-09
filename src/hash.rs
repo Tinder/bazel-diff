@@ -1,12 +1,14 @@
 use crate::bazel::{
     encode_configured_input, split_configured, target_label, target_name, BazelOptions,
-    QueriedTargets, RepositoryInputGroup, RepositoryInputs, ScopedSources, VerifiedQuery,
+    QueriedTargets, RegistrationOrders, RepositoryInputGroup, RepositoryInputs, ScopedSources,
+    VerifiedQuery,
 };
 use crate::cancel::{self, Cancellation};
 use crate::components::{component_digest, member_digest, Completion, Components, Visit};
 use crate::model::{ConfiguredRoots, HashFileData, TargetHash};
 use crate::partial::{self, RecipeRecorder, RuleRecipe, TreeIndex};
 use crate::proto::blaze_query::{target, Rule, Target};
+use crate::repository_memberships::RepositoryMemberships;
 use anyhow::{anyhow, bail, Context, Result};
 use buffa::{EncodeSink, Message, SizeCache};
 use rayon::prelude::*;
@@ -341,6 +343,8 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
         options,
         QueriedTargets {
             targets,
+            repository_memberships: None,
+            registration_orders: RegistrationOrders::new(),
             verification: None,
             configured_roots: None,
             module_graph_json: None,
@@ -357,10 +361,12 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
 fn hash_targets_with_digests(
     options: &HashOptions,
     queried: QueriedTargets,
-    definition_digests: PreparedRules,
+    mut definition_digests: PreparedRules,
 ) -> Result<(HashFileData, GenerationTimings)> {
     let QueriedTargets {
         targets,
+        repository_memberships,
+        registration_orders,
         verification,
         configured_roots,
         module_graph_json,
@@ -373,6 +379,7 @@ fn hash_targets_with_digests(
     let mut external_resolver =
         ExternalRepoResolver::new(&options.bazel, root_mapping, output_base)?;
     external_resolver.scoped_sources = scoped_sources;
+    definition_digests.registration_orders = registration_orders;
     let module_graph_started = Instant::now();
     let module_graph_json = module_graph_json.or_else(|| options.bazel.module_graph_json());
     let verification = verification.filter(|_| {
@@ -389,8 +396,11 @@ fn hash_targets_with_digests(
         definition_digests,
         external_resolver,
         module_graph_json,
-        configured_roots,
-        verification,
+        repository_memberships,
+        ConfiguredHashEnvironment {
+            roots: configured_roots,
+            verification,
+        },
     )?;
     let timings = GenerationTimings {
         bazel_query_millis: 0,
@@ -400,19 +410,27 @@ fn hash_targets_with_digests(
     Ok((data, timings))
 }
 
+#[derive(Default)]
+struct ConfiguredHashEnvironment {
+    roots: Option<BTreeMap<String, String>>,
+    verification: Option<VerifiedQuery>,
+}
+
 fn hash_targets_with_environment(
     options: &HashOptions,
     targets: Vec<Target>,
     definition_digests: PreparedRules,
     external_resolver: ExternalRepoResolver,
     module_graph_json: Option<String>,
-    configured_roots: Option<BTreeMap<String, String>>,
-    verification: Option<VerifiedQuery>,
+    repository_memberships: Option<RepositoryMemberships>,
+    configured: ConfiguredHashEnvironment,
 ) -> Result<HashFileData> {
     if options.partial_tree.is_some() && options.bazel.use_cquery {
         bail!("partial graph mode does not support --useCquery");
     }
-    let mut verification = verification
+    let configured_roots = configured.roots;
+    let mut verification = configured
+        .verification
         .map(|query| ConfiguredCoverage::new(query, &targets, &definition_digests, options));
     let mut source_hasher = SourceHasher {
         workspace: &options.bazel.workspace,
@@ -474,6 +492,7 @@ fn hash_targets_with_environment(
     let PreparedRules {
         mut ids,
         mut prepared,
+        registration_orders,
     } = definition_digests;
     ids.reserve(targets.len().saturating_sub(ids.len()));
     let mut slots = Vec::with_capacity(targets.len());
@@ -482,6 +501,8 @@ fn hash_targets_with_environment(
     let mut decoded_rules = Vec::<(String, Rule)>::new();
     let mut source_targets = Vec::new();
     let mut hash_targets = Vec::with_capacity(targets.len());
+    let order_mapping =
+        (!registration_orders.is_empty()).then(|| source_hasher.external_resolver.repo_mapping());
     for target in targets {
         match target.r#type {
             target::Discriminator::Rule => {
@@ -494,7 +515,15 @@ fn hash_targets_with_environment(
                         .get(&rule.name)
                         .and_then(|&id| prepared.get_mut(id)?.take().map(|value| (id, value)))
                     {
-                        Some((id, prepared)) => {
+                        Some((id, mut prepared)) => {
+                            if let Some(mapping) = order_mapping {
+                                apply_registration_orders(
+                                    &rule,
+                                    &mut prepared,
+                                    &registration_orders,
+                                    mapping,
+                                );
+                            }
                             rules.slots[id].rule = Some(Rc::new(RuleNode::new(rule, prepared)));
                         }
                         None => decoded_rules.push((rule.name.clone(), rule)),
@@ -620,7 +649,10 @@ fn hash_targets_with_environment(
             .collect::<Vec<_>>()
     });
 
-    for (name, rule, prepared) in processed_rules {
+    for (name, rule, mut prepared) in processed_rules {
+        if let Some(mapping) = order_mapping {
+            apply_registration_orders(&rule, &mut prepared, &registration_orders, mapping);
+        }
         rules.slot(name).rule = Some(Rc::new(RuleNode::new(rule, prepared)));
     }
     // Fold each returned source into the existing hub once. Using the source
@@ -698,7 +730,6 @@ fn hash_targets_with_environment(
             source_hasher.external_resolver.canonical_repo_nodes(),
         );
     }
-
     let mut label_instances = None;
     for target in &hash_targets {
         let HashTarget::Generated {
@@ -768,6 +799,7 @@ fn hash_targets_with_environment(
         always_affected_seed: unique_invocation_seed(),
         components: Components::default(),
         recorder,
+        repository_memberships,
     };
     // `--order_output=no` makes the query order arbitrary. Keep output and fallback resolution
     // deterministic even though component digests are independent of their entry point.
@@ -831,6 +863,7 @@ fn hash_targets_with_environment(
         digests.push((key, kind, digest));
     }
     let recorder = context.recorder.take();
+    let repository_memberships = context.repository_memberships.take();
     let verified_contexts = context.verification.take().map(|state| {
         debug_assert!(state.pending.is_empty());
         state.contexts
@@ -868,6 +901,9 @@ fn hash_targets_with_environment(
         let (hashes, dep_edges) = aggregate_by_label(digests, options.track_deps);
         (hashes, dep_edges, None)
     };
+    if let Some(memberships) = &repository_memberships {
+        memberships.validate()?;
+    }
     let mut partial = None;
     if let (Some(recorder), Some(tree)) = (recorder, &options.partial_tree) {
         // The traversal above only recorded the recipes; the hashes an entry in this mode
@@ -883,6 +919,7 @@ fn hash_targets_with_environment(
     }
     Ok(HashFileData {
         observed_toolchains: None,
+        repository_memberships,
         hashes,
         configured_roots,
         module_graph_json,
@@ -1313,6 +1350,7 @@ fn label_hash(
 struct PreparedRules {
     ids: HashMap<String, usize>,
     prepared: Vec<Option<PreparedRule>>,
+    registration_orders: RegistrationOrders,
 }
 
 impl Extend<(String, PreparedRule)> for PreparedRules {
@@ -1469,6 +1507,7 @@ struct HashContext<'a> {
     components: Components<Rc<RuleNode>, (TargetDigest, Option<RuleRecipe>)>,
     /// Partial-graph mode: collects every rule's recipe as it is hashed.
     recorder: Option<RecipeRecorder>,
+    repository_memberships: Option<RepositoryMemberships>,
 }
 
 impl HashContext<'_> {
@@ -1586,6 +1625,11 @@ impl HashContext<'_> {
         {
             builder.direct(self.always_affected_seed);
         }
+        let mut direct_without_memberships = self
+            .repository_memberships
+            .as_ref()
+            .and_then(|memberships| memberships.receivers.get(canonical_key))
+            .map(|_| builder.direct.clone());
 
         let mut inputs: Vec<Cow<'_, str>> = if rule.input_positions.is_some() {
             rule.rule
@@ -1621,7 +1665,19 @@ impl HashContext<'_> {
             )
         };
         if let Some(group) = &rule.prepared.shared_inputs {
-            if !self.apply_repository_inputs(group, &mut builder) {
+            if self.apply_repository_inputs(group, &mut builder) {
+                if let Some(direct) = &mut direct_without_memberships {
+                    for input in &group.labels {
+                        if !self
+                            .repository_memberships
+                            .as_ref()
+                            .is_some_and(|memberships| memberships.contains(canonical_key, input))
+                        {
+                            direct.update(input.as_bytes());
+                        }
+                    }
+                }
+            } else {
                 inputs.extend(
                     group
                         .labels
@@ -1636,6 +1692,16 @@ impl HashContext<'_> {
                 .as_ref()
                 .and_then(|ids| ids.get(position).copied().flatten());
             builder.direct(encoded_input.as_bytes());
+            let membership = direct_without_memberships.is_some()
+                && self
+                    .repository_memberships
+                    .as_ref()
+                    .is_some_and(|memberships| memberships.contains(canonical_key, &encoded_input));
+            if !membership {
+                if let Some(direct) = &mut direct_without_memberships {
+                    direct.update(encoded_input.as_bytes());
+                }
+            }
             let input_label = target_label(&encoded_input);
             let verify_input = builder.verification.is_some()
                 && self
@@ -1645,6 +1711,11 @@ impl HashContext<'_> {
             match self.resolve_input(&encoded_input, input_label, input_slot, path) {
                 Some(Input::Source(digest)) => {
                     builder.source(input_label, digest);
+                    if !membership {
+                        if let Some(direct) = &mut direct_without_memberships {
+                            direct.update(digest);
+                        }
+                    }
                     if verify_input {
                         let context = (encoded_input == input_label)
                             .then(|| {
@@ -1710,11 +1781,21 @@ impl HashContext<'_> {
                             .slot(input_label.to_owned())
                             .set_source(&mut self.source_digests, digest);
                         builder.source(input_label, digest);
-                    } else if self.options.bazel.verbose {
-                        eprintln!(
-                            "[Warn] Unable to calculate digest for input {input_label} for rule {}",
-                            rule.rule.name
-                        );
+                        if !membership {
+                            if let Some(direct) = &mut direct_without_memberships {
+                                direct.update(digest);
+                            }
+                        }
+                    } else {
+                        if !membership {
+                            direct_without_memberships = None;
+                        }
+                        if self.options.bazel.verbose {
+                            eprintln!(
+                                "[Warn] Unable to calculate digest for input {input_label} for rule {}",
+                                rule.rule.name
+                            );
+                        }
                     }
                 }
             }
@@ -1735,6 +1816,22 @@ impl HashContext<'_> {
                     continue;
                 }
                 builder.direct(package_group.as_bytes());
+                if let Some(direct) = &mut direct_without_memberships {
+                    direct.update(package_group.as_bytes());
+                }
+                if self
+                    .repository_memberships
+                    .as_ref()
+                    .is_some_and(|memberships| memberships.contains(canonical_key, package_group))
+                {
+                    if let Some(receiver) = self
+                        .repository_memberships
+                        .as_mut()
+                        .and_then(|memberships| memberships.receivers.get_mut(canonical_key))
+                    {
+                        receiver.ordinary_overlaps.insert(package_group.to_owned());
+                    }
+                }
                 let digest = match group_slot
                     .completed(package_group)
                     .or_else(|| group.digest.get())
@@ -1758,6 +1855,15 @@ impl HashContext<'_> {
         }
 
         path.pop().expect("rule path contains the current rule");
+        if let Some(direct) = direct_without_memberships {
+            if let Some(receiver) = self
+                .repository_memberships
+                .as_mut()
+                .and_then(|memberships| memberships.receivers.get_mut(canonical_key))
+            {
+                receiver.direct_without_memberships = Some(hex::encode(direct.finalize()));
+            }
+        }
         // Publish a context only when the normal node completes. A required edge to an
         // unfinished component has already made its parent unverified.
         if let Some(verified) = builder.finish_verification() {
@@ -2378,6 +2484,39 @@ fn prehash_rule(rule: &mut Rule, ignored: &HashSet<String>) -> DigestBytes {
     // queried rule pins tens of kilobytes of dead capacity until hashing ends.
     rule.attribute.shrink_to_fit();
     digest
+}
+
+fn apply_registration_orders(
+    rule: &Rule,
+    prepared: &mut PreparedRule,
+    registration_orders: &RegistrationOrders,
+    mapping: &HashMap<String, String>,
+) {
+    let Some(types) = rule.possible_toolchain_types.as_option() else {
+        return;
+    };
+    let mut orders = BTreeMap::new();
+    for operand in &types.label {
+        let operand = crate::bazel::canonical_query_label(operand, mapping);
+        if let Some(by_type) = registration_orders.get(operand.as_ref()) {
+            orders.extend(by_type);
+        }
+    }
+    if orders.is_empty() {
+        return;
+    }
+    // Priority changes the reader's dependency selection. Keep that context on positively
+    // observed readers rather than a type node that can also be used as ordinary data.
+    let mut digest = Sha256::new();
+    digest.update(b"MODULE toolchain reader order\0");
+    digest.update(prepared.definition_digest);
+    digest.update((orders.len() as u64).to_le_bytes());
+    for (ty, order) in orders {
+        digest.update((ty.len() as u64).to_le_bytes());
+        digest.update(ty.as_bytes());
+        digest.update(order);
+    }
+    prepared.definition_digest = digest.finalize().into();
 }
 
 fn hash_attribute(
@@ -3321,6 +3460,7 @@ mod tests {
             command_options: Vec::new(),
             cquery_options: Vec::new(),
             use_cquery: false,
+            use_module_toolchain_registrations: false,
             cquery_expression: None,
             cquery_root_expression: None,
             keep_going: false,
@@ -3449,7 +3589,7 @@ mod tests {
             },
             Some(r#"{"name":"root"}"#.to_owned()),
             None,
-            None,
+            ConfiguredHashEnvironment::default(),
         )
     }
 
@@ -3472,7 +3612,7 @@ mod tests {
             },
             Some(r#"{"name":"root"}"#.to_owned()),
             None,
-            None,
+            ConfiguredHashEnvironment::default(),
         )?;
         assert_eq!(indexed.hashes, reference.hashes);
         assert_eq!(indexed.dep_edges, reference.dep_edges);
@@ -3893,7 +4033,7 @@ esac
                 },
                 Some(r#"{"name":"root"}"#.to_owned()),
                 None,
-                None,
+                ConfiguredHashEnvironment::default(),
             )
             .unwrap()
         };
@@ -4161,7 +4301,7 @@ esac
                 },
                 Some(r#"{"name":"root"}"#.to_owned()),
                 None,
-                None,
+                ConfiguredHashEnvironment::default(),
             )
             .unwrap()
         };
@@ -4633,7 +4773,7 @@ esac
                 resolver,
                 Some(r#"{"name":"root"}"#.to_owned()),
                 None,
-                None,
+                ConfiguredHashEnvironment::default(),
             )
             .unwrap()
         };
@@ -4865,7 +5005,7 @@ esac
             ExternalRepoResolver::default(),
             None,
             None,
-            None,
+            ConfiguredHashEnvironment::default(),
         )
         .unwrap();
         assert_eq!(actual.hashes, expected.hashes);

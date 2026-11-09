@@ -1,0 +1,21 @@
+constraint_setting(name = "optional_platform")
+
+constraint_value(
+    name = "optional",
+    constraint_setting = ":optional_platform",
+)
+
+tool(name = "nested", version = "nested")
+
+toolchain(
+    name = "nested_declaration",
+    toolchain = ":nested",
+    toolchain_type = "@ext//:toolchain_type",
+)
+
+toolchain(
+    name = "unavailable",
+    exec_compatible_with = [":optional"],
+    toolchain = "@optional//:impl",
+    toolchain_type = "@ext//:toolchain_type",
+)

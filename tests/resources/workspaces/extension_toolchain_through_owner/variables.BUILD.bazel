@@ -1,0 +1,18 @@
+load(":variables.bzl", "variables")
+
+variables(
+    name = "provider",
+    value = "before",
+)
+
+alias(
+    name = "forward",
+    actual = ":provider",
+)
+
+genrule(
+    name = "consumer",
+    toolchains = [":forward"],
+    outs = ["consumer.txt"],
+    cmd = "printf '%s' '$(PROVIDER_VALUE)' > $@",
+)

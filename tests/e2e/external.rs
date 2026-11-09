@@ -786,6 +786,7 @@ fn fine_alias_follows_already_returned_aliases_to_its_library() {
         format!(
             r#"{text}
 exports_files(["payload.txt"])
+filegroup(name = "unrelated")
 alias(name = "bridge", actual = ":second_bridge", visibility = ["//visibility:public"])
 alias(name = "second_bridge", actual = "@library//:copy")
 "#
@@ -799,25 +800,50 @@ genrule(name = "copy", srcs = ["@@//:payload.txt"], outs = ["copied.txt"], cmd =
         )
     });
     let out = tempfile::tempdir().unwrap();
+    let capable = supports_module_toolchain_inputs(root, "//:consumer");
     let snapshot = |value: &str| {
         fs::write(root.join("payload.txt"), value).unwrap();
         assert_product(root, "//:consumer", "consumer.txt", value);
-        let file = out.path().join(format!("{value}.json"));
-        let run = generate(root, &file, &["--fineGrainedHashExternalRepos=@public"]);
-        assert!(
-            run.status.success(),
-            "{}",
-            String::from_utf8_lossy(&run.stderr)
-        );
-        file
+        [(false, false), (true, false), (true, true)]
+            .into_iter()
+            .filter(|&(typed, _)| !typed || capable)
+            .map(|(typed, filtered)| {
+                let file = out.path().join(format!("{value}-{typed}-{filtered}.json"));
+                let edges = out
+                    .path()
+                    .join(format!("{value}-{typed}-{filtered}-edges.json"));
+                let mut args = vec!["--fineGrainedHashExternalRepos=@public"];
+                if typed {
+                    args.push("--useModuleToolchainRegistrations");
+                }
+                if filtered {
+                    args.push("--excludeTargetsQuery=//:unrelated");
+                }
+                args.extend(["-d", edges.to_str().unwrap()]);
+                let run = generate(root, &file, &args);
+                assert!(
+                    run.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&run.stderr)
+                );
+                (file, edges, typed)
+            })
+            .collect::<Vec<_>>()
     };
     let before = snapshot("before");
     let after = snapshot("after");
     let result = out.path().join("impacted.txt");
-    assert!(impacted(root, &before, &after, &result, &[])
-        .status
-        .success());
-    assert!(read_lines(&result).contains("//:consumer"));
+    for (before, after) in before.iter().zip(&after) {
+        if after.2 {
+            let report = repository_impacts(root, &before.0, &after.0, &after.1, &result);
+            assert!(impact_labels(&report["targets"]).contains("//:consumer"));
+        } else {
+            assert!(impacted(root, &before.0, &after.0, &result, &[])
+                .status
+                .success());
+            assert!(read_lines(&result).contains("//:consumer"));
+        }
+    }
 }
 
 #[test]
@@ -906,6 +932,259 @@ genrule(name = "copy_leaf", srcs = ["@@//:deep_payload.txt"], outs = ["deep_leaf
     ] {
         assert!(graph[&format!("{package}:{from}")].contains(&format!("{package}:{to}")));
     }
+}
+
+#[test]
+fn observed_bridge_alias_keeps_toolchain_users_separate_from_siblings() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("extension_repo_patch");
+    let root = workspace.path();
+    fs::write(root.join("noise.txt"), "A").unwrap();
+    edit(&root.join("sdk_rules/BUILD"), |text| {
+        let text = text.replace(
+            "toolchain_type = \":toolchain_type\"",
+            "toolchain_type = \":outer_type\"",
+        );
+        format!(
+            r#"{text}
+toolchain_type(name = "other_type")
+config_setting(name = "use_other_type", values = {{"define": "use_type=other"}})
+alias(
+    name = "public_type",
+    actual = select({{
+        ":use_other_type": ":other_type",
+        "//conditions:default": ":toolchain_type",
+    }}),
+)
+alias(name = "outer_type", actual = ":public_type")
+"#
+        )
+    });
+    edit(&root.join("MODULE.bazel"), |text| {
+        format!(
+            r#"{text}
+bridges = use_extension("//:bridges.bzl", "bridges")
+use_repo(bridges, "public", "bridge")
+"#
+        )
+    });
+    edit(&root.join("BUILD"), |text| {
+        let text = text.replace(
+            "sdk_user(name = \"app\")",
+            "sdk_user(name = \"app\", visibility = [\"@bridge//:__pkg__\"])",
+        );
+        format!(
+            r#"{text}
+exports_files(["noise.txt"])
+genrule(name = "bridged", srcs = ["@public//:app"], outs = ["bridged.txt"], cmd = "cp $< $@")
+genrule(name = "noise_user", srcs = ["@public//:noise"], outs = ["noise_user.txt"], cmd = "cp $< $@")
+"#
+        )
+    });
+    if !supports_module_toolchain_inputs(root, "//:app") {
+        return;
+    }
+    let out = tempfile::tempdir().unwrap();
+    let snapshot = |name: &str, sdk: &str, noise: &str| {
+        assert_product(root, "//:bridged", "bridged.txt", sdk);
+        assert_product(root, "//:noise_user", "noise_user.txt", noise);
+        let file = out.path().join(format!("{name}.json"));
+        let edges = out.path().join(format!("{name}-edges.json"));
+        let run = generate(
+            root,
+            &file,
+            &[
+                "--fineGrainedHashExternalRepos=@public",
+                "--useModuleToolchainRegistrations",
+                "--includeTargetType",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        (file, edges)
+    };
+    let before = snapshot("before", "1.0.0-patched", "A");
+    fs::write(root.join("noise.txt"), "B").unwrap();
+    let noise = snapshot("noise", "1.0.0-patched", "B");
+    fs::write(root.join("noise.txt"), "A").unwrap();
+    edit(&root.join("patches/sdk.patch"), |text| {
+        text.replace("+1.0.0-patched", "+1.0.0-repatched")
+    });
+    let sdk = snapshot("sdk", "1.0.0-repatched", "A");
+
+    let graph = repository_edges(&before.1);
+    let public = graph["//:bridged"]
+        .iter()
+        .find(|label| label.starts_with('@') && label.ends_with("//:app"))
+        .unwrap();
+    let bridge = graph[public]
+        .iter()
+        .find(|label| label.starts_with('@') && label.ends_with("//:app"))
+        .unwrap();
+    assert!(graph[bridge].contains("//:app"));
+    let registration = graph["//:app"]
+        .iter()
+        .find(|label| label.ends_with("//:sdk_toolchain"))
+        .unwrap();
+    let package = registration.strip_suffix(":sdk_toolchain").unwrap();
+    let outer_type = format!("{package}:outer_type");
+    let type_alias = format!("{package}:public_type");
+    assert!(graph[registration].contains(&outer_type));
+    assert!(graph[&outer_type].contains(&type_alias));
+    assert!(graph[&type_alias].contains(&format!("{package}:toolchain_type")));
+    assert!(graph[&type_alias].contains(&format!("{package}:other_type")));
+
+    let build = root.join("sdk_rules/BUILD");
+    let definition = fs::read_to_string(&build).unwrap();
+    let changed = definition.replace(
+        "values = {\"define\": \"use_type=other\"}",
+        "values = {\"compilation_mode\": \"fastbuild\"}",
+    );
+    assert_ne!(definition, changed);
+    fs::write(&build, changed).unwrap();
+    let condition_hashes = out.path().join("condition.json");
+    let condition_edges = out.path().join("condition-edges.json");
+    let generated = generate(
+        root,
+        &condition_hashes,
+        &[
+            "--fineGrainedHashExternalRepos=@public",
+            "--useModuleToolchainRegistrations",
+            "--includeTargetType",
+            "-d",
+            condition_edges.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let product = std::process::Command::new(bazel())
+        .current_dir(root)
+        .args(["build", "//:app"])
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&product.stderr);
+    assert!(
+        !product.status.success() && error.contains("toolchain_type"),
+        "{error}"
+    );
+    let condition_report = repository_impacts(
+        root,
+        &sdk.0,
+        &condition_hashes,
+        &condition_edges,
+        &out.path().join("condition-impacts.json"),
+    );
+    let condition_changes = impact_labels(&condition_report["targets"]);
+    assert!(
+        condition_changes.contains("//:app") && condition_changes.contains("//:bridged"),
+        "definite={condition_changes:?}, provisional={}",
+        condition_report["provisionalTargets"]
+    );
+    assert!(!condition_changes.contains("//:noise_user"));
+    fs::write(build, definition).unwrap();
+
+    let changes = |name: &str, after: &(std::path::PathBuf, std::path::PathBuf)| {
+        let result = out.path().join(format!("{name}-impacted.json"));
+        repository_impacts(root, &before.0, &after.0, &after.1, &result)
+    };
+    let noise_report = changes("noise", &noise);
+    let sdk_report = changes("sdk", &sdk);
+    let noise_changes = impact_labels(&noise_report["targets"]);
+    let mut sdk_changes = impact_labels(&sdk_report["targets"]);
+    sdk_changes.extend(impact_labels(&sdk_report["provisionalTargets"]));
+    assert!(sdk_changes.contains("//:app"), "{sdk_changes:?}");
+    assert!(sdk_changes.contains("//:bridged"), "{sdk_changes:?}");
+    assert!(!sdk_changes.contains("//:noise_user"), "{sdk_changes:?}");
+    assert!(noise_changes.contains("//:noise_user"), "{noise_changes:?}");
+    assert!(!noise_changes.contains("//:bridged"), "{noise_changes:?}");
+}
+
+#[test]
+fn hidden_toolchain_input_reaches_main_rule_and_bridge_alias() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("extension_repo_patch");
+    let root = workspace.path();
+    edit(&root.join("sdk_rules/defs.bzl"), |text| {
+        format!(
+            r#"{text}
+bare_sdk_user = rule(
+    implementation = _sdk_user_impl,
+    toolchains = ["//:toolchain_type"],
+)
+"#
+        )
+    });
+    edit(&root.join("MODULE.bazel"), |text| {
+        format!(
+            r#"{text}
+bridges = use_extension("//:bridges.bzl", "bridges")
+use_repo(bridges, "public", "bridge")
+register_toolchains("//:local_registration")
+"#
+        )
+    });
+    fs::write(
+        root.join("BUILD"),
+        r#"load("@sdk_rules//:defs.bzl", "bare_sdk_user", "sdk_toolchain")
+exports_files(["noise.txt"])
+bare_sdk_user(name = "app", visibility = ["@bridge//:__pkg__"])
+sdk_toolchain(name = "local_impl", version_file = "@@+bridges+noise//:value.txt")
+toolchain(name = "local_registration", toolchain = ":local_impl", toolchain_type = "@sdk_rules//:toolchain_type")
+genrule(name = "bridged", srcs = ["@public//:app"], outs = ["bridged.txt"], cmd = "cp $< $@")
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("noise.txt"), "A").unwrap();
+    if !supports_module_toolchain_inputs(root, "//:app") {
+        return;
+    }
+    let out = tempfile::tempdir().unwrap();
+    let snapshot = |value: &str| {
+        fs::write(root.join("noise.txt"), value).unwrap();
+        assert_product(root, "//:app", "app.txt", value);
+        assert_product(root, "//:bridged", "bridged.txt", value);
+        let file = out.path().join(format!("{value}.json"));
+        let edges = out.path().join(format!("{value}-edges.json"));
+        let run = generate(
+            root,
+            &file,
+            &[
+                "--fineGrainedHashExternalRepos=@public",
+                "--useModuleToolchainRegistrations",
+                "--includeTargetType",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        (file, edges)
+    };
+    let before = snapshot("A");
+    let after = snapshot("B");
+    let graph = repository_edges(&before.1);
+    let result = out.path().join("impacted.json");
+    let report = repository_impacts(root, &before.0, &after.0, &after.1, &result);
+    let labels = impact_labels(&report["targets"]);
+    assert!(labels.contains("//:bridged"), "{labels:?}");
+    assert!(labels.contains("//:app"), "{labels:?}");
+    assert!(graph["//:app"].contains("//:local_registration"));
+    assert!(graph["//:local_registration"].contains("//:local_impl"));
 }
 
 #[test]
@@ -1567,7 +1846,7 @@ fn toolchain_declarations_follow_their_implementations() {
     .status
     .success());
     let changes: Vec<serde_json::Value> =
-        serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
     let distance = |name: &str| {
         changes
             .iter()
@@ -1579,14 +1858,241 @@ fn toolchain_declarations_follow_their_implementations() {
     assert_eq!(distance("//declaration:choice"), Some(1));
     assert_eq!(distance("//declaration:other"), None);
     assert!(dep_edges(&edges)["//declaration:choice"].contains("//declaration:other"));
+
+    if supports_module_toolchain_inputs(root, "//declaration:consumer") {
+        let before = out.path().join("typed-before.json");
+        let after = out.path().join("typed-after.json");
+        let mut typed_args = args.to_vec();
+        typed_args.push("--useModuleToolchainRegistrations");
+        assert!(generate(root, &before, &typed_args).status.success());
+        edit(&root.join("declaration/BUILD.bazel"), |text| {
+            text.replace("version = \"other\"", "version = \"unrelated\"")
+        });
+        assert_product(
+            root,
+            "//declaration:consumer",
+            "declaration/consumer.txt",
+            "after",
+        );
+        assert!(generate(root, &after, &typed_args).status.success());
+        let report = repository_impacts(root, &before, &after, &edges, &result);
+        let changes = report["targets"].as_array().unwrap();
+        let labels: BTreeSet<_> = changes
+            .iter()
+            .map(|row| row["label"].as_str().unwrap())
+            .collect();
+        assert!(labels.contains("//declaration:other"), "{labels:?}");
+        for label in [
+            "//declaration:primary",
+            "//declaration:consumer",
+            "//:uses_app",
+        ] {
+            assert!(!labels.contains(label), "{labels:?}");
+        }
+
+        // Only their registration order changes. Both declarations and implementation
+        // sources stay in the graph in both snapshots.
+        edit(&root.join("declaration/BUILD.bazel"), |text| {
+            text.replace(
+                r#""//conditions:default": ":primary""#,
+                r#""//conditions:default": ":other""#,
+            )
+        });
+        let module_path = root.join("MODULE.bazel");
+        let module = fs::read_to_string(&module_path).unwrap();
+        for (snapshot, registrations, expected) in [
+            (
+                &before,
+                r#""//declaration:registration", "//declaration:choice""#,
+                "after",
+            ),
+            (
+                &after,
+                r#""//declaration:choice", "//declaration:registration""#,
+                "unrelated",
+            ),
+        ] {
+            fs::write(
+                &module_path,
+                module.replace(r#""//declaration:registration""#, registrations),
+            )
+            .unwrap();
+            assert_product(
+                root,
+                "//declaration:consumer",
+                "declaration/consumer.txt",
+                expected,
+            );
+            assert!(generate(root, snapshot, &typed_args).status.success());
+        }
+        let output = out.path().join("ordered-registration-impacts.json");
+        let report = repository_impacts(root, &before, &after, &edges, &output);
+        let rows = report["targets"].as_array().unwrap();
+        let reader = rows
+            .iter()
+            .find(|row| row["label"] == "//declaration:consumer")
+            .unwrap();
+        assert_eq!(reader["targetDistance"], 0);
+        assert!(rows
+            .iter()
+            .all(|row| row["label"] != "//declaration:primary"
+                && row["label"] != "//declaration:other"));
+    }
 }
 
-// Module `ext`'s extension generates `@app`, whose rule resolves a toolchain, and the repositories
-// that toolchain can come from. A query never shows a resolved toolchain as an input, so with
-// `@app` fine-grained the change has to reach `//:uses_app` through `ext`, however `ext` registers
-// the toolchain: from a repository it imports, through an alias whose toolchain lives in a
-// repository nobody imports, or by canonical label without importing anything. This is why
-// `--labelOnlyModuleExtensions` is opt-in: an extension like this one must not be listed.
+#[test]
+fn unavailable_toolchain_implementation_keeps_usable_changes() {
+    let before = copy_workspace("extension_toolchain_through_owner");
+    let after = copy_workspace("extension_toolchain_through_owner");
+    for workspace in [&before, &after] {
+        let root = workspace.path();
+        let unavailable = fs::read_to_string(root.join("unavailable.BUILD.bazel")).unwrap();
+        edit(&root.join("declaration/BUILD.bazel"), |build| {
+            let build = build.replace(
+                "tool(name = \"primary\", version = \"before\")",
+                "tool(name = \"primary\", version = \"before\", deps = [\":nested_declaration\"])",
+            );
+            format!("{build}\n{unavailable}")
+        });
+        edit(&root.join("MODULE.bazel"), |module| {
+            format!(
+                "{module}\nregister_toolchains(\"//declaration:registration\", \"//declaration:unavailable\")\n"
+            )
+        });
+    }
+    if !supports_module_toolchain_inputs(before.path(), "//declaration:consumer") {
+        return;
+    }
+    edit(&after.path().join("declaration/BUILD.bazel"), |build| {
+        build.replace("version = \"before\"", "version = \"after\"")
+    });
+    for (workspace, value) in [(&before, "before"), (&after, "after")] {
+        assert_product(
+            workspace.path(),
+            "//declaration:consumer",
+            "declaration/consumer.txt",
+            value,
+        );
+    }
+    for projection in [
+        "--bazelCommandOptions=--proto:output_rule_attrs=all",
+        "--bazelCommandOptions=--proto:output_rule_attrs=name --proto:include_synthetic_attribute_hash --noproto:locations",
+    ] {
+        let report = repository_diff_workspaces(
+            before.path(),
+            after.path(),
+            &[
+                "--useModuleToolchainRegistrations",
+                "--includeTargetType",
+                projection,
+            ],
+        );
+        let changes = impact_labels(&report["targets"]);
+        assert!(changes.contains("//declaration:consumer"), "{changes:?}");
+        assert!(
+            !changes.contains("//declaration:unavailable"),
+            "{changes:?}"
+        );
+    }
+}
+
+#[test]
+fn genrule_toolchain_candidates_keep_ordinary_providers() {
+    let workspace = copy_workspace("extension_toolchain_through_owner");
+    let root = workspace.path();
+    edit(&root.join("MODULE.bazel"), |module| {
+        format!("{module}\nregister_toolchains(\"//declaration:registration\")\n")
+    });
+    if !supports_module_toolchain_inputs(root, "//declaration:consumer") {
+        return;
+    }
+    let variables = root.join("variables");
+    fs::create_dir(&variables).unwrap();
+    fs::copy(
+        root.join("variables.BUILD.bazel"),
+        variables.join("BUILD.bazel"),
+    )
+    .unwrap();
+    fs::copy(root.join("variables.bzl"), variables.join("variables.bzl")).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let before = out.path().join("before.json");
+    let after = out.path().join("after.json");
+    let edges = out.path().join("edges.json");
+    let result = out.path().join("impacted.json");
+    let args = [
+        "--useModuleToolchainRegistrations",
+        "--includeTargetType",
+        "-d",
+        edges.to_str().unwrap(),
+    ];
+    for (hashes, value) in [(&before, "before"), (&after, "after")] {
+        if value == "after" {
+            edit(&variables.join("BUILD.bazel"), |text| {
+                text.replace("value = \"before\"", "value = \"after\"")
+            });
+        }
+        assert_product(
+            root,
+            "//variables:consumer",
+            "variables/consumer.txt",
+            value,
+        );
+        assert_product(
+            root,
+            "//declaration:consumer",
+            "declaration/consumer.txt",
+            "before",
+        );
+        assert!(generate(root, hashes, &args).status.success());
+    }
+    let report = repository_impacts(root, &before, &after, &edges, &result);
+    let labels = impact_labels(&report["targets"]);
+    for label in [
+        "//variables:provider",
+        "//variables:forward",
+        "//variables:consumer",
+    ] {
+        assert!(labels.contains(label), "{labels:?}");
+    }
+    assert!(!labels.contains("//declaration:consumer"), "{labels:?}");
+    let edges = repository_edges(&edges);
+    assert!(edges["//variables:consumer"].contains("//variables:forward"));
+    assert!(edges["//variables:forward"].contains("//variables:provider"));
+
+    let missing = out.path().join("missing.json");
+    let mut incomplete = args.to_vec();
+    incomplete.push("--excludeTargetsQuery=//variables:provider");
+    let output = generate(root, &missing, &incomplete);
+    assert!(output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("toolchain metadata input //variables:provider was not returned as a rule"),
+        "{error}"
+    );
+    assert!(repository_unresolved(&missing).contains("toolchain input observation failed"));
+
+    edit(&root.join("declaration/BUILD.bazel"), |text| {
+        text.replace(
+            "toolchain_type = \"@ext//:toolchain_type\"",
+            "toolchain_type = \"//variables:provider\"",
+        )
+    });
+    let invalid = out.path().join("invalid.json");
+    let output = generate(root, &invalid, &args);
+    assert!(output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains(
+            "registered toolchain type //variables:provider did not resolve to a native type"
+        ),
+        "{error}"
+    );
+    assert!(repository_unresolved(&invalid).contains("toolchain input observation failed"));
+}
+
+// A fine repository can expose one target in a compiler repository without exposing the compiler
+// its other target uses. Keep that user through both the legacy fallback and evaluated registration
+// inputs, including imported, aliased, and unimported registrations.
 #[test]
 fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
     if !supports_mod_show_repo() {
@@ -1607,21 +2113,62 @@ fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
                 ),
             )
             .unwrap();
+            if registration.contains("@tc//:all") {
+                // Keep the registered declaration and implementation fixed. Only the
+                // file read through its filegroup in another generated repository changes.
+                fs::write(
+                    workspace.path().join("versions.json"),
+                    r#"{"payload":"1.0"}"#,
+                )
+                .unwrap();
+            } else if registration.contains("tc_alias") {
+                edit(&workspace.path().join("ext/tools.bzl"), |text| {
+                    text.replace("version = \"fixed\"", "version = versions[\"toolchain\"]")
+                });
+            } else {
+                // The implementation itself may be an alias, independently of registration.
+                edit(&workspace.path().join("ext/tools.bzl"), |text| {
+                    text.replace(
+                        "toolchain(name = \"tc\", toolchain = \":impl\",",
+                        "alias(name = \"implementation\", actual = \":impl\")\ntoolchain(name = \"tc\", toolchain = \":implementation\",",
+                    )
+                });
+            }
         }
         edit(&bumped.path().join("versions.json"), |text| {
             text.replace("1.0", "2.0")
         });
-        let impacted = diff_local(
-            first.path(),
-            bumped.path(),
-            &["--fineGrainedHashExternalRepos", "@app"],
-        );
-        assert!(
-            impacted
-                .iter()
-                .any(|label| label == "//:uses_app" || label == "@@//:uses_app"),
-            "{registration}: {impacted:?}"
-        );
+        let capable = supports_module_toolchain_inputs(first.path(), "//:uses_app");
+        assert_product(first.path(), "//:uses_app", "uses_app.txt", "1.0");
+        assert_product(bumped.path(), "//:uses_app", "uses_app.txt", "2.0");
+        for workspace in [&first, &bumped] {
+            assert_product(
+                workspace.path(),
+                "//:reads_manual",
+                "manual.txt",
+                "unchanged guide",
+            );
+        }
+        for typed in [false, true].into_iter().filter(|&typed| !typed || capable) {
+            let mut args = vec!["--fineGrainedHashExternalRepos", "@app"];
+            if typed {
+                args.push("--useModuleToolchainRegistrations");
+            }
+            let impacted = if typed {
+                let report = repository_diff_workspaces(first.path(), bumped.path(), &args);
+                let mut labels = impact_labels(&report["targets"]);
+                labels.extend(impact_labels(&report["provisionalTargets"]));
+                labels
+            } else {
+                diff_local(first.path(), bumped.path(), &args)
+            };
+            assert!(
+                impacted
+                    .iter()
+                    .any(|label| label == "//:uses_app" || label == "@@//:uses_app"),
+                "{registration}, typed={typed}: {impacted:?}"
+            );
+        }
         if registration.starts_with("register_toolchains") {
             // The assertion is specifically about consumers of @app. The distinct @tc_impl
             // repository selected via a registered toolchain must still invalidate its user.
@@ -1718,6 +2265,190 @@ fn external_macro_stack_uses_returned_source() {
     };
     assert!(contains("//:uses_bridge"), "{impacted:?}");
     assert!(!contains("//:unrelated"), "{impacted:?}");
+}
+
+#[test]
+fn module_dependent_keeps_external_filegroup_changes_eligible() {
+    let workspace = copy_workspace("extension_toolchain_through_owner");
+    let root = workspace.path();
+    if !supports_module_toolchain_inputs(root, "//:uses_app") {
+        return;
+    }
+    // The main rule refers only to front, whose MODULE depends on the owner of guide.
+    // Neither regular module is enrolled for fine-grained hashes.
+    fs::create_dir(root.join("front")).unwrap();
+    fs::write(
+        root.join("front/MODULE.bazel"),
+        "module(name = \"front\")\nbazel_dep(name = \"ext\")\n",
+    )
+    .unwrap();
+    fs::write(root.join("front/BUILD.bazel"), r#"filegroup(name = "manual", srcs = ["@ext//:manual"], visibility = ["//visibility:public"])"#).unwrap();
+    edit(&root.join(".bazelignore"), |text| {
+        format!("{text}\nfront\n")
+    });
+    edit(&root.join("MODULE.bazel"), |text| {
+        format!("{text}\nbazel_dep(name = \"front\")\nlocal_path_override(module_name = \"front\", path = \"front\")\n")
+    });
+    edit(&root.join("BUILD.bazel"), |text| {
+        format!("{text}\ngenrule(name = \"guide\", srcs = [\"@front//:manual\"], outs = [\"guide.txt\"], cmd = \"cat $< > $@\")\nfilegroup(name = \"unused\")\n")
+    });
+    edit(&root.join("ext/MODULE.bazel"), |text| {
+        text.replace(
+            r#"use_repo(tools, "tc")"#,
+            r#"use_repo(tools, "tc", "guide")"#,
+        )
+    });
+    edit(&root.join("ext/BUILD.bazel"), |text| {
+        format!("{text}\nfilegroup(name = \"manual\", srcs = [\"@guide//:version.txt\"], visibility = [\"//visibility:public\"])\n")
+    });
+    edit(&root.join("ext/tools.bzl"), |text| {
+        text.replace(
+            r#"app(name = "app")"#,
+            "app(name = \"app\")\n    payload(name = \"guide\", value = versions[\"guide\"])",
+        )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let before = out.path().join("before.json");
+    let after = out.path().join("after.json");
+    let edges = out.path().join("head-edges.json");
+    for (path, value) in [(&before, "A"), (&after, "B")] {
+        fs::write(
+            root.join("versions.json"),
+            serde_json::json!({"toolchain": "1.0", "guide": value}).to_string(),
+        )
+        .unwrap();
+        assert_product(root, "//:guide", "guide.txt", value);
+        assert_product(root, "//:uses_app", "uses_app.txt", "1.0");
+        let run = generate(
+            root,
+            path,
+            &[
+                "--useModuleToolchainRegistrations",
+                "--fineGrainedHashExternalRepos=@app",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+    let result = out.path().join("impacts.json");
+    let report = repository_impacts(root, &before, &after, &edges, &result);
+    let rows = report["targets"].as_array().unwrap();
+    let mut eligible = impact_labels(&report["targets"]);
+    eligible.extend(impact_labels(&report["provisionalTargets"]));
+    assert!(eligible.contains("//:guide"), "{report}");
+    assert!(
+        rows.iter().all(|row| row["label"] != "//:uses_app"),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn module_toolchain_mode_keeps_unsupported_producer_uncertain() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("copied_external_source");
+    if supports_module_toolchain_inputs(workspace.path(), "//:consumer") {
+        return;
+    }
+    let output = tempfile::tempdir().unwrap();
+    let hashes = output.path().join("hashes.json");
+    let edges = output.path().join("edges.json");
+    let result = generate(
+        workspace.path(),
+        &hashes,
+        &[
+            "--useModuleToolchainRegistrations",
+            "-d",
+            edges.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!repository_unresolved(&hashes).is_empty());
+    let report = repository_impacts(
+        workspace.path(),
+        &hashes,
+        &hashes,
+        &edges,
+        &output.path().join("self.json"),
+    );
+    assert!(impact_labels(&report["targets"]).is_empty());
+    assert!(impact_labels(&report["provisionalTargets"]).is_empty());
+}
+
+#[test]
+fn repository_report_keeps_copied_source_changes_eligible() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("copied_external_source");
+    let root = workspace.path();
+    if !supports_module_toolchain_inputs(root, "//:consumer") {
+        return;
+    }
+    let output = tempfile::tempdir().unwrap();
+    let capture = |name: &str, data: &str, unrelated: &str| {
+        fs::write(
+            root.join("versions.json"),
+            serde_json::json!({"data": data, "unrelated": unrelated}).to_string(),
+        )
+        .unwrap();
+        let hashes = output.path().join(format!("{name}.json"));
+        let edges = output.path().join(format!("{name}-edges.json"));
+        let result = generate(
+            root,
+            &hashes,
+            &[
+                "--useModuleToolchainRegistrations",
+                "--fineGrainedHashExternalRepos=@public",
+                "--includeTargetType",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_product(root, "//:consumer", "out.h", data);
+        assert_product(root, "//:via_filegroup", "from-group.h", data);
+        assert_product(root, "//:stable", "stable.txt", "fixed");
+        (hashes, edges)
+    };
+    let before = capture("before", "A", "X");
+    for (name, data, unrelated) in [("data", "B", "X"), ("sibling", "A", "Y")] {
+        let after = capture(name, data, unrelated);
+        let report = repository_impacts(
+            root,
+            &before.0,
+            &after.0,
+            &after.1,
+            &output.path().join(format!("{name}-impacts.json")),
+        );
+        let definite = impact_labels(&report["targets"]);
+        let mut eligible = definite.clone();
+        eligible.extend(impact_labels(&report["provisionalTargets"]));
+        // An unobserved copied output may have only a provisional membership reason.
+        // Keep that work eligible for the separate configured verification.
+        for label in ["//:consumer", "//:via_filegroup"] {
+            if data == "B" {
+                assert!(eligible.contains(label), "{name}: {report}");
+            } else {
+                assert!(!definite.contains(label), "{name}: {report}");
+            }
+        }
+        assert!(!definite.contains("//:stable"), "{name}: {report}");
+    }
 }
 
 #[test]

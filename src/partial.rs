@@ -734,6 +734,7 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
         hashes,
         // Fresh query observations can depend on external definitions outside these recipes.
         observed_toolchains: None,
+        repository_memberships: None,
         module_graph_json: base.module_graph_json.clone(),
         dependency_fingerprint: base.dependency_fingerprint.clone(),
         dep_edges: base.dep_edges.clone(),
@@ -748,6 +749,9 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
 /// per-invocation seeds (always-affected tags); each of those would make a derived entry differ
 /// from a full generation, which is the one property the mode rests on.
 pub fn validate_hash_options(options: &HashOptions) -> Result<()> {
+    if options.bazel.use_module_toolchain_registrations {
+        bail!("--partialGraph does not support --useModuleToolchainRegistrations");
+    }
     if options.bazel.use_cquery {
         bail!("--partialGraph does not support --useCquery");
     }
@@ -1480,6 +1484,7 @@ mod tests {
             configured_roots: None,
             hashes: evaluate(&recipes, &targets, &fixture_tree()).unwrap(),
             observed_toolchains: None,
+            repository_memberships: None,
             module_graph_json: Some("{}".into()),
             dependency_fingerprint: Some("fp".into()),
             dep_edges: BTreeMap::from([("//pkg:bin".to_owned(), vec!["//pkg:lib".to_owned()])]),

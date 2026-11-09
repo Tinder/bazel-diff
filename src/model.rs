@@ -1,4 +1,7 @@
 use crate::partial::PartialRecipes;
+use crate::repository_memberships::{
+    OrdinaryInputDescriptor, RepositoryMemberships, RepositoryOrigins,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeStruct};
@@ -216,6 +219,7 @@ impl Serialize for SerializedMetadata<'_> {
         let mut state = serializer.serialize_struct(
             "HashMetadata",
             usize::from(self.data.observed_toolchains.is_some())
+                + usize::from(self.data.repository_memberships.is_some())
                 + usize::from(self.data.module_graph_json.is_some())
                 + usize::from(include_dep_edges)
                 + usize::from(self.data.dependency_fingerprint.is_some())
@@ -225,6 +229,9 @@ impl Serialize for SerializedMetadata<'_> {
         )?;
         if let Some(index) = &self.data.observed_toolchains {
             state.serialize_field("observedToolchains", index)?;
+        }
+        if let Some(memberships) = &self.data.repository_memberships {
+            state.serialize_field("repositoryMemberships", memberships)?;
         }
         if let Some(module_graph_json) = &self.data.module_graph_json {
             state.serialize_field("moduleGraphJson", module_graph_json)?;
@@ -267,6 +274,7 @@ impl Serialize for SerializedHashFile<'_> {
             include_target_type: self.include_target_type,
         };
         if self.data.observed_toolchains.is_none()
+            && self.data.repository_memberships.is_none()
             && self.data.module_graph_json.is_none()
             && self.data.dependency_fingerprint.is_none()
             && self.data.partial.is_none()
@@ -293,6 +301,7 @@ impl Serialize for SerializedHashFile<'_> {
 #[derive(Clone, Debug, Default)]
 pub struct HashFileData {
     pub observed_toolchains: Option<crate::toolchain_candidates::ObservedToolchains>,
+    pub repository_memberships: Option<RepositoryMemberships>,
     pub configured_roots: Option<ConfiguredRoots>,
     pub hashes: BTreeMap<String, TargetHash>,
     pub module_graph_json: Option<String>,
@@ -419,33 +428,33 @@ impl<'de> Deserialize<'de> for JsonStr<'de> {
 /// instead of searching the tree for every label; a repeated label keeps its last value, as
 /// deserializing straight into a `BTreeMap` does.
 pub fn dep_edges_from_slice(bytes: &[u8]) -> serde_json::Result<BTreeMap<String, Vec<String>>> {
-    struct DepEdges(BTreeMap<String, Vec<String>>);
+    serde_json::from_slice::<DependencyEdges>(bytes).map(|edges| edges.0)
+}
 
-    impl<'de> Deserialize<'de> for DepEdges {
-        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            struct DepEdgesVisitor;
+pub struct DependencyEdges(pub BTreeMap<String, Vec<String>>);
 
-            impl<'de> Visitor<'de> for DepEdgesVisitor {
-                type Value = DepEdges;
+impl<'de> Deserialize<'de> for DependencyEdges {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DepEdgesVisitor;
 
-                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    formatter.write_str("an object mapping labels to label arrays")
-                }
+        impl<'de> Visitor<'de> for DepEdgesVisitor {
+            type Value = DependencyEdges;
 
-                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                    let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
-                    while let Some(entry) = map.next_entry::<String, Vec<String>>()? {
-                        entries.push(entry);
-                    }
-                    Ok(DepEdges(entries.into_iter().collect()))
-                }
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an object mapping labels to label arrays")
             }
 
-            deserializer.deserialize_map(DepEdgesVisitor)
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(entry) = map.next_entry::<String, Vec<String>>()? {
+                    entries.push(entry);
+                }
+                Ok(DependencyEdges(entries.into_iter().collect()))
+            }
         }
-    }
 
-    serde_json::from_slice::<DepEdges>(bytes).map(|edges| edges.0)
+        deserializer.deserialize_map(DepEdgesVisitor)
+    }
 }
 
 /// The `{label: "kind#hash~direct"}` object, parsed entry by entry.
@@ -484,6 +493,7 @@ impl<'de> Deserialize<'de> for Hashes {
 #[serde(rename_all = "camelCase")]
 struct Metadata {
     observed_toolchains: Option<crate::toolchain_candidates::ObservedToolchains>,
+    repository_memberships: Option<RepositoryMemberships>,
     configured_roots: Option<ConfiguredRoots>,
     module_graph_json: Option<String>,
     dependency_fingerprint: Option<String>,
@@ -523,6 +533,7 @@ impl<'de> Deserialize<'de> for HashFileData {
                         "metadata" => {
                             let metadata = map.next_value::<Metadata>()?;
                             data.observed_toolchains = metadata.observed_toolchains;
+                            data.repository_memberships = metadata.repository_memberships;
                             data.module_graph_json = metadata.module_graph_json;
                             data.dependency_fingerprint = metadata.dependency_fingerprint;
                             data.dep_edges = metadata.dep_edges;
@@ -609,7 +620,11 @@ impl HashFileData {
     /// intermediate `serde_json::Value`, which is what keeps a million-entry file to one pass and
     /// one allocation per label.
     pub fn from_slice(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes).context("invalid hash JSON")
+        let data: Self = serde_json::from_slice(bytes).context("invalid hash JSON")?;
+        if data.repository_memberships.is_some() {
+            bail!("repository membership hashes require the tagged impact-graph reader");
+        }
+        Ok(data)
     }
 
     pub fn to_value(&self, include_target_type: bool, include_deps: bool) -> Value {
@@ -624,6 +639,7 @@ impl HashFileData {
             })
             .collect::<Map<_, _>>();
         if self.observed_toolchains.is_none()
+            && self.repository_memberships.is_none()
             && self.module_graph_json.is_none()
             && self.dependency_fingerprint.is_none()
             && self.partial.is_none()
@@ -639,6 +655,13 @@ impl HashFileData {
                 "observedToolchains".into(),
                 serde_json::to_value(index)
                     .expect("serializing toolchain observations cannot fail"),
+            );
+        }
+        if let Some(memberships) = &self.repository_memberships {
+            metadata.insert(
+                "repositoryMemberships".into(),
+                serde_json::to_value(memberships)
+                    .expect("serializing repository memberships cannot fail"),
             );
         }
         if let Some(module_graph_json) = &self.module_graph_json {
@@ -695,42 +718,282 @@ pub struct ImpactedTargetWithDistance {
     pub package_distance: usize,
 }
 
-/// The native comparison result and the changed graph used to compute its distances.
-/// Read each path's keys in the dependency-edges file supplied to this comparison.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct ImpactGraph {
     pub version: u32,
     pub targets: Vec<ImpactedTargetWithDistance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisional_targets: Option<Vec<ImpactedTargetWithDistance>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_inputs: Option<OrdinaryInputDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_origins: Option<BTreeMap<String, RepositoryOrigins>>,
     pub paths: Vec<ImpactPath>,
-    /// Roots whose verified configured hash inputs and context are equal in this comparison.
-    /// An absent label remains unknown; caller obligations outside this graph still apply.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub unresolved: BTreeSet<String>,
+    #[serde(default)]
     pub unaffected_roots: BTreeSet<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum ImpactPathKind {
     Ordinary,
+    Provisional,
     Configured,
     Shared,
-    /// An independent MODULE obligation, represented as one distance-zero root.
     Forced,
 }
 
-/// A set of eligible outputs and the native origins and changed nodes that reach them.
-/// `direct` includes the existing distance-zero fallback for incomplete edge files.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ImpactPath {
     pub kind: ImpactPathKind,
     pub changed: BTreeSet<String>,
     pub direct: BTreeSet<String>,
-    /// Public output label to its key in the supplied head dependency graph.
     pub roots: BTreeMap<String, String>,
+    /// The normal parent-to-input map restricted to this changed path and its edge kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edges: Option<BTreeMap<String, Vec<String>>>,
+}
+
+impl ImpactGraph {
+    /// Separate the real ordinary path from the compatibility path that includes repository
+    /// memberships. Version 2 reads those edge kinds from the tagged dependency graph.
+    pub fn distinguish_repository_memberships(
+        mut self,
+        from: &HashFileData,
+        to: &HashFileData,
+        edges: &BTreeMap<String, Vec<String>>,
+    ) -> Result<Self> {
+        let before = from
+            .repository_memberships
+            .as_ref()
+            .context("base repository membership provenance is unavailable")?;
+        let after = to
+            .repository_memberships
+            .as_ref()
+            .context("head repository membership provenance is unavailable")?;
+        before.validate()?;
+        after.validate()?;
+        let mut paths = Vec::new();
+        for mut path in self.paths {
+            if path.kind != ImpactPathKind::Ordinary {
+                paths.push(path);
+                continue;
+            }
+            let direct: BTreeSet<_> = path
+                .direct
+                .iter()
+                .filter(|label| {
+                    let Some(head) = to.hashes.get(*label) else {
+                        return false;
+                    };
+                    let changed = from
+                        .hashes
+                        .get(*label)
+                        .is_none_or(|base| base.direct_hash != head.direct_hash);
+                    if !changed {
+                        return false;
+                    }
+                    let base_hash = from.hashes.get(*label);
+                    let base = match before.receivers.get(*label) {
+                        Some(receiver) => receiver
+                            .direct_without_memberships
+                            .as_deref()
+                            .map(Digest::parse),
+                        None => base_hash.map(|hash| hash.direct_hash.clone()),
+                    };
+                    let head = match after.receivers.get(*label) {
+                        Some(receiver) => receiver
+                            .direct_without_memberships
+                            .as_deref()
+                            .map(Digest::parse),
+                        None => Some(head.direct_hash.clone()),
+                    };
+                    match (base_hash, base, head) {
+                        (None, _, Some(_)) => true,
+                        (Some(_), Some(base), Some(head)) => base != head,
+                        _ => false,
+                    }
+                })
+                .cloned()
+                .collect();
+            let mut parents = HashMap::<&str, Vec<&str>>::new();
+            let mut provisional = path
+                .direct
+                .difference(&direct)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for parent in &path.changed {
+                let membership_changed =
+                    match (before.receivers.get(parent), after.receivers.get(parent)) {
+                        (None, None) => false,
+                        (Some(base), Some(head)) => {
+                            before.groups[base.group] != after.groups[head.group]
+                                || base.ordinary_overlaps != head.ordinary_overlaps
+                        }
+                        _ => true,
+                    };
+                if membership_changed {
+                    provisional.insert(parent.clone());
+                }
+                for child in edges.get(parent).into_iter().flatten() {
+                    if path.changed.contains(child) {
+                        parents.entry(child).or_default().push(parent);
+                        if after.contains(parent, child) {
+                            provisional.insert(parent.clone());
+                        }
+                    }
+                }
+            }
+            let seeds: Vec<_> = direct.iter().map(String::as_str).collect();
+            let reached = reverse_distances(&parents, &seeds, |child, parent| {
+                (!after.contains(parent, child)).then_some(1)
+            });
+            let roots = path
+                .roots
+                .iter()
+                .filter(|(_, key)| reached.contains_key(key.as_str()))
+                .map(|(label, key)| (label.clone(), key.clone()))
+                .collect::<BTreeMap<_, _>>();
+            if !roots.is_empty() {
+                paths.push(ImpactPath {
+                    kind: ImpactPathKind::Ordinary,
+                    changed: reached.keys().map(|label| (*label).to_owned()).collect(),
+                    direct,
+                    roots,
+                    edges: None,
+                });
+            }
+            let seeds: Vec<_> = provisional.iter().map(String::as_str).collect();
+            let reached = reverse_distances(&parents, &seeds, |_, _| Some(1));
+            path.roots
+                .retain(|_, key| reached.contains_key(key.as_str()));
+            if !path.roots.is_empty() {
+                path.kind = ImpactPathKind::Provisional;
+                paths.push(path);
+            }
+        }
+        let mut definite = BTreeMap::<String, (usize, usize)>::new();
+        for path in paths
+            .iter()
+            .filter(|path| path.kind != ImpactPathKind::Provisional)
+        {
+            for (label, (target, package)) in
+                impact_path_distances(path, edges, |child, parent| match path.kind {
+                    ImpactPathKind::Ordinary => !after.contains(parent, child),
+                    ImpactPathKind::Shared => {
+                        !child.starts_with("//external:") && !parent.starts_with("//external:")
+                    }
+                    _ => true,
+                })?
+            {
+                definite
+                    .entry(label)
+                    .and_modify(|distance| {
+                        distance.0 = distance.0.min(target);
+                        distance.1 = distance.1.min(package);
+                    })
+                    .or_insert((target, package));
+            }
+        }
+        let provisional: BTreeSet<_> = paths
+            .iter()
+            .filter(|path| path.kind == ImpactPathKind::Provisional)
+            .flat_map(|path| path.roots.keys())
+            .collect();
+        let targets = std::mem::take(&mut self.targets);
+        self.targets = targets
+            .iter()
+            .filter_map(|target| {
+                definite
+                    .get(&target.label)
+                    .map(
+                        |&(target_distance, package_distance)| ImpactedTargetWithDistance {
+                            label: target.label.clone(),
+                            target_distance,
+                            package_distance,
+                        },
+                    )
+            })
+            .collect();
+        self.provisional_targets = Some(
+            targets
+                .into_iter()
+                .filter(|target| provisional.contains(&target.label))
+                .collect(),
+        );
+        self.version = 2;
+        self.unresolved.extend(before.unresolved.iter().cloned());
+        self.unresolved.extend(after.unresolved.iter().cloned());
+        for path in &mut paths {
+            path.edges = Some(
+                path.changed
+                    .iter()
+                    .map(|parent| {
+                        let children = edges
+                            .get(parent)
+                            .into_iter()
+                            .flatten()
+                            .filter(|child| {
+                                path.changed.contains(*child)
+                                    && match path.kind {
+                                        ImpactPathKind::Ordinary => !after.contains(parent, child),
+                                        ImpactPathKind::Shared => {
+                                            !child.starts_with("//external:")
+                                                && !parent.starts_with("//external:")
+                                        }
+                                        _ => true,
+                                    }
+                            })
+                            .cloned()
+                            .collect();
+                        (parent.clone(), children)
+                    })
+                    .collect(),
+            );
+        }
+        self.paths = paths;
+        Ok(self)
+    }
+}
+
+fn impact_path_distances(
+    path: &ImpactPath,
+    edges: &BTreeMap<String, Vec<String>>,
+    include_edge: impl Fn(&str, &str) -> bool,
+) -> Result<BTreeMap<String, (usize, usize)>> {
+    let mut parents = HashMap::<&str, Vec<&str>>::new();
+    for parent in &path.changed {
+        for child in edges.get(parent).into_iter().flatten() {
+            if path.changed.contains(child) && include_edge(child, parent) {
+                parents.entry(child).or_default().push(parent);
+            }
+        }
+    }
+    let seeds: Vec<_> = path.direct.iter().map(String::as_str).collect();
+    let target = reverse_distances(&parents, &seeds, |_, _| Some(1));
+    let package = reverse_distances(&parents, &seeds, |child, parent| {
+        Some(usize::from(
+            child.split(':').next().unwrap_or(child) != parent.split(':').next().unwrap_or(parent),
+        ))
+    });
+    path.roots
+        .iter()
+        .map(|(label, key)| {
+            let target = target
+                .get(key.as_str())
+                .with_context(|| format!("definite path has no target distance for {label}"))?;
+            let package = package
+                .get(key.as_str())
+                .with_context(|| format!("definite path has no package distance for {label}"))?;
+            Ok((label.clone(), (*target, *package)))
+        })
+        .collect()
 }
 
 fn kind_rank(hash: Option<&TargetHash>) -> u8 {
@@ -1011,6 +1274,7 @@ pub(crate) fn hash_file_impact_graph(
             changed: trace.changed,
             direct: trace.direct,
             roots: graph_roots,
+            edges: None,
         });
     }
     let mut needs_sort = false;
@@ -1032,6 +1296,7 @@ pub(crate) fn hash_file_impact_graph(
             changed: trace.shared_changed,
             direct: trace.shared_direct,
             roots,
+            edges: None,
         });
         result.targets.extend(result.shared);
         needs_sort = true;
@@ -1079,6 +1344,7 @@ pub(crate) fn hash_file_impact_graph(
             changed: changed.clone(),
             direct: changed,
             roots: BTreeMap::from([(label, key)]),
+            edges: None,
         });
     }
     if needs_sort {
@@ -1106,7 +1372,11 @@ pub(crate) fn hash_file_impact_graph(
     Ok(ImpactGraph {
         version: 1,
         targets: result.targets,
+        provisional_targets: None,
+        ordinary_inputs: None,
+        repository_origins: None,
         paths,
+        unresolved: BTreeSet::new(),
         unaffected_roots,
     })
 }
@@ -1491,6 +1761,7 @@ fn distances_for_types(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository_memberships::{RepositoryMember, RepositoryReceiver};
     use std::io::Write;
 
     fn target(kind: &str, hash: &str, direct: &str) -> TargetHash {
@@ -1499,6 +1770,167 @@ mod tests {
             hash: hash.into(),
             direct_hash: direct.into(),
         }
+    }
+
+    #[test]
+    fn membership_shortcuts_do_not_shorten_definite_paths() {
+        let memberships = |leaf: &str| RepositoryMemberships {
+            groups: vec![vec![RepositoryMember {
+                label: format!("//external:{leaf}"),
+                canonical_repository: Some(format!("@@ext++values+{leaf}")),
+                selected: true,
+            }]],
+            receivers: BTreeMap::from([(
+                "//external:hub".into(),
+                RepositoryReceiver {
+                    group: 0,
+                    ordinary_overlaps: BTreeSet::new(),
+                    direct_without_memberships: Some("11".repeat(32)),
+                },
+            )]),
+            ..Default::default()
+        };
+        let before = HashFileData {
+            hashes: BTreeMap::from([
+                ("//app:root".into(), target("Rule", "old", "root")),
+                ("//a:one".into(), target("Rule", "old", "one")),
+                ("//b:two".into(), target("Rule", "old", "two")),
+                ("//c:source".into(), target("SourceFile", "old", "old")),
+                ("//external:hub".into(), target("Rule", "old", "old")),
+                ("//external:old".into(), target("Rule", "old", "old")),
+            ]),
+            repository_memberships: Some(memberships("old")),
+            ..Default::default()
+        };
+        let after = HashFileData {
+            hashes: BTreeMap::from([
+                ("//app:root".into(), target("Rule", "new", "root")),
+                ("//a:one".into(), target("Rule", "new", "one")),
+                ("//b:two".into(), target("Rule", "new", "two")),
+                ("//c:source".into(), target("SourceFile", "new", "new")),
+                ("//external:hub".into(), target("Rule", "new", "new")),
+                ("//external:new".into(), target("Rule", "new", "new")),
+            ]),
+            repository_memberships: Some(memberships("new")),
+            ..Default::default()
+        };
+        let edges = BTreeMap::from([
+            (
+                "//app:root".into(),
+                vec!["//a:one".into(), "//external:hub".into()],
+            ),
+            ("//a:one".into(), vec!["//b:two".into()]),
+            ("//b:two".into(), vec!["//c:source".into()]),
+            ("//c:source".into(), Vec::new()),
+            ("//external:hub".into(), vec!["//external:new".into()]),
+            ("//external:new".into(), Vec::new()),
+        ]);
+        let types = HashSet::from(["Rule".into()]);
+        let graph = hash_file_impact_graph(
+            &before,
+            &after,
+            &edges,
+            &BTreeSet::new(),
+            Some(&types),
+            false,
+        )
+        .unwrap()
+        .distinguish_repository_memberships(&before, &after, &edges)
+        .unwrap();
+        let root = graph
+            .targets
+            .iter()
+            .find(|target| target.label == "//app:root")
+            .unwrap();
+        assert_eq!((root.target_distance, root.package_distance), (3, 3));
+        let root = graph
+            .provisional_targets
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|target| target.label == "//app:root")
+            .unwrap();
+        assert_eq!((root.target_distance, root.package_distance), (1, 1));
+        let ordinary = graph
+            .paths
+            .iter()
+            .find(|path| path.kind == ImpactPathKind::Ordinary)
+            .unwrap();
+        assert!(ordinary.changed.contains("//c:source"));
+        assert!(!ordinary.roots.contains_key("//c:source"));
+        assert_eq!(ordinary.edges.as_ref().unwrap()["//app:root"], ["//a:one"]);
+        let provisional = graph
+            .paths
+            .iter()
+            .find(|path| path.kind == ImpactPathKind::Provisional)
+            .unwrap();
+        assert_eq!(
+            provisional.edges.as_ref().unwrap()["//external:hub"],
+            ["//external:new"]
+        );
+
+        let same = hash_file_impact_graph(
+            &after,
+            &after,
+            &edges,
+            &BTreeSet::new(),
+            Some(&types),
+            false,
+        )
+        .unwrap()
+        .distinguish_repository_memberships(&after, &after, &edges)
+        .unwrap();
+        assert!(same.targets.is_empty());
+        assert!(same.provisional_targets.unwrap().is_empty());
+    }
+
+    #[test]
+    fn receiver_appearance_preserves_an_independent_direct_change() {
+        let before = HashFileData {
+            hashes: BTreeMap::from([(
+                "//external:hub".into(),
+                target("Rule", "old", &"11".repeat(32)),
+            )]),
+            repository_memberships: Some(RepositoryMemberships::default()),
+            ..Default::default()
+        };
+        let after = HashFileData {
+            hashes: BTreeMap::from([
+                ("//external:hub".into(), target("Rule", "new", "new")),
+                ("//external:leaf".into(), target("Rule", "leaf", "leaf")),
+            ]),
+            repository_memberships: Some(RepositoryMemberships {
+                groups: vec![vec![RepositoryMember {
+                    label: "//external:leaf".into(),
+                    canonical_repository: Some("@@ext++values+leaf".into()),
+                    selected: true,
+                }]],
+                receivers: BTreeMap::from([(
+                    "//external:hub".into(),
+                    RepositoryReceiver {
+                        group: 0,
+                        ordinary_overlaps: BTreeSet::new(),
+                        direct_without_memberships: Some("22".repeat(32)),
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let edges = BTreeMap::from([
+            ("//external:hub".into(), vec!["//external:leaf".into()]),
+            ("//external:leaf".into(), Vec::new()),
+        ]);
+        let graph = hash_file_impact_graph(&before, &after, &edges, &BTreeSet::new(), None, false)
+            .unwrap()
+            .distinguish_repository_memberships(&before, &after, &edges)
+            .unwrap();
+        let hub = graph
+            .targets
+            .iter()
+            .find(|target| target.label == "//external:hub")
+            .unwrap();
+        assert_eq!((hub.target_distance, hub.package_distance), (0, 0));
     }
 
     #[test]

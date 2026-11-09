@@ -860,6 +860,8 @@ Options:
           Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
+      --useModuleToolchainRegistrations
+          Record observed MODULE toolchain inputs and distinguish inferred repository memberships. Writes tagged files for --reportImpactGraph; missing producer data stays unresolved
       --cqueryRootExpression <CQUERY_ROOT_EXPRESSION>
           Hash and report the configured top-level targets in this expression
       --cqueryRootExpressionFile <CQUERY_ROOT_EXPRESSION_FILE>
@@ -938,6 +940,8 @@ Options:
           [possible values: true, false]
       --toolchainCandidatesFile <TOOLCHAIN_CANDIDATES_FILE>
           Write positive toolchain reader observations. Absence cannot exclude a scheduled target
+      --repositoryOriginRoots <REPOSITORY_ORIGIN_ROOTS>
+          JSON array of requested roots whose repository causes should be included in the report
   -h, --help
           Print help
   -V, --version
@@ -1030,6 +1034,8 @@ Options:
           Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
+      --useModuleToolchainRegistrations
+          Record observed MODULE toolchain inputs and distinguish inferred repository memberships. Writes tagged files for --reportImpactGraph; missing producer data stays unresolved
       --cqueryRootExpression <CQUERY_ROOT_EXPRESSION>
           Hash and report the configured top-level targets in this expression
       --cqueryRootExpressionFile <CQUERY_ROOT_EXPRESSION_FILE>
@@ -1144,6 +1150,8 @@ Options:
           Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
+      --useModuleToolchainRegistrations
+          Record observed MODULE toolchain inputs and distinguish inferred repository memberships. Writes tagged files for --reportImpactGraph; missing producer data stays unresolved
       --cqueryRootExpression <CQUERY_ROOT_EXPRESSION>
           Hash and report the configured top-level targets in this expression
       --cqueryRootExpressionFile <CQUERY_ROOT_EXPRESSION_FILE>
@@ -1268,7 +1276,7 @@ A few inputs are normalized or extended on the way in:
   An attribute that names a workspace path absolutely (a crate or Go module built from a directory
   in the workspace, a `file://%workspace%` registry URL) is hashed relative to the workspace, so
   identical checkouts at different paths hash the same.
-  In query mode the module that owns a module extension stands in for every repository the
+  By default in query mode, the module that owns a module extension stands in for every repository the
   extension generates, because a toolchain resolved from one of them is not a query input. Every
   target that uses a rule of the owning module, every target of a module with a `bazel_dep` path
   to it, and every fine-grained target inside one of those repositories therefore changes whenever
@@ -1281,6 +1289,25 @@ A few inputs are normalized or extended on the way in:
   `rules_go`'s `go_sdk`: a change to it would be missed. An extension whose name another `.bzl` file of the same
   module also exports is reported and ignored, since Bazel tells their repositories apart only by
   a numeric suffix.
+  With `--useModuleToolchainRegistrations`, the repositories named by
+  `--fineGrainedHashExternalRepos` identify the extension usages whose inferred owner and hub
+  memberships are recorded separately from ordinary dependencies. Naming an imported hub is
+  sufficient; Bazel-diff resolves it through the root repository mapping. Other usages and
+  genuine dependency overlaps keep their ordinary behavior.
+  This mode writes tagged hash and edge files for `get-impacted-targets --reportImpactGraph`.
+  `targets` and ordinary paths use returned ordinary inputs and positively observed toolchain
+  registration relations. `provisionalTargets` and provisional paths may also use the selected
+  memberships. A membership alone never makes a target definite.
+  When Bazel returns evaluated MODULE registrations and possible native toolchain types, the
+  mode connects observed readers to matching declarations and their implementation labels,
+  and records registration order. These declarations are candidates for the observed types;
+  the mode does not traverse missing implementation bodies. With stock Bazel, membership
+  recording works but `unresolved` reports incomplete compiler nomination because the complete
+  producer interface is unavailable. Absence cannot exclude a change visible only through a toolchain.
+  Use fresh full ordinary queries with the profile defined by MODULE registrations, including rc settings.
+  Partial generation, cached services, configured query, isolated roots, and explicit custom
+  toolchain profiles are unsupported. A caller must retain provisional work until separate
+  configured evidence explicitly clears the matching request; scoped clearance remains pending.
   `--isolatedDependencyRoot=@crates` asserts that every outside consumer of this
   root-isolated usage reaches a member through a target input or a BUILD load in the ordinary
   query. Do not enable it for usages that supply an implicitly selected toolchain, or whose

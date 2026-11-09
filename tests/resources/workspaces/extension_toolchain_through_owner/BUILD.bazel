@@ -1,4 +1,13 @@
-filegroup(
+genrule(
     name = "uses_app",
     srcs = ["@app//:lib"],
+    outs = ["uses_app.txt"],
+    cmd = "cat $< > $@",
+)
+
+genrule(
+    name = "reads_manual",
+    srcs = ["@app//:manual"],
+    outs = ["manual.txt"],
+    cmd = "cat $< > $@",
 )

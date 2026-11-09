@@ -728,6 +728,7 @@ impl BazelOptions {
         strict
             .command_options
             .extend(["--nokeep_going".into(), "--proto:rule_classes".into()]);
+        let mut reached_aliases = BTreeSet::new();
         let mut extra = if missing.is_empty() {
             Vec::new()
         } else {
@@ -741,6 +742,15 @@ impl BazelOptions {
                 Some(version),
                 &mut |batch| transform(batch, None),
                 |row| {
+                    // A dependency can lead back to an alias in the primary query. Keep its
+                    // binding even though the existing target row remains authoritative.
+                    if let Some(rule) = row
+                        .rule
+                        .as_option()
+                        .filter(|rule| rule.rule_class_key.as_deref() == Some("alias"))
+                    {
+                        reached_aliases.insert(rule.name.clone());
+                    }
                     target_name(row).is_some_and(|name| {
                         !primary.contains(&canonical_query_label(name, &mapping))
                     })
@@ -846,13 +856,14 @@ impl BazelOptions {
                 extra.extend(rows);
             }
         }
-        let new_aliases = extra
-            .iter()
-            .filter_map(|target| target.rule.as_option())
-            .filter(|r| r.rule_class_key.as_deref() == Some("alias"))
-            .map(|r| r.name.clone())
-            .collect();
-        bindings.extend(self.alias_actuals(&new_aliases, version)?);
+        reached_aliases.extend(
+            extra
+                .iter()
+                .filter_map(|target| target.rule.as_option())
+                .filter(|r| r.rule_class_key.as_deref() == Some("alias"))
+                .map(|r| r.name.clone()),
+        );
+        bindings.extend(self.alias_actuals(&reached_aliases, version)?);
         // Primary and supplemental rows may have been prehashed, which releases their
         // projected attributes. Re-read only these native aliases with the original options,
         // then use their evaluated actual, including the mapping of select keys to labels.
@@ -1861,7 +1872,7 @@ impl BazelOptions {
         use_cquery: bool,
         version: Option<BazelVersion>,
         transform: &mut impl FnMut(&mut [Target]),
-        retain: impl Fn(&Target) -> bool,
+        retain: impl FnMut(&Target) -> bool,
     ) -> Result<Vec<Target>> {
         let version = match version {
             Some(version) => version,
@@ -3195,7 +3206,7 @@ fn decode_target_stream(
 fn decode_target_stream_filtered(
     path: &Path,
     transform: &mut impl FnMut(&mut [Target]),
-    retain: impl Fn(&Target) -> bool,
+    mut retain: impl FnMut(&Target) -> bool,
 ) -> Result<Vec<Target>> {
     let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
     let mut targets = Vec::new();
@@ -3213,7 +3224,7 @@ fn decode_target_stream_filtered(
         let start = targets.len();
         targets.reserve(decoded.len());
         for lowered in decoded.drain(..) {
-            if let Some(target) = lowered?.filter(&retain) {
+            if let Some(target) = lowered?.filter(&mut retain) {
                 targets.push(target);
             }
         }

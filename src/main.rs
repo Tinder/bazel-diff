@@ -766,7 +766,7 @@ fn fingerprint_flags(
     ]);
     if !args.use_cquery && !fine_grained_repos.is_empty() && args.isolated_dependency_root.is_none()
     {
-        flags.insert("fineAliasInputs".into(), "4".into());
+        flags.insert("fineAliasInputs".into(), "5".into());
     }
     if let Some(root) = &args.isolated_dependency_root {
         flags.insert("isolatedDependencyRoot".into(), root.clone());
@@ -1658,7 +1658,7 @@ mod tests {
         file_only.fine_grained_hash_external_repos_file = Some(fine_file);
         let file_flags = fingerprint_flags(&file_only, false, &[]).unwrap();
         assert_eq!(file_flags["fineGrainedHashExternalRepos"], "abc,from_file");
-        assert_eq!(file_flags["fineAliasInputs"], "4");
+        assert_eq!(file_flags["fineAliasInputs"], "5");
     }
 
     #[test]

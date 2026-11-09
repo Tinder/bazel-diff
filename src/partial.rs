@@ -44,7 +44,7 @@ type DigestBytes = [u8; 32];
 
 /// Bumped when the recipe format or the evaluation formula changes, so an entry an older
 /// release wrote is regenerated rather than evaluated under a formula it was not recorded for.
-pub const RECIPE_VERSION: u32 = 13;
+pub const RECIPE_VERSION: u32 = 14;
 
 // ---------------------------------------------------------------------------------------------
 // Git tree index

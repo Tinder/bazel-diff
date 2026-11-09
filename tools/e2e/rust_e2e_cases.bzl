@@ -220,6 +220,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::cquery_verifies_aspect_free_selected_toolchain",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::cquery_verifies_covered_configured_roots",
                 "timeout": "moderate",
             },

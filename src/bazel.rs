@@ -2342,7 +2342,10 @@ impl BazelOptions {
             .run_configured(&mut command)
             .context("failed to execute Bazel query")?;
         let code = output.status.code().unwrap_or(-1);
-        if code != 0 && !(self.keep_going && code == 3) {
+        // A formatter can emit its completion marker before a keep-going query returns 3.
+        // Verification requires command success; ordinary partial positives keep their policy.
+        let partial = self.keep_going && code == 3 && !verify;
+        if code != 0 && !partial {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("Bazel query failed, exit code {code}: {stderr}");
         }
@@ -2358,6 +2361,7 @@ impl BazelOptions {
                 roots.as_deref_mut(),
                 compatible.as_ref().filter(|_| rooted),
                 verify,
+                verify && rooted,
             )?
         } else if use_cquery {
             decode_cquery_stream(
@@ -3744,7 +3748,7 @@ fn decode_cquery_stream(
     roots: Option<&mut Vec<(String, String)>>,
     compatible: Option<&HashSet<String>>,
 ) -> Result<Vec<Target>> {
-    let graph = decode_cquery_graph(path, streamed, transform, roots, compatible, false)?;
+    let graph = decode_cquery_graph(path, streamed, transform, roots, compatible, false, false)?;
     Ok(graph.targets)
 }
 
@@ -3755,6 +3759,7 @@ fn decode_cquery_graph(
     roots: Option<&mut Vec<(String, String)>>,
     compatible: Option<&HashSet<String>>,
     verify: bool,
+    marker_expected: bool,
 ) -> Result<QueryGraph> {
     let mut decoder = CqueryDecoder {
         root_labels: roots.as_ref().map(|_| Vec::new()),
@@ -3762,6 +3767,8 @@ fn decode_cquery_graph(
         verify,
         ..CqueryDecoder::default()
     };
+    let mut marker = false;
+    let mut invalid_marker = false;
     if streamed {
         // Results decode in parallel, a raw batch at a time; naming them stays in stream order
         // because a result's configuration may be defined by an earlier message.
@@ -3771,10 +3778,22 @@ fn decode_cquery_graph(
         while read_raw_batch(&mut reader, &mut batch)? {
             batch
                 .slices()
-                .map(|bytes| CqueryResult::decode_from_slice(bytes).map_err(anyhow::Error::from))
+                .map(|bytes| {
+                    CqueryResult::decode_from_slice(bytes)
+                        // The producer writes field 5 = true in its own terminal frame.
+                        .map(|result| (result, bytes == [0x28, 0x01]))
+                        .map_err(anyhow::Error::from)
+                })
                 .collect_into_vec(&mut decoded);
             for result in decoded.drain(..) {
-                let mut result = result?;
+                let (mut result, marker_only) = result?;
+                if marker {
+                    invalid_marker = true;
+                }
+                if result.explicit_aspect_inputs {
+                    marker = true;
+                    invalid_marker |= !marker_expected || !marker_only;
+                }
                 retain_compatible_configured_targets(&mut result, compatible, roots.is_some());
                 decoder.push(result, transform);
             }
@@ -3782,9 +3801,13 @@ fn decode_cquery_graph(
     } else {
         let bytes = fs::read(path)?;
         let mut result = CqueryResult::decode_from_slice(&bytes)?;
+        marker = result.explicit_aspect_inputs;
+        invalid_marker = marker && !marker_expected;
         retain_compatible_configured_targets(&mut result, compatible, roots.is_some());
         decoder.push(result, transform);
     }
+    decoder.explicit_aspect_inputs = marker_expected && marker && !invalid_marker;
+    decoder.invalid_explicit_aspect_marker = invalid_marker;
     decoder.finish(transform)?;
     if roots.is_some() || compatible.is_some() || verify {
         // Bazel can force the same toolchain onto different execution platforms without
@@ -3870,6 +3893,8 @@ struct CqueryDecoder {
     aspect_identities: Vec<ConfiguredAspect>,
     aspect_results: Vec<ConfiguredAspectResult>,
     observed_aspects: Option<Vec<ObservedAspect>>,
+    explicit_aspect_inputs: bool,
+    invalid_explicit_aspect_marker: bool,
     source_locations: BTreeMap<String, Option<String>>,
 }
 
@@ -4062,7 +4087,9 @@ impl CqueryDecoder {
             bail!("configured target {label} has a bare label ambiguous with the configured-key encoding");
         }
         if self.verify
-            && (!self.aspect_identities.is_empty()
+            && !self.invalid_explicit_aspect_marker
+            && (self.explicit_aspect_inputs
+                || !self.aspect_identities.is_empty()
                 || !self.aspect_results.is_empty()
                 || self.targets.iter().any(|target| {
                     target.rule.as_option().is_some_and(|rule| {
@@ -8371,7 +8398,7 @@ exit 1
         assert_eq!(query_calls(workspace.path()), calls);
 
         let disabled = tempfile::tempdir().unwrap();
-        let script = query_script(disabled.path(), "8.7.0", &[], 0);
+        let script = query_script(disabled.path(), "8.7.0", &[], 0, 0);
         let mut options = probe_options(disabled.path(), script);
         options.isolated_dependency_root = Some("@hub".into());
         refuses(&options, "Bzlmod repository discovery is unavailable");
@@ -8609,6 +8636,57 @@ exit 1
     }
 
     #[test]
+    fn explicit_aspect_completion_requires_requested_terminal_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cquery.pb");
+        let row = results(vec![configured(rule_target("//a:root"), Some("abc123"), 0)]);
+        let marker = CqueryResult {
+            explicit_aspect_inputs: true,
+            ..Default::default()
+        };
+        let verified = |frames: &[CqueryResult], expected| {
+            write_delimited(&path, frames);
+            decode_cquery_graph(&path, true, &mut |_| {}, None, None, true, expected)
+                .unwrap()
+                .into_verified()
+                .is_some()
+        };
+        assert!(!verified(std::slice::from_ref(&row), true));
+        assert!(verified(&[row.clone(), marker.clone()], true));
+        assert!(!verified(&[row.clone(), marker.clone()], false));
+        assert!(!verified(&[marker.clone(), row.clone()], true));
+        assert!(!verified(
+            &[row.clone(), marker.clone(), CqueryResult::default()],
+            true
+        ));
+        let mut combined = row.clone();
+        combined.explicit_aspect_inputs = true;
+        assert!(!verified(std::slice::from_ref(&combined), true));
+
+        fs::write(&path, combined.encode_to_vec()).unwrap();
+        assert!(
+            decode_cquery_graph(&path, false, &mut |_| {}, None, None, true, true)
+                .unwrap()
+                .into_verified()
+                .is_some()
+        );
+        assert!(
+            decode_cquery_graph(&path, false, &mut |_| {}, None, None, true, false)
+                .unwrap()
+                .into_verified()
+                .is_none()
+        );
+
+        write_delimited(&path, &[row, marker]);
+        let ordinary = decode_cquery_stream(&path, true, &mut |_| {}, None, None).unwrap();
+        assert_eq!(target_name(&ordinary[0]), Some("//a:root|abc123"));
+        let mut truncated = fs::read(&path).unwrap();
+        truncated.pop();
+        fs::write(&path, truncated).unwrap();
+        assert!(decode_cquery_graph(&path, true, &mut |_| {}, None, None, true, true).is_err());
+    }
+
+    #[test]
     fn explicit_aspects_resolve_query_local_ids() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("cquery.pb");
@@ -8686,7 +8764,7 @@ exit 1
                     },
                 ],
             );
-            decode_cquery_graph(&path, true, &mut |_| {}, None, None, true)?
+            decode_cquery_graph(&path, true, &mut |_| {}, None, None, true, false)?
                 .into_verified()
                 .context("typed aspect records were returned")
         };
@@ -8738,7 +8816,8 @@ exit 1
     /// compatible-target cquery (`--output starlark`) lists `compatible`, one per line, with a
     /// blank line that the runner must ignore; the proto cquery copies `cquery_proto` to its
     /// `--output_file`, or prints it when the runner redirects stdout instead (a Bazel older
-    /// than 8.2); `query` copies `query_proto` the same way and exits with `query_exit`,
+    /// than 8.2), then exits with `cquery_exit`; `query` copies `query_proto` the same way and
+    /// exits with `query_exit`,
     /// reporting on stderr when that is non-zero. Every invocation is appended to `calls.log`.
     #[cfg(unix)]
     fn query_script(
@@ -8746,6 +8825,7 @@ exit 1
         version: &str,
         compatible: &[&str],
         query_exit: i32,
+        cquery_exit: i32,
     ) -> PathBuf {
         let result = results(vec![
             configured(rule_target("//app:lib"), Some("abc123"), 1),
@@ -8793,7 +8873,7 @@ if [ "$1" = cquery ]; then
   else
     copy_or_print "{streamed}" "$@"
   fi
-  exit 0
+  exit {cquery_exit}
 fi
 if [ "$1" = query ]; then
   copy_or_print "{query}" "$@"
@@ -8837,7 +8917,13 @@ exit 1
             ("6.5.0", "proto", false),
         ] {
             let workspace = tempfile::tempdir().unwrap();
-            let script = query_script(workspace.path(), version, &["//app:lib", "//app:tool"], 0);
+            let script = query_script(
+                workspace.path(),
+                version,
+                &["//app:lib", "//app:tool"],
+                0,
+                0,
+            );
             let mut options = probe_options(workspace.path(), script);
             options.use_cquery = true;
             options.cquery_options = vec!["--define=flavor=test".into()];
@@ -8887,15 +8973,63 @@ exit 1
         }
     }
 
-    /// A failed compatible-target cquery stops the query instead of silently keeping every
-    /// target, and a plain `query` that exits non-zero is an error that quotes Bazel's stderr --
-    /// unless `--keep_going` was asked for and Bazel exited 3, the code it uses for a partial
-    /// answer, in which case the output it did produce is used.
+    /// A completion marker does not upgrade a partial command result to verified coverage.
+    #[test]
+    #[cfg(unix)]
+    fn verification_rejects_partial_query_even_with_completion_marker() {
+        let workspace = tempfile::tempdir().unwrap();
+        let script = query_script(workspace.path(), "8.7.0", &["//app:lib"], 0, 3);
+        write_delimited(
+            &workspace.path().join("cquery-stream.pb"),
+            &[
+                results(vec![configured(
+                    rule_target("//app:lib"),
+                    Some("abc123"),
+                    0,
+                )]),
+                CqueryResult {
+                    explicit_aspect_inputs: true,
+                    ..Default::default()
+                },
+            ],
+        );
+        let mut options = probe_options(workspace.path(), script);
+        options.use_cquery = true;
+        options.keep_going = true;
+        options.cquery_root_expression = Some("//app:lib".into());
+        let ordinary = options
+            .query_with_capture(
+                "deps(config(//app:lib, target))",
+                true,
+                Some(BazelVersion(8, 7, 0)),
+                &mut |_| {},
+                CqueryCapture::Standard,
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(target_name(&ordinary.targets[0]), Some("//app:lib|abc123"));
+        let error = options
+            .query_with_capture(
+                "deps(config(//app:lib, target))",
+                true,
+                Some(BazelVersion(8, 7, 0)),
+                &mut |_| {},
+                CqueryCapture::Verification,
+                |_| true,
+            )
+            .err()
+            .expect("partial verification must be unavailable");
+        assert!(error
+            .to_string()
+            .contains("Bazel query failed, exit code 3"));
+    }
+
+    /// Ordinary query accepts only exit 3 under keep-going; other failures retain their stderr.
     #[test]
     #[cfg(unix)]
     fn query_surfaces_bazel_failures_and_tolerates_partial_answers_with_keep_going() {
         let workspace = tempfile::tempdir().unwrap();
-        let script = query_script(workspace.path(), "8.7.0", &[], 1);
+        let script = query_script(workspace.path(), "8.7.0", &[], 1, 0);
         let mut options = probe_options(workspace.path(), script);
         options.command_options = vec!["--noimplicit_deps".into()];
 
@@ -8925,7 +9059,7 @@ exit 1
         );
 
         let partial = tempfile::tempdir().unwrap();
-        let script = query_script(partial.path(), "8.7.0", &[], 3);
+        let script = query_script(partial.path(), "8.7.0", &[], 3, 0);
         let mut options = probe_options(partial.path(), script);
         let error = options.query("//app:all", false).unwrap_err().to_string();
         assert!(error.contains("Bazel query failed, exit code 3"), "{error}");

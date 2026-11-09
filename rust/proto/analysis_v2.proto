@@ -48,4 +48,5 @@ message CqueryResult {
   repeated Configuration configurations = 2;
   repeated ConfiguredAspect aspects = 3;
   repeated ConfiguredAspectResult aspect_results = 4;
+  bool explicit_aspect_inputs = 5;
 }

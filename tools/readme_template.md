@@ -142,12 +142,13 @@ for an absent one. It requests the full attributes and typed explicit aspect
 serialization needed to check coverage. These extra edges establish coverage;
 they do not become positive impact paths.
 
-Verification requires a Bazel producer with typed explicit aspect records, such
-as [Bazel #32496](https://github.com/bazelbuild/bazel/pull/32496). The current
-format has no capability marker for a response without aspects, so the capture
-must contain an actual typed aspect record. A supported root may be independent of
-that aspect. An unsupported or failed verification query leaves the normal
-hashes available without negative authority.
+Verification requires a Bazel producer with typed explicit aspect output, such
+as [Bazel #32496](https://github.com/bazelbuild/bazel/pull/32496). Its completion
+marker can establish that the requested view contains no aspects; streamed output
+must end with the separate marker frame. Older output still requires an actual
+typed aspect record, which may be independent of a supported root. Verification
+also requires a successful query: partial or failed output leaves the normal
+hashes available without negative authority, even when it contains a marker.
 
 The initial supported roots are in the main repository and reach no aspect
 application. Each prerequisite in the full view must match the exact input used by

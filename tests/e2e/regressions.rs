@@ -1079,6 +1079,133 @@ fn cquery_keeps_dependencies_of_every_configured_instance() {
 }
 
 #[test]
+fn cquery_verifies_aspect_free_selected_toolchain() {
+    let workspace = copy_workspace("cquery_nested_toolchains");
+    let root = workspace.path();
+    edit(&root.join("BUILD"), |text| {
+        format!("{text}\ngenrule(name = \"only_x_product\", srcs = [\":only_x\"], outs = [\"only_x_product.txt\"], cmd = \"cat $< > $@\")\n")
+    });
+    fs::write(root.join("x.txt"), "X1").unwrap();
+    fs::write(root.join("y.txt"), "Y1").unwrap();
+    let capability = std::process::Command::new(bazel())
+        .current_dir(root)
+        .args([
+            "cquery",
+            "deps(config(//:only_x_product, target))",
+            "--experimental_explicit_aspects",
+            "--implicit_deps",
+            "--tool_deps",
+            "--nodep_deps",
+            "--include_aspects",
+            "--transitions=lite",
+            "--proto:include_configurations",
+            "--proto:rule_inputs_and_outputs",
+            "--consistent_labels",
+            "--output=jsonproto",
+        ])
+        .output()
+        .unwrap();
+    if !capability.status.success() {
+        let stderr = String::from_utf8_lossy(&capability.stderr);
+        if stderr.contains("Unrecognized option: --experimental_explicit_aspects") {
+            return;
+        }
+        panic!("explicit-aspect capability query failed: {stderr}");
+    }
+    let capability: serde_json::Value = serde_json::from_slice(&capability.stdout).unwrap();
+    if capability["explicitAspectInputs"] != true {
+        return;
+    }
+    assert!(capability["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["target"]["rule"]["name"]
+            .as_str()
+            .is_some_and(|name| name.trim_start_matches('@') == "//:only_x_product")));
+    for field in ["aspects", "aspectResults"] {
+        assert!(capability
+            .get(field)
+            .is_none_or(|rows| rows.as_array().is_some_and(Vec::is_empty)));
+    }
+    let out = tempfile::tempdir().unwrap();
+    let base = out.path().join("base.json");
+    let artifacts = std::env::var_os("TEST_UNDECLARED_OUTPUTS_DIR").map(std::path::PathBuf::from);
+    for (name, x, y) in [
+        ("base", "X1", "Y1"),
+        ("sibling", "X1", "Y2"),
+        ("compiler", "X2", "Y1"),
+    ] {
+        fs::write(root.join("x.txt"), x).unwrap();
+        fs::write(root.join("y.txt"), y).unwrap();
+        let hashes = out.path().join(format!("{name}.json"));
+        let edges = out.path().join(format!("{name}-edges.json"));
+        let generated = generate(
+            root,
+            &hashes,
+            &[
+                "--useCquery",
+                "--cqueryRootExpression",
+                "//:only_x_product",
+                "--verifyConfiguredRoots",
+                "--includeTargetType",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let build = std::process::Command::new(bazel())
+            .current_dir(root)
+            .args(["build", "//:only_x_product"])
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("bazel-bin/only_x_product.txt")).unwrap(),
+            x
+        );
+        let report = out.path().join(format!("{name}-report.json"));
+        let compared = impacted(
+            root,
+            &base,
+            &hashes,
+            &report,
+            &["-d", edges.to_str().unwrap(), "--reportImpactGraph"],
+        );
+        assert!(
+            compared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compared.stderr)
+        );
+        let result: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        let changed = result["targets"].as_array().unwrap().iter().any(|target| {
+            target["label"].as_str().unwrap().trim_start_matches('@') == "//:only_x_product"
+        });
+        let unaffected = result["unaffectedRoots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|label| label.as_str().unwrap().trim_start_matches('@') == "//:only_x_product");
+        assert_eq!(changed, name == "compiler", "{name}: {result}");
+        assert_eq!(unaffected, name != "compiler", "{name}: {result}");
+        if let Some(artifacts) = &artifacts {
+            fs::copy(&hashes, artifacts.join(format!("{name}-hashes.json"))).unwrap();
+            fs::copy(&edges, artifacts.join(format!("{name}-edges.json"))).unwrap();
+            fs::copy(&report, artifacts.join(format!("{name}-report.json"))).unwrap();
+        }
+    }
+}
+
+#[test]
 fn cquery_rejects_indistinguishable_toolchain_instances() {
     let workspace = copy_workspace("cquery_nested_toolchains");
     let workspace = workspace.path();

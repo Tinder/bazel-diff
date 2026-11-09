@@ -1976,14 +1976,25 @@ fn extension_repo_patch_edit_impacts_toolchain_user() {
     edit(&second.path().join("patches/sdk.patch"), |text| {
         text.replace("+1.0.0-patched", "+1.0.0-repatched")
     });
-    let impacted = diff_workspaces(first.path(), second.path(), &[]);
-    assert!(
-        impacted
-            .iter()
-            .any(|label| label == "//:app" || label == "@@//:app"),
-        "{impacted:?}"
-    );
-    assert!(!impacted.contains("//:control"), "{impacted:?}");
+    let capable = supports_module_toolchain_inputs(first.path(), "//:app");
+    for typed in [false, true].into_iter().filter(|&typed| !typed || capable) {
+        let args = if typed {
+            &["--useModuleToolchainRegistrations"][..]
+        } else {
+            &[]
+        };
+        let impacted = diff_workspaces(first.path(), second.path(), args);
+        assert!(
+            impacted
+                .iter()
+                .any(|label| label == "//:app" || label == "@@//:app"),
+            "typed={typed}: {impacted:?}"
+        );
+        assert!(
+            !impacted.contains("//:control"),
+            "typed={typed}: {impacted:?}"
+        );
+    }
 }
 
 /// The cquery side of the case above: the resolved toolchain is a real configured input

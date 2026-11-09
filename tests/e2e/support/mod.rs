@@ -155,6 +155,84 @@ pub fn supports_mod_show_repo() -> bool {
     version >= (8, 6, 0) && version != (9, 0, 0)
 }
 
+/// Test-only capability check. A supported producer must return both the evaluated registration
+/// array and the typed rule messages; an unrelated command failure must not skip a positive test.
+pub fn supports_module_toolchain_inputs(workspace: &Path, target: &str) -> bool {
+    let registry = Command::new(bazel())
+        .current_dir(workspace)
+        .args([
+            "mod",
+            "graph",
+            "--output=json",
+            "--include_toolchain_registrations",
+        ])
+        .output()
+        .unwrap();
+    if !registry.status.success() {
+        let error = String::from_utf8_lossy(&registry.stderr);
+        assert!(
+            error.contains("Unrecognized option")
+                && error.contains("--include_toolchain_registrations"),
+            "{error}"
+        );
+        return false;
+    }
+    let graph: serde_json::Value = serde_json::from_slice(&registry.stdout).unwrap();
+    let Some(registrations) = graph.get("moduleToolchainRegistrations") else {
+        return false;
+    };
+    assert!(registrations.is_array(), "{registrations}");
+
+    let query = Command::new(bazel())
+        .current_dir(workspace)
+        .args([
+            "query",
+            target,
+            "--output=streamed_jsonproto",
+            "--consistent_labels",
+            "--implicit_deps",
+            "--tool_deps",
+            "--proto:rule_inputs_and_outputs",
+            "--proto:possible_toolchain_types",
+            "--nokeep_going",
+        ])
+        .output()
+        .unwrap();
+    if !query.status.success() {
+        let error = String::from_utf8_lossy(&query.stderr);
+        assert!(
+            error.contains("Unrecognized option")
+                && error.contains("--proto:possible_toolchain_types"),
+            "{error}"
+        );
+        return false;
+    }
+    let rows: Vec<serde_json::Value> = query
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    let rule = rows
+        .iter()
+        .filter_map(|row| row.get("rule"))
+        .find(|rule| {
+            rule.get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name.trim_start_matches('@') == target.trim_start_matches('@'))
+        })
+        .expect("capability query returned the requested rule");
+    let Some(types) = rule.get("possibleToolchainTypes") else {
+        return false;
+    };
+    assert!(types.is_object(), "{types}");
+    let Some(transitions) = types.get("transitions") else {
+        return false;
+    };
+    assert!(transitions.is_object(), "{transitions}");
+    true
+}
+
 /// Whether the local Bazel still loads WORKSPACE files. Bazel 9 removed WORKSPACE support
 /// outright, so a fixture whose repos are declared in a WORKSPACE file has no `@repo` to query.
 pub fn supports_workspace() -> bool {

@@ -91,6 +91,9 @@ pub fn configuration_fingerprint(
     if !options.bazel.use_cquery {
         hasher.update(b"queryToolchainImplementations=1\0");
     }
+    if options.bazel.use_module_toolchain_registrations {
+        hasher.update(b"observedModuleToolchainEdges=3\0");
+    }
     hasher.update(b"stackSourcePaths=1\0");
     hasher.update(b"localArchiveBuildFile=1\0");
     if !options.bazel.use_cquery
@@ -105,7 +108,13 @@ pub fn configuration_fingerprint(
         hasher.update([0]);
     }
     if partial_graph {
-        hasher.update(format!("partialGraph={}", partial::RECIPE_VERSION).as_bytes());
+        hasher.update(
+            format!(
+                "partialGraph={}",
+                partial::recipe_version(options.bazel.use_module_toolchain_registrations)
+            )
+            .as_bytes(),
+        );
         hasher.update([0]);
     }
     hex::encode(hasher.finalize())[..12].to_owned()
@@ -141,6 +150,7 @@ mod tests {
                 command_options: Vec::new(),
                 cquery_options: Vec::new(),
                 use_cquery: false,
+                use_module_toolchain_registrations: false,
                 cquery_expression: None,
                 cquery_root_expression: None,
                 keep_going: false,

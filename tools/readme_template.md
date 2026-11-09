@@ -843,7 +843,7 @@ A few inputs are normalized or extended on the way in:
   An attribute that names a workspace path absolutely (a crate or Go module built from a directory
   in the workspace, a `file://%workspace%` registry URL) is hashed relative to the workspace, so
   identical checkouts at different paths hash the same.
-  In query mode the module that owns a module extension stands in for every repository the
+  By default in query mode, the module that owns a module extension stands in for every repository the
   extension generates, because a toolchain resolved from one of them is not a query input. Every
   target that uses a rule of the owning module, every target of a module with a `bazel_dep` path
   to it, and every fine-grained target inside one of those repositories therefore changes whenever
@@ -856,6 +856,25 @@ A few inputs are normalized or extended on the way in:
   `rules_go`'s `go_sdk`: a change to it would be missed. An extension whose name another `.bzl` file of the same
   module also exports is reported and ignored, since Bazel tells their repositories apart only by
   a numeric suffix.
+  With `--useModuleToolchainRegistrations`, the repositories named by
+  `--fineGrainedHashExternalRepos` identify the extension usages for which ordinary query
+  replaces these inferred dependencies. Naming an imported hub is sufficient. Bazel-diff
+  resolves its apparent name through the root repository mapping, or accepts its canonical
+  name. Other imports from the same usage are covered. Other usages keep their existing
+  repository dependencies, including those defined by the same module.
+  The opt-in follows ordinary target inputs and build files, as well as matching toolchain
+  declarations, aliases, and implementation dependencies for the native types a rule may use.
+  Registrations retain their relative MODULE priority within each type. This includes possible
+  implementations that a particular platform would skip.
+  Use the option only when the top-level toolchain profile comes from MODULE registrations,
+  including the settings in your rc files. It requires a Bazel producer that reports evaluated
+  registrations, possible toolchain types, and transition effects. No released Bazel version
+  currently supplies all three. Generation fails when Bazel cannot load a required dependency
+  or its definition, when the caller excludes one, or when a returned transition may change
+  toolchain resolution through
+  platforms, extra toolchains, execution configuration, or an unknown transition factory.
+  A transition that writes its existing platform can also be reported this way. The ordinary
+  built-in execution transition remains supported.
   `--isolatedDependencyRoot=@crates` asserts that every outside consumer of this
   root-isolated usage reaches a member through a target input or a BUILD load in the ordinary
   query. Do not enable it for usages that supply an implicitly selected toolchain, or whose

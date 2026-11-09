@@ -6,12 +6,16 @@ use bazel_diff::git::{self, DerivationPolicy, Git};
 use bazel_diff::hash::{generate_hashes, generate_verified_hashes, HashOptions};
 use bazel_diff::model::{
     dep_edges_from_slice, filter_and_sort_labels, hash_file_distances, ConfiguredRoots,
-    HashFileData,
+    DependencyEdges, HashFileData, ImpactPathKind,
 };
 use bazel_diff::module_graph::{bzlmod_enabled_for, impact_graph, impacted_with_module_changes};
 use bazel_diff::partial::{self, Classification, Glob};
+use bazel_diff::repository_memberships::{
+    extract_origins, OrdinaryInputDescriptor, RepositoryMemberships, RepositoryOrigins,
+};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -163,6 +167,11 @@ struct HashingArgs {
         default_value_t = false
     )]
     use_cquery: bool,
+
+    /// Record observed MODULE toolchain inputs and distinguish inferred repository memberships.
+    /// Requires typed producer output and writes tagged files for --reportImpactGraph.
+    #[arg(long = "useModuleToolchainRegistrations")]
+    use_module_toolchain_registrations: bool,
 
     /// Hash and report the configured top-level targets in this expression.
     #[arg(
@@ -327,6 +336,10 @@ struct GetImpactedTargetsArgs {
     /// Write positive toolchain reader observations. Absence cannot exclude a scheduled target.
     #[arg(long = "toolchainCandidatesFile", requires = "dep_edges_file")]
     toolchain_candidates_file: Option<PathBuf>,
+
+    /// JSON array of requested roots whose repository causes should be included in the report.
+    #[arg(long = "repositoryOriginRoots", requires = "report_impact_graph")]
+    repository_origin_roots: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -701,6 +714,7 @@ fn bazel_options(args: &HashingArgs, verbose: bool) -> Result<BazelOptions> {
         command_options: flatten_options(&args.bazel_command_options),
         cquery_options: flatten_options(&args.cquery_command_options),
         use_cquery: args.use_cquery,
+        use_module_toolchain_registrations: args.use_module_toolchain_registrations,
         cquery_expression: args.cquery_expression.clone(),
         cquery_root_expression: args.root_expression()?,
         keep_going: args.keep_going,
@@ -817,6 +831,11 @@ fn fingerprint_flags(
         ("stackSourcePaths".into(), "1".into()),
         ("localArchiveBuildFile".into(), "1".into()),
     ]);
+    if args.use_module_toolchain_registrations {
+        flags.insert("useModuleToolchainRegistrations".into(), "true".into());
+        flags.insert("repositoryMemberships".into(), "2".into());
+        flags.insert("toolchainReaderOrder".into(), "1".into());
+    }
     if !args.use_cquery && !fine_grained_repos.is_empty() && args.isolated_dependency_root.is_none()
     {
         flags.insert("fineAliasInputs".into(), "5".into());
@@ -856,6 +875,25 @@ fn write_json(path: Option<&Path>, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum RepositoryFormat {
+    #[serde(rename = "bazel-diff-repository-memberships-v2")]
+    V2,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RepositoryHashes<T> {
+    format: RepositoryFormat,
+    payload: T,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RepositoryDependencyGraph<E, M> {
+    version: u32,
+    edges: E,
+    memberships: M,
+}
+
 fn run_generate(args: &GenerateHashesArgs, verbose: bool) -> Result<HashFileData> {
     run_generate_with(args, verbose, generate_hashes)
 }
@@ -890,6 +928,9 @@ fn run_generate_with(
     } else {
         generate(&options)?
     };
+    if args.hashing.use_module_toolchain_registrations != data.repository_memberships.is_some() {
+        bail!("repository membership output does not match the requested observation mode");
+    }
     if !args.target_type.is_empty() {
         let types = args.target_type.iter().cloned().collect::<HashSet<_>>();
         data.hashes.retain(|_, hash| types.contains(&hash.kind));
@@ -904,17 +945,38 @@ fn run_generate_with(
     }
     // A partial-graph file carries every target's type and its dependency edges, which a
     // derivation from it needs to evaluate the recipes and to write --depEdgesFile.
-    write_json(
-        args.output_path.as_deref(),
-        &data.serialized(
-            args.include_target_type || args.partial_graph,
-            args.partial_graph && args.dep_edges_file.is_some(),
-        ),
-    )?;
+    let payload = data.serialized(
+        args.include_target_type || args.partial_graph,
+        args.partial_graph && args.dep_edges_file.is_some(),
+    );
+    if let Some(memberships) = &data.repository_memberships {
+        memberships.validate()?;
+        write_json(
+            args.output_path.as_deref(),
+            &RepositoryHashes {
+                format: RepositoryFormat::V2,
+                payload,
+            },
+        )?;
+    } else {
+        write_json(args.output_path.as_deref(), &payload)?;
+    }
     if let Some(path) = &args.dep_edges_file {
         let context = || format!("failed to write {}", path.display());
         let file = File::create(path).with_context(context)?;
-        write_json_file(file, &data.dep_edges).with_context(context)?;
+        if let Some(memberships) = &data.repository_memberships {
+            write_json_file(
+                file,
+                &RepositoryDependencyGraph {
+                    version: 2,
+                    edges: &data.dep_edges,
+                    memberships,
+                },
+            )
+            .with_context(context)?;
+        } else {
+            write_json_file(file, &data.dep_edges).with_context(context)?;
+        }
     }
     Ok(data)
 }
@@ -929,6 +991,7 @@ fn partial_graph_hashes(
     generate: impl FnOnce(&HashOptions) -> Result<HashFileData>,
 ) -> Result<HashFileData> {
     partial::validate_hash_options(options)?;
+    let recipe_version = partial::recipe_version(options.bazel.use_module_toolchain_registrations);
     if args.content_hash_path.is_some() {
         bail!("--partialGraph does not support --contentHashPath: source content is read from the git tree");
     }
@@ -971,11 +1034,11 @@ fn partial_graph_hashes(
                 (None, _) => {
                     format!("{} carries no partial-graph recipes", path.display())
                 }
-                (Some(recipes), _) if recipes.version != partial::RECIPE_VERSION => format!(
+                (Some(recipes), _) if recipes.version != recipe_version => format!(
                     "{} carries partial-graph recipe version {}, expected {}",
                     path.display(),
                     recipes.version,
-                    partial::RECIPE_VERSION
+                    recipe_version
                 ),
                 (_, _)
                     if args.dep_edges_file.is_some()
@@ -1060,6 +1123,7 @@ fn get_bazel_options(args: &GetImpactedTargetsArgs, verbose: bool) -> BazelOptio
         command_options: Vec::new(),
         cquery_options: Vec::new(),
         use_cquery: false,
+        use_module_toolchain_registrations: false,
         cquery_expression: None,
         cquery_root_expression: None,
         keep_going: false,
@@ -1074,9 +1138,37 @@ fn get_bazel_options(args: &GetImpactedTargetsArgs, verbose: bool) -> BazelOptio
     }
 }
 
+fn read_impact_hashes(bytes: &[u8], allow_memberships: bool) -> Result<(HashFileData, bool)> {
+    match HashFileData::from_slice(bytes) {
+        Ok(data) => Ok((data, false)),
+        Err(error) if !allow_memberships => Err(error),
+        Err(_) => {
+            let RepositoryHashes { format: _, payload } =
+                serde_json::from_slice::<RepositoryHashes<HashFileData>>(bytes)
+                    .context("invalid tagged repository hash JSON")?;
+            payload
+                .repository_memberships
+                .as_ref()
+                .context("tagged repository hashes have no membership provenance")?
+                .validate()?;
+            Ok((payload, true))
+        }
+    }
+}
+
 fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> {
-    let from = HashFileData::read(&args.starting_hashes)?;
-    let to = HashFileData::read(&args.final_hashes)?;
+    let starting_bytes = fs::read(&args.starting_hashes)
+        .with_context(|| format!("failed to read {}", args.starting_hashes.display()))?;
+    let final_bytes = fs::read(&args.final_hashes)
+        .with_context(|| format!("failed to read {}", args.final_hashes.display()))?;
+    let (from, from_memberships) = read_impact_hashes(&starting_bytes, args.report_impact_graph)?;
+    let (to, to_memberships) = read_impact_hashes(&final_bytes, args.report_impact_graph)?;
+    if from_memberships != to_memberships {
+        bail!("starting and final hashes use different repository membership formats");
+    }
+    if args.repository_origin_roots.is_some() && !to_memberships {
+        bail!("--repositoryOriginRoots requires tagged repository membership hashes");
+    }
     ensure_same_mode(&from, &to)?;
     let bazel = get_bazel_options(args, verbose);
     let exclude_external = args
@@ -1085,7 +1177,22 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
     let target_types = (!args.target_type.is_empty())
         .then(|| args.target_type.iter().cloned().collect::<HashSet<_>>());
     let output = if let Some(dep_edges_file) = &args.dep_edges_file {
-        let dep_edges = dep_edges_from_slice(&fs::read(dep_edges_file)?)?;
+        let edge_bytes = fs::read(dep_edges_file)
+            .with_context(|| format!("failed to read {}", dep_edges_file.display()))?;
+        let dep_edges = if to_memberships {
+            let graph = serde_json::from_slice::<
+                RepositoryDependencyGraph<DependencyEdges, RepositoryMemberships>,
+            >(&edge_bytes)
+            .context("invalid tagged repository dependency graph")?;
+            if graph.version != 2 || Some(&graph.memberships) != to.repository_memberships.as_ref()
+            {
+                bail!("head dependency graph does not match repository membership hashes");
+            }
+            graph.memberships.validate()?;
+            graph.edges.0
+        } else {
+            dep_edges_from_slice(&edge_bytes)?
+        };
         if let Some(path) = &args.toolchain_candidates_file {
             let mut report = bazel_diff::toolchain_candidates::compare(&from, &to);
             bazel_diff::toolchain_candidates::add_returned_readers(&mut report, &to, &dep_edges);
@@ -1102,7 +1209,7 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
             write_json_file(File::create(path)?, &report)?;
         }
         if args.report_impact_graph {
-            let report = impact_graph(
+            let mut report = impact_graph(
                 &from,
                 &to,
                 &dep_edges,
@@ -1110,6 +1217,56 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
                 target_types.as_ref(),
                 exclude_external,
             )?;
+            if to_memberships {
+                report = report.distinguish_repository_memberships(&from, &to, &dep_edges)?;
+                report.ordinary_inputs = Some(OrdinaryInputDescriptor {
+                    starting_hashes_sha256: hex::encode(Sha256::digest(&starting_bytes)),
+                    final_hashes_sha256: hex::encode(Sha256::digest(&final_bytes)),
+                    head_edges_sha256: hex::encode(Sha256::digest(&edge_bytes)),
+                });
+                if let Some(path) = &args.repository_origin_roots {
+                    let requested = serde_json::from_slice::<BTreeSet<String>>(&fs::read(path)?)
+                        .context("invalid repository origin root array")?;
+                    let mut origins = BTreeMap::<String, RepositoryOrigins>::new();
+                    let mut matched = BTreeSet::new();
+                    for path in report
+                        .paths
+                        .iter()
+                        .filter(|path| path.kind == ImpactPathKind::Provisional)
+                    {
+                        let roots = path
+                            .roots
+                            .iter()
+                            .filter(|(label, _)| requested.contains(*label))
+                            .map(|(label, key)| (label.clone(), key.clone()))
+                            .collect();
+                        for (root, extracted) in extract_origins(
+                            &from,
+                            &to,
+                            &dep_edges,
+                            &path.changed,
+                            &path.direct,
+                            &roots,
+                        )? {
+                            matched.insert(root.clone());
+                            let result = origins.entry(root).or_default();
+                            result.base.extend(extracted.base);
+                            result.head.extend(extracted.head);
+                            result.unresolved.extend(extracted.unresolved);
+                        }
+                    }
+                    for root in requested.difference(&matched) {
+                        origins
+                            .entry(root.clone())
+                            .or_default()
+                            .unresolved
+                            .insert(format!(
+                                "root {root} has no provisional path in this ordinary comparison"
+                            ));
+                    }
+                    report.repository_origins = Some(origins);
+                }
+            }
             serde_json::to_string(&report)?
         } else {
             let module_impacted = (from.module_graph_json != to.module_graph_json)
@@ -1211,6 +1368,11 @@ fn run_warmup_with(
     generate_hashes: impl FnOnce(&GenerateHashesArgs) -> Result<()>,
     write_fingerprint: impl FnOnce(&FingerprintArgs) -> Result<()>,
 ) -> Result<()> {
+    if args.generate.hashing.use_module_toolchain_registrations {
+        bail!(
+            "warmup does not support --useModuleToolchainRegistrations; use fresh generate-hashes"
+        );
+    }
     if let Some(parent) = args.base_hashes.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1498,6 +1660,7 @@ mod tests {
             label_only_module_extensions: Vec::new(),
             isolated_dependency_root: None,
             use_cquery: false,
+            use_module_toolchain_registrations: false,
             cquery_expression: None,
             cquery_root_expression: None,
             cquery_root_expression_file: None,
@@ -2507,10 +2670,11 @@ mod tests {
         .unwrap();
         let base_args = || GetImpactedTargetsArgs {
             toolchain_candidates_file: None,
+            report_impact_graph: false,
+            repository_origin_roots: None,
             starting_hashes: from_path.clone(),
             final_hashes: to_path.clone(),
             dep_edges_file: None,
-            report_impact_graph: false,
             target_type: vec!["Rule".into()],
             output: Some(text_output.clone()),
             workspace_path: workspace.path().to_path_buf(),
@@ -2656,7 +2820,7 @@ mod tests {
     #[test]
     fn warmup_orders_generation_before_fingerprint_and_stops_on_failure() {
         let workspace = tempfile::tempdir().unwrap();
-        let args = WarmupArgs {
+        let mut args = WarmupArgs {
             generate: GenerateHashesArgs {
                 hashing: hashing_args(workspace.path()),
                 content_hash_path: None,
@@ -2702,6 +2866,13 @@ mod tests {
         )
         .is_err());
         assert!(!fingerprint_called.get());
+        args.generate.hashing.use_module_toolchain_registrations = true;
+        assert_eq!(
+            run_warmup_with(&args, |_| unreachable!(), |_| unreachable!())
+                .unwrap_err()
+                .to_string(),
+            "warmup does not support --useModuleToolchainRegistrations; use fresh generate-hashes"
+        );
     }
 
     fn git_in(repo: &Path, args: &[&str]) -> String {
@@ -3034,10 +3205,11 @@ mod tests {
         let error = run_get_impacted(
             &GetImpactedTargetsArgs {
                 toolchain_candidates_file: None,
+                report_impact_graph: false,
+                repository_origin_roots: None,
                 starting_hashes: from.clone(),
                 final_hashes: to.clone(),
                 dep_edges_file: Some(deps.clone()),
-                report_impact_graph: false,
                 target_type: Vec::new(),
                 output: None,
                 workspace_path: dir.path().to_path_buf(),

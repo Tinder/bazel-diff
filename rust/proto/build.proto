@@ -141,6 +141,12 @@ message Rule {
   repeated string definition_stack = 14;
   repeated ConfiguredRuleInput configured_rule_input = 15;
   optional string rule_class_key = 16;
+
+  message PossibleToolchainTypes {
+    repeated string label = 1;
+  }
+
+  optional PossibleToolchainTypes possible_toolchain_types = 20;
 }
 
 message Repository {

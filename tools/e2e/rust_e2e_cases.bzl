@@ -140,6 +140,14 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::genrule_toolchain_candidates_keep_ordinary_providers",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::hidden_toolchain_input_reaches_main_rule_and_bridge_alias",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::hub_named_by_canonical_name_is_fine_grained_under_its_apparent_name",
                 "timeout": "moderate",
             },
@@ -172,7 +180,23 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::module_dependent_follows_an_external_filegroup",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::module_toolchain_mode_reports_unsupported_producer",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::observed_bridge_alias_keeps_toolchain_users_separate_from_siblings",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::ordinary_alias_can_use_a_matcher_from_a_reached_external_package",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::ordinary_consumer_tracks_a_copied_external_source",
                 "timeout": "moderate",
             },
             {
@@ -197,6 +221,10 @@ RUST_E2E_SUITES = [
             },
             {
                 "name": "external::transitive_external_repo_change_reaches_consumer_cquery",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::unavailable_toolchain_implementation_keeps_usable_changes",
                 "timeout": "moderate",
             },
             {

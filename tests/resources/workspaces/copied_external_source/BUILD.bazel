@@ -1,0 +1,21 @@
+exports_files(["versions.json"])
+
+genrule(
+    name = "consumer",
+    srcs = ["@vendored//:sdk.h"],
+    outs = ["out.h"],
+    cmd = "cat $< > $@",
+)
+
+genrule(
+    name = "via_filegroup",
+    srcs = ["@vendored//:headers"],
+    outs = ["from-group.h"],
+    cmd = "cat $< > $@",
+)
+
+genrule(
+    name = "stable",
+    outs = ["stable.txt"],
+    cmd = "printf fixed > $@",
+)

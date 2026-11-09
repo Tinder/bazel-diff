@@ -45,6 +45,16 @@ type DigestBytes = [u8; 32];
 /// Bumped when the recipe format or the evaluation formula changes, so an entry an older
 /// release wrote is regenerated rather than evaluated under a formula it was not recorded for.
 pub const RECIPE_VERSION: u32 = 14;
+const MODULE_TOOLCHAIN_RECIPE_VERSION: u32 = 16;
+
+/// Distinguishes the ordinary dependency recipe while keeping the existing hash-file marker.
+pub const fn recipe_version(use_module_toolchain_registrations: bool) -> u32 {
+    if use_module_toolchain_registrations {
+        MODULE_TOOLCHAIN_RECIPE_VERSION
+    } else {
+        RECIPE_VERSION
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Git tree index
@@ -331,10 +341,14 @@ pub(crate) struct RecipeRecorder {
 }
 
 impl RecipeRecorder {
-    pub(crate) fn new(seed_hash: DigestBytes, package_seeds: bool) -> Self {
+    pub(crate) fn new(
+        seed_hash: DigestBytes,
+        package_seeds: bool,
+        use_module_toolchain_registrations: bool,
+    ) -> Self {
         Self {
             recipes: PartialRecipes {
-                version: RECIPE_VERSION,
+                version: recipe_version(use_module_toolchain_registrations),
                 seed_hash: hex::encode(seed_hash),
                 package_seeds,
                 ..Default::default()
@@ -504,9 +518,12 @@ pub fn evaluate(
     targets: &BTreeMap<String, String>,
     tree: &TreeIndex,
 ) -> Result<BTreeMap<String, TargetHash>> {
-    if recipes.version != RECIPE_VERSION {
+    if !matches!(
+        recipes.version,
+        RECIPE_VERSION | MODULE_TOOLCHAIN_RECIPE_VERSION
+    ) {
         bail!(
-            "recipes were recorded with format version {}, this release evaluates version {RECIPE_VERSION}",
+            "recipes were recorded with format version {}, this release evaluates versions {RECIPE_VERSION} and {MODULE_TOOLCHAIN_RECIPE_VERSION}",
             recipes.version
         );
     }
@@ -734,6 +751,7 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
         hashes,
         // Fresh query observations can depend on external definitions outside these recipes.
         observed_toolchains: None,
+        repository_memberships: None,
         module_graph_json: base.module_graph_json.clone(),
         dependency_fingerprint: base.dependency_fingerprint.clone(),
         dep_edges: base.dep_edges.clone(),
@@ -748,6 +766,9 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
 /// per-invocation seeds (always-affected tags); each of those would make a derived entry differ
 /// from a full generation, which is the one property the mode rests on.
 pub fn validate_hash_options(options: &HashOptions) -> Result<()> {
+    if options.bazel.use_module_toolchain_registrations {
+        bail!("--partialGraph does not support --useModuleToolchainRegistrations");
+    }
     if options.bazel.use_cquery {
         bail!("--partialGraph does not support --useCquery");
     }
@@ -1214,7 +1235,7 @@ mod tests {
     }
 
     fn recipes() -> PartialRecipes {
-        let mut recorder = RecipeRecorder::new([7; 32], true);
+        let mut recorder = RecipeRecorder::new([7; 32], true, false);
         recorder.record_source("//pkg:a.txt", &["//tools:defs.bzl".into()]);
         recorder.record_source("//pkg:b.txt", &["//tools:defs.bzl".into()]);
         recorder.record_source("//pkg:odd.txt", &[]);
@@ -1278,7 +1299,7 @@ mod tests {
     fn recorder_stores_package_subincludes_with_per_source_overrides() {
         let recipes = recipes();
         // The same sources recorded in another order yield the same recipes.
-        let mut reversed = RecipeRecorder::new([7; 32], true);
+        let mut reversed = RecipeRecorder::new([7; 32], true, false);
         reversed.record_source("//other:d.txt", &["//tools:late.bzl".into()]);
         reversed.record_source("//other:c.txt", &[]);
         reversed.record_source("//pkg:odd.txt", &[]);
@@ -1480,6 +1501,7 @@ mod tests {
             configured_roots: None,
             hashes: evaluate(&recipes, &targets, &fixture_tree()).unwrap(),
             observed_toolchains: None,
+            repository_memberships: None,
             module_graph_json: Some("{}".into()),
             dependency_fingerprint: Some("fp".into()),
             dep_edges: BTreeMap::from([("//pkg:bin".to_owned(), vec!["//pkg:lib".to_owned()])]),

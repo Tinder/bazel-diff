@@ -1,0 +1,4 @@
+module(name = "copied_external_source")
+
+sdk = use_extension("//:setup.bzl", "sdk_inputs")
+use_repo(sdk, "public", "vendored")

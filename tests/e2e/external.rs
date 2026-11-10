@@ -1239,6 +1239,67 @@ fn fine_aliases_honor_query_failure_mode() {
         .any(|label| label.ends_with("hidden//:forward")));
 }
 
+#[test]
+fn fine_aliases_acquire_a_library_with_many_dict_selects() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    // Flattened, these 40 selects have 2^40 combinations.
+    edit(&root.join("library/defs/library.bzl"), |text| {
+        format!(
+            "{}{}",
+            text.replace(
+                "\"selected\": attr.string(mandatory = True),",
+                "\"selected\": attr.string(mandatory = True),\n        \"env\": attr.string_dict(),",
+            ),
+            r#"
+def many_selects(count):
+    result = None
+    for i in range(count):
+        branch = select({
+            ":c%d" % i: {"k%d" % i: "on"},
+            "//conditions:default": {"k%d" % i: "off"},
+        })
+        result = branch if result == None else result | branch
+    return result
+"#
+        )
+    });
+    edit(&root.join("library/BUILD.bazel"), |text| {
+        format!(
+            "{}\n[config_setting(name = \"c%d\" % i, define_values = {{\"c%d\" % i: \"1\"}}) for i in range(40)]\n",
+            text.replace(
+                "load(\"//defs:library.bzl\", \"library\")",
+                "load(\"//defs:library.bzl\", \"library\", \"many_selects\")",
+            )
+            .replace(
+                "selected = \"data.txt\",",
+                "selected = \"data.txt\",\n    env = many_selects(40),",
+            )
+        )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let hashes_path = out.path().join("hashes.json");
+    let result = generate(
+        root,
+        &hashes_path,
+        &[
+            "--fineGrainedHashExternalRepos=@public",
+            "--excludeExternalTargets",
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(hashes(&hashes_path)
+        .keys()
+        .any(|label| label.ends_with("library//:lib")));
+}
+
 const ISOLATED_ROOT: &[&str] = &["--isolatedDependencyRoot", "@hub"];
 
 fn assert_product(workspace: &std::path::Path, target: &str, file: &str, expected: &str) {

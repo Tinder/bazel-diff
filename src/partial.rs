@@ -42,9 +42,10 @@ use std::path::{Component, Path, PathBuf};
 
 type DigestBytes = [u8; 32];
 
-/// Bumped when the recipe format or the evaluation formula changes, so an entry an older
-/// release wrote is regenerated rather than evaluated under a formula it was not recorded for.
-pub const RECIPE_VERSION: u32 = 14;
+/// Bumped when recorded inputs, the recipe format, or the evaluation formula changes, so an
+/// entry an older release wrote is regenerated rather than evaluated under a formula it was not
+/// recorded for.
+pub const RECIPE_VERSION: u32 = 19;
 
 // ---------------------------------------------------------------------------------------------
 // Git tree index

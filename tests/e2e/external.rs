@@ -1871,4 +1871,87 @@ fn returned_external_source_reaches_consumer() {
         "{targets:?}"
     );
     assert!(!targets.contains("@@//:unrelated") && !targets.contains("//:unrelated"));
+
+    if supports_mod_show_repo() {
+        ordinary_external_filegroup_consumers();
+    }
+}
+
+fn ordinary_external_filegroup_consumers() {
+    let workspace = copy_workspace("extension_toolchain_through_owner");
+    let root = workspace.path();
+    fs::copy(
+        root.join("filegroup_readers.BUILD"),
+        root.join("BUILD.bazel"),
+    )
+    .unwrap();
+    let output = tempfile::tempdir().unwrap();
+    for (state, source, compiler, unrelated) in [
+        ("base", "one", "1.0", "before"),
+        ("compiler", "one", "2.0", "before"),
+        ("copy", "two", "1.0", "before"),
+        ("unrelated", "one", "1.0", "after"),
+    ] {
+        fs::write(root.join("ext/wrapper.sh"), source).unwrap();
+        fs::write(
+            root.join("versions.json"),
+            format!(r#"{{"toolchain":"{compiler}"}}"#),
+        )
+        .unwrap();
+        fs::write(root.join("unrelated.txt"), unrelated).unwrap();
+        for (mode, query) in [
+            ("ordinary", "--bazelCommandOptions=--noproto:locations"),
+            ("projected", "--bazelCommandOptions=--noproto:locations --proto:output_rule_attrs=tags,testonly --proto:include_synthetic_attribute_hash"),
+            (
+                "filtered",
+                "--bazelCommandOptions=--noproto:locations --notool_deps --proto:output_rule_attrs=tags,testonly --proto:include_synthetic_attribute_hash",
+            ),
+        ] {
+            let hashes = output.path().join(format!("{state}-{mode}.json"));
+            assert!(generate(
+                root,
+                &hashes,
+                &[
+                    "--fineGrainedHashExternalRepos=@ext",
+                    "--excludeExternalTargets",
+                    query,
+                ]
+            )
+            .status
+            .success());
+            if state != "base" {
+                let before = output.path().join(format!("base-{mode}.json"));
+                let result = output.path().join("impact.txt");
+                assert!(impacted(root, &before, &hashes, &result, &[])
+                    .status
+                    .success());
+                let changed = read_lines(&result);
+                if mode != "filtered" {
+                    assert_eq!(
+                        changed.contains("//:copy_reader"),
+                        state == "copy",
+                        "{state}: {changed:?}"
+                    );
+                    assert_eq!(
+                        changed.contains("//:unrelated"),
+                        state == "unrelated",
+                        "{state}: {changed:?}"
+                    );
+                }
+                if state == "compiler" || state == "copy" {
+                    assert!(
+                        changed.contains("//:tool_reader"),
+                        "{state}/{mode}: {changed:?}"
+                    );
+                }
+            }
+        }
+        assert_product(root, "//:copy_reader", "plain.txt", source);
+        assert_product(
+            root,
+            "//:tool_reader",
+            "mixed.txt",
+            &format!("{source}{compiler}"),
+        );
+    }
 }

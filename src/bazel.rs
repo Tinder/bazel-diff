@@ -408,7 +408,9 @@ impl BazelOptions {
         &self,
         mut transform: impl FnMut(&mut [Target], Option<RepositoryInputs>),
     ) -> Result<QueriedTargets> {
-        self.query_all_targets_encoded(false, |batch, _, inputs| transform(batch, inputs))
+        self.query_all_targets_encoded(false, |batch, _, inputs, _ordinary_inputs| {
+            transform(batch, inputs)
+        })
     }
 
     /// [`Self::query_all_targets_with`], with ordinary query results decoded by
@@ -417,10 +419,16 @@ impl BazelOptions {
     /// the bytes it was decoded from (see [`EncodedTargets`]). Targets decoded in full (repository
     /// rules) come with empty bytes, and batches that were not decoded lean (cquery, Bzlmod
     /// repositories, an isolated dependency root's strict query) with an empty slice.
+    /// The final argument carries positively classified ordinary module dependencies only.
     pub(crate) fn query_all_targets_encoded(
         &self,
         lean: bool,
-        transform: impl FnMut(&mut [Target], &EncodedTargets<'_>, Option<RepositoryInputs>),
+        transform: impl FnMut(
+            &mut [Target],
+            &EncodedTargets<'_>,
+            Option<RepositoryInputs>,
+            Option<Vec<String>>,
+        ),
     ) -> Result<QueriedTargets> {
         if self.cquery_root_expression.is_some() {
             if !self.use_cquery {
@@ -455,12 +463,21 @@ impl BazelOptions {
             ..self.clone()
         }
         // Verification is a cquery; nothing it decodes is lean.
-        .query_all_targets_inner(|batch, _, inputs| transform(batch, inputs), true, false)
+        .query_all_targets_inner(
+            |batch, _, inputs, _ordinary_inputs| transform(batch, inputs),
+            true,
+            false,
+        )
     }
 
     fn query_all_targets_inner(
         &self,
-        mut transform: impl FnMut(&mut [Target], &EncodedTargets<'_>, Option<RepositoryInputs>),
+        mut transform: impl FnMut(
+            &mut [Target],
+            &EncodedTargets<'_>,
+            Option<RepositoryInputs>,
+            Option<Vec<String>>,
+        ),
         verify: bool,
         lean: bool,
     ) -> Result<QueriedTargets> {
@@ -514,9 +531,13 @@ impl BazelOptions {
             }
         }
         if bzlmod_enabled && supports_bzlmod {
-            let queried = self.query_bzlmod_repos(root_mapping, survey, &mut |target, inputs| {
-                transform(std::slice::from_mut(target), &[], inputs);
-            });
+            let queried = self.query_bzlmod_repos(
+                root_mapping,
+                survey,
+                &mut |target, inputs, ordinary_inputs| {
+                    transform(std::slice::from_mut(target), &[], inputs, ordinary_inputs);
+                },
+            );
             let queried = if let Some(root) = &self.isolated_dependency_root {
                 queried.with_context(|| format!("--isolatedDependencyRoot={root}"))
             } else {
@@ -565,7 +586,7 @@ impl BazelOptions {
                             false,
                             &mut |batch, _| {
                                 scope.record_build_loads(batch, &mut loads);
-                                transform(batch, &[], None);
+                                transform(batch, &[], None, None);
                             },
                         )
                     } else if verify && use_cquery {
@@ -573,7 +594,7 @@ impl BazelOptions {
                         // view below qualifies coverage without adding positive impact paths.
                         let targets =
                             self.query_with(expression, true, version, false, &mut |batch, _| {
-                                transform(batch, &[], None)
+                                transform(batch, &[], None, None)
                             })?;
                         let graph = self.query_with_capture(
                             expression,
@@ -599,7 +620,7 @@ impl BazelOptions {
                             use_cquery,
                             version,
                             lean,
-                            &mut |batch, encoded| transform(batch, encoded, None),
+                            &mut |batch, encoded| transform(batch, encoded, None, None),
                         )
                     }
                 },
@@ -640,7 +661,7 @@ impl BazelOptions {
                         scope.record_build_loads(batch, &mut loads);
                     })?;
                 retain_supplemental_targets(&mut extra, &targets);
-                transform(&mut extra, &[], None);
+                transform(&mut extra, &[], None, None);
                 coverage.record(&scope, &extra);
                 targets.extend(extra);
                 if let Some(missing) = coverage.missing.first() {
@@ -650,16 +671,39 @@ impl BazelOptions {
             scope.connect_external_readers(&loads, &mut targets, &coverage)?;
         }
         let mut alias_sources = HashMap::new();
+        let mut filegroups = BTreeMap::new();
+        let mut filegroup_sources = BTreeMap::new();
+        let mut filegroup_parents = BTreeMap::new();
         if !self.use_cquery
             && !self.fine_grained_external_repos.is_empty()
             && self.isolated_dependency_root.is_none()
         {
+            match self.external_filegroup_inputs(
+                &targets,
+                root_mapping.as_deref(),
+                version,
+                &mut filegroup_sources,
+                &mut filegroup_parents,
+            ) {
+                Ok(result) => {
+                    let (mut rows, observed) = result;
+                    transform(&mut rows, &[], None, None);
+                    targets.extend(rows);
+                    filegroups.extend(observed);
+                }
+                Err(error) => {
+                    self.check_cancelled()?;
+                    eprintln!(
+                        "[Warn] retaining repository fallbacks for unobserved filegroup inputs: {error:#}"
+                    );
+                }
+            }
             if let Err(error) = self.acquire_alias_inputs(
                 &mut targets,
                 root_mapping.as_deref(),
                 version,
                 &mut alias_sources,
-                &mut |batch, inputs| transform(batch, &[], inputs),
+                &mut |batch, inputs| transform(batch, &[], inputs, None),
             ) {
                 self.check_cancelled()?;
                 if !self.keep_going {
@@ -693,8 +737,333 @@ impl BazelOptions {
                 repository_inputs: scope.repository_inputs,
                 queried_files: HashSet::new(),
                 alias_sources,
+                filegroups,
+                filegroup_sources,
+                filegroup_parents,
             },
         })
+    }
+
+    /// Follow explicit inputs into already observed external packages. An evaluated
+    /// native filegroup can forward into another package, including through more
+    /// filegroups. Other rule kinds keep their existing repository coverage.
+    fn external_filegroup_inputs(
+        &self,
+        primary: &[Target],
+        root_mapping: Option<&[u8]>,
+        version: Option<BazelVersion>,
+        filegroup_sources: &mut BTreeMap<String, AliasSource>,
+        filegroup_parents: &mut BTreeMap<String, FilegroupWitness>,
+    ) -> Result<(Vec<Target>, BTreeMap<String, FilegroupWitness>)> {
+        let Some(root_mapping) = root_mapping else {
+            return Ok(Default::default());
+        };
+        let mapping =
+            crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(root_mapping));
+        let mut present = HashSet::new();
+        let mut packages = HashSet::new();
+        let mut missing_loads = BTreeMap::new();
+        for row in primary {
+            let Some(name) = target_name(row) else {
+                continue;
+            };
+            let id = canonical_query_label(name, &mapping);
+            present.insert(id);
+            let build = row.source_file.as_option().filter(|file| {
+                matches!(
+                    file.name.rsplit_once(':'),
+                    Some((_, "BUILD" | "BUILD.bazel"))
+                ) && file.package_contains_errors != Some(true)
+            });
+            if let Some(file) = build
+                .filter(|file| file.package_contains_errors.is_none() && file.subinclude.is_empty())
+            {
+                if let Some(pkg) = file.name.strip_suffix(":BUILD.bazel") {
+                    missing_loads.insert(canonical_query_label(pkg, &mapping), None);
+                }
+            }
+            let loads = build
+                .into_iter()
+                .flat_map(|file| file.subinclude.iter().map(String::as_str));
+            for label in std::iter::once(name).chain(loads) {
+                let label = canonical_query_label(label, &mapping);
+                if let Some(pkg) = external_query_package(&label) {
+                    packages.insert(pkg.to_owned());
+                }
+            }
+        }
+        let mut pending = BTreeSet::new();
+        let mut unseeded = BTreeSet::new();
+        let mut referring_genrules = BTreeMap::<String, BTreeSet<&str>>::new();
+        for row in primary {
+            let Some(rule) = row.rule.as_option() else {
+                continue;
+            };
+            if main_repo_label_key(&rule.name).starts_with("//external:") {
+                continue;
+            }
+            let external_group = rule.name.starts_with('@')
+                && !main_repo_label_key(&rule.name).starts_with("//")
+                && rule.rule_class_key.as_deref() == Some("filegroup");
+            for input in &rule.rule_input {
+                let input = canonical_query_label(input, &mapping);
+                if present.contains(input.as_ref()) {
+                    continue;
+                }
+                let package = external_query_package(&input);
+                let candidates =
+                    if external_group || package.is_some_and(|pkg| packages.contains(pkg)) {
+                        &mut pending
+                    } else {
+                        if package.is_none() {
+                            continue;
+                        }
+                        let parent_package = rule
+                            .name
+                            .rsplit_once(':')
+                            .map(|(pkg, _)| canonical_query_label(pkg, &mapping));
+                        let Some(parent) = parent_package
+                            .as_ref()
+                            .and_then(|pkg| missing_loads.get_mut(pkg.as_ref()))
+                        else {
+                            continue;
+                        };
+                        parent.get_or_insert(rule.name.as_str());
+                        &mut unseeded
+                    };
+                let input = input.into_owned();
+                if rule.rule_class == "genrule" {
+                    referring_genrules
+                        .entry(input.clone())
+                        .or_default()
+                        .insert(rule.name.as_str());
+                }
+                candidates.insert(input);
+            }
+        }
+        let mut strict = self.clone();
+        strict.keep_going = false;
+        // The structural witness must include dependencies the caller may hide.
+        strict.command_options.extend([
+            "--nokeep_going".into(),
+            "--tool_deps".into(),
+            "--implicit_deps".into(),
+            "--proto:rule_classes".into(),
+            "--proto:rule_inputs_and_outputs".into(),
+            "--proto:output_rule_attrs=all".into(),
+            "--noproto:flatten_selects".into(),
+            "--proto:locations".into(),
+            "--norelative_locations".into(),
+        ]);
+        if !unseeded.is_empty() {
+            // Some Bazel formatters omit the subinclude list for BUILD.bazel. Only
+            // actual .bzl labels from buildfiles() can supply the missing load here.
+            let representatives = missing_loads
+                .into_values()
+                .flatten()
+                .map(str::to_owned)
+                .collect();
+            let loads = query_set(&representatives).and_then(|roots| {
+                let query = self.with_exclude_filter(format!("buildfiles({roots})"));
+                strict.query_with_filtered(&query, false, version, false, &mut |_, _| {}, |row| {
+                    row.source_file
+                        .as_option()
+                        .is_some_and(|file| file.name.ends_with(".bzl"))
+                })
+            });
+            match loads {
+                Ok(rows) => {
+                    for name in rows.iter().filter_map(target_name) {
+                        if let Some(pkg) =
+                            external_query_package(&canonical_query_label(name, &mapping))
+                        {
+                            packages.insert(pkg.to_owned());
+                        }
+                    }
+                    pending.extend(unseeded.into_iter().filter(|input| {
+                        external_query_package(input).is_some_and(|pkg| packages.contains(pkg))
+                    }));
+                }
+                Err(error) => {
+                    self.check_cancelled()?;
+                    eprintln!(
+                        "[Warn] retaining repository inputs of unobserved BUILD.bazel loads: {error:#}"
+                    );
+                }
+            }
+        }
+        let mut ordinary = Self {
+            keep_going: false,
+            ..self.clone()
+        };
+        // Class identity certifies the re-read row without changing its attribute projection.
+        ordinary.command_options.push("--proto:rule_classes".into());
+        let mut requested = BTreeSet::new();
+        let mut filegroups = BTreeMap::new();
+        let mut sources = BTreeMap::new();
+        while !pending.is_empty() {
+            let batch = std::mem::take(&mut pending);
+            let query = query_set(&batch)?;
+            let query = self.with_exclude_filter(query);
+            let rows = strict.query_with_filtered(
+                &query,
+                false,
+                version,
+                false,
+                &mut |_, _| {},
+                |row| {
+                    if let Some(source) = row.source_file.as_option() {
+                        AliasSource::observe(source, &mut sources);
+                    }
+                    true
+                },
+            )?;
+            present.extend(batch.iter().cloned().map(Cow::Owned));
+            for row in rows {
+                let Some(name) = target_name(&row) else {
+                    continue;
+                };
+                if !batch.contains(canonical_query_label(name, &mapping).as_ref()) {
+                    continue;
+                }
+                let name = name.to_owned();
+                if let Some(rule) = row.rule.into_option() {
+                    if rule.rule_class_key.as_deref() != Some("filegroup") {
+                        continue;
+                    }
+                    for input in &rule.rule_input {
+                        let id = canonical_query_label(input, &mapping);
+                        if !present.contains(id.as_ref()) {
+                            pending.insert(id.into_owned());
+                        }
+                    }
+                    filegroups.insert(name.clone(), FilegroupWitness::new(rule));
+                } else if row.source_file.as_option().is_none() {
+                    continue;
+                }
+                requested.insert(name);
+            }
+        }
+        let parent_names: BTreeSet<_> = filegroups
+            .keys()
+            .filter_map(|group| {
+                referring_genrules.get(canonical_query_label(group, &mapping).as_ref())
+            })
+            .flatten()
+            .map(|&name| name.to_owned())
+            .collect();
+        let mut previously_present = BTreeSet::new();
+        if !parent_names.is_empty() {
+            let parent_roots = query_set(&parent_names)?;
+            let parent_query = self.with_exclude_filter(format!("deps({parent_roots}, 1)"));
+            strict.command_options.push("--proto:default_values".into());
+            let mut direct_sources = BTreeMap::new();
+            let metadata = strict.query_with_filtered(
+                &parent_query,
+                false,
+                version,
+                false,
+                &mut |_, _| {},
+                |row| {
+                    if let Some(source) = row.source_file.as_option() {
+                        AliasSource::observe(source, &mut direct_sources);
+                    }
+                    true
+                },
+            );
+            match metadata {
+                Ok(parent_rows) => {
+                    let mut unique = BTreeMap::new();
+                    for row in parent_rows {
+                        if let Some(parent) = row.rule.into_option() {
+                            if parent_names.contains(&parent.name) {
+                                match unique.entry(parent.name.clone()) {
+                                    Entry::Vacant(entry) => {
+                                        entry.insert(Some(parent));
+                                    }
+                                    Entry::Occupied(mut entry) => {
+                                        entry.insert(None);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    filegroup_parents.extend(unique.into_iter().filter_map(|(name, rule)| {
+                        rule.filter(|r| r.rule_class_key.as_deref() == Some("genrule"))
+                            .map(|r| (name, FilegroupWitness::new(r)))
+                    }));
+                    let inputs: HashSet<_> = filegroup_parents
+                        .values()
+                        .flat_map(|parent| &parent.declaration.rule_input)
+                        .collect();
+                    for (label, witness) in direct_sources {
+                        if !inputs.contains(&label) {
+                            continue;
+                        }
+                        if !requested.contains(&label)
+                            && present.contains(canonical_query_label(&label, &mapping).as_ref())
+                        {
+                            previously_present.insert(label.clone());
+                        }
+                        requested.insert(label.clone());
+                        AliasSource::record(&mut sources, label, witness);
+                    }
+                }
+                Err(error) => {
+                    self.check_cancelled()?;
+                    eprintln!("[Warn] retaining repository inputs of unobserved filegroup parents: {error:#}");
+                }
+            }
+        }
+        if requested.is_empty() {
+            return Ok(Default::default());
+        }
+        // The strict declaration carries all structural attributes. When the caller requests
+        // Bazel's synthetic attribute hash, bind its own projection to the same returned rule.
+        // The parent already exists in the primary inventory and is read only as a witness.
+        let projected = self.command_options.iter().any(|option| {
+            matches!(
+                option.as_str(),
+                "--proto:include_synthetic_attribute_hash"
+                    | "--proto:include_synthetic_attribute_hash=true"
+            )
+        });
+        if projected {
+            requested.extend(filegroup_parents.keys().cloned());
+            previously_present.extend(filegroup_parents.keys().cloned());
+        }
+        let query = query_set(&requested)?;
+        let query = self.with_exclude_filter(query);
+        let mut rows = ordinary.query_with(&query, false, version, false, &mut |_, _| {})?;
+        let returned: HashSet<_> = rows.iter().filter_map(target_name).collect();
+        filegroups.retain(|name, _| returned.contains(name.as_str()));
+        if projected {
+            let mut seen = HashSet::new();
+            for rule in rows.iter().filter_map(|row| row.rule.as_option()) {
+                let Some(witness) = filegroups
+                    .get_mut(&rule.name)
+                    .or_else(|| filegroup_parents.get_mut(&rule.name))
+                else {
+                    continue;
+                };
+                witness.projected_definition = if seen.insert(&rule.name)
+                    && rule.rule_class_key == witness.declaration.rule_class_key
+                {
+                    crate::hash::projected_filegroup_definition(rule)
+                } else {
+                    None
+                };
+            }
+        }
+        for source in rows.iter().filter_map(|row| row.source_file.as_option()) {
+            let witness = sources.get(&source.name).and_then(Option::as_ref);
+            if let Some(witness) = witness {
+                filegroup_sources.insert(source.name.clone(), witness.clone());
+            }
+        }
+        // Re-read primary sources and parents supply only evidence for their original rows.
+        rows.retain(|row| target_name(row).is_none_or(|name| !previously_present.contains(name)));
+        Ok((rows, filegroups))
     }
 
     /// A fine repository may expose libraries in other repositories through aliases. Follow
@@ -866,34 +1235,7 @@ impl BazelOptions {
                         .as_option()
                         .filter(|s| missing.contains(&s.name))
                     {
-                        // Visibility labels are evaluated for a real InputFile. A synthetic
-                        // buildfiles() result carries no such declaration.
-                        let witness = source.location.as_ref().and_then(|location| {
-                            if source.visibility_label.is_empty()
-                                || !source.package_group.is_empty()
-                                || source.license.as_option().is_some()
-                            {
-                                return None;
-                            }
-                            let mut visibility = source.visibility_label.clone();
-                            visibility.sort_unstable();
-                            visibility.dedup();
-                            Some(AliasSource {
-                                label: source.name.clone(),
-                                location: location.clone(),
-                                visibility,
-                            })
-                        });
-                        match sources.entry(source.name.clone()) {
-                            Entry::Vacant(entry) => {
-                                entry.insert(witness);
-                            }
-                            Entry::Occupied(mut entry) => {
-                                if entry.get() != &witness {
-                                    entry.insert(None);
-                                }
-                            }
-                        }
+                        AliasSource::observe(source, &mut sources);
                     }
                     // A dependency can lead back to an alias in the primary query. Keep its
                     // binding even though the existing target row remains authoritative.
@@ -1059,26 +1401,7 @@ impl BazelOptions {
         }
         let first = targets.len();
         targets.extend(extra);
-        let mut definitions: HashMap<String, Vec<String>> = targets[first..]
-            .iter()
-            .filter_map(|row| row.rule.as_option().map(|r| &r.name))
-            .filter_map(|name| name.rsplit_once(':'))
-            .map(|(package, _)| (package.to_owned(), Vec::new()))
-            .collect();
-        for row in targets.iter() {
-            let Some(source) = row.source_file.as_option() else {
-                continue;
-            };
-            let Some((package, "BUILD" | "BUILD.bazel")) = source.name.rsplit_once(':') else {
-                continue;
-            };
-            if let Some(inputs) = definitions.get_mut(package) {
-                inputs.push(source.name.clone());
-                inputs.extend(source.subinclude.iter().cloned());
-                inputs.sort_unstable();
-                inputs.dedup();
-            }
-        }
+        let definitions = self.package_inputs_for_acquired_rules(targets, first, Some(version))?;
         for (index, row) in targets.iter_mut().enumerate() {
             let Some(rule) = row.rule.as_option_mut() else {
                 continue;
@@ -1104,6 +1427,90 @@ impl BazelOptions {
             }
         }
         Ok(())
+    }
+
+    /// Collect loading inputs for newly acquired rules. `buildfiles` can report a
+    /// synthetic load-only BUILD at the same label as the real BUILD. Refresh only
+    /// ambiguous rows in packages containing an acquired rule; unrelated load-only
+    /// packages must not be evaluated as target dependencies.
+    fn package_inputs_for_acquired_rules(
+        &self,
+        targets: &mut [Target],
+        first: usize,
+        version: Option<BazelVersion>,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut definitions: HashMap<String, Vec<String>> = targets[first..]
+            .iter()
+            .filter_map(|row| row.rule.as_option().map(|rule| &rule.name))
+            .filter_map(|name| name.rsplit_once(':'))
+            .map(|(package, _)| (package.to_owned(), Vec::new()))
+            .collect();
+        if definitions.is_empty() {
+            return Ok(definitions);
+        }
+        let builds: Vec<_> = targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let source = row.source_file.as_option()?;
+                let (package, "BUILD" | "BUILD.bazel") = source.name.rsplit_once(':')? else {
+                    return None;
+                };
+                definitions.contains_key(package).then_some(index)
+            })
+            .collect();
+        let requested: BTreeSet<_> = builds
+            .iter()
+            .filter_map(|&index| targets[index].source_file.as_option())
+            .filter(|source| source.package_contains_errors.is_none())
+            .map(|source| source.name.clone())
+            .collect();
+        if !requested.is_empty() {
+            let mut strict = self.clone();
+            strict.keep_going = false;
+            strict.command_options.push("--nokeep_going".into());
+            let expression = self.with_exclude_filter(query_set(&requested)?);
+            match strict.query_with(&expression, false, version, false, &mut |_, _| {}) {
+                Ok(rows) => {
+                    let mut observed = HashMap::new();
+                    for row in rows {
+                        let Some(name) = target_name(&row).filter(|name| requested.contains(*name))
+                        else {
+                            continue;
+                        };
+                        let loads = row.source_file.as_option().and_then(|source| {
+                            (source.package_contains_errors == Some(false))
+                                .then(|| source.subinclude.clone())
+                        });
+                        observed
+                            .entry(name.to_owned())
+                            .and_modify(|value| *value = None)
+                            .or_insert(loads);
+                    }
+                    for &index in &builds {
+                        let source = targets[index].source_file.as_option_mut().unwrap();
+                        if let Some(Some(loads)) = observed.get(&source.name) {
+                            source.subinclude.clone_from(loads);
+                            source.package_contains_errors = Some(false);
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.check_cancelled()?;
+                    eprintln!("[Warn] retaining prior BUILD loading inputs after query failure: {error:#}");
+                }
+            }
+        }
+        for index in builds {
+            let source = targets[index].source_file.as_option().unwrap();
+            let package = source.name.rsplit_once(':').unwrap().0;
+            let inputs = definitions.get_mut(package).unwrap();
+            inputs.push(source.name.clone());
+            inputs.extend(source.subinclude.iter().cloned());
+            inputs.sort_unstable();
+            inputs.dedup();
+        }
+        Ok(definitions)
     }
 
     fn alias_actuals(
@@ -1212,7 +1619,7 @@ impl BazelOptions {
         &self,
         root_mapping: Option<Vec<u8>>,
         survey: ModuleSurvey,
-        transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>),
+        transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>, Option<Vec<String>>),
     ) -> Result<BzlmodRepos> {
         let mut failed = FailedExtensions::default();
         // The initial probe returns stdout only on success. The fallback may be partial.
@@ -1332,7 +1739,10 @@ impl BazelOptions {
         let targets = lower_repositories(
             repositories,
             &canonical_to_apparent,
-            &module_edges,
+            ModuleDependencies {
+                edges: &module_edges,
+                mappings: &extension_repos.module_mappings,
+            },
             // In query mode a toolchain is resolved, never declared, so the Go SDK repo behind
             // `go_sdk.download(patches = ...)` is on no target's input list and the module that
             // owns the extension stands in for it. cquery sees the resolved toolchain as a real
@@ -1642,7 +2052,7 @@ impl BazelOptions {
                     .cloned(),
             );
             complete_mappings &= mappings.len() == module_repos.len();
-            if complete_mappings && !hidden_module_repos.is_empty() {
+            if complete_mappings {
                 module_mappings.extend(module_repos.iter().cloned().zip(mappings));
             }
         }
@@ -2745,6 +3155,11 @@ fn canonical_query_label<'a>(label: &'a str, mapping: &HashMap<String, String>) 
     Cow::Borrowed(label)
 }
 
+fn external_query_package(label: &str) -> Option<&str> {
+    let (package, _) = label.rsplit_once(':')?;
+    (package.starts_with("@@") && !package.starts_with("@@//")).then_some(package)
+}
+
 fn target_inputs(target: &Target) -> impl Iterator<Item = &String> {
     target
         .rule
@@ -3273,6 +3688,29 @@ pub(crate) struct ScopedSources {
     pub(crate) repository_inputs: BTreeSet<String>,
     pub(crate) queried_files: HashSet<String>,
     pub(crate) alias_sources: HashMap<String, AliasSource>,
+    /// Full native declaration returned separately from the caller's projected hash row.
+    pub(crate) filegroups: BTreeMap<String, FilegroupWitness>,
+    /// Declared inputs returned by both the strict filegroup inventory and the ordinary projection.
+    pub(crate) filegroup_sources: BTreeMap<String, AliasSource>,
+    /// Full declarations of native rules with direct inputs in the observed filegroups.
+    pub(crate) filegroup_parents: BTreeMap<String, FilegroupWitness>,
+}
+
+/// The full structural declaration and, where Bazel returned its synthetic attribute hash,
+/// the definition digest of the corresponding caller-projected row.
+#[derive(Clone)]
+pub(crate) struct FilegroupWitness {
+    pub(crate) declaration: Rule,
+    pub(crate) projected_definition: Option<[u8; 32]>,
+}
+
+impl FilegroupWitness {
+    pub(crate) fn new(declaration: Rule) -> Self {
+        Self {
+            declaration,
+            projected_definition: None,
+        }
+    }
 }
 
 /// Evaluated metadata of a literal native alias destination returned in the strict closure.
@@ -3281,6 +3719,46 @@ pub(crate) struct AliasSource {
     pub(crate) label: String,
     pub(crate) location: String,
     pub(crate) visibility: Vec<String>,
+}
+
+impl AliasSource {
+    fn observe(
+        source: &crate::proto::blaze_query::SourceFile,
+        sources: &mut BTreeMap<String, Option<Self>>,
+    ) {
+        // Visibility labels are evaluated for a real InputFile. A synthetic
+        // buildfiles() result carries no such declaration.
+        let witness = source.location.as_ref().and_then(|location| {
+            if source.visibility_label.is_empty()
+                || !source.package_group.is_empty()
+                || source.license.as_option().is_some()
+            {
+                return None;
+            }
+            let mut visibility = source.visibility_label.clone();
+            visibility.sort_unstable();
+            visibility.dedup();
+            Some(AliasSource {
+                label: source.name.clone(),
+                location: location.clone(),
+                visibility,
+            })
+        });
+        Self::record(sources, source.name.clone(), witness);
+    }
+
+    fn record(sources: &mut BTreeMap<String, Option<Self>>, label: String, witness: Option<Self>) {
+        match sources.entry(label) {
+            Entry::Vacant(entry) => {
+                entry.insert(witness);
+            }
+            Entry::Occupied(mut entry) => {
+                if entry.get() != &witness {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
 }
 
 /// Targets with the accepted module graph and successful unfiltered root mapping from discovery.
@@ -3458,26 +3936,39 @@ pub(crate) struct RepositoryInputGroup {
 fn materialize_repository_inputs_for_batch(batch: &mut [Target], inputs: Option<RepositoryInputs>) {
     if let Some(inputs) = inputs {
         for target in batch {
-            materialize_repository_inputs(target, Some(inputs.clone()));
+            materialize_repository_inputs(target, Some(inputs.clone()), None);
         }
     }
 }
 
-fn materialize_repository_inputs(target: &mut Target, shared: Option<RepositoryInputs>) {
+fn materialize_repository_inputs(
+    target: &mut Target,
+    shared: Option<RepositoryInputs>,
+    _ordinary_inputs: Option<Vec<String>>,
+) {
     if let Some(inputs) = shared.as_ref().and_then(RepositoryInputs::siblings) {
         target.rule.as_option_mut().unwrap().rule_input = inputs.labels.clone();
     }
 }
 
+struct ModuleDependencies<'a> {
+    edges: &'a BTreeMap<String, BTreeSet<String>>,
+    mappings: &'a BTreeMap<String, RepoMapping>,
+}
+
 fn lower_repositories(
     mut repositories: Vec<Repository>,
     canonical_to_apparent: &BTreeMap<String, Vec<String>>,
-    module_edges: &BTreeMap<String, BTreeSet<String>>,
+    modules: ModuleDependencies<'_>,
     extension_edges: Option<&BTreeSet<String>>,
     label_only: &LabelOnlyRepositories,
     workspace: &Path,
-    transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>),
+    transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>, Option<Vec<String>>),
 ) -> Vec<Target> {
+    let ModuleDependencies {
+        edges: module_edges,
+        mappings: module_mappings,
+    } = modules;
     let workspace = RepositoryWorkspace::from_repositories(workspace, &repositories);
     // A module the root cannot see has no apparent name there; its node is named by canonical
     // name, matching the `apparent_names` fallback below.
@@ -3487,15 +3978,28 @@ fn lower_repositories(
             .cloned()
             .unwrap_or_else(|| vec![canonical.to_owned()])
     };
-    let module_to_canonical = repositories
-        .iter()
-        .filter_map(|repository| {
-            let canonical = repository.canonical_name.as_deref()?;
-            (canonical.matches('+').count() == 1)
-                .then(|| (canonical.split('+').next().unwrap_or(canonical), canonical))
-        })
-        .map(|(module, canonical)| (module.to_owned(), canonical.to_owned()))
-        .collect::<BTreeMap<_, _>>();
+    let mut module_to_canonical = BTreeMap::<String, String>::new();
+    let mut ambiguous_modules = BTreeSet::new();
+    for repository in &repositories {
+        let Some(canonical) = repository.canonical_name.as_deref() else {
+            continue;
+        };
+        if canonical.matches('+').count() != 1 {
+            continue;
+        }
+        let module = canonical.split('+').next().unwrap_or(canonical);
+        match module_to_canonical.entry(module.to_owned()) {
+            Entry::Vacant(entry) => {
+                entry.insert(canonical.to_owned());
+            }
+            Entry::Occupied(mut entry) => {
+                if entry.get() != canonical {
+                    ambiguous_modules.insert(entry.key().clone());
+                    entry.insert(canonical.to_owned());
+                }
+            }
+        }
+    }
 
     // An extension's repositories are built by the owning module's extension code, from tags
     // the owning module's definition shapes, so that definition -- attributes, override patches,
@@ -3577,12 +4081,45 @@ fn lower_repositories(
             .map(|(_module_repo, definition_hash)| definition_hash.as_str());
         let module = (canonical.matches('+').count() == 1)
             .then(|| canonical.split('+').next().unwrap_or(canonical));
-        let mut dependencies = module
+        // A successful `mod graph` may still honor display filters. The owner's
+        // completed mapping is independent of them and must account for every
+        // regular repository dependency before this node can be projected.
+        let ordinary_complete = module.is_some_and(|module| {
+            !ambiguous_modules.contains(module)
+                && module_edges
+                    .get(module)
+                    .into_iter()
+                    .flatten()
+                    .all(|dependency| {
+                        !ambiguous_modules.contains(dependency.as_str())
+                            && module_to_canonical.contains_key(dependency)
+                    })
+                && module_mappings.get(canonical).is_some_and(|mapping| {
+                    mapping.values().all(|dependency| {
+                        if dependency == canonical
+                            || WELL_KNOWN_MODULES.contains(&dependency.as_str())
+                            || is_extension_repo(dependency)
+                        {
+                            return true;
+                        }
+                        let Some(name) = dependency.split_once('+').map(|(name, _)| name) else {
+                            return false;
+                        };
+                        !ambiguous_modules.contains(name)
+                            && module_to_canonical.get(name) == Some(dependency)
+                            && module_edges
+                                .get(module)
+                                .is_some_and(|dependencies| dependencies.contains(name))
+                    })
+                })
+        });
+        let ordinary_dependencies = module
             .into_iter()
             .flat_map(|module| module_edges.get(module).into_iter().flatten())
             .filter_map(|dependency| module_to_canonical.get(dependency))
             .flat_map(|canonical| node_names(canonical))
             .collect::<BTreeSet<_>>();
+        let mut dependencies = ordinary_dependencies.clone();
         if let Some(repos) = module_extension_repos.get(canonical) {
             dependencies.extend(repos.iter().cloned());
         }
@@ -3628,13 +4165,20 @@ fn lower_repositories(
                 None => (&dependencies, None),
             };
             let mut target = repository_target(rules.next().unwrap(), &apparent, inputs);
+            let ordinary_inputs = ordinary_complete.then(|| {
+                ordinary_dependencies
+                    .iter()
+                    .filter(|dependency| dependency.as_str() != apparent)
+                    .map(|dependency| format!("//external:{dependency}"))
+                    .collect()
+            });
             let inputs = match shared {
                 Some(group) => Some(RepositoryInputs::WithSiblings(group)),
                 None => {
                     (generated && inputs.is_empty()).then_some(RepositoryInputs::DefinitionOnly)
                 }
             };
-            transform(&mut target, inputs);
+            transform(&mut target, inputs, ordinary_inputs);
             targets.push(target);
         }
     }
@@ -4928,7 +5472,10 @@ fn compact_target(target: &mut Target) {
             rule.DEPRECATED_public_by_default = None;
             rule.DEPRECATED_is_skylark = None;
             rule.definition_stack.clear();
-            if !matches!(rule.rule_class_key.as_deref(), Some("toolchain" | "alias")) {
+            if !matches!(
+                rule.rule_class_key.as_deref(),
+                Some("toolchain" | "alias" | "filegroup" | "genrule")
+            ) {
                 rule.rule_class_key = None;
             }
             rule.__buffa_unknown_fields.clear();
@@ -4942,7 +5489,14 @@ fn compact_target(target: &mut Target) {
             source.visibility_label.clear();
             source.feature.clear();
             source.license = buffa::MessageField::none();
-            source.package_contains_errors = None;
+            // A present BUILD error bit distinguishes an evaluated empty load list
+            // from older formatters that omit all BUILD.bazel package information.
+            if !matches!(
+                source.name.rsplit_once(':'),
+                Some((_, "BUILD" | "BUILD.bazel"))
+            ) {
+                source.package_contains_errors = None;
+            }
             source.__buffa_unknown_fields.clear();
         }
         target::Discriminator::GeneratedFile => {
@@ -6882,11 +7436,16 @@ mod tests {
         let targets = lower_repositories(
             repositories,
             &mapping,
-            &edges,
+            ModuleDependencies {
+                edges: &edges,
+                mappings: &BTreeMap::new(),
+            },
             None,
             &LabelOnlyRepositories::default(),
             Path::new("."),
-            &mut |target, _| transformed.push(target_name(target).unwrap().to_owned()),
+            &mut |target, _inputs, _ordinary_inputs| {
+                transformed.push(target_name(target).unwrap().to_owned());
+            },
         );
         assert_eq!(targets.len(), 3);
         assert_eq!(
@@ -6935,11 +7494,14 @@ mod tests {
                 patched("dep++ext+spoke"),
             ],
             &parse_repo_mapping(r#"{"before":"before+","a":"dep+","b":"dep+"}"#),
-            &BTreeMap::new(),
+            ModuleDependencies {
+                edges: &BTreeMap::new(),
+                mappings: &BTreeMap::new(),
+            },
             Some(&BTreeSet::new()),
             &LabelOnlyRepositories::default(),
             workspace.path(),
-            &mut |target, _| {
+            &mut |target, _inputs, _ordinary_inputs| {
                 // The module definitions have been hashed, but dep's targets have not been emitted.
                 if target_name(target) == Some("//external:before") {
                     fs::write(&patch, "second").unwrap();
@@ -7015,7 +7577,10 @@ mod tests {
             let targets = lower_repositories(
                 vec![repository()],
                 &mapping,
-                &BTreeMap::new(),
+                ModuleDependencies {
+                    edges: &BTreeMap::new(),
+                    mappings: &BTreeMap::new(),
+                },
                 None,
                 &LabelOnlyRepositories::default(),
                 workspace.path(),
@@ -7070,7 +7635,10 @@ mod tests {
         let targets = lower_repositories(
             repositories,
             &mapping,
-            &parse_module_dependency_edges(graph),
+            ModuleDependencies {
+                edges: &parse_module_dependency_edges(graph),
+                mappings: &BTreeMap::new(),
+            },
             None,
             &LabelOnlyRepositories::default(),
             Path::new("."),
@@ -7719,7 +8287,10 @@ exit 1
         let query = lower_repositories(
             repositories(),
             &mapping,
-            &edges,
+            ModuleDependencies {
+                edges: &edges,
+                mappings: &BTreeMap::new(),
+            },
             Some(&imported),
             &LabelOnlyRepositories::default(),
             Path::new("."),
@@ -7767,7 +8338,10 @@ exit 1
         let label_only = lower_repositories(
             repositories(),
             &mapping,
-            &edges,
+            ModuleDependencies {
+                edges: &edges,
+                mappings: &BTreeMap::new(),
+            },
             Some(&imported),
             &LabelOnlyRepositories {
                 extensions: BTreeSet::from([
@@ -7800,7 +8374,10 @@ exit 1
         let cquery = lower_repositories(
             repositories(),
             &mapping,
-            &edges,
+            ModuleDependencies {
+                edges: &edges,
+                mappings: &BTreeMap::new(),
+            },
             None,
             &LabelOnlyRepositories::default(),
             Path::new("."),
@@ -8197,7 +8774,10 @@ exit 1
             lower_repositories(
                 repositories(),
                 &mapping,
-                &BTreeMap::new(),
+                ModuleDependencies {
+                    edges: &BTreeMap::new(),
+                    mappings: &BTreeMap::new(),
+                },
                 None,
                 &LabelOnlyRepositories::default(),
                 workspace.path(),
@@ -9603,6 +10183,265 @@ exit 1
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acquired_package_inputs_refresh_only_real_builds() {
+        const BUILD: &str = "@sdk_rules//:BUILD";
+        const LOAD: &str = "@sdk_rules//:defs.bzl";
+        const CHANGED_LOAD: &str = "@sdk_rules//:changed.bzl";
+        let workspace = tempfile::tempdir().unwrap();
+        let dir = workspace.path();
+        let source = |name: &str, loads: &[&str], errors: Option<bool>| Target {
+            r#type: target::Discriminator::SourceFile,
+            source_file: buffa::MessageField::some(SourceFile {
+                name: name.into(),
+                subinclude: loads.iter().map(|label| (*label).into()).collect(),
+                package_contains_errors: errors,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let script = dir.join("query.sh");
+        fs::write(
+            &script,
+            r#"set -eu
+[ "$1" = query ]
+strict=no
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --query_file) shift; expression=$(cat "$1") ;;
+    --output_file) shift; output="$1" ;;
+    --keep_going) strict=no ;;
+    --nokeep_going) strict=yes ;;
+  esac
+  shift
+done
+[ "$strict" = yes ]
+echo "$expression" >> calls.log
+[ "$expression" = "set('@sdk_rules//:BUILD')" ]
+cp response.pb "$output"
+if [ -f fail ]; then exit 3; fi
+"#,
+        )
+        .unwrap();
+        let mut options = probe_options(dir, script);
+        options.command_options.push("--keep_going".into());
+        let rows = || {
+            vec![
+                source(BUILD, &[], None),
+                source("@load_only//:BUILD", &[], None),
+                source(LOAD, &[], None),
+                source(CHANGED_LOAD, &[], None),
+                rule_with_inputs("@sdk_rules//:sdk_impl", &[]),
+            ]
+        };
+        let collect = |targets: &mut [Target]| {
+            options
+                .package_inputs_for_acquired_rules(targets, 4, Some(BazelVersion(8, 8, 2)))
+                .unwrap()
+        };
+        write_delimited(
+            &dir.join("response.pb"),
+            &[source(BUILD, &[LOAD], Some(false))],
+        );
+        let mut ambiguous = rows();
+        let recovered = collect(&mut ambiguous);
+        let mut real = rows();
+        real[0] = source(BUILD, &[LOAD], Some(false));
+        assert_eq!(collect(&mut real), recovered);
+        assert_eq!(ambiguous[0], real[0]);
+        assert_eq!(query_calls(dir), ["set('@sdk_rules//:BUILD')"]);
+        assert_eq!(recovered["@sdk_rules//"], [BUILD, LOAD]);
+        assert!(ambiguous[1]
+            .source_file
+            .as_option()
+            .unwrap()
+            .subinclude
+            .is_empty());
+
+        // A changed real load remains a changed input to the acquired rule.
+        write_delimited(
+            &dir.join("response.pb"),
+            &[source(BUILD, &[CHANGED_LOAD], Some(false))],
+        );
+        assert_eq!(collect(&mut rows())["@sdk_rules//"], [BUILD, CHANGED_LOAD]);
+
+        // A missing positive marker or partial query cannot replace the old row.
+        write_delimited(&dir.join("response.pb"), &[source(BUILD, &[LOAD], None)]);
+        assert_eq!(collect(&mut rows())["@sdk_rules//"], [BUILD]);
+        write_delimited(
+            &dir.join("response.pb"),
+            &[source(BUILD, &[LOAD], Some(false))],
+        );
+        fs::write(dir.join("fail"), []).unwrap();
+        assert_eq!(collect(&mut rows())["@sdk_rules//"], [BUILD]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn external_filegroup_inputs_follow_only_observed_groups_and_sources() {
+        const OUTER: &str = "@@hub+//:files";
+        const INNER: &str = "@@tools+//lib:inner";
+        const COPY: &str = "@@tools+//lib:copy.txt";
+        const TOOL: &str = "@@hub+//:compiler";
+        const KNOWN: &str = "@@bazel_tools//tools/genrule:known";
+        const SETUP: &str = "@@bazel_tools//tools/genrule:genrule-setup.sh";
+        let workspace = tempfile::tempdir().unwrap();
+        let dir = workspace.path();
+        let native = |name, class: &str, inputs: &[&str]| {
+            let mut target = rule_with_inputs(name, inputs);
+            let rule = target.rule.as_option_mut().unwrap();
+            rule.rule_class = class.into();
+            rule.rule_class_key = Some(class.into());
+            target
+        };
+        let source = |name: &str| Target {
+            r#type: target::Discriminator::SourceFile,
+            source_file: buffa::MessageField::some(SourceFile {
+                name: name.into(),
+                location: Some(format!("/source/{}:1:1", name.rsplit_once(':').unwrap().1)),
+                visibility_label: vec!["//visibility:public".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let outer = native(OUTER, "filegroup", &[INNER]);
+        let inner = native(INNER, "filegroup", &[COPY]);
+        let copy = source(COPY);
+        let setup = source(SETUP);
+        let tool = rule_with_inputs(TOOL, &["@@unloaded+//:implementation"]);
+        let known = native(KNOWN, "filegroup", &[SETUP]);
+        for row in [&outer, &inner, &copy, &setup, &tool, &known] {
+            let file = dir.join(target_name(row).unwrap());
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            write_delimited(&file, std::slice::from_ref(row));
+        }
+
+        let reader = native("//:reader", "genrule", &[OUTER]);
+        let full_reader = native("//:reader", "genrule", &[OUTER, TOOL, SETUP]);
+        write_delimited(
+            &dir.join("full-parent"),
+            &[full_reader, outer.clone(), tool, setup.clone()],
+        );
+        write_delimited(&dir.join("filtered-parent"), &[reader.clone(), outer]);
+        let build = source("//:BUILD.bazel");
+        write_delimited(
+            &dir.join("loads"),
+            &[
+                build.clone(),
+                source("@@hub+//:defs.bzl"),
+                source("@@boundary+//:BUILD.bazel"),
+            ],
+        );
+        // Both readers share a BUILD.bazel with an omitted load list. Only the .bzl
+        // returned by buildfiles can seed a package; the boundary BUILD cannot.
+        let mut primary = [
+            build,
+            reader,
+            rule_with_inputs("//:also_reads_tool", &[TOOL, "@@boundary+//:unloaded"]),
+            rule_with_inputs("//:known", &[KNOWN]),
+            setup,
+        ];
+
+        // Return only the requested label frames. An opaque tool's own implementation
+        // has no frame. The real Bazel E2E checks the meaning of these projection flags.
+        let script = dir.join("query.sh");
+        fs::write(&script, r#"set -eu
+[ "$1" = query ]
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --query_file) shift; expression=$(cat "$1") ;;
+    --notool_deps) tools=no ;;
+    --tool_deps) tools=yes ;;
+    --noimplicit_deps) implicit=no ;;
+    --implicit_deps) implicit=yes ;;
+  esac
+  shift
+done
+echo "$tools $implicit $expression" >> calls.log
+case "$expression" in
+  "buildfiles(set('//:reader'))"|"buildfiles(set('//:also_reads_tool'))")
+    cat loads
+    if [ -f fail-loads ]; then exit 3; fi ;;
+  "deps(set('//:reader'), 1)")
+    case "$tools $implicit" in
+      "yes yes") cat full-parent ;;
+      "no no") cat filtered-parent ;;
+      *) exit 1 ;;
+    esac ;;
+  set\(*)
+    for label in $(printf '%s\n' "$expression" | sed "s/^set(//; s/)$//; s/'//g"); do cat "$label"; done ;;
+  *) exit 1 ;;
+esac
+"#).unwrap();
+        let mut options = probe_options(dir, script);
+        options.command_options = vec!["--notool_deps".into(), "--noimplicit_deps".into()];
+        let mut sources = BTreeMap::new();
+        let mut parents = BTreeMap::new();
+        let (rows, groups) = options
+            .external_filegroup_inputs(
+                &primary,
+                Some(b"{}"),
+                Some(BazelVersion(8, 0, 0)),
+                &mut sources,
+                &mut parents,
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().filter_map(target_name).collect::<BTreeSet<_>>(),
+            BTreeSet::from([OUTER, INNER, COPY, KNOWN])
+        );
+        assert_eq!(groups[OUTER].declaration.rule_input, [INNER]);
+        assert_eq!(groups[INNER].declaration.rule_input, [COPY]);
+        assert_eq!(
+            parents["//:reader"].declaration.rule_input,
+            [OUTER, TOOL, SETUP]
+        );
+        assert_eq!(sources[COPY].location, "/source/copy.txt:1:1");
+        assert_eq!(sources[SETUP].visibility, ["//visibility:public"]);
+        assert!(query_calls(dir)
+            .iter()
+            .any(|call| call.starts_with("no no set(")));
+
+        // A strict query may emit valid rows before failing. Already known groups
+        // are still acquired; partial loads cannot authorize new candidate packages.
+        fs::write(dir.join("fail-loads"), "").unwrap();
+        for reported_error in [None, Some(false), Some(true)] {
+            primary[0]
+                .source_file
+                .as_option_mut()
+                .unwrap()
+                .package_contains_errors = reported_error;
+            compact_target(&mut primary[0]);
+            let calls_before = query_calls(dir).len();
+            let (rows, groups) = options
+                .external_filegroup_inputs(
+                    &primary,
+                    Some(b"{}"),
+                    Some(BazelVersion(8, 0, 0)),
+                    &mut BTreeMap::new(),
+                    &mut BTreeMap::new(),
+                )
+                .unwrap();
+            assert_eq!(
+                rows.iter().filter_map(target_name).collect::<Vec<_>>(),
+                [KNOWN]
+            );
+            assert_eq!(
+                groups.keys().map(String::as_str).collect::<Vec<_>>(),
+                [KNOWN]
+            );
+            let calls = query_calls(dir);
+            assert_eq!(
+                calls[calls_before..]
+                    .iter()
+                    .any(|call| call.contains("buildfiles(")),
+                reported_error.is_none()
+            );
+        }
     }
 
     /// `cquery` first asks Bazel which targets are compatible with the target platform, then

@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+pub const FINE_ALIAS_INPUTS_VERSION: u32 = 8;
+
 /// Digests the hash-affecting configuration: the package version, every query and hashing
 /// option, whether dependency edges are recorded, and, only when on, partial-graph mode (its
 /// entries hash under a different formula and carry recipes, so they are never served in place
@@ -97,7 +99,7 @@ pub fn configuration_fingerprint(
         && !options.bazel.fine_grained_external_repos.is_empty()
         && options.bazel.isolated_dependency_root.is_none()
     {
-        hasher.update(b"fineAliasInputs=5\0");
+        hasher.update(format!("fineAliasInputs={FINE_ALIAS_INPUTS_VERSION}\0").as_bytes());
     }
     if let Some(root) = &options.bazel.isolated_dependency_root {
         hasher.update(b"isolatedDependencyRoot=");

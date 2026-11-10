@@ -104,6 +104,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::fine_alias_to_a_source_tracks_its_contents_and_visibility",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::fine_aliases_acquire_hidden_libraries_and_definition_sources",
                 "timeout": "moderate",
             },

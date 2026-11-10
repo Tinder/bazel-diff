@@ -358,6 +358,118 @@ fn hub_named_by_canonical_name_is_fine_grained_under_its_apparent_name() {
     }
 }
 
+#[test]
+fn fine_alias_to_a_source_tracks_its_contents_and_visibility() {
+    if !supports_mod_show_repo() || !cfg!(unix) {
+        return;
+    }
+    let workspace = copy_workspace("fine_grained_hub_by_canonical_name");
+    let root = workspace.path();
+    // Import the source repository so its synthetic node also reaches the unimported sibling.
+    edit(&root.join("MODULE.bazel"), |m| {
+        format!("{m}\nuse_repo(crates, \"crates__a\")\n")
+    });
+    fs::write(root.join("BUILD.bazel"), r#"
+genrule(name = "uses_source", srcs = ["@crates//:a_source"], outs = ["source.txt"], cmd = "cat $< > $@")
+genrule(name = "reads_build", srcs = ["@crates//:a_build"], outs = ["definition.txt"], cmd = "cat $< > $@")
+"#).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let base = out.path().join("base.json");
+    let result = out.path().join("impacted.txt");
+    let template = root.join("spoke.BUILD");
+    let definition = fs::read_to_string(&template).unwrap();
+    for (state, a, b) in [
+        ("base", "1", "1"),
+        ("payload", "2", "1"),
+        ("sibling", "1", "2"),
+        ("no_sibling", "1", "1"),
+        ("unused", "1", "1"),
+        ("private", "1", "1"),
+        ("repository", "1", "1"),
+    ] {
+        let build = match state {
+            "unused" => format!("{definition}\nfilegroup(name = \"unused\")\n"),
+            "private" => definition.replacen("//visibility:public", "//visibility:private", 1),
+            _ => definition.clone(),
+        };
+        fs::write(&template, &build).unwrap();
+        let note = if state == "repository" { "changed" } else { "" };
+        let versions = if state == "no_sibling" {
+            format!(r#"{{"a":"{a}","note":"{note}"}}"#)
+        } else {
+            format!(r#"{{"a":"{a}","b":"{b}","note":"{note}"}}"#)
+        };
+        fs::write(root.join("versions.json"), versions).unwrap();
+        let snapshot = out.path().join(format!("{state}.json"));
+        let edges = out.path().join("edges.json");
+        let output = generate(
+            root,
+            &snapshot,
+            &[
+                "--fineGrainedHashExternalRepos=@crates",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_product(root, "//:reads_build", "definition.txt", build.trim());
+        if state == "private" {
+            let build = std::process::Command::new(bazel())
+                .current_dir(root)
+                .args(["build", "//:uses_source"])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&build.stderr);
+            assert!(
+                !build.status.success() && stderr.contains("not visible"),
+                "{stderr}"
+            );
+        } else {
+            assert_product(root, "//:uses_source", "source.txt", a);
+        }
+        assert!(impacted(
+            root,
+            &base,
+            &snapshot,
+            &result,
+            &["-d", edges.to_str().unwrap()]
+        )
+        .status
+        .success());
+        let changes: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+        let row = |name: &str| {
+            changes.iter().find(|r| {
+                r["label"].as_str().is_some_and(|label| {
+                    label == name || name.starts_with("//") && label.trim_start_matches('@') == name
+                })
+            })
+        };
+        assert_eq!(
+            row("//:uses_source").is_some(),
+            matches!(state, "payload" | "private" | "repository"),
+            "{state}: {changes:?}"
+        );
+        if matches!(state, "private" | "unused") {
+            assert!(row("//:reads_build").is_some(), "{state}: {changes:?}");
+        }
+        if state == "no_sibling" {
+            assert!(row("@crates//:a_source").is_none(), "{changes:?}");
+        }
+        if state == "repository" {
+            for (name, distance) in [("@crates//:a_source", 1), ("//:uses_source", 2)] {
+                let entry = row(name).unwrap();
+                assert_eq!(entry["targetDistance"], distance, "{name}");
+                assert_eq!(entry["packageDistance"], distance, "{name}");
+            }
+        }
+    }
+}
+
 // Module `ext`'s extension generates the `@crates` hub and its spokes, whose targets use a rule
 // `ext` defines. In query mode `//external:ext` stands in for everything its extensions generate,
 // so a fine-grained spoke target reaching `ext` through it changes whenever any other spoke does.

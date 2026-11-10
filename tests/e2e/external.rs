@@ -382,6 +382,7 @@ genrule(name = "reads_build", srcs = ["@crates//:a_build"], outs = ["definition.
         ("base", "1", "1"),
         ("payload", "2", "1"),
         ("sibling", "1", "2"),
+        ("no_sibling", "1", "1"),
         ("unused", "1", "1"),
         ("private", "1", "1"),
         ("repository", "1", "1"),
@@ -393,11 +394,12 @@ genrule(name = "reads_build", srcs = ["@crates//:a_build"], outs = ["definition.
         };
         fs::write(&template, &build).unwrap();
         let note = if state == "repository" { "changed" } else { "" };
-        fs::write(
-            root.join("versions.json"),
-            format!(r#"{{"a":"{a}","b":"{b}","note":"{note}"}}"#),
-        )
-        .unwrap();
+        let versions = if state == "no_sibling" {
+            format!(r#"{{"a":"{a}","note":"{note}"}}"#)
+        } else {
+            format!(r#"{{"a":"{a}","b":"{b}","note":"{note}"}}"#)
+        };
+        fs::write(root.join("versions.json"), versions).unwrap();
         let snapshot = out.path().join(format!("{state}.json"));
         let edges = out.path().join("edges.json");
         let output = generate(
@@ -454,6 +456,9 @@ genrule(name = "reads_build", srcs = ["@crates//:a_build"], outs = ["definition.
         );
         if matches!(state, "private" | "unused") {
             assert!(row("//:reads_build").is_some(), "{state}: {changes:?}");
+        }
+        if state == "no_sibling" {
+            assert!(row("@crates//:a_source").is_none(), "{changes:?}");
         }
         if state == "repository" {
             for (name, distance) in [("@crates//:a_source", 1), ("//:uses_source", 2)] {

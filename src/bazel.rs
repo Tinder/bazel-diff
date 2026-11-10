@@ -3434,7 +3434,22 @@ fn chunk_arguments(arguments: &[String], budget: usize) -> Vec<&[String]> {
     chunks
 }
 
-pub(crate) type RepositoryInputs = Arc<RepositoryInputGroup>;
+/// A generated repository can acquire its first unimported sibling later. Keep its
+/// definition available to qualified readers on both sides of that change.
+#[derive(Clone)]
+pub(crate) enum RepositoryInputs {
+    DefinitionOnly,
+    WithSiblings(Arc<RepositoryInputGroup>),
+}
+
+impl RepositoryInputs {
+    pub(crate) fn siblings(&self) -> Option<&RepositoryInputGroup> {
+        match self {
+            Self::DefinitionOnly => None,
+            Self::WithSiblings(group) => Some(group),
+        }
+    }
+}
 
 pub(crate) struct RepositoryInputGroup {
     pub(crate) extension: String,
@@ -3450,7 +3465,7 @@ fn materialize_repository_inputs_for_batch(batch: &mut [Target], inputs: Option<
 }
 
 fn materialize_repository_inputs(target: &mut Target, shared: Option<RepositoryInputs>) {
-    if let Some(inputs) = shared {
+    if let Some(inputs) = shared.as_ref().and_then(RepositoryInputs::siblings) {
         target.rule.as_option_mut().unwrap().rule_input = inputs.labels.clone();
     }
 }
@@ -3552,11 +3567,12 @@ fn lower_repositories(
     }
 
     let mut targets = Vec::new();
-    let mut shared_groups = HashMap::<String, RepositoryInputs>::new();
+    let mut shared_groups = HashMap::<String, Arc<RepositoryInputGroup>>::new();
     let empty = BTreeSet::new();
     for (index, mut repository) in repositories.into_iter().enumerate() {
         let canonical = repository.canonical_name.as_deref().unwrap_or_default();
         let extension = extension_usage_prefix(canonical);
+        let generated = extension.is_some();
         let owner_definition_hash = extension
             .and_then(|extension| extension_repo_owner(extension, &module_definitions))
             .map(|(_module_repo, definition_hash)| definition_hash.as_str());
@@ -3613,7 +3629,13 @@ fn lower_repositories(
                 None => (&dependencies, None),
             };
             let mut target = repository_target(rules.next().unwrap(), &apparent, inputs);
-            transform(&mut target, shared);
+            let inputs = match shared {
+                Some(group) => Some(RepositoryInputs::WithSiblings(group)),
+                None => {
+                    (generated && inputs.is_empty()).then_some(RepositoryInputs::DefinitionOnly)
+                }
+            };
+            transform(&mut target, inputs);
             targets.push(target);
         }
     }

@@ -281,7 +281,7 @@ fn generate_hashes_timed_inner(
     let mut digests = Vec::new();
     let query_started = Instant::now();
     let mut prepare = |batch: &mut [Target], encoded: &EncodedTargets<'_>, inputs| {
-        let prehash = |target: &mut Target, encoded: &[EncodedAttribute<'_>], shared_inputs| {
+        let prehash = |target: &mut Target, encoded: &[EncodedAttribute<'_>], repository_inputs| {
             let rule = target.rule.as_option_mut()?;
             // Read before `prehash_rule` drops the attributes they come from.
             let loading_inputs = partial_loading_inputs(options, rule);
@@ -293,7 +293,7 @@ fn generate_hashes_timed_inner(
                         encoded,
                         &options.ignored_attributes,
                     ),
-                    shared_inputs,
+                    repository_inputs,
                     loading_inputs,
                 },
             ))
@@ -667,7 +667,7 @@ fn hash_targets_with_environment(
                     rule,
                     PreparedRule {
                         definition_digest,
-                        shared_inputs: None,
+                        repository_inputs: None,
                         loading_inputs,
                     },
                 )
@@ -1443,7 +1443,7 @@ impl Labels {
                 .get(&companion)
                 .and_then(|slot| slot.rule.as_ref())
                 .is_some_and(|repo| {
-                    repo.prepared.shared_inputs.is_some() && repo.rule.rule_input.is_empty()
+                    repo.prepared.repository_inputs.is_some() && repo.rule.rule_input.is_empty()
                 });
             let Some(id) = self.ids.get(name) else {
                 continue;
@@ -1506,7 +1506,7 @@ impl Labels {
                 .get(&repository)
                 .and_then(|slot| slot.rule.as_ref())
                 .filter(|node| {
-                    node.prepared.shared_inputs.is_some() && node.rule.rule_input.is_empty()
+                    node.prepared.repository_inputs.is_some() && node.rule.rule_input.is_empty()
                 })
                 .map(|node| node.prepared.definition_digest);
             let Some(definition_digest) = definition_digest else {
@@ -1519,7 +1519,7 @@ impl Labels {
             };
             let prepared = PreparedRule {
                 definition_digest,
-                shared_inputs: None,
+                repository_inputs: None,
                 loading_inputs: Vec::new(),
             };
             self.slot(definition.clone()).rule = Some(Rc::new(RuleNode::new(rule, prepared)));
@@ -1838,7 +1838,12 @@ impl HashContext<'_> {
                 canonical_repo_nodes,
             )
         };
-        if let Some(group) = &rule.prepared.shared_inputs {
+        if let Some(group) = rule
+            .prepared
+            .repository_inputs
+            .as_ref()
+            .and_then(RepositoryInputs::siblings)
+        {
             if !self.apply_repository_inputs(group, &mut builder) {
                 inputs.extend(
                     group
@@ -2147,7 +2152,7 @@ impl RuleNode {
 
 struct PreparedRule {
     definition_digest: DigestBytes,
-    shared_inputs: Option<RepositoryInputs>,
+    repository_inputs: Option<RepositoryInputs>,
     /// Partial-graph mode: the workspace paths a repository rule's definition digest folds in
     /// (see [`partial::rule_loading_inputs`]); empty for every other rule.
     loading_inputs: Vec<String>,
@@ -4830,8 +4835,12 @@ esac
             extension: "ext++files".into(),
             labels: vec!["//external:ext++files+sibling".into()],
         });
-        for (name, inputs, shared_inputs) in [
-            (repository, vec![], Some(group)),
+        for (name, inputs, repository_inputs) in [
+            (
+                repository,
+                vec![],
+                Some(RepositoryInputs::WithSiblings(group)),
+            ),
             ("@hub//:file", vec![file], None),
             ("@hub//:mixed", vec![file, other], None),
             ("@hub//:unobserved", vec![other], None),
@@ -4846,7 +4855,7 @@ esac
                 rule,
                 PreparedRule {
                     definition_digest: [1; 32],
-                    shared_inputs,
+                    repository_inputs,
                     loading_inputs: Vec::new(),
                 },
             )));
@@ -4895,8 +4904,8 @@ esac
             [definition.as_str(), repository, other, file]
         );
         assert_eq!(node("@hub//:unobserved").rule.rule_input, unobserved_inputs);
-        assert!(node(repository).prepared.shared_inputs.is_some());
-        assert!(node(&definition).prepared.shared_inputs.is_none());
+        assert!(node(repository).prepared.repository_inputs.is_some());
+        assert!(node(&definition).prepared.repository_inputs.is_none());
         assert_eq!(
             node(repository).prepared.definition_digest,
             node(&definition).prepared.definition_digest
@@ -4924,8 +4933,12 @@ esac
             extension: "ext++files".into(),
             labels: vec!["//external:ext++files+sibling".into()],
         });
-        for (name, inputs, shared_inputs) in [
-            (repository, vec![], Some(group)),
+        for (name, inputs, repository_inputs) in [
+            (
+                repository,
+                vec![],
+                Some(RepositoryInputs::WithSiblings(group)),
+            ),
             ("@hub//:file", vec![file], None),
         ] {
             labels.slot(name.into()).rule = Some(Rc::new(RuleNode::new(
@@ -4936,7 +4949,7 @@ esac
                 },
                 PreparedRule {
                     definition_digest: [1; 32],
-                    shared_inputs,
+                    repository_inputs,
                     loading_inputs: Vec::new(),
                 },
             )));
@@ -4960,7 +4973,7 @@ esac
         assert!(views.is_empty());
         labels.prepare_inputs(&fine, &mapping, &views);
         let repository = labels.get(repository).unwrap().rule.as_ref().unwrap();
-        assert!(repository.prepared.shared_inputs.is_some());
+        assert!(repository.prepared.repository_inputs.is_some());
         assert_eq!(
             labels
                 .get("@hub//:file")
@@ -5012,7 +5025,7 @@ esac
             );
             let prepared = PreparedRule {
                 definition_digest: prehash_rule(&mut rule, &HashSet::new()),
-                shared_inputs: None,
+                repository_inputs: None,
                 loading_inputs: Vec::new(),
             };
             labels.slot(name.to_owned()).rule = Some(Rc::new(RuleNode::new(rule, prepared)));
@@ -5402,7 +5415,7 @@ esac
                     rule.name.clone(),
                     PreparedRule {
                         definition_digest: prehash_rule(rule, &options.ignored_attributes),
-                        shared_inputs: Some(Arc::clone(&group)),
+                        repository_inputs: Some(RepositoryInputs::WithSiblings(Arc::clone(&group))),
                         loading_inputs: Vec::new(),
                     },
                 )]);

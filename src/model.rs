@@ -120,6 +120,9 @@ pub struct TargetHash {
     pub direct_hash: Digest,
 }
 
+/// Internal hash rows remain available to distance traversal but are not build targets.
+pub(crate) const REPOSITORY_DEFINITION_KIND: &str = "RepositoryDefinition";
+
 impl TargetHash {
     pub fn parse(value: &str) -> Result<Self> {
         let (kind, hashes) = value
@@ -145,11 +148,21 @@ impl TargetHash {
     }
 
     pub fn json_value(&self, include_target_type: bool) -> String {
-        if include_target_type {
+        if self.include_kind(include_target_type) {
             format!("{}#{}~{}", self.kind, self.hash, self.direct_hash)
         } else {
             format!("{}~{}", self.hash, self.direct_hash)
         }
+    }
+
+    fn include_kind(&self, requested: bool) -> bool {
+        let Self {
+            kind,
+            hash: _,
+            direct_hash: _,
+        } = self;
+        // Preserve the internal identity even when ordinary target kinds are omitted.
+        requested || kind == REPOSITORY_DEFINITION_KIND
     }
 }
 
@@ -163,16 +176,17 @@ impl Serialize for SerializedTargetHash<'_> {
     where
         S: Serializer,
     {
-        if self.include_target_type {
+        let Self {
+            hash,
+            include_target_type,
+        } = self;
+        if hash.include_kind(*include_target_type) {
             serializer.collect_str(&format_args!(
                 "{}#{}~{}",
-                self.hash.kind, self.hash.hash, self.hash.direct_hash
+                hash.kind, hash.hash, hash.direct_hash
             ))
         } else {
-            serializer.collect_str(&format_args!(
-                "{}~{}",
-                self.hash.hash, self.hash.direct_hash
-            ))
+            serializer.collect_str(&format_args!("{}~{}", hash.hash, hash.direct_hash))
         }
     }
 }
@@ -748,9 +762,17 @@ fn kind_rank(hash: Option<&TargetHash>) -> u8 {
 
 fn accepts(
     label: &str,
+    from: &BTreeMap<String, TargetHash>,
     to: &BTreeMap<String, TargetHash>,
     target_types: Option<&HashSet<String>>,
 ) -> Result<bool> {
+    if to
+        .get(label)
+        .or_else(|| from.get(label))
+        .is_some_and(|hash| hash.kind == REPOSITORY_DEFINITION_KIND)
+    {
+        return Ok(false);
+    }
     let Some(target_types) = target_types else {
         return Ok(true);
     };
@@ -780,7 +802,7 @@ pub fn impacted_targets(
         })
         .map(|(label, _)| label.clone())
         .filter(|label| !exclude_external || !label.starts_with("//external:"))
-        .filter_map(|label| match accepts(&label, to, target_types) {
+        .filter_map(|label| match accepts(&label, from, to, target_types) {
             Ok(true) => Some(Ok(label)),
             Ok(false) => None,
             Err(error) => Some(Err(error)),
@@ -799,7 +821,7 @@ pub fn filter_and_sort_labels(
     let mut impacted = labels
         .into_iter()
         .filter(|label| !exclude_external || !label.starts_with("//external:"))
-        .filter_map(|label| match accepts(&label, to, target_types) {
+        .filter_map(|label| match accepts(&label, from, to, target_types) {
             Ok(true) => Some(Ok(label)),
             Ok(false) => None,
             Err(error) => Some(Err(error)),
@@ -1040,7 +1062,7 @@ pub(crate) fn hash_file_impact_graph(
     for label in module_forced {
         if to.hashes.contains_key(label)
             && (!exclude_external || !label.starts_with("//external:"))
-            && accepts(label, &to.hashes, target_types)?
+            && accepts(label, &from.hashes, &to.hashes, target_types)?
         {
             forced_roots.insert(label.clone(), label.clone());
         }
@@ -1440,7 +1462,7 @@ fn distances_for_types(
                     (None, None) => (0, 0),
                     _ => unreachable!("both distance walks use the same graph and origins"),
                 };
-            match accepts(label, to, target_types) {
+            match accepts(label, from, to, target_types) {
                 Ok(true) => Some(Ok(ImpactedTargetWithDistance {
                     label: label.to_owned(),
                     target_distance,
@@ -1619,6 +1641,44 @@ mod tests {
     }
 
     #[test]
+    fn repository_definitions_are_internal_distance_nodes() {
+        let definition = "//external:definition";
+        let from = BTreeMap::from([
+            (
+                definition.into(),
+                target(REPOSITORY_DEFINITION_KIND, "old", "old"),
+            ),
+            ("//external:repository".into(), target("Rule", "old", "old")),
+            ("//app:reader".into(), target("Rule", "old-reader", "same")),
+        ]);
+        let to = BTreeMap::from([
+            (
+                definition.into(),
+                target(REPOSITORY_DEFINITION_KIND, "new", "new"),
+            ),
+            ("//external:repository".into(), target("Rule", "new", "new")),
+            ("//app:reader".into(), target("Rule", "new-reader", "same")),
+        ]);
+        let serialized = to[definition].json_value(false);
+        assert_eq!(
+            TargetHash::parse(&serialized).unwrap().kind,
+            REPOSITORY_DEFINITION_KIND
+        );
+        let edges = BTreeMap::from([("//app:reader".into(), vec![definition.into()])]);
+        let result = impacted_targets_with_distances(&from, &to, &edges, None, false).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].label, "//app:reader");
+        assert_eq!(result[0].target_distance, 1);
+        assert_eq!(result[0].package_distance, 1);
+        assert_eq!(result[1].label, "//external:repository");
+        assert_eq!(result[1].target_distance, 0);
+        assert_eq!(
+            impacted_targets(&from, &to, None, false).unwrap(),
+            ["//app:reader", "//external:repository"]
+        );
+    }
+
+    #[test]
     fn streaming_serialization_matches_value_schema() {
         let mut data = HashFileData {
             hashes: BTreeMap::from([
@@ -1626,6 +1686,14 @@ mod tests {
                 (
                     "//b:b".into(),
                     target("SourceFile", "overall-b", "direct-b"),
+                ),
+                (
+                    "//external:definition".into(),
+                    target(
+                        REPOSITORY_DEFINITION_KIND,
+                        "overall-members",
+                        "direct-members",
+                    ),
                 ),
             ]),
             ..Default::default()

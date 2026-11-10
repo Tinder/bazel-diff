@@ -5,7 +5,7 @@ use crate::bazel::{
 };
 use crate::cancel::{self, Cancellation};
 use crate::components::{component_digest, member_digest, Completion, Components, Visit};
-use crate::model::{ConfiguredRoots, HashFileData, TargetHash};
+use crate::model::{ConfiguredRoots, HashFileData, TargetHash, REPOSITORY_DEFINITION_KIND};
 use crate::partial::{self, RecipeRecorder, RuleRecipe, TreeIndex};
 use crate::proto::blaze_query::{target, Rule, Target};
 use anyhow::{anyhow, bail, Context, Result};
@@ -192,6 +192,7 @@ impl TargetDigestBuilder {
 
 enum HashTarget {
     Rule(String),
+    RepositoryDefinition(String),
     Generated {
         name: String,
         generating_rule: String,
@@ -202,8 +203,13 @@ enum HashTarget {
 impl HashTarget {
     fn label(&self) -> &str {
         match self {
-            HashTarget::Rule(label) | HashTarget::Source(label) => label,
-            HashTarget::Generated { name, .. } => name,
+            HashTarget::Rule(label) => label,
+            HashTarget::RepositoryDefinition(label) => label,
+            HashTarget::Source(label) => label,
+            HashTarget::Generated {
+                name,
+                generating_rule: _,
+            } => name,
         }
     }
 }
@@ -753,6 +759,7 @@ fn hash_targets_with_environment(
             &observed_alias_sources,
             fine,
             mapping,
+            &mut hash_targets,
         );
         rules.prepare_inputs(fine, mapping, &covered);
     }
@@ -836,6 +843,10 @@ fn hash_targets_with_environment(
             HashTarget::Rule(key) => {
                 let digest = context.rule_digest(&key, &mut Vec::new())?;
                 (key, "Rule", digest)
+            }
+            HashTarget::RepositoryDefinition(key) => {
+                let digest = context.rule_digest(&key, &mut Vec::new())?;
+                (key, REPOSITORY_DEFINITION_KIND, digest)
             }
             HashTarget::Generated {
                 name,
@@ -1392,17 +1403,27 @@ struct Labels {
     slots: Vec<LabelSlot>,
 }
 
+const REPOSITORY_DEFINITION_PREFIX: &str = "//external:__bazel_diff_repository_definition__/";
+
+struct RepositoryView<'a> {
+    operand: &'a str,
+    definition: Arc<str>,
+}
+
+type RepositoryViews<'a> = HashMap<usize, RepositoryView<'a>>;
+
 impl Labels {
-    /// Attach the selected repository definition and effective SourceFile visibility to the
-    /// forwarding alias. Its file digest is already folded by the ordinary input loop.
+    /// Keep the repository definition at its original graph hop for an observed source.
+    /// The original aggregate and every unqualified occurrence remain unchanged.
     fn bind_alias_sources<'a>(
         &mut self,
         aliases: &'a HashMap<String, AliasSource>,
         observed: &HashSet<String>,
         fine: &BTreeSet<String>,
         mapping: &HashMap<String, String>,
-    ) -> HashMap<usize, &'a str> {
-        let mut covered = HashMap::new();
+        targets: &mut Vec<HashTarget>,
+    ) -> RepositoryViews<'a> {
+        let mut requested = BTreeMap::<String, Vec<(usize, &str)>>::new();
         for (
             name,
             AliasSource {
@@ -1418,18 +1439,16 @@ impl Labels {
             let Cow::Owned(companion) = transform_external_input(label, fine, mapping) else {
                 continue;
             };
-            // The normal lowering keeps the intrinsic RepoSpec/owner definition separate
-            // from its generated sibling group. Preserve any other repository relation.
-            let definition = self
+            let projectable = self
                 .get(&companion)
                 .and_then(|slot| slot.rule.as_ref())
-                .filter(|repo| {
+                .is_some_and(|repo| {
                     repo.prepared.shared_inputs.is_some() && repo.rule.rule_input.is_empty()
-                })
-                .map(|repo| repo.prepared.definition_digest);
-            let Some(&id) = self.ids.get(name) else {
+                });
+            let Some(id) = self.ids.get(name) else {
                 continue;
             };
+            let id = *id;
             let Some(node) = self.slots[id].rule.as_mut().and_then(Rc::get_mut) else {
                 continue;
             };
@@ -1437,12 +1456,13 @@ impl Labels {
                 continue;
             }
             let mut hasher = Sha256::new();
-            hasher.update(b"native alias source definition");
+            hasher.update(b"native alias source visibility");
             hasher.update(node.prepared.definition_digest);
-            // Without a pure sibling group the normal repository operand is unchanged.
-            if let Some(definition) = definition {
-                hasher.update(definition);
-                covered.insert(id, label.as_str());
+            if projectable {
+                requested
+                    .entry(companion)
+                    .or_default()
+                    .push((id, label.as_str()));
             }
             for visibility in visibility {
                 hasher.update((visibility.len() as u64).to_le_bytes());
@@ -1450,14 +1470,79 @@ impl Labels {
             }
             node.prepared.definition_digest = hasher.finalize().into();
         }
-        covered
+        if requested.is_empty() {
+            return RepositoryViews::default();
+        }
+        let candidates = {
+            let occupied = targets
+                .iter()
+                .filter_map(|target| {
+                    let HashTarget::Generated {
+                        name,
+                        generating_rule: _,
+                    } = target
+                    else {
+                        return None;
+                    };
+                    name.starts_with(REPOSITORY_DEFINITION_PREFIX)
+                        .then_some(name.as_str())
+                })
+                .collect::<HashSet<_>>();
+            requested
+                .into_iter()
+                .filter_map(|(repository, uses)| {
+                    let definition = format!(
+                        "{REPOSITORY_DEFINITION_PREFIX}{}",
+                        hex::encode(repository.as_bytes())
+                    );
+                    (!occupied.contains(definition.as_str()) && !self.ids.contains_key(&definition))
+                        .then_some((repository, definition, uses))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut views = RepositoryViews::new();
+        for (repository, definition, uses) in candidates {
+            let definition_digest = self
+                .get(&repository)
+                .and_then(|slot| slot.rule.as_ref())
+                .filter(|node| {
+                    node.prepared.shared_inputs.is_some() && node.rule.rule_input.is_empty()
+                })
+                .map(|node| node.prepared.definition_digest);
+            let Some(definition_digest) = definition_digest else {
+                continue;
+            };
+            let rule = Rule {
+                name: definition.clone(),
+                rule_class: "repository_definition".into(),
+                ..Default::default()
+            };
+            let prepared = PreparedRule {
+                definition_digest,
+                shared_inputs: None,
+                loading_inputs: Vec::new(),
+            };
+            self.slot(definition.clone()).rule = Some(Rc::new(RuleNode::new(rule, prepared)));
+            targets.push(HashTarget::RepositoryDefinition(definition.clone()));
+            let definition = Arc::<str>::from(definition);
+            for (id, operand) in uses {
+                views.insert(
+                    id,
+                    RepositoryView {
+                        operand,
+                        definition: Arc::clone(&definition),
+                    },
+                );
+            }
+        }
+        views
     }
 
     fn prepare_inputs(
         &mut self,
         fine: &BTreeSet<String>,
         mapping: &HashMap<String, String>,
-        covered: &HashMap<usize, &str>,
+        views: &RepositoryViews<'_>,
     ) {
         let empty = HashMap::new();
         let canonical_fine = fine.iter().any(|repo| repo.starts_with("@@"));
@@ -1480,8 +1565,15 @@ impl Labels {
                         &empty
                     };
                     for i in 0..inputs.len() {
-                        if covered.get(&index).is_some_and(|&label| inputs[i] == label) {
-                            continue;
+                        if let Some(view) = views.get(&index) {
+                            let RepositoryView {
+                                operand,
+                                definition,
+                            } = view;
+                            if inputs[i] == *operand {
+                                inputs.push(definition.to_string());
+                                continue;
+                            }
                         }
                         if let Cow::Owned(synthetic) =
                             transform_external_input(&inputs[i], fine, canonical)
@@ -4730,6 +4822,7 @@ esac
             ids: HashMap::new(),
             slots: Vec::new(),
         };
+        let mut targets = Vec::new();
         let file = "@@ext++files+data//:value.txt";
         let other = "@@ext++files+data//:other";
         let repository = "//external:ext++files+data";
@@ -4743,6 +4836,7 @@ esac
             ("@hub//:mixed", vec![file, other], None),
             ("@hub//:unobserved", vec![other], None),
         ] {
+            targets.push(HashTarget::Rule(name.into()));
             let rule = Rule {
                 name: name.into(),
                 rule_input: inputs.into_iter().map(str::to_owned).collect(),
@@ -4777,23 +4871,107 @@ esac
         let fine = BTreeSet::from(["@hub".to_owned()]);
         let mapping = HashMap::new();
         let observed = HashSet::from([file.to_owned()]);
-        let covered = labels.bind_alias_sources(&aliases, &observed, &fine, &mapping);
-        labels.prepare_inputs(&fine, &mapping, &covered);
+        let unobserved = labels
+            .get("@hub//:unobserved")
+            .unwrap()
+            .rule
+            .as_ref()
+            .unwrap();
+        let unobserved_inputs = rule_inputs(&unobserved.rule, false, &fine, &mapping)
+            .into_iter()
+            .map(Cow::into_owned)
+            .collect::<Vec<_>>();
+        let unobserved_definition = unobserved.prepared.definition_digest;
+        let views = labels.bind_alias_sources(&aliases, &observed, &fine, &mapping, &mut targets);
+        let definition = views[&labels.ids["@hub//:file"]].definition.to_string();
+        labels.prepare_inputs(&fine, &mapping, &views);
         let node = |name| labels.get(name).unwrap().rule.as_ref().unwrap();
-        assert_eq!(node("@hub//:file").rule.rule_input, [file]);
         assert_eq!(
-            node("@hub//:mixed").rule.rule_input,
-            [repository, other, file]
+            node("@hub//:file").rule.rule_input,
+            [definition.as_str(), file]
         );
         assert_eq!(
-            node("@hub//:unobserved").rule.rule_input,
-            [repository, other]
+            node("@hub//:mixed").rule.rule_input,
+            [definition.as_str(), repository, other, file]
+        );
+        assert_eq!(node("@hub//:unobserved").rule.rule_input, unobserved_inputs);
+        assert!(node(repository).prepared.shared_inputs.is_some());
+        assert!(node(&definition).prepared.shared_inputs.is_none());
+        assert_eq!(
+            node(repository).prepared.definition_digest,
+            node(&definition).prepared.definition_digest
         );
         assert_eq!(
             node("@hub//:unobserved").prepared.definition_digest,
-            [1; 32]
+            unobserved_definition
         );
         assert_ne!(node("@hub//:file").prepared.definition_digest, [1; 32]);
+    }
+
+    #[test]
+    fn an_occupied_definition_name_keeps_the_original_repository() {
+        let repository = "//external:ext++files+data";
+        let file = "@@ext++files+data//:value.txt";
+        let definition = format!(
+            "{REPOSITORY_DEFINITION_PREFIX}{}",
+            hex::encode(repository.as_bytes())
+        );
+        let mut labels = Labels {
+            ids: HashMap::new(),
+            slots: Vec::new(),
+        };
+        let group = Arc::new(RepositoryInputGroup {
+            extension: "ext++files".into(),
+            labels: vec!["//external:ext++files+sibling".into()],
+        });
+        for (name, inputs, shared_inputs) in [
+            (repository, vec![], Some(group)),
+            ("@hub//:file", vec![file], None),
+        ] {
+            labels.slot(name.into()).rule = Some(Rc::new(RuleNode::new(
+                Rule {
+                    name: name.into(),
+                    rule_input: inputs.into_iter().map(str::to_owned).collect(),
+                    ..Default::default()
+                },
+                PreparedRule {
+                    definition_digest: [1; 32],
+                    shared_inputs,
+                    loading_inputs: Vec::new(),
+                },
+            )));
+        }
+        let aliases = HashMap::from([(
+            "@hub//:file".into(),
+            AliasSource {
+                label: file.into(),
+                location: file.into(),
+                visibility: vec!["//visibility:public".into()],
+            },
+        )]);
+        let mut targets = vec![HashTarget::Generated {
+            name: definition,
+            generating_rule: "//:generator".into(),
+        }];
+        let observed = HashSet::from([file.to_owned()]);
+        let fine = BTreeSet::from(["@hub".to_owned()]);
+        let mapping = HashMap::new();
+        let views = labels.bind_alias_sources(&aliases, &observed, &fine, &mapping, &mut targets);
+        assert!(views.is_empty());
+        labels.prepare_inputs(&fine, &mapping, &views);
+        let repository = labels.get(repository).unwrap().rule.as_ref().unwrap();
+        assert!(repository.prepared.shared_inputs.is_some());
+        assert_eq!(
+            labels
+                .get("@hub//:file")
+                .unwrap()
+                .rule
+                .as_ref()
+                .unwrap()
+                .rule
+                .rule_input,
+            ["//external:ext++files+data", file]
+        );
     }
 
     #[test]
@@ -4839,7 +5017,7 @@ esac
             };
             labels.slot(name.to_owned()).rule = Some(Rc::new(RuleNode::new(rule, prepared)));
         }
-        labels.prepare_inputs(&fine, &canonical, &HashMap::new());
+        labels.prepare_inputs(&fine, &canonical, &RepositoryViews::default());
         let inputs = |name| {
             &labels
                 .get(name)

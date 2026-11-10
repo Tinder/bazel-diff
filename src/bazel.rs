@@ -1401,26 +1401,7 @@ impl BazelOptions {
         }
         let first = targets.len();
         targets.extend(extra);
-        let mut definitions: HashMap<String, Vec<String>> = targets[first..]
-            .iter()
-            .filter_map(|row| row.rule.as_option().map(|r| &r.name))
-            .filter_map(|name| name.rsplit_once(':'))
-            .map(|(package, _)| (package.to_owned(), Vec::new()))
-            .collect();
-        for row in targets.iter() {
-            let Some(source) = row.source_file.as_option() else {
-                continue;
-            };
-            let Some((package, "BUILD" | "BUILD.bazel")) = source.name.rsplit_once(':') else {
-                continue;
-            };
-            if let Some(inputs) = definitions.get_mut(package) {
-                inputs.push(source.name.clone());
-                inputs.extend(source.subinclude.iter().cloned());
-                inputs.sort_unstable();
-                inputs.dedup();
-            }
-        }
+        let definitions = self.package_inputs_for_acquired_rules(targets, first, Some(version))?;
         for (index, row) in targets.iter_mut().enumerate() {
             let Some(rule) = row.rule.as_option_mut() else {
                 continue;
@@ -1446,6 +1427,90 @@ impl BazelOptions {
             }
         }
         Ok(())
+    }
+
+    /// Collect loading inputs for newly acquired rules. `buildfiles` can report a
+    /// synthetic load-only BUILD at the same label as the real BUILD. Refresh only
+    /// ambiguous rows in packages containing an acquired rule; unrelated load-only
+    /// packages must not be evaluated as target dependencies.
+    fn package_inputs_for_acquired_rules(
+        &self,
+        targets: &mut [Target],
+        first: usize,
+        version: Option<BazelVersion>,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut definitions: HashMap<String, Vec<String>> = targets[first..]
+            .iter()
+            .filter_map(|row| row.rule.as_option().map(|rule| &rule.name))
+            .filter_map(|name| name.rsplit_once(':'))
+            .map(|(package, _)| (package.to_owned(), Vec::new()))
+            .collect();
+        if definitions.is_empty() {
+            return Ok(definitions);
+        }
+        let builds: Vec<_> = targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let source = row.source_file.as_option()?;
+                let (package, "BUILD" | "BUILD.bazel") = source.name.rsplit_once(':')? else {
+                    return None;
+                };
+                definitions.contains_key(package).then_some(index)
+            })
+            .collect();
+        let requested: BTreeSet<_> = builds
+            .iter()
+            .filter_map(|&index| targets[index].source_file.as_option())
+            .filter(|source| source.package_contains_errors.is_none())
+            .map(|source| source.name.clone())
+            .collect();
+        if !requested.is_empty() {
+            let mut strict = self.clone();
+            strict.keep_going = false;
+            strict.command_options.push("--nokeep_going".into());
+            let expression = self.with_exclude_filter(query_set(&requested)?);
+            match strict.query_with(&expression, false, version, false, &mut |_, _| {}) {
+                Ok(rows) => {
+                    let mut observed = HashMap::new();
+                    for row in rows {
+                        let Some(name) = target_name(&row).filter(|name| requested.contains(*name))
+                        else {
+                            continue;
+                        };
+                        let loads = row.source_file.as_option().and_then(|source| {
+                            (source.package_contains_errors == Some(false))
+                                .then(|| source.subinclude.clone())
+                        });
+                        observed
+                            .entry(name.to_owned())
+                            .and_modify(|value| *value = None)
+                            .or_insert(loads);
+                    }
+                    for &index in &builds {
+                        let source = targets[index].source_file.as_option_mut().unwrap();
+                        if let Some(Some(loads)) = observed.get(&source.name) {
+                            source.subinclude.clone_from(loads);
+                            source.package_contains_errors = Some(false);
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.check_cancelled()?;
+                    eprintln!("[Warn] retaining prior BUILD loading inputs after query failure: {error:#}");
+                }
+            }
+        }
+        for index in builds {
+            let source = targets[index].source_file.as_option().unwrap();
+            let package = source.name.rsplit_once(':').unwrap().0;
+            let inputs = definitions.get_mut(package).unwrap();
+            inputs.push(source.name.clone());
+            inputs.extend(source.subinclude.iter().cloned());
+            inputs.sort_unstable();
+            inputs.dedup();
+        }
+        Ok(definitions)
     }
 
     fn alias_actuals(
@@ -10118,6 +10183,100 @@ exit 1
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acquired_package_inputs_refresh_only_real_builds() {
+        const BUILD: &str = "@sdk_rules//:BUILD";
+        const LOAD: &str = "@sdk_rules//:defs.bzl";
+        const CHANGED_LOAD: &str = "@sdk_rules//:changed.bzl";
+        let workspace = tempfile::tempdir().unwrap();
+        let dir = workspace.path();
+        let source = |name: &str, loads: &[&str], errors: Option<bool>| Target {
+            r#type: target::Discriminator::SourceFile,
+            source_file: buffa::MessageField::some(SourceFile {
+                name: name.into(),
+                subinclude: loads.iter().map(|label| (*label).into()).collect(),
+                package_contains_errors: errors,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let script = dir.join("query.sh");
+        fs::write(
+            &script,
+            r#"set -eu
+[ "$1" = query ]
+strict=no
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --query_file) shift; expression=$(cat "$1") ;;
+    --output_file) shift; output="$1" ;;
+    --keep_going) strict=no ;;
+    --nokeep_going) strict=yes ;;
+  esac
+  shift
+done
+[ "$strict" = yes ]
+echo "$expression" >> calls.log
+[ "$expression" = "set('@sdk_rules//:BUILD')" ]
+cp response.pb "$output"
+if [ -f fail ]; then exit 3; fi
+"#,
+        )
+        .unwrap();
+        let mut options = probe_options(dir, script);
+        options.command_options.push("--keep_going".into());
+        let rows = || {
+            vec![
+                source(BUILD, &[], None),
+                source("@load_only//:BUILD", &[], None),
+                source(LOAD, &[], None),
+                source(CHANGED_LOAD, &[], None),
+                rule_with_inputs("@sdk_rules//:sdk_impl", &[]),
+            ]
+        };
+        let collect = |targets: &mut [Target]| {
+            options
+                .package_inputs_for_acquired_rules(targets, 4, Some(BazelVersion(8, 8, 2)))
+                .unwrap()
+        };
+        write_delimited(
+            &dir.join("response.pb"),
+            &[source(BUILD, &[LOAD], Some(false))],
+        );
+        let mut ambiguous = rows();
+        let recovered = collect(&mut ambiguous);
+        let mut real = rows();
+        real[0] = source(BUILD, &[LOAD], Some(false));
+        assert_eq!(collect(&mut real), recovered);
+        assert_eq!(ambiguous[0], real[0]);
+        assert_eq!(query_calls(dir), ["set('@sdk_rules//:BUILD')"]);
+        assert_eq!(recovered["@sdk_rules//"], [BUILD, LOAD]);
+        assert!(ambiguous[1]
+            .source_file
+            .as_option()
+            .unwrap()
+            .subinclude
+            .is_empty());
+
+        // A changed real load remains a changed input to the acquired rule.
+        write_delimited(
+            &dir.join("response.pb"),
+            &[source(BUILD, &[CHANGED_LOAD], Some(false))],
+        );
+        assert_eq!(collect(&mut rows())["@sdk_rules//"], [BUILD, CHANGED_LOAD]);
+
+        // A missing positive marker or partial query cannot replace the old row.
+        write_delimited(&dir.join("response.pb"), &[source(BUILD, &[LOAD], None)]);
+        assert_eq!(collect(&mut rows())["@sdk_rules//"], [BUILD]);
+        write_delimited(
+            &dir.join("response.pb"),
+            &[source(BUILD, &[LOAD], Some(false))],
+        );
+        fs::write(dir.join("fail"), []).unwrap();
+        assert_eq!(collect(&mut rows())["@sdk_rules//"], [BUILD]);
     }
 
     #[test]

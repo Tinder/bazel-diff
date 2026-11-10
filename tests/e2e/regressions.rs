@@ -2003,7 +2003,63 @@ fn extension_repo_patch_edit_impacts_toolchain_user() {
             .any(|label| label == "//:app" || label == "@@//:app"),
         "{impacted:?}"
     );
-    assert!(!impacted.contains("//:control"), "{impacted:?}");
+    assert!(
+        impacted
+            .iter()
+            .all(|label| label.trim_start_matches('@') != "//:control"),
+        "{impacted:?}"
+    );
+
+    // An alias in the fine-grained repository reaches sdk_impl. Its BUILD also
+    // loads defs.bzl, so buildfiles can return a synthetic row for the SDK BUILD.
+    // Renaming a transitive load must change that BUILD's hash at fixed BUILD bytes.
+    let sdk_build_hash = |load: &str| {
+        let workspace = copy_workspace("extension_repo_patch");
+        let root = workspace.path();
+        edit(&root.join("MODULE.bazel"), |text| {
+            text + "\nuse_repo(sdk, \"sdk_aliases\")\n"
+        });
+        edit(&root.join("BUILD"), |text| {
+            text + "\nfilegroup(name = \"sdk_probe\", srcs = [\"@sdk_aliases//:implementation\"])\n"
+        });
+        edit(&root.join("sdk_rules/extensions.bzl"), |text| {
+            let generated = r#"rctx.file("BUILD.bazel", 'exports_files(["version.txt"])\n')"#;
+            let alias = r#"rctx.file("BUILD.bazel", 'load("%s", "SdkInfo")\nexports_files(["version.txt"])\nalias(name = "implementation", actual = "%s", visibility = ["//visibility:public"])\n' % (Label("//:defs.bzl"), Label("//:sdk_impl")))"#;
+            let sdk = "    _sdk_repo(name = \"default_sdk\"";
+            text.replace(generated, alias).replace(
+                sdk,
+                &format!("    _sdk_repo(name = \"sdk_aliases\", version = \"1\")\n{sdk}"),
+            )
+        });
+        edit(&root.join("sdk_rules/defs.bzl"), |text| {
+            text.replace(
+                "SdkInfo = provider",
+                &format!("load(\":{load}.bzl\", \"marker\")\n\nSdkInfo = provider"),
+            )
+        });
+        fs::write(root.join(format!("sdk_rules/{load}.bzl")), "marker = 1\n").unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let file = output.path().join("hashes.json");
+        let generated = generate(
+            root,
+            &file,
+            &[
+                "--excludeExternalTargets",
+                "--includeTargetType",
+                "--bazelCommandOptions=--nokeep_going --noproto:locations",
+                "--fineGrainedHashExternalRepos=@sdk_aliases",
+            ],
+        );
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        hashes(&file)
+            .remove("@sdk_rules//:BUILD")
+            .expect("acquired SDK BUILD")
+    };
+    assert_ne!(sdk_build_hash("first"), sdk_build_hash("renamed"));
 }
 
 /// The cquery side of the case above: the resolved toolchain is a real configured input

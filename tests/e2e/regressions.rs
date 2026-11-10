@@ -49,16 +49,36 @@ fn package_group_change_impacts_consumers() {
     edit(&second.path().join("lib/defs.bzl"), |text| {
         text.replace("ALLOWED = [\"//consumer\"]", "ALLOWED = []")
     });
+    let ordinary = diff_workspaces(first.path(), second.path(), &[]);
     assert_eq!(
-        diff_workspaces(first.path(), second.path(), &[]),
+        ordinary,
         BTreeSet::from([
             "//consumer:use_thing".to_owned(),
             "//consumer:use_thing.txt".to_owned(),
+            "//lib:allowed".to_owned(),
             "//lib:consumers".to_owned(),
             "//lib:thing".to_owned(),
             "//lib:thing.txt".to_owned(),
         ])
     );
+    // Keep both revisions analyzable for cquery while changing only the package group.
+    edit(&second.path().join("lib/defs.bzl"), |text| {
+        text.replace(
+            "ALLOWED = []",
+            "ALLOWED = [\"//consumer\", \"//additional\"]",
+        )
+    });
+    let impacted = diff_workspaces(first.path(), second.path(), &["--useCquery"]);
+    let local_labels: BTreeSet<_> = impacted
+        .iter()
+        .map(|label| {
+            label
+                .strip_prefix("@@")
+                .or_else(|| label.strip_prefix('@'))
+                .unwrap_or(label)
+        })
+        .collect();
+    assert_eq!(local_labels, ordinary.iter().map(String::as_str).collect());
 }
 
 #[test]

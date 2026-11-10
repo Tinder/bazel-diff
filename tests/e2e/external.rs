@@ -384,6 +384,7 @@ genrule(name = "reads_build", srcs = ["@crates//:a_build"], outs = ["definition.
         ("sibling", "1", "2"),
         ("unused", "1", "1"),
         ("private", "1", "1"),
+        ("repository", "1", "1"),
     ] {
         let build = match state {
             "unused" => format!("{definition}\nfilegroup(name = \"unused\")\n"),
@@ -391,13 +392,23 @@ genrule(name = "reads_build", srcs = ["@crates//:a_build"], outs = ["definition.
             _ => definition.clone(),
         };
         fs::write(&template, &build).unwrap();
+        let note = if state == "repository" { "changed" } else { "" };
         fs::write(
             root.join("versions.json"),
-            format!(r#"{{"a":"{a}","b":"{b}"}}"#),
+            format!(r#"{{"a":"{a}","b":"{b}","note":"{note}"}}"#),
         )
         .unwrap();
         let snapshot = out.path().join(format!("{state}.json"));
-        let output = generate(root, &snapshot, &["--fineGrainedHashExternalRepos=@crates"]);
+        let edges = out.path().join("edges.json");
+        let output = generate(
+            root,
+            &snapshot,
+            &[
+                "--fineGrainedHashExternalRepos=@crates",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
         assert!(
             output.status.success(),
             "{}",
@@ -418,22 +429,38 @@ genrule(name = "reads_build", srcs = ["@crates//:a_build"], outs = ["definition.
         } else {
             assert_product(root, "//:uses_source", "source.txt", a);
         }
-        assert!(impacted(root, &base, &snapshot, &result, &[])
-            .status
-            .success());
-        let labels = read_lines(&result);
-        let has = |name| {
-            labels
-                .iter()
-                .any(|label| label.trim_start_matches('@') == name)
+        assert!(impacted(
+            root,
+            &base,
+            &snapshot,
+            &result,
+            &["-d", edges.to_str().unwrap()]
+        )
+        .status
+        .success());
+        let changes: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+        let row = |name: &str| {
+            changes.iter().find(|r| {
+                r["label"].as_str().is_some_and(|label| {
+                    label == name || name.starts_with("//") && label.trim_start_matches('@') == name
+                })
+            })
         };
         assert_eq!(
-            has("//:uses_source"),
-            matches!(state, "payload" | "private"),
-            "{state}: {labels:?}"
+            row("//:uses_source").is_some(),
+            matches!(state, "payload" | "private" | "repository"),
+            "{state}: {changes:?}"
         );
         if matches!(state, "private" | "unused") {
-            assert!(has("//:reads_build"), "{state}: {labels:?}");
+            assert!(row("//:reads_build").is_some(), "{state}: {changes:?}");
+        }
+        if state == "repository" {
+            for (name, distance) in [("@crates//:a_source", 1), ("//:uses_source", 2)] {
+                let entry = row(name).unwrap();
+                assert_eq!(entry["targetDistance"], distance, "{name}");
+                assert_eq!(entry["packageDistance"], distance, "{name}");
+            }
         }
     }
 }

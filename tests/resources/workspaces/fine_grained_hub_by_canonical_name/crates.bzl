@@ -2,7 +2,7 @@ def _spoke_impl(rctx):
     rctx.file("data.txt", rctx.attr.version)
     rctx.file("BUILD.bazel", rctx.read(Label("//:spoke.BUILD")))
 
-spoke = repository_rule(implementation = _spoke_impl, attrs = {"version": attr.string()})
+spoke = repository_rule(implementation = _spoke_impl, attrs = {"version": attr.string(), "note": attr.string()})
 
 def _hub_impl(rctx):
     rctx.file("versions.txt", rctx.attr.versions)
@@ -22,8 +22,9 @@ hub = repository_rule(
 
 def _crates_impl(mctx):
     versions = json.decode(mctx.read(Label("//:versions.json")))
+    note = versions.pop("note", "")
     for name, version in versions.items():
-        spoke(name = "crates__" + name, version = version)
+        spoke(name = "crates__" + name, version = version, note = note if name == "a" else "")
     hub(name = "crates", names = sorted(versions), versions = json.encode(versions))
 
 crates = module_extension(implementation = _crates_impl)

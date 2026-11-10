@@ -1901,9 +1901,10 @@ fn ordinary_external_filegroup_consumers() {
         fs::write(root.join("unrelated.txt"), unrelated).unwrap();
         for (mode, query) in [
             ("ordinary", "--bazelCommandOptions=--noproto:locations"),
+            ("projected", "--bazelCommandOptions=--noproto:locations --proto:output_rule_attrs=tags,testonly --proto:include_synthetic_attribute_hash"),
             (
                 "filtered",
-                "--bazelCommandOptions=--noproto:locations --notool_deps",
+                "--bazelCommandOptions=--noproto:locations --notool_deps --proto:output_rule_attrs=tags,testonly --proto:include_synthetic_attribute_hash",
             ),
         ] {
             let hashes = output.path().join(format!("{state}-{mode}.json"));
@@ -1925,7 +1926,7 @@ fn ordinary_external_filegroup_consumers() {
                     .status
                     .success());
                 let changed = read_lines(&result);
-                if mode == "ordinary" {
+                if mode != "filtered" {
                     assert_eq!(
                         changed.contains("//:copy_reader"),
                         state == "copy",

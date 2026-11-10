@@ -1,6 +1,6 @@
 use crate::bazel::{
     encode_configured_input, encoded_rule_attributes, split_configured, target_label, target_name,
-    AliasSource, BazelOptions, EncodedAttribute, EncodedTargets, QueriedTargets,
+    AliasSource, BazelOptions, EncodedAttribute, EncodedTargets, FilegroupWitness, QueriedTargets,
     RepositoryInputGroup, RepositoryInputs, ScopedSources, VerifiedQuery,
 };
 use crate::cancel::{self, Cancellation};
@@ -1539,14 +1539,15 @@ impl Labels {
         qualified
     }
 
-    /// A native filegroup is complete when the normal definition matches its full declaration
-    /// and every input is an observed InputFile or another complete filegroup. Cycles and other
-    /// rule kinds remain unresolved. Native genrule parents additionally require complete direct
-    /// children and an explicitly returned empty toolchains attribute.
+    /// A native filegroup needs a strict native declaration, a matching ordinary definition,
+    /// and an observed InputFile or complete filegroup for every input. The definition matches
+    /// either the full declaration or a fresh caller-projected row with synthetic hash evidence.
+    /// Cycles and other rule kinds remain unresolved. Native genrule parents additionally require
+    /// complete direct children and an explicitly returned empty toolchains attribute.
     fn bind_filegroup_inputs<'a>(
         &mut self,
-        filegroups: &'a BTreeMap<String, Rule>,
-        parents: &'a BTreeMap<String, Rule>,
+        filegroups: &'a BTreeMap<String, FilegroupWitness>,
+        parents: &'a BTreeMap<String, FilegroupWitness>,
         sources: &HashMap<&str, Option<&AliasSource>>,
         observed: &HashSet<String>,
         ignored: &HashSet<String>,
@@ -1557,14 +1558,15 @@ impl Labels {
         }
         let mut pending = filegroups
             .iter()
-            .filter_map(|(name, rule)| {
+            .filter_map(|(name, witness)| {
+                let rule = &witness.declaration;
                 let id = self.ids.get(name)?;
                 let id = *id;
                 let node = self.slots[id].rule.as_ref()?;
                 if Rc::strong_count(node) != 1
                     || rule.rule_class_key.as_deref() != Some("filegroup")
                     || node.rule.rule_class_key.as_deref() != Some("filegroup")
-                    || node.prepared.definition_digest != rule_definition_digest(rule, ignored)
+                    || !witness.matches_definition(node.prepared.definition_digest, ignored)
                 {
                     return None;
                 }
@@ -1633,7 +1635,8 @@ impl Labels {
                 complete.insert(name);
             }
         }
-        for (name, parent) in parents {
+        for (name, witness) in parents {
+            let parent = &witness.declaration;
             let Some(id) = self.ids.get(name) else {
                 continue;
             };
@@ -1644,7 +1647,7 @@ impl Labels {
             // Native genrule adds resolver requirements through this nonconfigurable attribute.
             if parent.rule_class_key.as_deref() != Some("genrule")
                 || parent.rule_class != node.rule.rule_class
-                || node.prepared.definition_digest != rule_definition_digest(parent, ignored)
+                || !witness.matches_definition(node.prepared.definition_digest, ignored)
                 || !parent.attribute.iter().any(|attribute| {
                     attribute.name == "toolchains"
                         && attribute.r#type == AttributeKind::LabelList
@@ -2889,6 +2892,35 @@ pub(crate) fn without_integrity_pinned_urls(
         _ => return None,
     }
     Some(stripped)
+}
+
+/// Bazel emits this STRING attribute for its synthetic rule hash, which includes
+/// selector mappings omitted from a filtered attribute list. Its value is opaque
+/// and is already part of the caller's ordinary definition digest.
+pub(crate) fn projected_filegroup_definition(rule: &Rule) -> Option<DigestBytes> {
+    let mut attributes = rule
+        .attribute
+        .iter()
+        .filter(|attr| attr.name == "$internal_attr_hash");
+    let hash = attributes.next()?;
+    (attributes.next().is_none()
+        && hash.r#type == AttributeKind::String
+        && hash
+            .string_value
+            .as_ref()
+            .is_some_and(|value| !value.is_empty()))
+    .then(|| rule_definition_digest(rule, &HashSet::new()))
+}
+
+impl FilegroupWitness {
+    fn matches_definition(&self, actual: DigestBytes, ignored: &HashSet<String>) -> bool {
+        let Self {
+            declaration,
+            projected_definition,
+        } = self;
+        *projected_definition == Some(actual)
+            || rule_definition_digest(declaration, ignored) == actual
+    }
 }
 
 fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes {
@@ -4471,6 +4503,30 @@ esac
     }
 
     #[test]
+    fn projected_filegroup_definition_requires_synthetic_attribute_evidence() {
+        let mut rule = Rule::default();
+        assert_eq!(projected_filegroup_definition(&rule), None);
+        rule.attribute.push(Attribute {
+            name: "$internal_attr_hash".into(),
+            r#type: AttributeKind::String,
+            ..Default::default()
+        });
+        assert_eq!(projected_filegroup_definition(&rule), None);
+        rule.attribute[0].string_value = Some(String::new());
+        assert_eq!(projected_filegroup_definition(&rule), None);
+        rule.attribute[0].string_value = Some("opaque".into());
+        assert_eq!(
+            projected_filegroup_definition(&rule),
+            Some(rule_definition_digest(&rule, &HashSet::new()))
+        );
+        rule.attribute[0].r#type = AttributeKind::Label;
+        assert_eq!(projected_filegroup_definition(&rule), None);
+        rule.attribute[0].r#type = AttributeKind::String;
+        rule.attribute.push(rule.attribute[0].clone());
+        assert_eq!(projected_filegroup_definition(&rule), None);
+    }
+
+    #[test]
     fn streamed_rule_preprocessing_releases_unused_attribute_storage() {
         let mut rule = Rule {
             attribute: vec![Attribute {
@@ -5419,6 +5475,14 @@ esac
             })
             .collect::<BTreeMap<_, _>>();
         let mut qualified = QualifiedInputs::new();
+        let filegroups = filegroups
+            .into_iter()
+            .map(|(name, rule)| (name, FilegroupWitness::new(rule)))
+            .collect();
+        let parents = parents
+            .into_iter()
+            .map(|(name, rule)| (name, FilegroupWitness::new(rule)))
+            .collect();
         labels.bind_filegroup_inputs(
             &filegroups,
             &parents,

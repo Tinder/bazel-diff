@@ -753,8 +753,8 @@ impl BazelOptions {
         root_mapping: Option<&[u8]>,
         version: Option<BazelVersion>,
         filegroup_sources: &mut BTreeMap<String, AliasSource>,
-        filegroup_parents: &mut BTreeMap<String, Rule>,
-    ) -> Result<(Vec<Target>, BTreeMap<String, Rule>)> {
+        filegroup_parents: &mut BTreeMap<String, FilegroupWitness>,
+    ) -> Result<(Vec<Target>, BTreeMap<String, FilegroupWitness>)> {
         let Some(root_mapping) = root_mapping else {
             return Ok(Default::default());
         };
@@ -937,7 +937,7 @@ impl BazelOptions {
                             pending.insert(id.into_owned());
                         }
                     }
-                    filegroups.insert(name.clone(), rule);
+                    filegroups.insert(name.clone(), FilegroupWitness::new(rule));
                 } else if row.source_file.as_option().is_none() {
                     continue;
                 }
@@ -990,11 +990,11 @@ impl BazelOptions {
                     }
                     filegroup_parents.extend(unique.into_iter().filter_map(|(name, rule)| {
                         rule.filter(|r| r.rule_class_key.as_deref() == Some("genrule"))
-                            .map(|r| (name, r))
+                            .map(|r| (name, FilegroupWitness::new(r)))
                     }));
                     let inputs: HashSet<_> = filegroup_parents
                         .values()
-                        .flat_map(|parent| &parent.rule_input)
+                        .flat_map(|parent| &parent.declaration.rule_input)
                         .collect();
                     for (label, witness) in direct_sources {
                         if !inputs.contains(&label) {
@@ -1018,23 +1018,51 @@ impl BazelOptions {
         if requested.is_empty() {
             return Ok(Default::default());
         }
+        // The strict declaration carries all structural attributes. When the caller requests
+        // Bazel's synthetic attribute hash, bind its own projection to the same returned rule.
+        // The parent already exists in the primary inventory and is read only as a witness.
+        let projected = self.command_options.iter().any(|option| {
+            matches!(
+                option.as_str(),
+                "--proto:include_synthetic_attribute_hash"
+                    | "--proto:include_synthetic_attribute_hash=true"
+            )
+        });
+        if projected {
+            requested.extend(filegroup_parents.keys().cloned());
+            previously_present.extend(filegroup_parents.keys().cloned());
+        }
         let query = query_set(&requested)?;
         let query = self.with_exclude_filter(query);
         let mut rows = ordinary.query_with(&query, false, version, false, &mut |_, _| {})?;
         let returned: HashSet<_> = rows.iter().filter_map(target_name).collect();
         filegroups.retain(|name, _| returned.contains(name.as_str()));
+        if projected {
+            let mut seen = HashSet::new();
+            for rule in rows.iter().filter_map(|row| row.rule.as_option()) {
+                let Some(witness) = filegroups
+                    .get_mut(&rule.name)
+                    .or_else(|| filegroup_parents.get_mut(&rule.name))
+                else {
+                    continue;
+                };
+                witness.projected_definition = if seen.insert(&rule.name)
+                    && rule.rule_class_key == witness.declaration.rule_class_key
+                {
+                    crate::hash::projected_filegroup_definition(rule)
+                } else {
+                    None
+                };
+            }
+        }
         for source in rows.iter().filter_map(|row| row.source_file.as_option()) {
             let witness = sources.get(&source.name).and_then(Option::as_ref);
             if let Some(witness) = witness {
                 filegroup_sources.insert(source.name.clone(), witness.clone());
             }
         }
-        // A re-read can certify a source from the primary query without adding its row twice.
-        rows.retain(|row| {
-            row.source_file
-                .as_option()
-                .is_none_or(|source| !previously_present.contains(&source.name))
-        });
+        // Re-read primary sources and parents supply only evidence for their original rows.
+        rows.retain(|row| target_name(row).is_none_or(|name| !previously_present.contains(name)));
         Ok((rows, filegroups))
     }
 
@@ -3596,11 +3624,28 @@ pub(crate) struct ScopedSources {
     pub(crate) queried_files: HashSet<String>,
     pub(crate) alias_sources: HashMap<String, AliasSource>,
     /// Full native declaration returned separately from the caller's projected hash row.
-    pub(crate) filegroups: BTreeMap<String, Rule>,
+    pub(crate) filegroups: BTreeMap<String, FilegroupWitness>,
     /// Declared inputs returned by both the strict filegroup inventory and the ordinary projection.
     pub(crate) filegroup_sources: BTreeMap<String, AliasSource>,
     /// Full declarations of native rules with direct inputs in the observed filegroups.
-    pub(crate) filegroup_parents: BTreeMap<String, Rule>,
+    pub(crate) filegroup_parents: BTreeMap<String, FilegroupWitness>,
+}
+
+/// The full structural declaration and, where Bazel returned its synthetic attribute hash,
+/// the definition digest of the corresponding caller-projected row.
+#[derive(Clone)]
+pub(crate) struct FilegroupWitness {
+    pub(crate) declaration: Rule,
+    pub(crate) projected_definition: Option<[u8; 32]>,
+}
+
+impl FilegroupWitness {
+    pub(crate) fn new(declaration: Rule) -> Self {
+        Self {
+            declaration,
+            projected_definition: None,
+        }
+    }
 }
 
 /// Evaluated metadata of a literal native alias destination returned in the strict closure.
@@ -10190,9 +10235,12 @@ esac
             rows.iter().filter_map(target_name).collect::<BTreeSet<_>>(),
             BTreeSet::from([OUTER, INNER, COPY, KNOWN])
         );
-        assert_eq!(groups[OUTER].rule_input, [INNER]);
-        assert_eq!(groups[INNER].rule_input, [COPY]);
-        assert_eq!(parents["//:reader"].rule_input, [OUTER, TOOL, SETUP]);
+        assert_eq!(groups[OUTER].declaration.rule_input, [INNER]);
+        assert_eq!(groups[INNER].declaration.rule_input, [COPY]);
+        assert_eq!(
+            parents["//:reader"].declaration.rule_input,
+            [OUTER, TOOL, SETUP]
+        );
         assert_eq!(sources[COPY].location, "/source/copy.txt:1:1");
         assert_eq!(sources[SETUP].visibility, ["//visibility:public"]);
         assert!(query_calls(dir)

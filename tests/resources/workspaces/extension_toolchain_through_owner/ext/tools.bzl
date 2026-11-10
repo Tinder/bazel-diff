@@ -1,6 +1,9 @@
 def _app_impl(rctx):
+    rctx.file("copy.txt", rctx.read(Label("//:wrapper.sh")), executable = False)
+    rctx.file("files.bzl", 'COPIES = Label("//:copies")', executable = False)
     rctx.file("BUILD.bazel", """load("@ext//:defs.bzl", "app_lib")
 app_lib(name = "lib", visibility = ["//visibility:public"])
+filegroup(name = "copies", srcs = ["copy.txt"], visibility = ["//visibility:public"])
 """)
 
 app = repository_rule(implementation = _app_impl)

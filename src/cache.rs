@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-pub const FINE_ALIAS_INPUTS_VERSION: u32 = 8;
+pub const FINE_ALIAS_INPUTS_VERSION: u32 = 11;
 
 /// Digests the hash-affecting configuration: the package version, every query and hashing
 /// option, whether dependency edges are recorded, and, only when on, partial-graph mode (its

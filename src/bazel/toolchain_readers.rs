@@ -62,7 +62,7 @@ impl PrimaryRules {
 struct OrdinaryGraph<'a> {
     mapping: HashMap<String, String>,
     fine: BTreeSet<String>,
-    coarse: HashSet<&'a str>,
+    coarse: HashMap<&'a str, Option<[u8; 32]>>,
     rows: HashMap<String, &'a Target>,
     parents: HashMap<String, Vec<String>>,
     primary: BTreeMap<String, Option<usize>>,
@@ -99,7 +99,7 @@ impl<'a> OrdinaryGraph<'a> {
             coarse: repositories
                 .iter()
                 .filter(|row| row.remote_fetch)
-                .filter_map(|row| target_name(&row.target))
+                .filter_map(|row| target_name(&row.target).map(|name| (name, row.setup_hash)))
                 .collect(),
             rows: HashMap::new(),
             parents: HashMap::new(),
@@ -934,6 +934,7 @@ impl BazelOptions {
         pending.extend(missing_declarations);
         let mut visited = HashSet::new();
         let mut sources = Vec::new();
+        let mut setups = BTreeMap::<String, BTreeSet<[u8; 32]>>::new();
         while !pending.is_empty() {
             let names = std::mem::take(&mut pending);
             visited.extend(names.iter().cloned());
@@ -954,12 +955,15 @@ impl BazelOptions {
                     if visited.contains(&child) || child.starts_with("//external:") {
                         continue;
                     }
-                    let stop = repository(&child).is_some_and(|repo| {
-                        !owners.contains(repo)
-                            && !graph.fine.contains(repo)
-                            && !super::extension_usage_prefix(repo)
-                                .is_some_and(|family| fine_families.contains(family))
-                            && graph.coarse.contains(
+                    let boundary = repository(&child)
+                        .filter(|repo| {
+                            !owners.contains(*repo)
+                                && !graph.fine.contains(*repo)
+                                && !super::extension_usage_prefix(repo)
+                                    .is_some_and(|family| fine_families.contains(family))
+                        })
+                        .and_then(|_| {
+                            graph.coarse.get(
                                 crate::hash::transform_external_input(
                                     &child,
                                     &self.fine_grained_external_repos,
@@ -967,13 +971,29 @@ impl BazelOptions {
                                 )
                                 .as_ref(),
                             )
-                    });
-                    if !stop || graph.rows.contains_key(&child) {
-                        pending.insert(child);
+                        });
+                    match boundary.filter(|_| !graph.rows.contains_key(&child)) {
+                        Some(Some(digest)) => {
+                            let name = target_name(row).expect("named supplier");
+                            setups.entry(name.to_owned()).or_default().insert(*digest);
+                        }
+                        Some(None) => (),
+                        None => {
+                            pending.insert(child);
+                        }
                     }
                 }
             }
             sources.extend(rows);
+        }
+        for (supplier, inputs) in setups {
+            let mut hash = Sha256::new();
+            for input in inputs {
+                hash.update(input);
+            }
+            result
+                .supplier_hashes
+                .insert(supplier, hash.finalize().into());
         }
         let spellings: HashMap<_, _> = sources
             .iter()
@@ -1014,6 +1034,7 @@ impl BazelOptions {
 pub(super) struct ExtensionInputs {
     pub(super) declarations: Bindings,
     pub(super) registration_hashes: BTreeMap<String, [u8; 32]>,
+    pub(super) supplier_hashes: BTreeMap<String, [u8; 32]>,
     pub(super) usages: BTreeSet<String>,
     pub(super) bindings: BTreeMap<String, BTreeSet<String>>,
     pub(super) sources: Vec<Target>,

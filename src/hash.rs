@@ -342,17 +342,25 @@ fn generate_hashes_timed_inner(
             &mut prepare,
         )?
     };
-    for (name, order) in &queried.registration_hashes {
-        if let Some(prepared) = definition_digests
-            .ids
-            .get(name)
-            .and_then(|&id| definition_digests.prepared[id].as_mut())
-        {
-            let mut hash = Sha256::new();
-            hash.update(prepared.definition_digest);
-            hash.update(b"toolchain registration order");
-            hash.update(order);
-            prepared.definition_digest = hash.finalize().into();
+    for (kind, fingerprints) in [
+        ("toolchain registration order", &queried.registration_hashes),
+        (
+            "toolchain supplier repository inputs",
+            &queried.supplier_hashes,
+        ),
+    ] {
+        for (name, fingerprint) in fingerprints {
+            if let Some(prepared) = definition_digests
+                .ids
+                .get(name)
+                .and_then(|&id| definition_digests.prepared[id].as_mut())
+            {
+                let mut hash = Sha256::new();
+                hash.update(prepared.definition_digest);
+                hash.update(kind);
+                hash.update(fingerprint);
+                prepared.definition_digest = hash.finalize().into();
+            }
         }
     }
     let observations = if include_toolchain_inputs {
@@ -391,6 +399,7 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
         options,
         QueriedTargets {
             registration_hashes: BTreeMap::new(),
+            supplier_hashes: BTreeMap::new(),
             targets,
             verification: None,
             configured_roots: None,
@@ -412,6 +421,7 @@ fn hash_targets_with_digests(
 ) -> Result<(HashFileData, GenerationTimings)> {
     let QueriedTargets {
         registration_hashes: _,
+        supplier_hashes: _,
         targets,
         verification,
         configured_roots,

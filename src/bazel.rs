@@ -742,6 +742,7 @@ impl BazelOptions {
             }
         }
         let mut registration_hashes = BTreeMap::new();
+        let mut supplier_hashes = BTreeMap::new();
         let mut toolchain_declarations = BTreeMap::new();
         if let Some(mut defs) = definitions {
             let repos = defs.lower(self, &canonical_to_apparent, std::convert::identity);
@@ -775,6 +776,7 @@ impl BazelOptions {
                         }
                         observed = inputs.usages;
                         registration_hashes = inputs.registration_hashes;
+                        supplier_hashes = inputs.supplier_hashes;
                         toolchain_declarations = inputs.declarations;
                     }
                     Err(error) => {
@@ -797,6 +799,7 @@ impl BazelOptions {
         )?;
         Ok(QueriedTargets {
             registration_hashes,
+            supplier_hashes,
             targets,
             verification,
             configured_roots,
@@ -3866,6 +3869,7 @@ impl AliasSource {
 /// Targets with the accepted module graph and successful unfiltered root mapping from discovery.
 pub(crate) struct QueriedTargets {
     pub registration_hashes: BTreeMap<String, [u8; 32]>,
+    pub supplier_hashes: BTreeMap<String, [u8; 32]>,
     pub(crate) targets: Vec<Target>,
     pub(crate) verification: Option<VerifiedQuery>,
     pub(crate) configured_roots: Option<BTreeMap<String, String>>,
@@ -4097,6 +4101,7 @@ struct RepositoryRow {
     memberships: Vec<Arc<RepositoryInputGroup>>,
     generated: bool,
     remote_fetch: bool,
+    setup_hash: Option<[u8; 32]>,
     ordinary_complete: bool,
 }
 
@@ -4201,7 +4206,10 @@ fn repository_rows<T>(
     // definitions are inputs, including a supplying repository's own fetch-time
     // prerequisites. Its toolchain users and generated siblings are independent.
     let mut setup_inputs = BTreeMap::<String, BTreeSet<String>>::new();
-    for repository in &repositories {
+    for repository in repositories
+        .iter()
+        .filter(|repo| is_pinned_http_fetch(repo))
+    {
         let Some(name) = repository.canonical_name.as_deref() else {
             continue;
         };
@@ -4399,11 +4407,11 @@ fn repository_rows<T>(
         }
         let remote_fetch = bounded.get(canonical) == Some(&true);
         let inputs = setup_inputs.get(canonical);
-        let mut files = prepared_files
+        let files = prepared_files
             .remove(&index)
             .unwrap_or_else(|| prepare_repository(&mut repository, &workspace));
-        if let Some(inputs) = inputs {
-            let digest = setup_digests.entry(inputs).or_insert_with(|| {
+        let setup_hash = inputs.filter(|_| remote_fetch).map(|inputs| {
+            *setup_digests.entry(inputs).or_insert_with(|| {
                 let mut seen = BTreeSet::new();
                 let mut pending: Vec<_> = inputs.iter().collect();
                 while let Some(name) = pending.pop() {
@@ -4426,14 +4434,9 @@ fn repository_rows<T>(
                     }
                     hash.update([0]);
                 }
-                hash.finalize()
-            });
-            let mut hash = Sha256::new();
-            hash.update(files.inputs_hash.as_deref().unwrap_or_default());
-            hash.update([0]);
-            hash.update(digest.as_slice());
-            files.inputs_hash = Some(hex::encode(hash.finalize()));
-        }
+                <[u8; 32]>::from(hash.finalize())
+            })
+        });
         let rule = repository_rule(repository, files, owner_definition_hash);
         // All apparent names have the same definition. Move it into the final output.
         let mut rules = std::iter::repeat_n(rule, names.len());
@@ -4443,6 +4446,7 @@ fn repository_rows<T>(
                 memberships: memberships.clone(),
                 generated,
                 remote_fetch,
+                setup_hash,
                 ordinary_complete,
             }));
         }
@@ -5954,6 +5958,29 @@ fn attribute_label_values(attribute: &Attribute) -> impl Iterator<Item = &str> {
 
 // The built-in HTTP rules define their downloaded bytes by these attributes.
 // User repository rules can read unrelated files even with identical URL and hash.
+// The standard archive copies build_file to BUILD.bazel before applying patches
+// and remote overlays. With no later transformation the named file is exact.
+fn local_archive_overlay(repository: &Repository) -> Option<&str> {
+    if repository.repo_rule_name.as_deref() != Some("http_archive")
+        || !is_pinned_http_fetch(repository)
+        || repository.attribute.iter().any(|attr| {
+            matches!(
+                attr.name.as_str(),
+                "patches" | "remote_patches" | "remote_file_urls" | "files"
+            ) && (attribute_label_values(attr).next().is_some()
+                || !attr.string_dict_value.is_empty())
+        })
+    {
+        return None;
+    }
+    repository
+        .attribute
+        .iter()
+        .find(|attr| attr.name == "build_file")?
+        .string_value
+        .as_deref()
+}
+
 fn is_pinned_http_fetch(repository: &Repository) -> bool {
     let attrs = &repository.attribute;
     if repository.repo_rule_bzl_label.as_deref()
@@ -6111,6 +6138,7 @@ struct RepositoryWorkspace<'a> {
     path: &'a Path,
     roots: Vec<String>,
     local_repositories: BTreeMap<String, PathBuf>,
+    build_overlays: BTreeMap<String, Option<String>>,
 }
 
 impl<'a> RepositoryWorkspace<'a> {
@@ -6119,6 +6147,7 @@ impl<'a> RepositoryWorkspace<'a> {
             path,
             roots: workspace_roots(path),
             local_repositories: BTreeMap::new(),
+            build_overlays: BTreeMap::new(),
         }
     }
 
@@ -6160,13 +6189,40 @@ impl<'a> RepositoryWorkspace<'a> {
                 }
             }
         }
+        for repository in repositories {
+            if let Some(name) = &repository.canonical_name {
+                let overlay = local_archive_overlay(repository).map(str::to_owned);
+                match workspace.build_overlays.entry(name.clone()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(overlay);
+                    }
+                    Entry::Occupied(mut entry) if entry.get() != &overlay => {
+                        entry.insert(None);
+                    }
+                    _ => (),
+                }
+            }
+        }
         workspace
     }
 
-    fn local_input_file(&self, label: &str) -> Option<PathBuf> {
-        let (name, relative) = crate::hash::repository_input_path(label).ok()?;
-        let file = self.local_repositories.get(name)?.join(relative);
-        file.is_file().then_some(file)
+    fn local_input_file<'s>(&'s self, mut label: &'s str) -> Option<PathBuf> {
+        let mut seen = HashSet::new();
+        loop {
+            if let Some(relative) = crate::hash::main_repo_path(label) {
+                let file = self.path.join(relative);
+                return file.is_file().then_some(file);
+            }
+            let (name, relative) = crate::hash::repository_input_path(label).ok()?;
+            if let Some(root) = self.local_repositories.get(name) {
+                let file = root.join(relative);
+                return file.is_file().then_some(file);
+            }
+            if relative != Path::new("BUILD.bazel") || !seen.insert(name) {
+                return None;
+            }
+            label = self.build_overlays.get(name)?.as_deref()?;
+        }
     }
 }
 
@@ -6541,6 +6597,7 @@ mod tests {
             })],
             generated: false,
             remote_fetch: false,
+            setup_hash: None,
             ordinary_complete: false,
         };
         assert_eq!(

@@ -1398,6 +1398,10 @@ fn local_archive_build_file_reaches_only_its_own_repository_and_readers() {
                 .trim(),
             neighbor
         );
+        assert_eq!(
+            fs::read_to_string(root.join("bazel-bin/stable.txt")).unwrap(),
+            "unchanged"
+        );
         for product in ["copied", "local_copy"] {
             assert_eq!(
                 fs::read_to_string(root.join(format!("bazel-bin/{product}.txt")))
@@ -1447,6 +1451,7 @@ fn local_archive_build_file_reaches_only_its_own_repository_and_readers() {
             ("//:copied", arm == "active"),
             ("//:local_copy", arm == "active"),
             ("//:other", arm == "neighbor"),
+            ("//:stable", false),
         ] {
             assert_eq!(changed.contains(label), expected, "{arm}: {label}");
         }

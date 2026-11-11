@@ -34,4 +34,11 @@ genrule(
     cmd = "cat $(SRCS) > $@",
 )
 
-filegroup(name = "products", srcs = [":tool_user", ":plain", ":other", ":copied", ":local_copy"])
+genrule(
+    name = "stable",
+    srcs = ["@forwarded//:stable.txt"],
+    outs = ["stable.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+filegroup(name = "products", srcs = [":tool_user", ":plain", ":other", ":copied", ":local_copy", ":stable"])

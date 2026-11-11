@@ -17,3 +17,15 @@ copy_definition = repository_rule(
     implementation = _copy_definition,
     attrs = {"definition": attr.label(mandatory = True)},
 )
+
+def _forward_dependency(ctx):
+    ctx.file("stable.txt", "unchanged")
+    ctx.file("BUILD.bazel", """
+exports_files(["stable.txt"])
+alias(name = "dependency", actual = "{}")
+""".format(ctx.attr.dependency))
+
+forward_dependency = repository_rule(
+    implementation = _forward_dependency,
+    attrs = {"dependency": attr.label(mandatory = True)},
+)

@@ -21,3 +21,6 @@ register_toolchains("//:registration")
 copy_definition = use_repo_rule("//:tools.bzl", "copy_definition")
 copy_definition(name = "copied", definition = "@sdk//:BUILD.bazel")
 copy_definition(name = "local_copy", definition = "@overlays//:active.rules")
+
+forward = use_repo_rule("//:tools.bzl", "forward_dependency")
+forward(name = "forwarded", dependency = "@local_copy//:payload")

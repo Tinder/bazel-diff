@@ -1212,6 +1212,13 @@ impl BazelOptions {
         strict
             .command_options
             .extend(["--nokeep_going".into(), "--proto:rule_classes".into()]);
+        // The dependency and inventory queries below can reach arbitrary rules. Flattening a
+        // dict attribute enumerates every combination of its concatenated selects, which
+        // runs Bazel out of memory on a single target; hash those rows unflattened instead.
+        let mut supplemental = strict.clone();
+        supplemental
+            .command_options
+            .push("--noproto:flatten_selects".into());
         let mut reached_aliases = BTreeSet::new();
         let mut sources = BTreeMap::new();
         let mut extra = if missing.is_empty() {
@@ -1221,7 +1228,7 @@ impl BazelOptions {
                 "let needed = deps({}) in $needed + buildfiles($needed)",
                 query_set(&missing)?
             ));
-            let mut closure = strict.clone();
+            let mut closure = supplemental.clone();
             closure.command_options.push("--proto:locations".into());
             closure.query_with_filtered(
                 &expression,
@@ -1318,7 +1325,7 @@ impl BazelOptions {
                     })
                     .collect::<Result<Vec<_>>>()?
                     .join(" + ");
-                let records = strict.query_with(
+                let records = supplemental.query_with(
                     &self.with_exclude_filter(expression),
                     false,
                     Some(version),

@@ -108,6 +108,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::fine_aliases_acquire_a_library_with_many_dict_selects",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::fine_aliases_acquire_hidden_libraries_and_definition_sources",
                 "timeout": "moderate",
             },

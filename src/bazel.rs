@@ -23,6 +23,24 @@ use tempfile::NamedTempFile;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct BazelVersion(u32, u32, u32);
 
+#[derive(Debug)]
+struct QueryFailure {
+    code: i32,
+    stderr: String,
+}
+
+impl std::fmt::Display for QueryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Bazel query failed, exit code {}: {}",
+            self.code, self.stderr
+        )
+    }
+}
+
+impl std::error::Error for QueryFailure {}
+
 /// The flag that decides whether the `//external` package exists.
 const WORKSPACE_FLAG: &str = "enable_workspace";
 
@@ -563,6 +581,11 @@ impl BazelOptions {
             && self.isolated_dependency_root.is_none()
             && !self.fine_grained_external_repos.is_empty()
             && root_mapping.is_some();
+        let mut primary_rules = toolchain_readers::PrimaryRules::default();
+        let mut ordinary = self.clone();
+        if observe {
+            ordinary.command_options.push("--proto:rule_classes".into());
+        }
         let initial_repositories = if observe {
             Vec::new()
         } else {
@@ -631,12 +654,17 @@ impl BazelOptions {
                         }
                         Ok(targets)
                     } else {
-                        self.query_with(
+                        ordinary.query_with(
                             expression,
                             use_cquery,
                             version,
                             lean,
-                            &mut |batch, encoded| transform(batch, encoded, None, None),
+                            &mut |batch, encoded| {
+                                if observe {
+                                    primary_rules.record(batch, encoded);
+                                }
+                                transform(batch, encoded, None, None);
+                            },
                         )
                     }
                 },
@@ -686,7 +714,6 @@ impl BazelOptions {
             }
             scope.connect_external_readers(&loads, &mut targets, &coverage)?;
         }
-        let primary_len = targets.len();
         let mut alias_sources = HashMap::new();
         let mut filegroups = BTreeMap::new();
         let mut filegroup_sources = BTreeMap::new();
@@ -726,6 +753,7 @@ impl BazelOptions {
                 if !self.keep_going {
                     return Err(error).context("failed to acquire ordinary alias inputs");
                 }
+                primary_rules.alias_discovery_failed = true;
                 eprintln!("[Warn] keeping ordinary repository fallbacks for incomplete alias discovery: {error:#}");
             }
         }
@@ -742,7 +770,7 @@ impl BazelOptions {
                     .then_some(&defs.extensions);
                 match self.observe_external_inputs(
                     &targets,
-                    primary_len,
+                    primary_rules,
                     mapping,
                     survey,
                     (&repos, &metadata),
@@ -2929,8 +2957,11 @@ impl BazelOptions {
         // Verification requires command success; ordinary partial positives keep their policy.
         let partial = self.keep_going && code == 3 && !verify;
         if code != 0 && !partial {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Bazel query failed, exit code {code}: {stderr}");
+            return Err(QueryFailure {
+                code,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            }
+            .into());
         }
         if !output.stderr.is_empty() {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));

@@ -11,19 +11,67 @@ type RepositoryRows<'a> = (
 );
 type Bindings = BTreeMap<String, BTreeSet<String>>;
 
+#[derive(Default)]
+struct ReaderTypes {
+    known: Bindings,
+    unknown: BTreeSet<String>,
+}
+
+/// Bazel emits the class key on each rule and its documentation just once per
+/// class. Keep only a local class ID for discovery, outside the hashed rows.
+#[derive(Default)]
+pub(super) struct PrimaryRules {
+    pub(super) alias_discovery_failed: bool,
+    classes: HashMap<String, usize>,
+    names: BTreeMap<String, Option<usize>>,
+}
+
+impl PrimaryRules {
+    pub(super) fn record(&mut self, rows: &[Target], encoded: &super::EncodedTargets<'_>) {
+        for (index, row) in rows.iter().enumerate() {
+            let Some(rule) = row.rule.as_option() else {
+                continue;
+            };
+            let name = super::main_repo_label_key(&rule.name);
+            if !name.starts_with("//") || name.starts_with("//external:") {
+                continue;
+            }
+            // The compact rule drops the class key before hashing. Read field
+            // 16 from the same source message that provides its attributes.
+            let class = encoded
+                .get(index)
+                .and_then(|bytes| super::single_rule_field(bytes))
+                .and_then(|rule| super::last_payload(rule, 16))
+                .and_then(|key| std::str::from_utf8(key).ok())
+                .or(rule.rule_class_key.as_deref())
+                .filter(|key| !key.is_empty())
+                .map(|key| {
+                    if let Some(&id) = self.classes.get(key) {
+                        return id;
+                    }
+                    let id = self.classes.len();
+                    self.classes.insert(key.to_owned(), id);
+                    id
+                });
+            self.names.insert(name.to_owned(), class);
+        }
+    }
+}
+
 struct OrdinaryGraph<'a> {
     mapping: HashMap<String, String>,
     fine: BTreeSet<String>,
     rows: HashMap<String, &'a Target>,
     parents: HashMap<String, Vec<String>>,
-    primary: BTreeSet<String>,
+    primary: BTreeMap<String, Option<usize>>,
+    alias_discovery_failed: bool,
 }
 
 impl<'a> OrdinaryGraph<'a> {
     fn new(
         bazel: &BazelOptions,
         targets: &'a [Target],
-        primary_len: usize,
+        primary: PrimaryRules,
         root_mapping: &[u8],
     ) -> Self {
         let mapping =
@@ -46,23 +94,21 @@ impl<'a> OrdinaryGraph<'a> {
             fine,
             rows: HashMap::new(),
             parents: HashMap::new(),
-            primary: BTreeSet::new(),
+            primary: primary.names,
+            alias_discovery_failed: primary.alias_discovery_failed,
         };
-        graph.index(targets, primary_len);
+        graph.index(targets);
         graph
     }
 
-    fn index(&mut self, targets: &'a [Target], primary_len: usize) {
-        for (index, target) in targets.iter().enumerate() {
+    fn index(&mut self, targets: &'a [Target]) {
+        for target in targets {
             let Some(name) = target_name(target) else {
                 continue;
             };
             let id = self.canonical(name);
             if id.starts_with("//external:") {
                 continue;
-            }
-            if index < primary_len && id.starts_with("//") && target.rule.is_set() {
-                self.primary.insert(id.clone());
             }
             self.rows.insert(id.clone(), target);
             for child in super::target_inputs(target) {
@@ -126,6 +172,58 @@ fn regex_literal(name: &str) -> String {
     literal
 }
 
+// A projected DOT result can contract paths. The unprojected one-hop graph
+// emits a separate node record even when no edges leave a target.
+fn direct_type_edges(
+    text: &str,
+    mapping: &HashMap<String, String>,
+    labels: &BTreeSet<String>,
+    types: &BTreeSet<String>,
+) -> Option<Bindings> {
+    let body = text
+        .trim()
+        .strip_prefix("digraph mygraph {")?
+        .strip_suffix('}')?;
+    let mut result = Bindings::new();
+    let mut edges = Bindings::new();
+    for line in body.lines().map(str::trim) {
+        if line.is_empty() || line == "node [shape=box];" {
+            continue;
+        }
+        let value = line.strip_prefix('"')?.strip_suffix('"')?;
+        let (parent, child) = value
+            .split_once("\" -> \"")
+            .map_or((value, None), |(parent, child)| (parent, Some(child)));
+        // Bazel's DOT writer prints label text without escaping it. Never use
+        // an ambiguous or incomplete record to rule out a dependency.
+        if [Some(parent), child]
+            .into_iter()
+            .flatten()
+            .any(|label| label.contains(['"', '\\']))
+        {
+            return None;
+        }
+        let name = canonical_query_label(parent, mapping);
+        if labels.contains(name.as_ref()) {
+            if let Some(child) = child {
+                let child = canonical_query_label(child, mapping);
+                if types.contains(child.as_ref()) {
+                    edges
+                        .entry(name.into_owned())
+                        .or_default()
+                        .insert(child.into_owned());
+                }
+            } else {
+                result.entry(name.into_owned()).or_default();
+            }
+        }
+    }
+    for (name, observed) in &mut result {
+        *observed = edges.remove(name).unwrap_or_default();
+    }
+    Some(result)
+}
+
 /// A regular MODULE dependency remains an input even when an inferred edge has the same label.
 pub(super) fn removed_membership(
     label: &str,
@@ -133,12 +231,19 @@ pub(super) fn removed_membership(
     mapping: &HashMap<String, String>,
     usages: &BTreeSet<String>,
 ) -> bool {
-    let Some(name) = label.strip_prefix("//external:") else {
-        return false;
-    };
-    let canonical = mapping.get(name).map_or(name, String::as_str);
-    super::extension_usage_prefix(canonical).is_some_and(|usage| usages.contains(usage))
-        && !ordinary.is_some_and(|inputs| inputs.iter().any(|input| input == label))
+    membership_usage(label, ordinary, mapping).is_some_and(|usage| usages.contains(usage))
+}
+
+fn membership_usage<'a>(
+    label: &'a str,
+    ordinary: Option<&[String]>,
+    mapping: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    if ordinary.is_some_and(|inputs| inputs.iter().any(|input| input == label)) {
+        return None;
+    }
+    let name = label.strip_prefix("//external:")?;
+    super::extension_usage_prefix(mapping.get(name).map_or(name, String::as_str))
 }
 
 /// Every path lost by removing a membership has a first removed edge. Compute its
@@ -192,13 +297,13 @@ impl BazelOptions {
     pub(super) fn observe_external_inputs(
         &self,
         targets: &[Target],
-        primary_len: usize,
+        primary: PrimaryRules,
         mapping: &[u8],
         survey: Option<&super::ExtensionRepositories>,
         repository_rows: RepositoryRows<'_>,
         version: Option<BazelVersion>,
     ) -> Result<ExtensionInputs> {
-        let graph = OrdinaryGraph::new(self, targets, primary_len, mapping);
+        let graph = OrdinaryGraph::new(self, targets, primary, mapping);
         let version = match version {
             Some(version) => version,
             None => self.version()?,
@@ -289,30 +394,135 @@ impl BazelOptions {
     fn readers_of(
         &self,
         graph: &OrdinaryGraph<'_>,
-        candidates: &BTreeSet<String>,
         types: &BTreeSet<String>,
-        version: BazelVersion,
-    ) -> Result<BTreeMap<String, String>> {
-        if types.is_empty() || candidates.is_empty() {
-            return Ok(BTreeMap::new());
+    ) -> Result<ReaderTypes> {
+        let mut readers = ReaderTypes::default();
+        // Ordinary proto reports per-target label attributes, but omits the
+        // toolchain types declared on the rule class. Bazel's loading graph
+        // visits both. An absent class key gets its own observation.
+        let mut classes = BTreeMap::<_, Vec<&str>>::new();
+        for (name, class) in &graph.primary {
+            let Some(rule) = graph.rows.get(name).and_then(|row| row.rule.as_option()) else {
+                continue;
+            };
+            let explicit: BTreeSet<_> = rule
+                .rule_input
+                .iter()
+                .filter_map(|input| {
+                    types
+                        .get(canonical_query_label(input, &graph.mapping).as_ref())
+                        .cloned()
+                })
+                .collect();
+            if explicit.is_empty() {
+                classes
+                    .entry((class, class.is_none().then_some(name)))
+                    .or_default()
+                    .push(name);
+            } else {
+                readers.known.insert(name.clone(), explicit);
+            }
         }
-        let query = format!(
-            "let candidates = {} in rdeps($candidates, {}, 1) intersect $candidates",
-            query_set(candidates)?,
-            query_set(types)?
-        );
-        let rows = self.query_with(
-            &self.with_exclude_filter(query),
-            false,
-            Some(version),
-            false,
-            &mut |_, _| {},
-        )?;
-        Ok(rows
-            .iter()
-            .filter_map(target_name)
-            .map(|name| (graph.canonical(name), name.to_owned()))
-            .collect())
+        let mut groups = BTreeMap::new();
+        for members in classes.into_values() {
+            let first = members[0];
+            groups.insert(first.to_owned(), members);
+        }
+        // rdeps(roots, types, 1) preloads the transitive closure of roots.
+        // Query only immediate inputs. Isolate an unavailable representative
+        // so the other classes still get a complete observation.
+        let representatives: Vec<_> = groups.keys().cloned().collect();
+        let mut pending = vec![representatives.as_slice()];
+        while let Some(batch) = pending.pop().filter(|batch| !batch.is_empty()) {
+            let observations = self.direct_types(graph, batch, types)?;
+            if observations.is_none() && batch.len() > 1 {
+                let (left, right) = batch.split_at(batch.len() / 2);
+                pending.extend([right, left]);
+                continue;
+            }
+            for representative in batch {
+                let members = &groups[representative];
+                let mut types_seen = observations
+                    .as_ref()
+                    .and_then(|map| map.get(representative))
+                    .cloned();
+                // An unrelated missing attribute on one instance does not change
+                // requirements declared by its rule class. Another instance can
+                // witness those requirements even when the first cannot load.
+                if types_seen.is_none() && observations.as_ref().is_none_or(|map| !map.is_empty()) {
+                    for member in members.iter().skip(1) {
+                        let name = (*member).to_owned();
+                        types_seen = self
+                            .direct_types(graph, std::slice::from_ref(&name), types)?
+                            .and_then(|mut edges| edges.remove(&name));
+                        if types_seen.is_some() {
+                            break;
+                        }
+                    }
+                }
+                match types_seen {
+                    Some(observed) if !observed.is_empty() => {
+                        for &member in members {
+                            readers.known.insert(member.to_owned(), observed.clone());
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        eprintln!("[Warn] retaining possible toolchain implementations for {} rules represented by {representative}", members.len());
+                        readers
+                            .unknown
+                            .extend(members.iter().map(|name| (*name).to_owned()));
+                    }
+                }
+            }
+        }
+        if self.verbose {
+            eprintln!("[Info] Toolchain types examined {} main rules in {} class observations: {} nominated, {} unresolved", graph.primary.len(), representatives.len(), readers.known.len(), readers.unknown.len());
+        }
+        Ok(readers)
+    }
+
+    fn direct_types(
+        &self,
+        graph: &OrdinaryGraph<'_>,
+        labels: &[String],
+        types: &BTreeSet<String>,
+    ) -> Result<Option<Bindings>> {
+        let labels = labels.iter().cloned().collect::<BTreeSet<_>>();
+        let Ok(query) = query_set(&labels) else {
+            return Ok(None);
+        };
+        let file = tempfile::NamedTempFile::new()?;
+        std::fs::write(file.path(), format!("deps({query}, 1)"))?;
+        let mut command = self.command();
+        command
+            .arg("query")
+            .args(&self.command_options)
+            .args([
+                "--output=graph",
+                "--nograph:factored",
+                "--graph:conditional_edges_limit=0",
+                "--order_output=deps",
+                "--consistent_labels",
+                "--query_file",
+            ])
+            .arg(file.path());
+        let output = self.run(&mut command)?;
+        if !output.status.success() {
+            self.check_cancelled()?;
+            if matches!(output.status.code(), Some(3 | 7)) {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "could not inspect direct toolchain inputs: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let text = std::str::from_utf8(&output.stdout).ok();
+        Ok(Some(
+            text.and_then(|text| direct_type_edges(text, &graph.mapping, &labels, types))
+                .unwrap_or_default(),
+        ))
     }
 
     fn resolved_toolchain_inputs(
@@ -362,18 +572,31 @@ impl BazelOptions {
                 }
             }
         }
-        let names = self.readers_of(graph, &graph.primary, &types, version)?;
-        if names.is_empty() {
-            return Ok((Bindings::new(), true));
+        let readers = self.readers_of(graph, &types)?;
+        let mut bindings = Bindings::new();
+        for name in readers.unknown {
+            let spelling = target_name(graph.rows[&name]).expect("primary rule");
+            bindings.insert(
+                spelling.to_owned(),
+                implementations.values().cloned().collect(),
+            );
+        }
+        if readers.known.is_empty() {
+            return Ok((bindings, true));
         }
         // This observation only adds real positive edges. A shared toolchain can be
         // forced onto different execution platforms with the same public checksum.
         // No whole-closure identity or negative follows from a reader's direct row.
-        let readers = names.values().cloned().collect();
-        let mut configured = self.configured_children(graph, &query_set(&readers)?, version)?;
-        let covered = names.keys().all(|name| configured.contains_key(name));
-        let mut bindings = Bindings::new();
-        for (id, name) in names {
+        let names = readers.known.keys().cloned().collect();
+        let mut configured = self.configured_children(graph, &query_set(&names)?, version)?;
+        let covered = readers
+            .known
+            .keys()
+            .all(|name| configured.contains_key(name));
+        for (id, _) in readers.known {
+            let name = target_name(graph.rows[&id])
+                .expect("primary rule")
+                .to_owned();
             if let Some(inputs) = configured.remove(&id) {
                 let suppliers: BTreeSet<_> = inputs
                     .iter()
@@ -433,7 +656,7 @@ impl BazelOptions {
             }
             for parent in callers
                 .iter()
-                .filter(|parent| graph.primary.contains(*parent))
+                .filter(|parent| graph.primary.contains_key(*parent))
             {
                 roots.insert(parent.clone());
                 pending.push(child.clone());
@@ -467,31 +690,85 @@ impl BazelOptions {
         let mut missing = visit(&graph, pending);
         let mut graph = graph;
         if !missing.is_empty() {
-            // A rule can reference a valid alias outside the original query. Read its
-            // ordinary inputs before deciding whether the extension usage is covered.
-            match self.ordinary_dependency_inputs(&missing, version) {
-                Ok(mut rows) => {
-                    rows.retain(|row| {
-                        target_name(row)
-                            .is_some_and(|name| !graph.rows.contains_key(&graph.canonical(name)))
-                    });
-                    *recovered = rows;
-                    graph.index(recovered, 0);
-                    missing = visit(&graph, missing.into_iter().collect());
-                    if let Some(name) = missing.first() {
-                        anyhow::bail!("ordinary recovery did not return the dependency {name}");
+            // A failed keep-going alias lookup deliberately commits none of
+            // its forwarding rows. Preserve that decision for those operands.
+            let recoverable = missing
+                .iter()
+                .filter(|name| {
+                    !graph.alias_discovery_failed
+                        || !graph
+                            .parents
+                            .get(*name)
+                            .into_iter()
+                            .flatten()
+                            .any(|parent| {
+                                graph
+                                    .rows
+                                    .get(parent)
+                                    .and_then(|row| row.rule.as_option())
+                                    .is_some_and(|rule| rule.rule_class == "alias")
+                            })
+                })
+                .cloned()
+                .collect();
+            *recovered = self.recover_ordinary_inputs(&recoverable, version)?;
+            recovered.retain(|row| {
+                target_name(row)
+                    .is_some_and(|name| !graph.rows.contains_key(&graph.canonical(name)))
+            });
+            graph.index(recovered);
+            missing = visit(&graph, missing.into_iter().collect());
+        }
+        // A target that names a removed alias can be present in an ordinary
+        // wildcard query even though analyzing it would fail. Its readers
+        // retain the membership candidates that covered the unavailable input.
+        let unavailable = graph.ancestors(missing.clone(), |_| true);
+        if !missing.is_empty() {
+            let missing_families: BTreeSet<_> =
+                missing.iter().filter_map(|name| usage(name)).collect();
+            let mut members: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+            for (row, (shared, ordinary)) in repository_rows.0.iter().zip(repository_rows.1) {
+                let rule = row.rule.as_option().expect("repository");
+                for child in &rule.rule_input {
+                    if let Some(family) =
+                        membership_usage(child, ordinary.as_deref(), &graph.mapping)
+                    {
+                        if missing_families.contains(family) {
+                            members.entry(family).or_default().insert(child);
+                        }
                     }
                 }
-                Err(error) => {
-                    self.check_cancelled()?;
-                    eprintln!("[Warn] retaining repository dependencies for unobserved extension inputs: {error:#}");
+                if let Some(group) = shared.as_ref().and_then(super::RepositoryInputs::siblings) {
+                    if missing_families.contains(&group.extension) {
+                        members
+                            .entry(&group.extension)
+                            .or_default()
+                            .extend(group.labels.iter().map(String::as_str));
+                    }
                 }
             }
-        }
-        if let Some(first) = missing.first() {
-            eprintln!("[Warn] retaining repository dependencies for extension usages with {} missing ordinary inputs, including {first}", missing.len());
-            for family in missing.iter().filter_map(|name| usage(name)) {
-                result.usages.remove(&family);
+            for name in &missing {
+                let family = usage(name).expect("missing extension input");
+                let children = members.get(family.as_str());
+                for parent in graph.parents.get(name).into_iter().flatten() {
+                    let rule = graph.rows.get(parent).and_then(|row| row.rule.as_option());
+                    let Some(rule) = rule else {
+                        anyhow::bail!(
+                            "cannot retain repository inputs for {parent} reading {name}"
+                        );
+                    };
+                    result
+                        .bindings
+                        .entry(rule.name.clone())
+                        .or_default()
+                        .extend(children.into_iter().flatten().map(|s| (*s).to_owned()));
+                }
+            }
+            if self.verbose {
+                eprintln!(
+                    "[Info] retaining extension membership on readers of {} unavailable inputs",
+                    missing.len()
+                );
             }
         }
         let canonical = |label: &str| graph.canonical(label);
@@ -540,8 +817,17 @@ impl BazelOptions {
                 .cloned(),
         );
         let possible = graph.ancestors(boundary, |_| true);
-        roots.extend(graph.primary.intersection(&possible).cloned());
-        let roots = graph.ancestors(roots, |name| graph.primary.contains(name));
+        roots.extend(
+            possible
+                .iter()
+                .filter(|name| graph.primary.contains_key(*name))
+                .cloned(),
+        );
+        let mut roots = graph.ancestors(roots, |name| graph.primary.contains_key(name));
+        roots.retain(|name| !unavailable.contains(name));
+        if roots.is_empty() {
+            return Ok(ExtensionInputs::default());
+        }
         let callers = query_set(&roots)?;
         // A compiler can come from another extension or be selected by a transitioned
         // external reader whose rule was never in the ordinary graph.
@@ -615,7 +901,7 @@ impl BazelOptions {
                         missing.insert(name.clone());
                         name.clone()
                     });
-                result.bindings.insert(spelling, inputs);
+                result.bindings.entry(spelling).or_default().extend(inputs);
             }
         }
         if !missing.is_empty() {
@@ -699,12 +985,67 @@ impl BazelOptions {
         Ok(result)
     }
 
-    fn ordinary_dependency_inputs(
+    fn recover_ordinary_inputs(
         &self,
         names: &BTreeSet<String>,
         version: BazelVersion,
     ) -> Result<Vec<Target>> {
-        let expression = format!("let d = deps({}) in $d + buildfiles($d)", query_set(names)?);
-        self.query_with(&expression, false, Some(version), false, &mut |_, _| {})
+        let mut result = Vec::new();
+        let names: Vec<_> = names.iter().cloned().collect();
+        let mut pending = vec![names.as_slice()];
+        while let Some(batch) = pending.pop().filter(|batch| !batch.is_empty()) {
+            let query = query_set(&batch.iter().cloned().collect())?;
+            let expression = format!("let d = deps({query}) in $d + buildfiles($d)");
+            match self.query_with(&expression, false, Some(version), false, &mut |_, _| {}) {
+                Ok(rows) => result.extend(rows),
+                Err(error) => {
+                    self.check_cancelled()?;
+                    if !error
+                        .downcast_ref::<super::QueryFailure>()
+                        .is_some_and(|failure| matches!(failure.code, 3 | 7))
+                    {
+                        return Err(error);
+                    }
+                    if batch.len() > 1 {
+                        let (left, right) = batch.split_at(batch.len() / 2);
+                        pending.extend([right, left]);
+                    } else {
+                        eprintln!(
+                            "[Warn] retaining repository inputs for {}: {error:#}",
+                            batch[0]
+                        );
+                    }
+                }
+            }
+        }
+        super::deduplicate_targets(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_type_edges_require_a_complete_unambiguous_node_record() {
+        let mapping = HashMap::new();
+        let labels = BTreeSet::from(["//:reader".into(), "//:wrapper".into()]);
+        let types = BTreeSet::from(["//:type".into()]);
+        let query = |body: &str| direct_type_edges(body, &mapping, &labels, &types);
+        let valid = r#"digraph mygraph {
+  node [shape=box];
+  "@@//:reader"
+  "@@//:reader" -> "@@//:type"
+  "@@//:wrapper"
+  "@@//:wrapper" -> "@@//:reader"
+}"#;
+        let edges = query(valid).unwrap();
+        assert_eq!(edges["//:reader"], types);
+        assert!(edges["//:wrapper"].is_empty());
+        assert!(query("").is_none());
+        assert!(query(&valid.replace(r#""@@//:type""#, r#""@@//:type"#)).is_none());
+        assert!(query(&valid.replace(r#""@@//:type""#, r#""@@//:escaped\"name""#)).is_none());
+        let absent = query(&valid.replace("  \"@@//:reader\"\n", "")).unwrap();
+        assert!(!absent.contains_key("//:reader"));
     }
 }

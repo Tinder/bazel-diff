@@ -2012,8 +2012,23 @@ fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
         );
         if registration.starts_with(r#"use_repo(tools, "tc")"#) {
             for workspace in [&first, &bumped] {
+                let unrelated = workspace.path().join("unrelated");
+                fs::create_dir(&unrelated).unwrap();
+                fs::write(
+                    unrelated.join("MODULE.bazel"),
+                    "module(name = \"unrelated\")\n",
+                )
+                .unwrap();
+                fs::write(
+                    unrelated.join("BUILD.bazel"),
+                    "filegroup(name = \"partial\", srcs = [\"//absent:sdk\"], visibility = [\"//visibility:public\"])\n",
+                ).unwrap();
+                let partial = workspace.path().join("partial");
+                fs::create_dir(&partial).unwrap();
+                fs::write(partial.join("defs.bzl"), "def _partial(ctx):\n    return []\n\npartial = rule(implementation = _partial, attrs = {\"src\": attr.label()})\n").unwrap();
+                fs::write(partial.join("BUILD.bazel"), "load(\":defs.bzl\", \"partial\")\npartial(name = \"reader\", src = \"@unrelated//absent:sdk\")\n").unwrap();
                 edit(&workspace.path().join("MODULE.bazel"), |module| {
-                    format!("{module}\nuse_repo(tools, \"tc_impl\")\nregister_toolchains(\"//:registration\")\n")
+                    format!("{module}\nuse_repo(tools, \"tc_impl\")\nregister_toolchains(\"//:registration\")\nbazel_dep(name = \"unrelated\")\nlocal_path_override(module_name = \"unrelated\", path = \"unrelated\")\n")
                 });
                 edit(&workspace.path().join("BUILD.bazel"), |build| {
                     format!(
@@ -2024,6 +2039,8 @@ alias(name = "generator_alias", actual = ":generator_type")
 compiler(name = "compiler", src = "@tc_impl//:version.txt")
 toolchain(name = "registration", toolchain_type = ":generator_alias", toolchain = ":compiler")
 generate(name = "independent")
+filegroup(name = "unrelated", srcs = ["@unrelated//:partial"])
+filegroup(name = "removed_api", srcs = ["@app//:removed"])
 genrule(
     name = "read_versions",
     srcs = [":uses_app", "@tc_impl//:version.txt"],
@@ -2055,6 +2072,8 @@ genrule(
             };
             assert!(selected("//:independent"), "{changes:?}");
             assert!(selected("//:read_versions"), "{changes:?}");
+            assert!(selected("//partial:reader"), "{changes:?}");
+            assert!(selected("//:removed_api"), "{changes:?}");
             assert!(!selected("//:uses_app"), "{changes:?}");
         }
         if registration.starts_with("register_toolchains") {

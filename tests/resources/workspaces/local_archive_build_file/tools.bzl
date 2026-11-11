@@ -9,3 +9,11 @@ def _use(ctx):
     return [DefaultInfo(files = depset([out]))]
 
 use = rule(implementation = _use, toolchains = ["//:type"])
+
+def _copy_definition(ctx):
+    ctx.file("BUILD.bazel", ctx.read(ctx.attr.definition))
+
+copy_definition = repository_rule(
+    implementation = _copy_definition,
+    attrs = {"definition": attr.label(mandatory = True)},
+)

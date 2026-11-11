@@ -17,3 +17,7 @@ archive(
     urls = ["ARCHIVE_URL"],
 )
 register_toolchains("//:registration")
+
+copy_definition = use_repo_rule("//:tools.bzl", "copy_definition")
+copy_definition(name = "copied", definition = "@sdk//:BUILD.bazel")
+copy_definition(name = "local_copy", definition = "@overlays//:active.rules")

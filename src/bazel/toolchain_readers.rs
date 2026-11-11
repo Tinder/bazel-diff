@@ -62,6 +62,7 @@ impl PrimaryRules {
 struct OrdinaryGraph<'a> {
     mapping: HashMap<String, String>,
     fine: BTreeSet<String>,
+    coarse: HashSet<&'a str>,
     rows: HashMap<String, &'a Target>,
     parents: HashMap<String, Vec<String>>,
     primary: BTreeMap<String, Option<usize>>,
@@ -75,6 +76,7 @@ impl<'a> OrdinaryGraph<'a> {
         targets: &'a [Target],
         primary: PrimaryRules,
         root_mapping: &[u8],
+        repositories: &'a [super::RepositoryRow],
     ) -> Self {
         let mapping =
             crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(root_mapping));
@@ -94,6 +96,11 @@ impl<'a> OrdinaryGraph<'a> {
         let mut graph = Self {
             mapping,
             fine,
+            coarse: repositories
+                .iter()
+                .filter(|row| row.remote_fetch)
+                .filter_map(|row| target_name(&row.target))
+                .collect(),
             rows: HashMap::new(),
             parents: HashMap::new(),
             primary: primary.names,
@@ -306,7 +313,7 @@ impl BazelOptions {
             .map(str::to_owned),
         );
         let mut recovered = Vec::new();
-        let mut graph = OrdinaryGraph::new(self, targets, primary, mapping);
+        let mut graph = OrdinaryGraph::new(self, targets, primary, mapping, repository_rows);
         if graph.primary.is_empty() && repository_rows.iter().all(|row| row.memberships.is_empty())
         {
             return Ok(ExtensionInputs::default());
@@ -907,27 +914,61 @@ impl BazelOptions {
         }
         let used: BTreeSet<_> = bindings.values().flatten().cloned().collect();
         missing.retain(|name| used.contains(name));
-        let mut sources = self.recover_ordinary_inputs(&missing, version)?;
-        let mut visited: HashSet<_> = sources
+        // The ordinary external-repository contract already represents separately
+        // fetched payloads by their repository definition. Preserve each demanded
+        // supplier's own rules, and follow fine-grained, local and otherwise
+        // unrepresented inputs. A recursive deps() here fetches SDKs for every
+        // platform merely to discover inputs of a small number of wrappers.
+        let owners: HashSet<_> = missing
             .iter()
-            .filter_map(target_name)
-            .map(|name| graph.canonical(name))
+            .filter_map(|name| repository(name))
+            .map(str::to_owned)
             .collect();
-        let mut pending: BTreeSet<_> = missing
-            .into_iter()
-            .chain(missing_declarations)
-            .filter(|name| !visited.contains(name))
+        let fine_families: HashSet<_> = graph
+            .fine
+            .iter()
+            .filter_map(|name| super::extension_usage_prefix(name))
             .collect();
+        let nodes = crate::hash::canonical_repo_nodes(&graph.mapping);
+        let mut pending = missing;
+        pending.extend(missing_declarations);
+        let mut visited = HashSet::new();
+        let mut sources = Vec::new();
         while !pending.is_empty() {
             let names = std::mem::take(&mut pending);
             visited.extend(names.iter().cloned());
-            let rows = self.ordinary_rows(&names, version, false)?;
-            for row in &rows {
+            let absent = names
+                .iter()
+                .filter(|name| !graph.rows.contains_key(*name))
+                .cloned()
+                .collect();
+            let rows = self.ordinary_rows(&absent, version, false)?;
+            let existing = names
+                .iter()
+                .filter_map(|name| graph.rows.get(name).copied());
+            for row in existing.chain(rows.iter()) {
                 if !target_name(row).is_some_and(|name| names.contains(&graph.canonical(name))) {
                     continue;
                 }
                 for child in super::target_inputs(row).map(|name| graph.canonical(name)) {
-                    if !visited.contains(&child) && !graph.rows.contains_key(&child) {
+                    if visited.contains(&child) || child.starts_with("//external:") {
+                        continue;
+                    }
+                    let stop = repository(&child).is_some_and(|repo| {
+                        !owners.contains(repo)
+                            && !graph.fine.contains(repo)
+                            && !super::extension_usage_prefix(repo)
+                                .is_some_and(|family| fine_families.contains(family))
+                            && graph.coarse.contains(
+                                crate::hash::transform_external_input(
+                                    &child,
+                                    &self.fine_grained_external_repos,
+                                    &nodes,
+                                )
+                                .as_ref(),
+                            )
+                    });
+                    if !stop || graph.rows.contains_key(&child) {
                         pending.insert(child);
                     }
                 }

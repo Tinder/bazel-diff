@@ -3531,14 +3531,7 @@ fn resolve_isolated_root(
                     attr.r#type
                 );
             }
-            if !matches!(
-                attr.r#type,
-                Kind::Label
-                    | Kind::LabelList
-                    | Kind::LabelListDict
-                    | Kind::LabelDictUnary
-                    | Kind::LabelKeyedStringDict
-            ) {
+            if !is_repository_label_attribute(attr) {
                 continue;
             }
             for value in attribute_label_values(attr) {
@@ -4103,6 +4096,7 @@ struct RepositoryRow {
     target: Target,
     memberships: Vec<Arc<RepositoryInputGroup>>,
     generated: bool,
+    remote_fetch: bool,
     ordinary_complete: bool,
 }
 
@@ -4203,19 +4197,79 @@ fn repository_rows<T>(
     // edges from a module to its extension repositories below do not close a cycle.
     // The same record supplies the module definition and its synthetic rule. Use the record's
     // position, since separate records with the same canonical name may have different inputs.
-    let mut module_files = HashMap::new();
+    // Fetch-time labels point to files in another repository. Their supplying
+    // definitions are inputs, including a supplying repository's own fetch-time
+    // prerequisites. Its toolchain users and generated siblings are independent.
+    let mut setup_inputs = BTreeMap::<String, BTreeSet<String>>::new();
+    for repository in &repositories {
+        let Some(name) = repository.canonical_name.as_deref() else {
+            continue;
+        };
+        for (repo, label) in external_repository_labels(repository) {
+            if workspace.local_input_file(label).is_some() {
+                continue;
+            }
+            if repo != name {
+                setup_inputs
+                    .entry(name.to_owned())
+                    .or_default()
+                    .insert(repo.to_owned());
+            }
+        }
+    }
+    let mut bounded = BTreeMap::new();
+    for repository in &repositories {
+        if let Some(name) = repository.canonical_name.as_deref() {
+            let fixed = is_pinned_http_fetch(repository);
+            bounded
+                .entry(name.to_owned())
+                .and_modify(|all| *all &= fixed)
+                .or_insert(fixed);
+        }
+    }
+    // An archive overlay or patch may itself be the output of a repository rule
+    // that reads undeclared files. Only an exact local file or another bounded
+    // fetch can establish a closed input chain for the archive.
+    let mut dependents = HashMap::<&str, Vec<&str>>::new();
+    for (name, inputs) in &setup_inputs {
+        for input in inputs {
+            dependents.entry(input).or_default().push(name);
+        }
+    }
+    let mut incomplete: Vec<_> = dependents
+        .keys()
+        .copied()
+        .filter(|input| bounded.get(*input) != Some(&true))
+        .collect();
+    while let Some(name) = incomplete.pop() {
+        for &parent in dependents.get(name).into_iter().flatten() {
+            if bounded.get(parent) == Some(&true) {
+                bounded.insert(parent.to_owned(), false);
+                incomplete.push(parent);
+            }
+        }
+    }
+    let referenced: BTreeSet<_> = setup_inputs.values().flatten().collect();
+    let mut prepared_files = HashMap::new();
     let mut module_definitions = BTreeMap::new();
+    let mut input_definitions = BTreeMap::<String, BTreeSet<String>>::new();
     for (index, repository) in repositories.iter_mut().enumerate() {
         let Some(name) = &repository.canonical_name else {
             continue;
         };
-        if !is_extension_repo(name) {
+        let module = !is_extension_repo(name);
+        if module || referenced.contains(name) {
             let name = name.clone();
             let files = prepare_repository(repository, &workspace);
-            module_definitions.insert(name, repository_definition_hash(repository, &files));
-            module_files.insert(index, files);
+            let digest = repository_definition_hash(repository, &files);
+            if module {
+                module_definitions.insert(name.clone(), digest.clone());
+            }
+            input_definitions.entry(name).or_default().insert(digest);
+            prepared_files.insert(index, files);
         }
     }
+    let mut setup_digests = BTreeMap::new();
 
     // Query mode cannot see how a target reaches an extension's repositories: a toolchain is
     // resolved rather than declared, and a hub's aliases live in a BUILD file the query never
@@ -4343,9 +4397,43 @@ fn repository_rows<T>(
         if names.is_empty() {
             continue;
         }
-        let files = module_files
+        let remote_fetch = bounded.get(canonical) == Some(&true);
+        let inputs = setup_inputs.get(canonical);
+        let mut files = prepared_files
             .remove(&index)
             .unwrap_or_else(|| prepare_repository(&mut repository, &workspace));
+        if let Some(inputs) = inputs {
+            let digest = setup_digests.entry(inputs).or_insert_with(|| {
+                let mut seen = BTreeSet::new();
+                let mut pending: Vec<_> = inputs.iter().collect();
+                while let Some(name) = pending.pop() {
+                    if !seen.insert(name) {
+                        continue;
+                    }
+                    pending.extend(setup_inputs.get(name).into_iter().flatten());
+                    if let Some((owner, _)) = extension_usage_prefix(name)
+                        .and_then(|usage| extension_repo_owner(usage, &module_definitions))
+                    {
+                        pending.push(owner);
+                    }
+                }
+                let mut hash = Sha256::new();
+                for name in seen {
+                    hash.update(name.as_bytes());
+                    hash.update([0]);
+                    for digest in input_definitions.get(name).into_iter().flatten() {
+                        hash.update(digest.as_bytes());
+                    }
+                    hash.update([0]);
+                }
+                hash.finalize()
+            });
+            let mut hash = Sha256::new();
+            hash.update(files.inputs_hash.as_deref().unwrap_or_default());
+            hash.update([0]);
+            hash.update(digest.as_slice());
+            files.inputs_hash = Some(hex::encode(hash.finalize()));
+        }
         let rule = repository_rule(repository, files, owner_definition_hash);
         // All apparent names have the same definition. Move it into the final output.
         let mut rules = std::iter::repeat_n(rule, names.len());
@@ -4354,6 +4442,7 @@ fn repository_rows<T>(
                 target: repository_target(rules.next().unwrap(), &apparent, &ordinary_dependencies),
                 memberships: memberships.clone(),
                 generated,
+                remote_fetch,
                 ordinary_complete,
             }));
         }
@@ -5803,6 +5892,30 @@ pub(crate) fn attribute_main_repo_labels(attributes: &[Attribute]) -> impl Itera
     })
 }
 
+fn is_repository_label_attribute(attr: &Attribute) -> bool {
+    use crate::proto::blaze_query::attribute::Discriminator as Kind;
+    matches!(
+        attr.r#type,
+        Kind::Label
+            | Kind::LabelList
+            | Kind::LabelListDict
+            | Kind::LabelDictUnary
+            | Kind::LabelKeyedStringDict
+    )
+}
+
+fn external_repository_labels(repository: &Repository) -> impl Iterator<Item = (&str, &str)> {
+    repository
+        .attribute
+        .iter()
+        .filter(|attr| is_repository_label_attribute(attr))
+        .flat_map(attribute_label_values)
+        .filter_map(|label| {
+            let (repo, _) = label.strip_prefix("@@")?.split_once("//")?;
+            (!repo.is_empty()).then_some((repo, label))
+        })
+}
+
 /// The slots that can name targets after the caller checks the attribute discriminator.
 /// LABEL_DICT_UNARY is string -> label and LABEL_KEYED_STRING_DICT is label -> string.
 fn attribute_label_values(attribute: &Attribute) -> impl Iterator<Item = &str> {
@@ -5839,18 +5952,63 @@ fn attribute_label_values(attribute: &Attribute) -> impl Iterator<Item = &str> {
         .map(String::as_str)
 }
 
-/// Digest of a repository's own definition: its rule, its attributes, and the local tree and
-/// main-repository files behind them. Like the target hasher, it leaves out URLs whose content an
-/// integrity pins: `url`/`urls` under `sha256`/`integrity`, and the URLs
-/// `without_integrity_pinned_urls` drops.
-fn repository_definition_hash(repository: &Repository, files: &RepositoryFiles) -> String {
-    let pinned = repository.attribute.iter().any(|attribute| {
+// The built-in HTTP rules define their downloaded bytes by these attributes.
+// User repository rules can read unrelated files even with identical URL and hash.
+fn is_pinned_http_fetch(repository: &Repository) -> bool {
+    let attrs = &repository.attribute;
+    if repository.repo_rule_bzl_label.as_deref()
+        != Some("@@bazel_tools//tools/build_defs/repo:http.bzl")
+        || !has_content_pin(attrs)
+    {
+        return false;
+    }
+    match repository.repo_rule_name.as_deref() {
+        Some("http_file" | "http_jar") => true,
+        Some("http_archive") => attrs.iter().all(|attr| match attr.name.as_str() {
+            // Custom patch commands and tools can read arbitrary local files.
+            "patch_cmds" | "patch_cmds_win" => attr.string_list_value.is_empty(),
+            "patch_tool" => attr.string_value.as_deref().unwrap_or_default().is_empty(),
+            "patch_args" => attr.string_list_value.iter().all(|arg| {
+                arg.strip_prefix("-p")
+                    .is_some_and(|value| value.parse::<u32>().is_ok())
+            }),
+            "remote_patches" | "remote_file_urls" | "remote_module_file_urls" => {
+                let Some(remaining) = crate::hash::without_integrity_pinned_urls(attr, attrs)
+                else {
+                    return false;
+                };
+                remaining.string_list_value.is_empty()
+                    && remaining
+                        .string_dict_value
+                        .iter()
+                        .all(|entry| entry.key.is_empty())
+                    && remaining
+                        .string_list_dict_value
+                        .iter()
+                        .all(|entry| entry.value.is_empty())
+            }
+            _ => true,
+        }),
+        _ => false,
+    }
+}
+
+fn has_content_pin(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
         matches!(attribute.name.as_str(), "sha256" | "integrity")
             && attribute
                 .string_value
                 .as_deref()
                 .is_some_and(|value| !value.is_empty())
-    });
+    })
+}
+
+/// Digest of a repository's own definition: its rule, its attributes, and the local tree and
+/// main-repository files behind them. Like the target hasher, it leaves out URLs whose content an
+/// integrity pins: `url`/`urls` under `sha256`/`integrity`, and the URLs
+/// `without_integrity_pinned_urls` drops.
+fn repository_definition_hash(repository: &Repository, files: &RepositoryFiles) -> String {
+    let pinned = has_content_pin(&repository.attribute);
     let mut hasher = Sha256::new();
     hasher.update(repository.repo_rule_name.as_deref().unwrap_or_default());
     hasher.update([0]);
@@ -5877,8 +6035,7 @@ fn repository_definition_hash(repository: &Repository, files: &RepositoryFiles) 
     hex::encode(hasher.finalize())
 }
 
-/// Hash workspace inputs and the exact file named by a standard http_archive
-/// when Bazel identifies its source repository as a local checkout.
+/// Hash workspace inputs and typed file operands in proven local repository roots.
 fn repository_local_inputs_hash(
     repository: &Repository,
     workspace: &RepositoryWorkspace<'_>,
@@ -5907,8 +6064,10 @@ fn repository_local_inputs_hash(
         }
         record(label, &content.finalize());
     }
-    if let Some((label, digest)) = workspace.archive_build_file(repository) {
-        record(label, &digest);
+    for (_, label) in external_repository_labels(repository).collect::<BTreeSet<_>>() {
+        if let Some(path) = workspace.local_input_file(label) {
+            record(label, &Sha256::digest(fs::read(path).ok()?));
+        }
     }
     hashed_any.then(|| hex::encode(hasher.finalize()))
 }
@@ -6004,29 +6163,10 @@ impl<'a> RepositoryWorkspace<'a> {
         workspace
     }
 
-    fn archive_build_file<'r>(&self, repository: &'r Repository) -> Option<(&'r str, [u8; 32])> {
-        use crate::proto::blaze_query::attribute::Discriminator;
-        if repository.repo_rule_name.as_deref() != Some("http_archive")
-            || repository.repo_rule_bzl_label.as_deref()
-                != Some("@@bazel_tools//tools/build_defs/repo:http.bzl")
-        {
-            return None;
-        }
-        let label = repository
-            .attribute
-            .iter()
-            .find(|attr| attr.name == "build_file" && attr.r#type == Discriminator::Label)?
-            .string_value
-            .as_deref()?;
+    fn local_input_file(&self, label: &str) -> Option<PathBuf> {
         let (name, relative) = crate::hash::repository_input_path(label).ok()?;
-        if name.is_empty() {
-            return None;
-        }
         let file = self.local_repositories.get(name)?.join(relative);
-        if !file.is_file() {
-            return None;
-        }
-        Some((label, Sha256::digest(fs::read(file).ok()?).into()))
+        file.is_file().then_some(file)
     }
 }
 
@@ -6400,6 +6540,7 @@ mod tests {
                 labels: vec!["//external:both".into(), "//external:sibling".into()],
             })],
             generated: false,
+            remote_fetch: false,
             ordinary_complete: false,
         };
         assert_eq!(
@@ -7288,6 +7429,74 @@ mod tests {
     }
 
     #[test]
+    fn only_known_pinned_http_operations_can_stand_in_for_a_supplier_file() {
+        let mut repository = Repository {
+            repo_rule_name: Some("http_archive".into()),
+            repo_rule_bzl_label: Some("@@bazel_tools//tools/build_defs/repo:http.bzl".into()),
+            attribute: vec![Attribute {
+                name: "sha256".into(),
+                string_value: Some("pinned".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(is_pinned_http_fetch(&repository));
+        repository.attribute.push(Attribute {
+            name: "patch_cmds".into(),
+            string_list_value: vec!["cp /some/path compiler".into()],
+            ..Default::default()
+        });
+        assert!(!is_pinned_http_fetch(&repository));
+        repository.attribute.pop();
+        repository.repo_rule_bzl_label = Some("@@external_module+//:http.bzl".into());
+        assert!(!is_pinned_http_fetch(&repository));
+    }
+
+    #[test]
+    fn an_opaque_overlay_keeps_a_pinned_archive_in_the_supplier_query() {
+        let mut archive = Repository {
+            canonical_name: Some("sdk+".into()),
+            repo_rule_name: Some("http_archive".into()),
+            repo_rule_bzl_label: Some("@@bazel_tools//tools/build_defs/repo:http.bzl".into()),
+            attribute: vec![Attribute {
+                name: "sha256".into(),
+                string_value: Some("pinned".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut overlay = archive.clone();
+        overlay.canonical_name = Some("overlay+".into());
+        archive.attribute.push(Attribute {
+            name: "build_file".into(),
+            r#type: attribute::Discriminator::Label,
+            string_value: Some("@@overlay+//:build.tpl".into()),
+            ..Default::default()
+        });
+        let remote_fetch = |repos| {
+            repository_rows(
+                repos,
+                &BTreeMap::new(),
+                ModuleDependencies {
+                    edges: &BTreeMap::new(),
+                    mappings: &BTreeMap::new(),
+                },
+                None,
+                &LabelOnlyRepositories::default(),
+                Path::new("."),
+                |row| row.remote_fetch,
+            )
+        };
+        assert_eq!(
+            remote_fetch(vec![archive.clone(), overlay.clone()]),
+            [true, true]
+        );
+        overlay.repo_rule_bzl_label = Some("@@defs+//:custom.bzl".into());
+        assert_eq!(remote_fetch(vec![archive.clone(), overlay]), [false, false]);
+        assert_eq!(remote_fetch(vec![archive]), [false]);
+    }
+
+    #[test]
     fn archive_build_file_hashes_only_its_named_local_repository_file() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("overlays");
@@ -7364,8 +7573,9 @@ mod tests {
         archive.attribute[0].r#type = attribute::Discriminator::String;
         assert!(repository_local_inputs_hash(&archive, &workspace).is_none());
         archive.attribute[0].r#type = attribute::Discriminator::Label;
+        // The LABEL denotes the same local file when a custom repository rule reads it.
         archive.repo_rule_bzl_label = Some("@@other+//:http.bzl".into());
-        assert!(repository_local_inputs_hash(&archive, &workspace).is_none());
+        assert!(repository_local_inputs_hash(&archive, &workspace).is_some());
     }
 
     #[test]

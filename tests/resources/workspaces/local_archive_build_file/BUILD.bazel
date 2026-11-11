@@ -20,4 +20,18 @@ genrule(
     cmd = "cat $(SRCS) > $@",
 )
 
-filegroup(name = "products", srcs = [":tool_user", ":plain", ":other"])
+genrule(
+    name = "copied",
+    srcs = ["@copied//:payload"],
+    outs = ["copied.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+genrule(
+    name = "local_copy",
+    srcs = ["@local_copy//:payload"],
+    outs = ["local_copy.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+filegroup(name = "products", srcs = [":tool_user", ":plain", ":other", ":copied", ":local_copy"])

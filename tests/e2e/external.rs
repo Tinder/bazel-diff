@@ -1398,6 +1398,14 @@ fn local_archive_build_file_reaches_only_its_own_repository_and_readers() {
                 .trim(),
             neighbor
         );
+        for product in ["copied", "local_copy"] {
+            assert_eq!(
+                fs::read_to_string(root.join(format!("bazel-bin/{product}.txt")))
+                    .unwrap()
+                    .trim(),
+                active
+            );
+        }
         if arm == "base" {
             continue;
         }
@@ -1436,6 +1444,8 @@ fn local_archive_build_file_reaches_only_its_own_repository_and_readers() {
         for (label, expected) in [
             ("//:registration", arm == "active"),
             ("//:plain", arm == "active"),
+            ("//:copied", arm == "active"),
+            ("//:local_copy", arm == "active"),
             ("//:other", arm == "neighbor"),
         ] {
             assert_eq!(changed.contains(label), expected, "{arm}: {label}");

@@ -1,6 +1,7 @@
 //! Positive implementation edges for ordinary readers that Bazel resolves at analysis time.
 use super::{
-    canonical_query_label, query_set, target_label, target_name, BazelOptions, BazelVersion, Target,
+    canonical_query_label, query_set, target_label, target_name, BazelOptions, BazelVersion,
+    CqueryCapture, Target,
 };
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -338,9 +339,19 @@ impl BazelOptions {
         graph: &OrdinaryGraph<'_>,
         query: &str,
         version: BazelVersion,
+        capture: CqueryCapture<'_>,
     ) -> Result<Bindings> {
         let mut inputs = Bindings::new();
-        for row in self.query_with(query, true, Some(version), false, &mut |_, _| {})? {
+        let observed = self.query_with_capture(
+            query,
+            true,
+            Some(version),
+            false,
+            &mut |_, _| {},
+            capture,
+            |_| true,
+        )?;
+        for row in observed.targets {
             if let Some(rule) = row.rule.as_option() {
                 let reader = graph.canonical(target_label(&rule.name));
                 inputs.entry(reader).or_default().extend(
@@ -386,14 +397,13 @@ impl BazelOptions {
                         .cloned()
                 })
                 .collect();
-            if explicit.is_empty() {
-                classes
-                    .entry((class, class.is_none().then_some(name)))
-                    .or_default()
-                    .push(name);
-            } else {
-                readers.known.insert(name.clone(), explicit);
-            }
+            // A direct edge can come from the class or this instance. Only
+            // share the observed union with instances having the same inputs
+            // among these types.
+            classes
+                .entry((class, class.is_none().then_some(name), explicit))
+                .or_default()
+                .push(name);
         }
         let mut groups = BTreeMap::new();
         for members in classes.into_values() {
@@ -568,17 +578,16 @@ impl BazelOptions {
         // This observation only adds real positive edges. A shared toolchain can be
         // forced onto different execution platforms with the same public checksum.
         // No whole-closure identity or negative follows from a reader's direct row.
-        let mut configured = Bindings::new();
-        self.query_available(
-            readers.known.keys().cloned().collect(),
-            |code| matches!(code, 1 | 3 | 7),
-            |query| {
-                for (name, children) in self.configured_children(graph, query, version)? {
-                    configured.entry(name).or_default().extend(children);
-                }
-                Ok(())
-            },
-        )?;
+        let configured = if readers.known.is_empty() {
+            Bindings::new()
+        } else {
+            // A failed rule can coexist with fully emitted healthy reader rows.
+            // Missing readers retain their possible suppliers below.
+            let mut options = self.clone();
+            options.cquery_options.push("--keep_going".to_owned());
+            let query = query_set(&readers.known.keys().cloned().collect())?;
+            options.configured_children(graph, &query, version, CqueryCapture::AvailableReaders)?
+        };
         for (id, types) in readers.known {
             let suppliers: BTreeSet<_> = match configured.get(&id) {
                 Some(inputs) => inputs
@@ -844,7 +853,8 @@ impl BazelOptions {
             format!(" + (let members = {members} in (allpaths({}, ($p + (rdeps($g, $members, 1) except $members))) except $p))", in_universe(&entries))
         };
         let expression = format!("let g = {scope} in let p = {} in ((rdeps($g, $p, 1) intersect {}){opaque} + {callers})", in_universe(&providers), in_universe(&candidates));
-        let configured = self.configured_children(&graph, &expression, version)?;
+        let configured =
+            self.configured_children(&graph, &expression, version, CqueryCapture::Standard)?;
         if let Some(root) = roots.iter().find(|root| !configured.contains_key(*root)) {
             eprintln!("[Warn] retaining inferred external dependencies because the configured query did not return {root}");
             return Ok(ExtensionInputs::default());
@@ -883,6 +893,7 @@ impl BazelOptions {
                 &graph,
                 &format!("let g = {scope} in deps({})", in_universe(&missing)),
                 version,
+                CqueryCapture::Standard,
             )?;
             for name in &missing {
                 anyhow::ensure!(
@@ -959,40 +970,18 @@ impl BazelOptions {
         version: BazelVersion,
     ) -> Result<Vec<Target>> {
         let mut result = Vec::new();
-        self.query_available(
-            names.iter().cloned().collect(),
-            |code| matches!(code, 3 | 7),
-            |query| {
-                let expression = format!("let d = deps({query}) in $d + buildfiles($d)");
-                result.extend(self.query_with(
-                    &expression,
-                    false,
-                    Some(version),
-                    false,
-                    &mut |_, _| {},
-                )?);
-                Ok(())
-            },
-        )?;
-        super::deduplicate_targets(result)
-    }
-
-    fn query_available(
-        &self,
-        names: Vec<String>,
-        recoverable: impl Fn(i32) -> bool,
-        mut read: impl FnMut(&str) -> Result<()>,
-    ) -> Result<()> {
+        let names: Vec<_> = names.iter().cloned().collect();
         let mut pending = vec![names.as_slice()];
         while let Some(batch) = pending.pop().filter(|batch| !batch.is_empty()) {
             let query = query_set(&batch.iter().cloned().collect())?;
-            match read(&query) {
-                Ok(()) => {}
+            let expression = format!("let d = deps({query}) in $d + buildfiles($d)");
+            match self.query_with(&expression, false, Some(version), false, &mut |_, _| {}) {
+                Ok(rows) => result.extend(rows),
                 Err(error) => {
                     self.check_cancelled()?;
                     if !error
                         .downcast_ref::<super::QueryFailure>()
-                        .is_some_and(|failure| recoverable(failure.code))
+                        .is_some_and(|failure| matches!(failure.code, 3 | 7))
                     {
                         return Err(error);
                     }
@@ -1001,14 +990,14 @@ impl BazelOptions {
                         pending.extend([right, left]);
                     } else {
                         eprintln!(
-                            "[Warn] retaining fallback inputs for {}: {error:#}",
+                            "[Warn] retaining repository inputs for {}: {error:#}",
                             batch[0]
                         );
                     }
                 }
             }
         }
-        Ok(())
+        super::deduplicate_targets(result)
     }
 }
 

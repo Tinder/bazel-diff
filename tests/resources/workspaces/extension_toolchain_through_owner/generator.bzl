@@ -15,7 +15,10 @@ def _generate(ctx):
 
 generate = rule(
     implementation = _generate,
-    attrs = {"fail_analysis": attr.bool()},
+    attrs = {
+        "fail_analysis": attr.bool(),
+        "type_label": attr.label(),
+    },
     toolchains = ["//:generator_type"],
 )
 

@@ -2836,8 +2836,9 @@ impl BazelOptions {
         capture: CqueryCapture<'_>,
         retain: impl FnMut(&Target) -> bool,
     ) -> Result<QueryGraph> {
+        let available_readers = matches!(capture, CqueryCapture::AvailableReaders);
         let (mut roots, verify) = match capture {
-            CqueryCapture::Standard => (None, false),
+            CqueryCapture::Standard | CqueryCapture::AvailableReaders => (None, false),
             CqueryCapture::Roots(roots) => (Some(roots), false),
             CqueryCapture::Verification => (None, true),
         };
@@ -2847,7 +2848,7 @@ impl BazelOptions {
             None => self.version()?,
         };
         let compatible = if use_cquery && !verify {
-            Some(self.query_compatible_labels(expression, version)?)
+            Some(self.query_compatible_labels(expression, version, available_readers)?)
         } else {
             None
         };
@@ -2925,7 +2926,8 @@ impl BazelOptions {
         let code = output.status.code().unwrap_or(-1);
         // A formatter can emit its completion marker before a keep-going query returns 3.
         // Verification requires command success; ordinary partial positives keep their policy.
-        let partial = self.keep_going && code == 3 && !verify;
+        let partial = (self.keep_going && code == 3 && !verify)
+            || (available_readers && matches!(code, 1 | 3 | 7));
         if code != 0 && !partial {
             return Err(QueryFailure {
                 code,
@@ -2979,6 +2981,7 @@ impl BazelOptions {
         &self,
         expression: &str,
         version: BazelVersion,
+        available_readers: bool,
     ) -> Result<HashSet<String>> {
         let output = self
             .query_formatted(
@@ -3000,7 +3003,9 @@ impl BazelOptions {
                 version,
             )
             .context("execute compatible-target cquery")?;
-        if !output.status.success() {
+        if !(output.status.success()
+            || (available_readers && matches!(output.status.code(), Some(1 | 3 | 7))))
+        {
             return Err(QueryFailure {
                 code: output.status.code().unwrap_or(-1),
                 message: format!(
@@ -3010,7 +3015,8 @@ impl BazelOptions {
             }
             .into());
         }
-        Ok(String::from_utf8_lossy(&output.stdout)
+        Ok(std::str::from_utf8(&output.stdout)
+            .context("decode compatible target labels")?
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| main_repo_label_key(line).to_owned())
@@ -3902,6 +3908,7 @@ impl QueryGraph {
 
 enum CqueryCapture<'a> {
     Standard,
+    AvailableReaders,
     Roots(&'a mut Vec<(String, String)>),
     Verification,
 }

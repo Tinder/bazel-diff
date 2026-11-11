@@ -2045,6 +2045,7 @@ compiler(name = "other_compiler", src = "@tc_impl//:version.txt")
 toolchain(name = "other", toolchain_type = ":other_type", toolchain = ":other_compiler")
 generate(name = "independent")
 generate(name = "unbuildable", fail_analysis = True)
+generate(name = "also_unbuildable", fail_analysis = True, type_label = ":other_type")
 filegroup(name = "unrelated", srcs = ["@unrelated//:partial"])
 filegroup(name = "removed_api", srcs = ["@app//:removed"])
 genrule(
@@ -2082,6 +2083,10 @@ genrule(
             for (reader, expected) in [
                 ("//:independent", vec!["//:compiler"]),
                 ("//:unbuildable", vec!["//:compiler", "//:unused_compiler"]),
+                (
+                    "//:also_unbuildable",
+                    vec!["//:compiler", "//:other_compiler", "//:unused_compiler"],
+                ),
             ] {
                 let compilers: Vec<_> = graph[reader]
                     .iter()

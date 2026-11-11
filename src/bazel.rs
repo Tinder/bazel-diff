@@ -9060,7 +9060,10 @@ if [ "$1" = cquery ]; then
     if grep -q ToolchainInfo "$formatter"; then response=providers.txt; fi
   fi
 elif [ -f selected-inputs.pb ] && grep -q '^let d = deps(' "$expression"; then
+  if grep -q '//:sdk' "$expression"; then exit 7; fi
   response=selected-inputs.pb
+elif [ -f ordinary-sdk.pb ] && grep -q '^let d = set(' "$expression"; then
+  response=ordinary-sdk.pb
 fi
 if [ -n "$output" ]; then cp "$response" "$output"; exit $?; fi
 exit 1
@@ -9128,14 +9131,17 @@ exit 1
             &dir.join("query-result.pb"),
             &[
                 rule(CLIENT, &[APP]),
-                rule(DATA_CLIENT, &[ALIAS]),
+                rule(DATA_CLIENT, &[ALIAS, "@rules_python//:wrapper"]),
                 rule(APP, &["@rules_python//:wrapper"]),
-                rule(SDK, &["//:version"]),
                 version,
             ],
         );
         // The fine repository's alias is referenced by a main rule but was not in the
         // primary response. Its selected actual forwards data from the generated sibling.
+        write_delimited(
+            &dir.join("ordinary-sdk.pb"),
+            &[rule(SDK, &["//:version", "@other//:unused"])],
+        );
         let mut alias = rule(ALIAS, &[BRIDGE]);
         alias.rule.as_option_mut().unwrap().rule_class = "alias".into();
         write_delimited(
@@ -9148,6 +9154,7 @@ exit 1
             (ALIAS, BRIDGE),
             (BRIDGE, DATA),
             (APP, SDK),
+            (SDK, "//:version"),
         ];
         let rows = edges
             .iter()
@@ -9199,6 +9206,7 @@ exit 1
         // A missing caller in the configured response preserves the legacy owner/hub paths.
         fs::write(compatible, [DATA_CLIENT, APP, BRIDGE].join("\n")).unwrap();
         let partial = hashes();
+        assert!(!partial.dep_edges.contains_key(ALIAS));
         repos[2].attribute.clear();
         write_delimited(&dir.join("show-repo.pb"), &repos);
         assert_eq!(changed(&partial, &hashes()), [CLIENT, DATA_CLIENT]);

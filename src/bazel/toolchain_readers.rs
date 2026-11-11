@@ -243,8 +243,12 @@ impl BazelOptions {
                     eprintln!("[Warn] retaining inferred external dependencies: {error:#}");
                 }
             }
-            super::retain_supplemental_targets(&mut result.sources, &recovered);
-            result.sources.extend(recovered);
+            // Recovery and removal of the extension's inferred edges are one update.
+            // Publishing the new rows against the old memberships adds sibling dependencies.
+            if !result.usages.is_empty() {
+                super::retain_supplemental_targets(&mut result.sources, &recovered);
+                result.sources.extend(recovered);
+            }
         }
         for (reader, inputs) in bindings {
             result.bindings.entry(reader).or_default().extend(inputs);
@@ -273,6 +277,10 @@ impl BazelOptions {
                     .entry(graph.canonical(target_label(&output.name)))
                     .or_default()
                     .insert(graph.canonical(target_label(&output.generating_rule)));
+            } else if let Some(name) = target_name(&row) {
+                inputs
+                    .entry(graph.canonical(target_label(name)))
+                    .or_default();
             }
         }
         Ok(inputs)
@@ -470,6 +478,9 @@ impl BazelOptions {
                     *recovered = rows;
                     graph.index(recovered, 0);
                     missing = visit(&graph, missing.into_iter().collect());
+                    if let Some(name) = missing.first() {
+                        anyhow::bail!("ordinary recovery did not return the dependency {name}");
+                    }
                 }
                 Err(error) => {
                     self.check_cancelled()?;
@@ -608,27 +619,82 @@ impl BazelOptions {
             }
         }
         if !missing.is_empty() {
-            result.sources = self.ordinary_dependency_inputs(&missing, version)?;
+            // A selected toolchain can have dependencies on other platforms in its
+            // ordinary rule. Ask for the configurations reached by these callers.
+            let selected = self.configured_children(
+                &graph,
+                &format!("let g = {scope} in deps({})", in_universe(&missing)),
+                version,
+            )?;
+            for name in &missing {
+                anyhow::ensure!(
+                    selected.contains_key(name),
+                    "missing configured input {name}"
+                );
+            }
+            for child in selected.values().flatten() {
+                anyhow::ensure!(
+                    selected.contains_key(child) || graph.rows.contains_key(child),
+                    "missing configured prerequisite {child}"
+                );
+            }
+            let names: BTreeSet<_> = selected
+                .keys()
+                .filter(|name| !graph.rows.contains_key(*name))
+                .cloned()
+                .collect();
+            let expression = format!("let d = {} in $d + buildfiles($d)", query_set(&names)?);
+            result.sources =
+                self.query_with(&expression, false, Some(version), false, &mut |_, _| {})?;
+            // Only these new rows were recovered from configured occurrences.
+            // Existing ordinary targets keep their complete inputs. Buildfiles in
+            // this response still supply the package's evaluated load inputs.
+            for row in &mut result.sources {
+                if let Some(rule) = row.rule.as_option_mut() {
+                    if let Some(children) = selected.get(&canonical(&rule.name)) {
+                        rule.rule_input
+                            .retain(|child| children.contains(&canonical(child)));
+                    }
+                }
+            }
             let spellings: HashMap<_, _> = result
                 .sources
                 .iter()
                 .filter_map(target_name)
                 .map(|name| (canonical(name), name.to_owned()))
                 .collect();
-            if missing.iter().any(|name| !spellings.contains_key(name)) {
-                result.usages.clear();
+            for name in &names {
+                anyhow::ensure!(
+                    spellings.contains_key(name),
+                    "missing ordinary target for configured input {name}"
+                );
             }
-            result.bindings = result
-                .bindings
-                .into_iter()
-                .map(|(name, children)| {
-                    let children = children
-                        .into_iter()
-                        .map(|name| spellings.get(&name).cloned().unwrap_or(name))
-                        .collect();
-                    (spellings.get(&name).cloned().unwrap_or(name), children)
-                })
-                .collect();
+            let spelling = |name: String| {
+                spellings
+                    .get(&name)
+                    .cloned()
+                    .or_else(|| {
+                        graph
+                            .rows
+                            .get(&name)
+                            .and_then(|row| target_name(row))
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or(name)
+            };
+            for (name, children) in selected {
+                if !children.is_empty() {
+                    result.bindings.entry(name).or_default().extend(children);
+                }
+            }
+            let mut bindings = Bindings::new();
+            for (name, children) in result.bindings {
+                bindings
+                    .entry(spelling(name))
+                    .or_default()
+                    .extend(children.into_iter().map(&spelling));
+            }
+            result.bindings = bindings;
         }
         Ok(result)
     }

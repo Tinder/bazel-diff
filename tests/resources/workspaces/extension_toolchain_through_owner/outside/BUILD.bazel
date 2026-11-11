@@ -10,7 +10,19 @@ platform(
     visibility = ["//visibility:public"],
 )
 
-tool(name = "impl", version = "outside-1")
+config_setting(
+    name = "other_runtime",
+    define_values = {"runtime": "other"},
+)
+
+# The alternative SDK requires a separate installation.
+tool(
+    name = "impl",
+    runtime = select({
+        ":other_runtime": "@bazel_tools//tools/unavailable_test_sdk:installation",
+        "//conditions:default": ":version.txt",
+    }),
+)
 
 toolchain(
     name = "registration",

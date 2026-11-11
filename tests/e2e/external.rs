@@ -1800,9 +1800,14 @@ genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "ca
             )
         });
     }
-    edit(&changed.path().join("outside/BUILD.bazel"), |build| {
-        build.replace("outside-1", "outside-2")
-    });
+    let ordinary = std::process::Command::new(bazel())
+        .current_dir(first.path())
+        .args(["query", "deps(@outside//:impl)", "--nokeep_going"])
+        .output()
+        .unwrap();
+    assert!(!ordinary.status.success());
+    assert!(String::from_utf8_lossy(&ordinary.stderr).contains("unavailable_test_sdk"));
+    fs::write(changed.path().join("outside/version.txt"), "outside-2\n").unwrap();
     for (workspace, content) in [(&first, "outside-1"), (&changed, "outside-2")] {
         assert_product(workspace.path(), "//:normal", "normal.txt", "1.0");
         assert_product(workspace.path(), "//:switched", "switched.txt", content);

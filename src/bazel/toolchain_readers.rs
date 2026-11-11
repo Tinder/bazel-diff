@@ -48,27 +48,30 @@ impl<'a> OrdinaryGraph<'a> {
             parents: HashMap::new(),
             primary: BTreeSet::new(),
         };
+        graph.index(targets, primary_len);
+        graph
+    }
+
+    fn index(&mut self, targets: &'a [Target], primary_len: usize) {
         for (index, target) in targets.iter().enumerate() {
             let Some(name) = target_name(target) else {
                 continue;
             };
-            let id = graph.canonical(name);
+            let id = self.canonical(name);
             if id.starts_with("//external:") {
                 continue;
             }
             if index < primary_len && id.starts_with("//") && target.rule.is_set() {
-                graph.primary.insert(id.clone());
+                self.primary.insert(id.clone());
             }
-            graph.rows.insert(id.clone(), target);
+            self.rows.insert(id.clone(), target);
             for child in super::target_inputs(target) {
-                graph
-                    .parents
-                    .entry(graph.canonical(child))
+                self.parents
+                    .entry(self.canonical(child))
                     .or_default()
                     .push(id.clone());
             }
         }
-        graph
     }
 
     fn canonical(&self, name: &str) -> String {
@@ -226,13 +229,22 @@ impl BazelOptions {
             options.resolved_toolchain_inputs(&graph, targets, mapping, version)?;
         let mut result = ExtensionInputs::default();
         if let Some(repositories) = survey.filter(|_| covered) {
-            match options.extension_inputs(&graph, repositories, repository_rows, version) {
+            let mut recovered = Vec::new();
+            match options.extension_inputs(
+                graph,
+                repositories,
+                repository_rows,
+                version,
+                &mut recovered,
+            ) {
                 Ok(observed) => result = observed,
                 Err(error) => {
                     self.check_cancelled()?;
                     eprintln!("[Warn] retaining inferred external dependencies: {error:#}");
                 }
             }
+            super::retain_supplemental_targets(&mut result.sources, &recovered);
+            result.sources.extend(recovered);
         }
         for (reader, inputs) in bindings {
             result.bindings.entry(reader).or_default().extend(inputs);
@@ -385,21 +397,22 @@ impl BazelOptions {
     /// a failed lookup leaves the repository lowering on its existing inputs.
     fn extension_inputs(
         &self,
-        graph: &OrdinaryGraph<'_>,
+        graph: OrdinaryGraph<'_>,
         repositories: &super::ExtensionRepositories,
         repository_rows: RepositoryRows<'_>,
         version: BazelVersion,
+        recovered: &mut Vec<Target>,
     ) -> Result<ExtensionInputs> {
         let usages: BTreeSet<_> = graph
             .fine
             .intersection(&repositories.generated)
             .filter_map(|repo| super::extension_usage_prefix(repo))
+            .map(str::to_owned)
             .collect();
         let usage = |name: &str| {
             let family = super::extension_usage_prefix(repository(name)?)?;
-            usages.get(family).map(|name| (*name).to_owned())
+            usages.get(family).cloned()
         };
-        let canonical = |label: &str| graph.canonical(label);
         let mut result = ExtensionInputs::default();
         if usages.is_empty() {
             return Ok(result);
@@ -420,32 +433,57 @@ impl BazelOptions {
         }
         let mut seen = BTreeSet::new();
         let mut readers = BTreeSet::new();
-        let mut incomplete = BTreeSet::new();
-        while let Some(name) = pending.pop() {
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            let Some(family) = usage(&name) else { continue };
-            let Some(row) = graph.rows.get(&name) else {
-                incomplete.insert(family);
-                continue;
-            };
-            result.usages.insert(family);
-            if let Some(rule) = row.rule.as_option() {
-                if rule.rule_class != "alias" {
-                    readers.insert(name);
+        let mut visit = |graph: &OrdinaryGraph<'_>, mut pending: Vec<String>| {
+            let mut missing = BTreeSet::new();
+            while let Some(name) = pending.pop() {
+                let Some(family) = usage(&name) else { continue };
+                let Some(row) = graph.rows.get(&name) else {
+                    missing.insert(name);
+                    continue;
+                };
+                if !seen.insert(name.clone()) {
+                    continue;
                 }
-                pending.extend(
-                    rule.rule_input
-                        .iter()
-                        .map(|child| canonical(child))
-                        .filter(|key| usage(key).is_some()),
-                );
-            } else if let Some(file) = row.generated_file.as_option() {
-                pending.push(canonical(&file.generating_rule));
+                result.usages.insert(family);
+                if let Some(rule) = row.rule.as_option() {
+                    if rule.rule_class != "alias" {
+                        readers.insert(name);
+                    }
+                    pending.extend(rule.rule_input.iter().map(|child| graph.canonical(child)));
+                } else if let Some(file) = row.generated_file.as_option() {
+                    pending.push(graph.canonical(&file.generating_rule));
+                }
+            }
+            missing
+        };
+        let mut missing = visit(&graph, pending);
+        let mut graph = graph;
+        if !missing.is_empty() {
+            // A rule can reference a valid alias outside the original query. Read its
+            // ordinary inputs before deciding whether the extension usage is covered.
+            match self.ordinary_dependency_inputs(&missing, version) {
+                Ok(mut rows) => {
+                    rows.retain(|row| {
+                        target_name(row)
+                            .is_some_and(|name| !graph.rows.contains_key(&graph.canonical(name)))
+                    });
+                    *recovered = rows;
+                    graph.index(recovered, 0);
+                    missing = visit(&graph, missing.into_iter().collect());
+                }
+                Err(error) => {
+                    self.check_cancelled()?;
+                    eprintln!("[Warn] retaining repository dependencies for unobserved extension inputs: {error:#}");
+                }
             }
         }
-        result.usages.retain(|family| !incomplete.contains(family));
+        if let Some(first) = missing.first() {
+            eprintln!("[Warn] retaining repository dependencies for extension usages with {} missing ordinary inputs, including {first}", missing.len());
+            for family in missing.iter().filter_map(|name| usage(name)) {
+                result.usages.remove(&family);
+            }
+        }
+        let canonical = |label: &str| graph.canonical(label);
         if result.usages.is_empty() {
             return Ok(result);
         }
@@ -531,8 +569,9 @@ impl BazelOptions {
             format!(" + (let members = {members} in (allpaths({}, ($p + (rdeps($g, $members, 1) except $members))) except $p))", in_universe(&entries))
         };
         let expression = format!("let g = {scope} in let p = {} in ((rdeps($g, $p, 1) intersect {}){opaque} + {callers})", in_universe(&providers), in_universe(&candidates));
-        let configured = self.configured_children(graph, &expression, version)?;
-        if !roots.iter().all(|root| configured.contains_key(root)) {
+        let configured = self.configured_children(&graph, &expression, version)?;
+        if let Some(root) = roots.iter().find(|root| !configured.contains_key(*root)) {
+            eprintln!("[Warn] retaining inferred external dependencies because the configured query did not return {root}");
             return Ok(ExtensionInputs::default());
         }
         let mut missing = BTreeSet::new();
@@ -569,12 +608,7 @@ impl BazelOptions {
             }
         }
         if !missing.is_empty() {
-            let expression = format!(
-                "let d = deps({}) in $d + buildfiles($d)",
-                query_set(&missing)?
-            );
-            result.sources =
-                self.query_with(&expression, false, Some(version), false, &mut |_, _| {})?;
+            result.sources = self.ordinary_dependency_inputs(&missing, version)?;
             let spellings: HashMap<_, _> = result
                 .sources
                 .iter()
@@ -597,5 +631,14 @@ impl BazelOptions {
                 .collect();
         }
         Ok(result)
+    }
+
+    fn ordinary_dependency_inputs(
+        &self,
+        names: &BTreeSet<String>,
+        version: BazelVersion,
+    ) -> Result<Vec<Target>> {
+        let expression = format!("let d = deps({}) in $d + buildfiles($d)", query_set(names)?);
+        self.query_with(&expression, false, Some(version), false, &mut |_, _| {})
     }
 }

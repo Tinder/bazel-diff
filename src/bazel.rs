@@ -9080,6 +9080,7 @@ exit 1
         use crate::model::impacted_targets;
 
         const APP: &str = "@pypi//:app";
+        const ALIAS: &str = "@pypi//extra:lookup";
         const BRIDGE: &str = "@rules_python//:bridge";
         const SIBLING: &str = "rules_python++pip+pypi_312_six";
         const DATA: &str = "@@rules_python++pip+pypi_312_six//:data";
@@ -9127,19 +9128,24 @@ exit 1
             &dir.join("query-result.pb"),
             &[
                 rule(CLIENT, &[APP]),
-                rule(DATA_CLIENT, &[BRIDGE]),
+                rule(DATA_CLIENT, &[ALIAS]),
                 rule(APP, &["@rules_python//:wrapper"]),
                 rule(SDK, &["//:version"]),
                 version,
             ],
         );
+        // The fine repository's alias is referenced by a main rule but was not in the
+        // primary response. Its selected actual forwards data from the generated sibling.
+        let mut alias = rule(ALIAS, &[BRIDGE]);
+        alias.rule.as_option_mut().unwrap().rule_class = "alias".into();
         write_delimited(
             &dir.join("selected-inputs.pb"),
-            &[rule(BRIDGE, &[DATA]), rule(DATA, &[])],
+            &[alias, rule(BRIDGE, &[DATA]), rule(DATA, &[])],
         );
         let edges = [
             (CLIENT, APP),
-            (DATA_CLIENT, BRIDGE),
+            (DATA_CLIENT, ALIAS),
+            (ALIAS, BRIDGE),
             (BRIDGE, DATA),
             (APP, SDK),
         ];
@@ -9167,6 +9173,7 @@ exit 1
         let hashes = || generate_hashes(&options).unwrap();
         let base = hashes();
         assert!(base.dep_edges[APP].iter().any(|input| input == SDK));
+        assert!(base.dep_edges[ALIAS].iter().any(|input| input == BRIDGE));
         assert!(base.dep_edges[BRIDGE].iter().any(|input| input == DATA));
         let changed = |before: &crate::model::HashFileData, after: &crate::model::HashFileData| {
             impacted_targets(&before.hashes, &after.hashes, None, false)

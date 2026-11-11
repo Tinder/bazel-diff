@@ -16,6 +16,7 @@ def _generate(ctx):
 generate = rule(
     implementation = _generate,
     attrs = {
+        "data": attr.label(allow_files = True),
         "fail_analysis": attr.bool(),
         "type_label": attr.label(),
     },

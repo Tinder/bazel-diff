@@ -522,6 +522,7 @@ crate(name = "data", srcs = ["@@ext++crates+crates__b//:lib"], visibility = ["//
             format!(
                 r#"{build}
 genrule(name = "copy", srcs = ["@ext//:data"], outs = ["copied.txt"], cmd = "cp $< $@")
+filegroup(name = "unavailable", srcs = ["@crates//:a"], target_compatible_with = ["@platforms//:incompatible"])
 "#
             )
         });
@@ -531,6 +532,7 @@ genrule(name = "copy", srcs = ["@ext//:data"], outs = ["copied.txt"], cmd = "cp 
     let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained[..2]));
     assert!(impacted.contains("//:copy"), "{impacted:?}");
     assert!(impacted.contains("//:uses_b"), "{impacted:?}");
+    assert!(impacted.contains("//:unavailable"), "{impacted:?}");
     assert!(!impacted.contains("//:uses_a"), "{impacted:?}");
 }
 
@@ -2044,7 +2046,7 @@ toolchain_type(name = "other_type")
 compiler(name = "other_compiler", src = "@tc_impl//:version.txt")
 toolchain(name = "other", toolchain_type = ":other_type", toolchain = ":other_compiler")
 generate(name = "independent")
-generate(name = "unbuildable", fail_analysis = True)
+generate(name = "unbuildable", data = "@tc_impl//:version.txt", fail_analysis = True)
 generate(name = "also_unbuildable", fail_analysis = True, type_label = ":other_type")
 filegroup(name = "unrelated", srcs = ["@unrelated//:partial"])
 filegroup(name = "removed_api", srcs = ["@app//:removed"])

@@ -497,8 +497,14 @@ fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
     });
     let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained));
     assert_eq!(impacted, BTreeSet::from(["//:uses_b".to_owned()]));
+    let registered = has_module_registrations(first.path());
     let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained[..2]));
-    assert_eq!(impacted, BTreeSet::from(["//:uses_b".to_owned()]));
+    let expected = if registered {
+        vec!["//:uses_b"]
+    } else {
+        vec!["//:uses_a", "//:uses_b"]
+    };
+    assert_eq!(impacted, expected.into_iter().map(str::to_owned).collect());
 
     let changed_rule = copy_workspace("extension_spokes_through_owner");
     fs::write(changed_rule.path().join("ext/tool.sh"), "exit 1\n").unwrap();
@@ -532,8 +538,10 @@ filegroup(name = "unavailable", srcs = ["@crates//:a"], target_compatible_with =
     let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained[..2]));
     assert!(impacted.contains("//:copy"), "{impacted:?}");
     assert!(impacted.contains("//:uses_b"), "{impacted:?}");
-    assert!(impacted.contains("//:unavailable"), "{impacted:?}");
-    assert!(!impacted.contains("//:uses_a"), "{impacted:?}");
+    if registered {
+        assert!(!impacted.contains("//:unavailable"), "{impacted:?}");
+        assert!(!impacted.contains("//:uses_a"), "{impacted:?}");
+    }
 }
 
 // Issue #603. Module `ext` owns the `@crates` extension, whose spokes are named after their
@@ -1059,7 +1067,9 @@ fn fine_aliases_track_the_selected_destination_with_fixed_inputs() {
     });
     // The missing filegroup leads back into the already queried public package.
     edit(&root.join("hidden.BUILD"), |text| {
-        format!("{text}\nfilegroup(name = \"round_trip\", srcs = [\"@public//:back\"], visibility = [\"//visibility:public\"])\n")
+        format!(
+            "{text}\nfilegroup(name = \"round_trip\", srcs = [\"@public//:back\"], visibility = [\"//visibility:public\"])\n"
+        )
     });
     let mut snapshots = [Vec::new(), Vec::new()];
     let first = "@hidden//:forward";
@@ -1631,7 +1641,9 @@ fn reports_observed_toolchain_type_references() {
             r#"toolchain_type = "@ext//:toolchain_type""#,
             r#"toolchain_type = ":public_type""#,
         );
-        format!("{text}\nalias(name = \"public_type\", actual = \"@ext//:toolchain_type\")\nfilegroup(name = \"type_holder\", srcs = [\"@ext//:toolchain_type\"])\n")
+        format!(
+            "{text}\nalias(name = \"public_type\", actual = \"@ext//:toolchain_type\")\nfilegroup(name = \"type_holder\", srcs = [\"@ext//:toolchain_type\"])\n"
+        )
     });
     // Stock query exposes ordinary attributes. The action still obtains its
     // compiler version through the resolved ToolchainInfo.
@@ -1787,7 +1799,9 @@ fn parent_transition_reaches_a_toolchain_outside_the_extension() {
                 r#"{module}
 bazel_dep(name = "outside")
 local_path_override(module_name = "outside", path = "outside")
-register_toolchains("@outside//:registration")
+bazel_dep(name = "registrar")
+local_path_override(module_name = "registrar", path = "registrar")
+register_toolchains("@registrar//:registration", "@registrar//other:registration")
 "#
             )
         });
@@ -1838,6 +1852,22 @@ genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "ca
             edges.to_str().unwrap(),
         ],
     );
+    if !has_module_registrations(first.path()) {
+        // Stock ordinary queries cannot name this hidden registration. The
+        // configured-root mode can observe it under the real incoming parent.
+        let selected = diff_local(
+            first.path(),
+            changed.path(),
+            &["--useCquery", "--cqueryRootExpression", "//:switched"],
+        );
+        assert!(
+            selected
+                .iter()
+                .any(|label| label.trim_start_matches('@') == "//:switched"),
+            "{selected:?}"
+        );
+        return;
+    }
     assert!(
         changes
             .iter()
@@ -1854,6 +1884,29 @@ genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "ca
             "{reader}: {inputs:?}"
         );
     }
+    // A declaration can choose a different compiler even when its label,
+    // order, implementation and the implementation's bytes stay fixed.
+    fs::copy(
+        first.path().join("outside/version.txt"),
+        changed.path().join("outside/version.txt"),
+    )
+    .unwrap();
+    let other = "registrar/other/BUILD.bazel";
+    let update = |path: &str| {
+        edit(&changed.path().join(path), |build| {
+            build.replace("@outside//:alternate", "@outside//:other")
+        })
+    };
+    update(other);
+    assert_product(changed.path(), "//:switched", "switched.txt", "outside-1");
+    let args = ["--fineGrainedHashExternalRepos", "@app"];
+    let changes = diff_local(first.path(), changed.path(), &args);
+    assert!(!changes.contains("//:switched"), "{changes:?}");
+    fs::copy(first.path().join(other), changed.path().join(other)).unwrap();
+    update("registrar/BUILD.bazel");
+    assert_product(changed.path(), "//:switched", "switched.txt", "1.0");
+    let changes = diff_local(first.path(), changed.path(), &args);
+    assert!(changes.contains("//:switched"), "{changes:?}");
 }
 
 #[test]
@@ -1891,10 +1944,14 @@ bridge_lib = rule(implementation = _bridge, toolchains = ["@ext//:other_type"])
         )
         .unwrap();
         edit(&root.join("MODULE.bazel"), |module| {
-            format!("{module}\nbazel_dep(name = \"bridge\")\nlocal_path_override(module_name = \"bridge\", path = \"bridge\")\n")
+            format!(
+                "{module}\nbazel_dep(name = \"bridge\")\nlocal_path_override(module_name = \"bridge\", path = \"bridge\")\n"
+            )
         });
         edit(&root.join("ext/BUILD.bazel"), |build| {
-            format!("{build}\ntoolchain_type(name = \"other_type\", visibility = [\"//visibility:public\"])\n")
+            format!(
+                "{build}\ntoolchain_type(name = \"other_type\", visibility = [\"//visibility:public\"])\n"
+            )
         });
         edit(&root.join("ext/defs.bzl"), |defs| {
             format!(
@@ -1920,7 +1977,9 @@ other_lib = rule(
         });
         edit(&root.join("ext/MODULE.bazel"), |module| {
             let module = module.replace("@tc//:all", "@tc//:tc");
-            format!("{module}\nuse_repo(tools, \"tc_impl\")\nregister_toolchains(\"@tc_impl//:other\")\n")
+            format!(
+                "{module}\nuse_repo(tools, \"tc_impl\")\nregister_toolchains(\"@tc_impl//:other\")\n"
+            )
         });
         edit(&root.join("BUILD.bazel"), |build| {
             format!(
@@ -1955,7 +2014,9 @@ genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "ca
     );
     assert!(selected.contains("//:other_reader"), "{selected:?}");
     assert!(selected.contains("//:bridge_reader"), "{selected:?}");
-    assert!(!selected.contains("//:normal"), "{selected:?}");
+    if has_module_registrations(first.path()) {
+        assert!(!selected.contains("//:normal"), "{selected:?}");
+    }
 }
 
 // The generated @app resolves a toolchain also produced by its extension. An
@@ -2030,7 +2091,9 @@ fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
                 fs::write(partial.join("defs.bzl"), "def _partial(ctx):\n    return []\n\npartial = rule(implementation = _partial, attrs = {\"src\": attr.label()})\n").unwrap();
                 fs::write(partial.join("BUILD.bazel"), "load(\":defs.bzl\", \"partial\")\npartial(name = \"reader\", src = \"@unrelated//absent:sdk\")\n").unwrap();
                 edit(&workspace.path().join("MODULE.bazel"), |module| {
-                    format!("{module}\nuse_repo(tools, \"tc_impl\")\nregister_toolchains(\"//:registration\")\nbazel_dep(name = \"unrelated\")\nlocal_path_override(module_name = \"unrelated\", path = \"unrelated\")\n")
+                    format!(
+                        "{module}\nuse_repo(tools, \"tc_impl\")\nregister_toolchains(\"//:registration\")\nbazel_dep(name = \"unrelated\")\nlocal_path_override(module_name = \"unrelated\", path = \"unrelated\")\n"
+                    )
                 });
                 edit(&workspace.path().join("BUILD.bazel"), |build| {
                     format!(
@@ -2106,8 +2169,27 @@ genrule(
             assert!(selected("//:unbuildable"), "{changes:?}");
             assert!(selected("//:read_versions"), "{changes:?}");
             assert!(selected("//partial:reader"), "{changes:?}");
-            assert!(selected("//:removed_api"), "{changes:?}");
-            assert!(!selected("//:uses_app"), "{changes:?}");
+            if has_module_registrations(first.path()) {
+                assert!(selected("//:removed_api"), "{changes:?}");
+            }
+            // Either visible declaration can be added by an incoming transition.
+            // The ordinary snapshot keeps both candidates for this toolchain type.
+            if has_module_registrations(first.path()) {
+                assert!(graph["@app//:lib"].contains("@tc_impl//:impl"));
+                assert!(graph["@app//:lib"].contains("@@ext++tools+tc//:impl"));
+            }
+            assert!(selected("//:uses_app"), "{changes:?}");
+            let precise = diff_local(
+                first.path(),
+                bumped.path(),
+                &["--useCquery", "--cqueryRootExpression", "//:uses_app"],
+            );
+            assert!(
+                !precise
+                    .iter()
+                    .any(|name| name.trim_start_matches('@') == "//:uses_app"),
+                "{precise:?}"
+            );
         }
         if registration.starts_with("register_toolchains") {
             // The assertion is specifically about consumers of @app. The distinct @tc_impl
@@ -2115,7 +2197,9 @@ genrule(
             // This other usage of the same extension is isolated and root-imported.
             for workspace in [&first, &bumped] {
                 edit(&workspace.path().join("MODULE.bazel"), |module| {
-                    format!("{module}\npeer = use_extension(\"@ext//:tools.bzl\", \"tools\", isolate = True)\nuse_repo(peer, peer_tc = \"tc\")\n")
+                    format!(
+                        "{module}\npeer = use_extension(\"@ext//:tools.bzl\", \"tools\", isolate = True)\nuse_repo(peer, peer_tc = \"tc\")\n"
+                    )
                 });
                 fs::write(
                     workspace.path().join(".bazelrc"),
@@ -2158,6 +2242,22 @@ genrule(
             );
         }
     }
+}
+
+fn has_module_registrations(workspace: &std::path::Path) -> bool {
+    let output = std::process::Command::new(bazel())
+        .current_dir(workspace)
+        .args([
+            "mod",
+            "graph",
+            "--output=json",
+            "--include_toolchain_registrations",
+        ])
+        .output()
+        .unwrap();
+    output.status.success()
+        && serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .is_ok_and(|graph| graph["moduleToolchainRegistrations"].is_array())
 }
 
 fn diff_local(
@@ -2276,30 +2376,37 @@ fn ordinary_external_filegroup_consumers() {
         fs::write(root.join("unrelated.txt"), unrelated).unwrap();
         for (mode, query) in [
             ("ordinary", "--bazelCommandOptions=--noproto:locations"),
-            ("projected", "--bazelCommandOptions=--noproto:locations --proto:output_rule_attrs=tags,testonly --proto:include_synthetic_attribute_hash"),
+            (
+                "projected",
+                "--bazelCommandOptions=--noproto:locations --proto:output_rule_attrs=tags,testonly --proto:include_synthetic_attribute_hash",
+            ),
             (
                 "filtered",
                 "--bazelCommandOptions=--noproto:locations --notool_deps --proto:output_rule_attrs=tags,testonly --proto:include_synthetic_attribute_hash",
             ),
         ] {
             let hashes = output.path().join(format!("{state}-{mode}.json"));
-            assert!(generate(
-                root,
-                &hashes,
-                &[
-                    "--fineGrainedHashExternalRepos=@ext",
-                    "--excludeExternalTargets",
-                    query,
-                ]
-            )
-            .status
-            .success());
+            assert!(
+                generate(
+                    root,
+                    &hashes,
+                    &[
+                        "--fineGrainedHashExternalRepos=@ext",
+                        "--excludeExternalTargets",
+                        query,
+                    ]
+                )
+                .status
+                .success()
+            );
             if state != "base" {
                 let before = output.path().join(format!("base-{mode}.json"));
                 let result = output.path().join("impact.txt");
-                assert!(impacted(root, &before, &hashes, &result, &[])
-                    .status
-                    .success());
+                assert!(
+                    impacted(root, &before, &hashes, &result, &[])
+                        .status
+                        .success()
+                );
                 let changed = read_lines(&result);
                 if mode != "filtered" {
                     assert_eq!(

@@ -262,7 +262,9 @@ pub fn generate_verified_hashes(options: &HashOptions) -> Result<HashFileData> {
         || options.bazel.exclude_targets_query.is_some()
         || options.bazel.exclude_external_targets
     {
-        bail!("--verifyConfiguredRoots requires full physical hashes without ignored attributes or excluded targets");
+        bail!(
+            "--verifyConfiguredRoots requires full physical hashes without ignored attributes or excluded targets"
+        );
     }
     generate_hashes_timed_inner(options, true, false).map(|(data, _)| data)
 }
@@ -340,6 +342,19 @@ fn generate_hashes_timed_inner(
             &mut prepare,
         )?
     };
+    for (name, order) in &queried.registration_hashes {
+        if let Some(prepared) = definition_digests
+            .ids
+            .get(name)
+            .and_then(|&id| definition_digests.prepared[id].as_mut())
+        {
+            let mut hash = Sha256::new();
+            hash.update(prepared.definition_digest);
+            hash.update(b"toolchain registration order");
+            hash.update(order);
+            prepared.definition_digest = hash.finalize().into();
+        }
+    }
     let observations = if include_toolchain_inputs {
         match options.bazel.observed_toolchains(
             &queried.targets,
@@ -375,6 +390,7 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
     hash_targets_with_digests(
         options,
         QueriedTargets {
+            registration_hashes: BTreeMap::new(),
             targets,
             verification: None,
             configured_roots: None,
@@ -395,6 +411,7 @@ fn hash_targets_with_digests(
     definition_digests: PreparedRules,
 ) -> Result<(HashFileData, GenerationTimings)> {
     let QueriedTargets {
+        registration_hashes: _,
         targets,
         verification,
         configured_roots,
@@ -807,7 +824,15 @@ fn hash_targets_with_environment(
         } else {
             RepositoryViews::default()
         };
-        rules.prepare_inputs(fine, mapping, &views);
+        rules.prepare_inputs(
+            fine,
+            mapping,
+            &views,
+            &source_hasher
+                .external_resolver
+                .scoped_sources
+                .toolchain_declarations,
+        );
     }
 
     let mut label_instances = None;
@@ -1897,6 +1922,7 @@ impl Labels {
         fine: &BTreeSet<String>,
         mapping: &HashMap<String, String>,
         views: &RepositoryViews<'_>,
+        declarations: &BTreeMap<String, BTreeSet<String>>,
     ) {
         let empty = HashMap::new();
         let canonical_fine = fine.iter().any(|repo| repo.starts_with("@@"));
@@ -1906,13 +1932,17 @@ impl Labels {
             .enumerate()
             .filter_map(|(index, slot)| {
                 let node = Rc::get_mut(slot.rule.as_mut()?)?;
-                Some((index, std::mem::take(&mut node.rule.rule_input)))
+                Some((
+                    index,
+                    std::mem::take(&mut node.rule.rule_input),
+                    declarations.get(&node.rule.name),
+                ))
             })
             .collect();
         let ids = &self.ids;
         let prepared = hash_pool().install(|| {
             work.into_par_iter()
-                .map(|(index, mut inputs)| {
+                .map(|(index, mut inputs, declarations)| {
                     let canonical = if needs_repo_nodes(&inputs, canonical_fine) {
                         mapping
                     } else {
@@ -1932,6 +1962,10 @@ impl Labels {
                             inputs.push(synthetic);
                         }
                     }
+                    // These are returned definitions of the actual candidate declarations.
+                    // An unrelated BUILD edit elsewhere in their repository cannot change
+                    // eligibility. Authored inputs above retain their usual repository coverage.
+                    inputs.extend(declarations.into_iter().flatten().cloned());
                     inputs.sort_unstable();
                     inputs.dedup();
                     let positions = inputs
@@ -2732,7 +2766,7 @@ fn repository_input_digest(
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("inspecting repository input {label} at {}", path.display())
-            })
+            });
         }
     }
     Ok(digest.finalize().into())
@@ -3621,7 +3655,7 @@ impl SourceHasher<'_> {
                             Err(e) => {
                                 return Err(e).with_context(|| {
                                     format!("failed to inspect source {} ({label})", path.display())
-                                })
+                                });
                             }
                         }
                     }
@@ -5298,7 +5332,7 @@ esac
         let qualified = labels.bind_alias_sources(&aliases, &observed, &fine, &mapping);
         let views = labels.repository_views(&qualified, &fine, &mapping, &mut targets);
         let definition = views[&labels.ids["@hub//:file"]][file].to_string();
-        labels.prepare_inputs(&fine, &mapping, &views);
+        labels.prepare_inputs(&fine, &mapping, &views, &BTreeMap::new());
         let node = |name| labels.get(name).unwrap().rule.as_ref().unwrap();
         assert_eq!(
             node("@hub//:file").rule.rule_input,
@@ -5499,7 +5533,7 @@ esac
             &mut qualified,
         );
         let views = labels.repository_views(&qualified, &fine, &mapping, &mut targets);
-        labels.prepare_inputs(&fine, &mapping, &views);
+        labels.prepare_inputs(&fine, &mapping, &views, &BTreeMap::new());
         let definition = repository_definition_label(repository);
         for name in names {
             let mut expected = original[name].clone();
@@ -5571,7 +5605,7 @@ esac
         let qualified = labels.bind_alias_sources(&aliases, &observed, &fine, &mapping);
         let views = labels.repository_views(&qualified, &fine, &mapping, &mut targets);
         assert!(views.is_empty());
-        labels.prepare_inputs(&fine, &mapping, &views);
+        labels.prepare_inputs(&fine, &mapping, &views, &BTreeMap::new());
         let repository = labels.get(repository).unwrap().rule.as_ref().unwrap();
         assert!(repository
             .prepared
@@ -5664,7 +5698,7 @@ esac
             let qualified =
                 QualifiedInputs::from([(labels.ids["@hub//:file"], BTreeSet::from([file]))]);
             let views = labels.repository_views(&qualified, &fine, &mapping, &mut targets);
-            labels.prepare_inputs(&fine, &mapping, &views);
+            labels.prepare_inputs(&fine, &mapping, &views, &BTreeMap::new());
             let inputs = |name: &str| {
                 &labels
                     .get(name)
@@ -5755,7 +5789,12 @@ esac
             };
             labels.slot(name.to_owned()).rule = Some(Rc::new(RuleNode::new(rule, prepared)));
         }
-        labels.prepare_inputs(&fine, &canonical, &RepositoryViews::default());
+        labels.prepare_inputs(
+            &fine,
+            &canonical,
+            &RepositoryViews::default(),
+            &BTreeMap::new(),
+        );
         let inputs = |name| {
             &labels
                 .get(name)

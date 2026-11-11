@@ -23,20 +23,6 @@ use tempfile::NamedTempFile;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct BazelVersion(u32, u32, u32);
 
-#[derive(Debug)]
-struct QueryFailure {
-    code: i32,
-    message: String,
-}
-
-impl std::fmt::Display for QueryFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for QueryFailure {}
-
 /// The flag that decides whether the `//external` package exists.
 const WORKSPACE_FLAG: &str = "enable_workspace";
 
@@ -540,7 +526,9 @@ impl BazelOptions {
         if let Some(root) = &self.isolated_dependency_root {
             if !supports_bzlmod {
                 let BazelVersion(major, minor, patch) = version.expect("checked version");
-                bail!("--isolatedDependencyRoot={root}: Bazel {major}.{minor}.{patch} does not support Bzlmod repository discovery");
+                bail!(
+                    "--isolatedDependencyRoot={root}: Bazel {major}.{minor}.{patch} does not support Bzlmod repository discovery"
+                );
             }
             if !bzlmod_enabled {
                 bail!(
@@ -748,9 +736,13 @@ impl BazelOptions {
                     return Err(error).context("failed to acquire ordinary alias inputs");
                 }
                 primary_rules.alias_discovery_failed = true;
-                eprintln!("[Warn] keeping ordinary repository fallbacks for incomplete alias discovery: {error:#}");
+                eprintln!(
+                    "[Warn] keeping ordinary repository fallbacks for incomplete alias discovery: {error:#}"
+                );
             }
         }
+        let mut registration_hashes = BTreeMap::new();
+        let mut toolchain_declarations = BTreeMap::new();
         if let Some(mut defs) = definitions {
             let repos = defs.lower(self, &canonical_to_apparent, std::convert::identity);
             let mut observed = BTreeSet::new();
@@ -782,6 +774,8 @@ impl BazelOptions {
                             }
                         }
                         observed = inputs.usages;
+                        registration_hashes = inputs.registration_hashes;
+                        toolchain_declarations = inputs.declarations;
                     }
                     Err(error) => {
                         self.check_cancelled()?;
@@ -802,6 +796,7 @@ impl BazelOptions {
             &canonical_to_apparent,
         )?;
         Ok(QueriedTargets {
+            registration_hashes,
             targets,
             verification,
             configured_roots,
@@ -810,6 +805,7 @@ impl BazelOptions {
             root_mapping,
             output_base: server_info.output_base,
             scoped_sources: ScopedSources {
+                toolchain_declarations,
                 repositories: scope
                     .aliases
                     .into_iter()
@@ -1095,7 +1091,9 @@ impl BazelOptions {
                 }
                 Err(error) => {
                     self.check_cancelled()?;
-                    eprintln!("[Warn] retaining repository inputs of unobserved filegroup parents: {error:#}");
+                    eprintln!(
+                        "[Warn] retaining repository inputs of unobserved filegroup parents: {error:#}"
+                    );
                 }
             }
         }
@@ -1588,7 +1586,9 @@ impl BazelOptions {
                 }
                 Err(error) => {
                     self.check_cancelled()?;
-                    eprintln!("[Warn] retaining prior BUILD loading inputs after query failure: {error:#}");
+                    eprintln!(
+                        "[Warn] retaining prior BUILD loading inputs after query failure: {error:#}"
+                    );
                 }
             }
         }
@@ -2116,7 +2116,9 @@ impl BazelOptions {
             ) {
                 Ok(mappings) => mappings,
                 Err(error) if !hidden_module_repos.is_empty() => {
-                    eprintln!("[Warn] {error:#}; enumerating extension repositories from the root-visible modules only");
+                    eprintln!(
+                        "[Warn] {error:#}; enumerating extension repositories from the root-visible modules only"
+                    );
                     complete_mappings = false;
                     self.dump_repo_mappings(&visible_module_repos, failed, &mut complete_mappings)?
                 }
@@ -2523,6 +2525,16 @@ impl BazelOptions {
         root_mapping: Option<&[u8]>,
         track_readers: bool,
     ) -> Result<crate::toolchain_candidates::ObservedToolchains> {
+        self.observed_toolchain_rows(targets.iter(), &[], root_mapping, track_readers)
+    }
+
+    fn observed_toolchain_rows<'a>(
+        &self,
+        targets: impl Clone + Iterator<Item = &'a Target>,
+        registered: &[Target],
+        root_mapping: Option<&[u8]>,
+        track_readers: bool,
+    ) -> Result<crate::toolchain_candidates::ObservedToolchains> {
         use crate::toolchain_candidates::{Declaration, ObservedToolchains};
         let mapping = root_mapping
             .map(|raw| crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(raw)))
@@ -2530,7 +2542,7 @@ impl BazelOptions {
         let canon = |s: &str| canonical_query_label(s, &mapping).into_owned();
         let rows = || {
             targets
-                .iter()
+                .clone()
                 .filter_map(|row| row.rule.as_option())
                 .filter(|r| !main_repo_label_key(&r.name).starts_with("//external:"))
         };
@@ -2539,9 +2551,15 @@ impl BazelOptions {
             readers: track_readers.then(BTreeMap::new),
             ..Default::default()
         };
+        let supplied: BTreeSet<_> = registered
+            .iter()
+            .filter_map(target_name)
+            .map(canon)
+            .collect();
         let names: BTreeSet<_> = rows()
             .filter(|r| r.rule_class == "toolchain")
             .map(|r| canon(&r.name))
+            .chain(supplied.iter().cloned())
             .collect();
         let mut types: BTreeSet<_> = rows()
             .filter(|r| r.rule_class == "toolchain_type")
@@ -2569,8 +2587,10 @@ impl BazelOptions {
             let expression = self.with_exclude_filter(names);
             metadata.query_with(&expression, false, version, false, &mut |_, _| {})
         };
-        for row in read(&names)? {
-            let Some(rule) = row.rule.into_option() else {
+        let missing = names.difference(&supplied).cloned().collect();
+        let ordinary = read(&missing)?;
+        for row in registered.iter().chain(&ordinary) {
+            let Some(rule) = row.rule.as_option() else {
                 continue;
             };
             let id = canon(&rule.name);
@@ -2836,8 +2856,9 @@ impl BazelOptions {
         capture: CqueryCapture<'_>,
         retain: impl FnMut(&Target) -> bool,
     ) -> Result<QueryGraph> {
+        let available_inputs = matches!(capture, CqueryCapture::AvailableOrdinaryInputs);
         let (mut roots, verify) = match capture {
-            CqueryCapture::Standard => (None, false),
+            CqueryCapture::Standard | CqueryCapture::AvailableOrdinaryInputs => (None, false),
             CqueryCapture::Roots(roots) => (Some(roots), false),
             CqueryCapture::Verification => (None, true),
         };
@@ -2847,7 +2868,7 @@ impl BazelOptions {
             None => self.version()?,
         };
         let compatible = if use_cquery && !verify {
-            Some(self.query_compatible_labels(expression, version, false)?)
+            Some(self.query_compatible_labels(expression, version)?)
         } else {
             None
         };
@@ -2925,16 +2946,14 @@ impl BazelOptions {
         let code = output.status.code().unwrap_or(-1);
         // A formatter can emit its completion marker before a keep-going query returns 3.
         // Verification requires command success; ordinary partial positives keep their policy.
-        let partial = self.keep_going && code == 3 && !verify;
+        let partial = self.keep_going
+            && !verify
+            && (code == 3 || (available_inputs && matches!(code, 1 | 7)));
         if code != 0 && !partial {
-            return Err(QueryFailure {
-                code,
-                message: format!(
-                    "Bazel query failed, exit code {code}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            }
-            .into());
+            bail!(
+                "Bazel query failed, exit code {code}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         if !output.stderr.is_empty() {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
@@ -2979,7 +2998,6 @@ impl BazelOptions {
         &self,
         expression: &str,
         version: BazelVersion,
-        available_readers: bool,
     ) -> Result<HashSet<String>> {
         let output = self
             .query_formatted(
@@ -3001,17 +3019,11 @@ impl BazelOptions {
                 version,
             )
             .context("execute compatible-target cquery")?;
-        if !(output.status.success()
-            || (available_readers && matches!(output.status.code(), Some(1 | 3 | 7))))
-        {
-            return Err(QueryFailure {
-                code: output.status.code().unwrap_or(-1),
-                message: format!(
-                    "compatible-target cquery failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            }
-            .into());
+        if !output.status.success() {
+            bail!(
+                "compatible-target cquery failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         Ok(std::str::from_utf8(&output.stdout)
             .context("decode compatible target labels")?
@@ -3335,7 +3347,10 @@ fn retain_supplemental_targets(extra: &mut Vec<Target>, primary: &[Target]) {
 
 impl IsolatedRepoScope {
     fn expression(&self, ordinary: &str) -> String {
-        format!("let members = deps('@{}//...:all-targets') in ({ordinary}) + $members + buildfiles($members)", self.anchor)
+        format!(
+            "let members = deps('@{}//...:all-targets') in ({ordinary}) + $members + buildfiles($members)",
+            self.anchor
+        )
     }
 
     fn canonical(&self, label: &str) -> Option<String> {
@@ -3776,6 +3791,8 @@ fn mod_argument_byte_budget_from(setting: Option<&str>) -> usize {
 
 #[derive(Clone, Default)]
 pub(crate) struct ScopedSources {
+    /// Positive registration definitions and their forwarding aliases for observed rule types.
+    pub(crate) toolchain_declarations: BTreeMap<String, BTreeSet<String>>,
     pub(crate) repositories: BTreeSet<String>,
     pub(crate) repository_inputs: BTreeSet<String>,
     pub(crate) queried_files: HashSet<String>,
@@ -3855,6 +3872,7 @@ impl AliasSource {
 
 /// Targets with the accepted module graph and successful unfiltered root mapping from discovery.
 pub(crate) struct QueriedTargets {
+    pub registration_hashes: BTreeMap<String, [u8; 32]>,
     pub(crate) targets: Vec<Target>,
     pub(crate) verification: Option<VerifiedQuery>,
     pub(crate) configured_roots: Option<BTreeMap<String, String>>,
@@ -3906,6 +3924,7 @@ impl QueryGraph {
 
 enum CqueryCapture<'a> {
     Standard,
+    AvailableOrdinaryInputs,
     Roots(&'a mut Vec<(String, String)>),
     Verification,
 }
@@ -5276,7 +5295,9 @@ impl CqueryDecoder {
         }
         self.flush(transform);
         if let Some(label) = &self.ambiguous_label {
-            bail!("configured target {label} has a bare label ambiguous with the configured-key encoding");
+            bail!(
+                "configured target {label} has a bare label ambiguous with the configured-key encoding"
+            );
         }
         if self.verify
             && !self.invalid_explicit_aspect_marker
@@ -9086,6 +9107,10 @@ if [ "$1 $2" = "info output_base" ]; then
   pwd
   exit 0
 fi
+if [ -f registered.pb ] && echo "$args" | grep -q -- --include_toolchain_registrations; then
+  echo '{{"moduleToolchainRegistrations":["//:registration"]}}'
+  exit 0
+fi
 if echo "$args" | grep -q "mod graph --output=json"; then
   if [ -f omit-graph-hint ]; then
     echo '{{"key":"<root>","name":"root","dependencies":[{{"key":"rules_go@0.62.0","name":"rules_go","dependencies":[]}}]}}'
@@ -9139,17 +9164,16 @@ for arg do
   esac
   previous=$arg
 done
-if [ "$1" = cquery ]; then
-  response=configured.pb
-  if [ -n "$formatter" ]; then
-    response=compatible.txt
-    if grep -q ToolchainInfo "$formatter"; then response=providers.txt; fi
+if [ -f reader.dot ] && echo "$args" | grep -q -- '--output=graph'; then
+  cat reader.dot
+  exit 0
+fi
+if [ -f registered.pb ]; then
+  if grep -q '^set(' "$expression" && grep -q '//:registration' "$expression"; then
+    response=registered.pb
+  elif grep -q '^let d = ' "$expression"; then
+    if grep -q '//:sdk' "$expression"; then response=ordinary-sdk.pb; else response=forwarded.pb; fi
   fi
-elif [ -f selected-inputs.pb ] && grep -q '^let d = deps(' "$expression"; then
-  if grep -q '//:sdk' "$expression"; then exit 7; fi
-  response=selected-inputs.pb
-elif [ -f ordinary-sdk.pb ] && grep -q '^let d = set(' "$expression"; then
-  response=ordinary-sdk.pb
 fi
 if [ -n "$output" ]; then cp "$response" "$output"; exit $?; fi
 exit 1
@@ -9164,7 +9188,7 @@ exit 1
 
     #[test]
     #[cfg(unix)]
-    fn ordinary_hashes_follow_configured_toolchains_and_files_through_an_external_rule() {
+    fn ordinary_hashes_follow_registered_toolchains_and_files_through_an_external_rule() {
         use crate::hash::{generate_hashes, HashOptions};
         use crate::model::impacted_targets;
 
@@ -9213,55 +9237,58 @@ exit 1
             }),
             ..Default::default()
         };
+        let mut registration = rule("//:registration", &["//:toolchain_type"]);
+        let declared = registration.rule.as_option_mut().unwrap();
+        declared.rule_class = "toolchain".into();
+        declared.rule_class_key = Some("toolchain".into());
+        declared.attribute = [("toolchain", SDK), ("toolchain_type", "//:toolchain_type")]
+            .into_iter()
+            .map(|(name, value)| Attribute {
+                name: name.into(),
+                r#type: attribute::Discriminator::Label,
+                string_value: Some(value.into()),
+                ..Default::default()
+            })
+            .collect();
+        write_delimited(
+            &dir.join("registered.pb"),
+            std::slice::from_ref(&registration),
+        );
         write_delimited(
             &dir.join("query-result.pb"),
             &[
                 rule(CLIENT, &[APP]),
                 rule(DATA_CLIENT, &[ALIAS, "@rules_python//:wrapper"]),
                 rule(APP, &["@rules_python//:wrapper"]),
+                registration,
                 version,
             ],
         );
         // The fine repository's alias is referenced by a main rule but was not in the
         // primary response. Its selected actual forwards data from the generated sibling.
-        write_delimited(
-            &dir.join("ordinary-sdk.pb"),
-            &[rule(SDK, &["//:version", "@other//:unused"])],
-        );
+        write_delimited(&dir.join("ordinary-sdk.pb"), &[rule(SDK, &["//:version"])]);
         let mut alias = rule(ALIAS, &[BRIDGE]);
         alias.rule.as_option_mut().unwrap().rule_class = "alias".into();
         write_delimited(
-            &dir.join("selected-inputs.pb"),
+            &dir.join("forwarded.pb"),
             &[alias, rule(BRIDGE, &[DATA]), rule(DATA, &[])],
         );
-        let edges = [
-            (CLIENT, APP),
-            (DATA_CLIENT, ALIAS),
-            (ALIAS, BRIDGE),
-            (BRIDGE, DATA),
-            (APP, SDK),
-            (SDK, "//:version"),
-        ];
-        let rows = edges
-            .iter()
-            .map(|(parent, child)| {
-                let mut row = rule_target(parent);
-                row.rule
-                    .as_option_mut()
-                    .unwrap()
-                    .configured_rule_input
-                    .push(ConfiguredRuleInput {
-                        label: Some((*child).into()),
-                        configuration_id: Some(1),
-                        ..Default::default()
-                    });
-                configured(row, Some("abc123"), 1)
-            })
-            .collect::<Vec<_>>();
-        write_delimited(&dir.join("configured.pb"), &[results(rows)]);
-        fs::write(dir.join("providers.txt"), SDK).unwrap();
-        let compatible = dir.join("compatible.txt");
-        fs::write(&compatible, edges.map(|(parent, _)| parent).join("\n")).unwrap();
+        // The stock loading graph includes this class's implicit toolchain
+        // type even though ordinary rule_input omits it.
+        let mut dot = String::from("digraph mygraph {\n");
+        for label in [
+            CLIENT,
+            DATA_CLIENT,
+            APP,
+            BRIDGE,
+            ALIAS,
+            DATA,
+            "//:registration",
+        ] {
+            dot.push_str(&format!("\"{label}\"\n"));
+        }
+        dot.push_str(&format!("\"{APP}\" -> \"//:toolchain_type\"\n}}"));
+        fs::write(dir.join("reader.dot"), dot).unwrap();
         fs::write(dir.join("version"), "1").unwrap();
         let hashes = || generate_hashes(&options).unwrap();
         let base = hashes();
@@ -9289,13 +9316,16 @@ exit 1
         write_delimited(&dir.join("show-repo.pb"), &repos);
         assert_eq!(changed(&base, &hashes()), [DATA_CLIENT]);
 
-        // A missing caller in the configured response preserves the legacy owner/hub paths.
-        fs::write(compatible, [DATA_CLIENT, APP, BRIDGE].join("\n")).unwrap();
-        let partial = hashes();
-        assert!(!partial.dep_edges.contains_key(ALIAS));
+        // Without the producer field the ordinary snapshot retains legacy
+        // owner membership, protecting callers of hidden registrations.
+        fs::remove_file(dir.join("registered.pb")).unwrap();
+        let legacy = hashes();
         repos[2].attribute.clear();
         write_delimited(&dir.join("show-repo.pb"), &repos);
-        assert_eq!(changed(&partial, &hashes()), [CLIENT, DATA_CLIENT]);
+        let changes = changed(&legacy, &hashes());
+        assert!(changes.contains(&CLIENT.to_owned()), "{changes:?}");
+        let calls = fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert!(!calls.lines().any(|line| line.starts_with("cquery ")));
     }
 
     #[test]

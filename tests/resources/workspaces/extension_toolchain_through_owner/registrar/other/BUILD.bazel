@@ -1,0 +1,7 @@
+toolchain(
+    name = "registration",
+    target_compatible_with = ["@outside//:alternate"],
+    toolchain = "@outside//:impl",
+    toolchain_type = "//:other_type",
+    visibility = ["//visibility:public"],
+)

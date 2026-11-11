@@ -9044,13 +9044,25 @@ if echo "$args" | grep -q "mod show_repo"; then
   cat "{repos}"
   exit 0
 fi
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--output_file" ]; then
-    cp "{query}" "$2"
-    exit 0
-  fi
-  shift
+response="{query}"
+for arg do
+  case "$previous" in
+    --output_file) output=$arg ;;
+    --query_file) expression=$arg ;;
+    --starlark:file) formatter=$arg ;;
+  esac
+  previous=$arg
 done
+if [ "$1" = cquery ]; then
+  response=configured.pb
+  if [ -n "$formatter" ]; then
+    response=compatible.txt
+    if grep -q ToolchainInfo "$formatter"; then response=providers.txt; fi
+  fi
+elif [ -f selected-inputs.pb ] && grep -q '^let d = deps(' "$expression"; then
+  response=selected-inputs.pb
+fi
+if [ -n "$output" ]; then cp "$response" "$output"; exit $?; fi
 exit 1
 "#,
             calls = calls.display(),
@@ -9059,6 +9071,130 @@ exit 1
         );
         fs::write(&script, body).unwrap();
         script
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ordinary_hashes_follow_configured_toolchains_and_files_through_an_external_rule() {
+        use crate::hash::{generate_hashes, HashOptions};
+        use crate::model::impacted_targets;
+
+        const APP: &str = "@pypi//:app";
+        const BRIDGE: &str = "@rules_python//:bridge";
+        const SIBLING: &str = "rules_python++pip+pypi_312_six";
+        const DATA: &str = "@@rules_python++pip+pypi_312_six//:data";
+        const CLIENT: &str = "//:uses_app";
+        const DATA_CLIENT: &str = "//:uses_data";
+        const SDK: &str = "//:sdk";
+        let workspace = tempfile::tempdir().unwrap();
+        let dir = workspace.path();
+        let mut repos: Vec<_> = ["rules_python+", "rules_python++pip+pypi", SIBLING]
+            .into_iter()
+            .map(|name| Repository {
+                canonical_name: Some(name.into()),
+                repo_rule_name: Some("http_archive".into()),
+                ..Default::default()
+            })
+            .collect();
+        let script = extension_flow_script(dir, &repos, None);
+        let mut bazel = probe_options(dir, script);
+        bazel.fine_grained_external_repos.insert("@pypi".into());
+        let options = HashOptions {
+            bazel,
+            content_hashes: None,
+            ignored_attributes: Default::default(),
+            seed_filepaths: Default::default(),
+            modified_filepaths: Default::default(),
+            track_deps: true,
+            always_affected_tags: Default::default(),
+            partial_tree: None,
+        };
+        let rule = |name: &str, inputs: &[&str]| {
+            let mut target = rule_target(name);
+            target.rule.as_option_mut().unwrap().rule_input =
+                inputs.iter().map(|name| (*name).to_owned()).collect();
+            target
+        };
+        let version = Target {
+            r#type: target::Discriminator::SourceFile,
+            source_file: buffa::MessageField::some(SourceFile {
+                name: "//:version".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        write_delimited(
+            &dir.join("query-result.pb"),
+            &[
+                rule(CLIENT, &[APP]),
+                rule(DATA_CLIENT, &[BRIDGE]),
+                rule(APP, &["@rules_python//:wrapper"]),
+                rule(SDK, &["//:version"]),
+                version,
+            ],
+        );
+        write_delimited(
+            &dir.join("selected-inputs.pb"),
+            &[rule(BRIDGE, &[DATA]), rule(DATA, &[])],
+        );
+        let edges = [
+            (CLIENT, APP),
+            (DATA_CLIENT, BRIDGE),
+            (BRIDGE, DATA),
+            (APP, SDK),
+        ];
+        let rows = edges
+            .iter()
+            .map(|(parent, child)| {
+                let mut row = rule_target(parent);
+                row.rule
+                    .as_option_mut()
+                    .unwrap()
+                    .configured_rule_input
+                    .push(ConfiguredRuleInput {
+                        label: Some((*child).into()),
+                        configuration_id: Some(1),
+                        ..Default::default()
+                    });
+                configured(row, Some("abc123"), 1)
+            })
+            .collect::<Vec<_>>();
+        write_delimited(&dir.join("configured.pb"), &[results(rows)]);
+        fs::write(dir.join("providers.txt"), SDK).unwrap();
+        let compatible = dir.join("compatible.txt");
+        fs::write(&compatible, edges.map(|(parent, _)| parent).join("\n")).unwrap();
+        fs::write(dir.join("version"), "1").unwrap();
+        let hashes = || generate_hashes(&options).unwrap();
+        let base = hashes();
+        assert!(base.dep_edges[APP].iter().any(|input| input == SDK));
+        assert!(base.dep_edges[BRIDGE].iter().any(|input| input == DATA));
+        let changed = |before: &crate::model::HashFileData, after: &crate::model::HashFileData| {
+            impacted_targets(&before.hashes, &after.hashes, None, false)
+                .unwrap()
+                .into_iter()
+                .filter(|label| label == CLIENT || label == DATA_CLIENT)
+                .collect::<Vec<_>>()
+        };
+        fs::write(dir.join("version"), "2").unwrap();
+        assert_eq!(changed(&base, &hashes()), [CLIENT]);
+        fs::write(dir.join("version"), "1").unwrap();
+
+        // A sibling RepoSpec changes without changing the SDK that the application consumes.
+        repos[2].attribute.push(Attribute {
+            name: "sha256".into(),
+            r#type: attribute::Discriminator::String,
+            string_value: Some("a".repeat(64)),
+            ..Default::default()
+        });
+        write_delimited(&dir.join("show-repo.pb"), &repos);
+        assert_eq!(changed(&base, &hashes()), [DATA_CLIENT]);
+
+        // A missing caller in the configured response preserves the legacy owner/hub paths.
+        fs::write(compatible, [DATA_CLIENT, APP, BRIDGE].join("\n")).unwrap();
+        let partial = hashes();
+        repos[2].attribute.clear();
+        write_delimited(&dir.join("show-repo.pb"), &repos);
+        assert_eq!(changed(&partial, &hashes()), [CLIENT, DATA_CLIENT]);
     }
 
     #[test]

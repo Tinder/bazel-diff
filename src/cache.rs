@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 pub const FINE_ALIAS_INPUTS_VERSION: u32 = 14;
+pub const LOCAL_ARCHIVE_BUILD_FILE_VERSION: u32 = 2;
 
 /// Digests the hash-affecting configuration: the package version, every query and hashing
 /// option, whether dependency edges are recorded, and, only when on, partial-graph mode (its
@@ -94,7 +95,7 @@ pub fn configuration_fingerprint(
         hasher.update(b"queryToolchainImplementations=1\0");
     }
     hasher.update(b"stackSourcePaths=1\0");
-    hasher.update(b"localArchiveBuildFile=1\0");
+    hasher.update(format!("localArchiveBuildFile={LOCAL_ARCHIVE_BUILD_FILE_VERSION}\0").as_bytes());
     if !options.bazel.use_cquery
         && !options.bazel.fine_grained_external_repos.is_empty()
         && options.bazel.isolated_dependency_root.is_none()

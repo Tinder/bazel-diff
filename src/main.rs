@@ -815,7 +815,10 @@ fn fingerprint_flags(
         ("keepGoing".into(), args.keep_going.to_string()),
         ("cycleComponents".into(), "1".into()),
         ("stackSourcePaths".into(), "1".into()),
-        ("localArchiveBuildFile".into(), "1".into()),
+        (
+            "localArchiveBuildFile".into(),
+            bazel_diff::cache::LOCAL_ARCHIVE_BUILD_FILE_VERSION.to_string(),
+        ),
     ]);
     if !args.use_cquery && !fine_grained_repos.is_empty() && args.isolated_dependency_root.is_none()
     {
@@ -2402,7 +2405,8 @@ mod tests {
         let first: serde_json::Value = serde_json::from_slice(&fs::read(first).unwrap()).unwrap();
         let second: serde_json::Value = serde_json::from_slice(&fs::read(second).unwrap()).unwrap();
         assert!(first.get("fingerprint").is_some());
-        assert!(first.get("flags").is_some());
+        assert_eq!(first["flags"]["localArchiveBuildFile"], "2");
+        assert_eq!(second["flags"]["localArchiveBuildFile"], "2");
         assert!(first.get("components").is_some());
         assert_ne!(first["fingerprint"], second["fingerprint"]);
     }

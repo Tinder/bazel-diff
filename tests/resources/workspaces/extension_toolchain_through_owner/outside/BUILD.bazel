@@ -1,0 +1,21 @@
+load("@ext//:defs.bzl", "tool")
+
+constraint_setting(name = "mode")
+
+constraint_value(name = "alternate", constraint_setting = ":mode")
+
+platform(
+    name = "platform",
+    constraint_values = [":alternate"],
+    visibility = ["//visibility:public"],
+)
+
+tool(name = "impl", version = "outside-1")
+
+toolchain(
+    name = "registration",
+    target_compatible_with = [":alternate"],
+    toolchain = ":impl",
+    toolchain_type = "@ext//:toolchain_type",
+    visibility = ["//visibility:public"],
+)

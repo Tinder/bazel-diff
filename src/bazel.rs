@@ -1,3 +1,4 @@
+mod toolchain_readers;
 use crate::cancel::{self, Cancellation};
 use crate::proto::analysis::{
     ConfiguredAspect, ConfiguredAspectResult, ConfiguredTarget, CqueryResult,
@@ -408,7 +409,7 @@ impl BazelOptions {
         &self,
         mut transform: impl FnMut(&mut [Target], Option<RepositoryInputs>),
     ) -> Result<QueriedTargets> {
-        self.query_all_targets_encoded(false, |batch, _, inputs, _ordinary_inputs| {
+        self.query_all_targets_encoded(false, false, |batch, _, inputs, _ordinary_inputs| {
             transform(batch, inputs)
         })
     }
@@ -423,6 +424,7 @@ impl BazelOptions {
     pub(crate) fn query_all_targets_encoded(
         &self,
         lean: bool,
+        physical_sources: bool,
         transform: impl FnMut(
             &mut [Target],
             &EncodedTargets<'_>,
@@ -443,9 +445,9 @@ impl BazelOptions {
                 keep_going: false,
                 ..self.clone()
             }
-            .query_all_targets_inner(transform, false, lean);
+            .query_all_targets_inner(transform, false, lean, physical_sources);
         }
-        self.query_all_targets_inner(transform, false, lean)
+        self.query_all_targets_inner(transform, false, lean, physical_sources)
     }
 
     pub(crate) fn query_all_targets_verified_with(
@@ -467,6 +469,7 @@ impl BazelOptions {
             |batch, _, inputs, _ordinary_inputs| transform(batch, inputs),
             true,
             false,
+            false,
         )
     }
 
@@ -480,6 +483,7 @@ impl BazelOptions {
         ),
         verify: bool,
         lean: bool,
+        physical_sources: bool,
     ) -> Result<QueriedTargets> {
         if let Some(root) = &self.isolated_dependency_root {
             if self.use_cquery {
@@ -531,13 +535,7 @@ impl BazelOptions {
             }
         }
         if bzlmod_enabled && supports_bzlmod {
-            let queried = self.query_bzlmod_repos(
-                root_mapping,
-                survey,
-                &mut |target, inputs, ordinary_inputs| {
-                    transform(std::slice::from_mut(target), &[], inputs, ordinary_inputs);
-                },
-            );
+            let queried = self.query_bzlmod_repos(root_mapping, survey);
             let queried = if let Some(root) = &self.isolated_dependency_root {
                 queried.with_context(|| format!("--isolatedDependencyRoot={root}"))
             } else {
@@ -552,7 +550,7 @@ impl BazelOptions {
             }
         }
         let BzlmodRepos {
-            targets: bzlmod_repos,
+            mut definitions,
             mut failed_extensions,
             canonical_to_apparent,
             module_graph_json,
@@ -560,6 +558,24 @@ impl BazelOptions {
             root_mapping,
             scope,
         } = bzlmod;
+        let observe = physical_sources
+            && !self.use_cquery
+            && self.isolated_dependency_root.is_none()
+            && !self.fine_grained_external_repos.is_empty()
+            && root_mapping.is_some();
+        let initial_repositories = if observe {
+            Vec::new()
+        } else {
+            definitions.take().map_or_else(Vec::new, |mut defs| {
+                defs.lower(
+                    self,
+                    &canonical_to_apparent,
+                    &mut |target, inputs, ordinary| {
+                        transform(std::slice::from_mut(target), &[], inputs, ordinary);
+                    },
+                )
+            })
+        };
         let configured_roots = self
             .cquery_root_expression
             .as_deref()
@@ -575,7 +591,7 @@ impl BazelOptions {
             Vec::new()
         } else {
             self.collect_all_targets(
-                bzlmod_repos,
+                initial_repositories,
                 server_info.external_package,
                 |expression, use_cquery| {
                     if let Some(strict) = &strict {
@@ -670,6 +686,7 @@ impl BazelOptions {
             }
             scope.connect_external_readers(&loads, &mut targets, &coverage)?;
         }
+        let primary_len = targets.len();
         let mut alias_sources = HashMap::new();
         let mut filegroups = BTreeMap::new();
         let mut filegroup_sources = BTreeMap::new();
@@ -711,6 +728,75 @@ impl BazelOptions {
                 }
                 eprintln!("[Warn] keeping ordinary repository fallbacks for incomplete alias discovery: {error:#}");
             }
+        }
+        if let Some(mut defs) = definitions {
+            let mut metadata = Vec::new();
+            let mut repos = defs.lower(self, &canonical_to_apparent, &mut |_, group, ordinary| {
+                metadata.push((group, ordinary));
+            });
+            let mut observed = BTreeSet::new();
+            if let Some(mapping) = root_mapping.as_deref() {
+                let survey = (module_graph_complete
+                    && defs.extensions.complete_mappings
+                    && !failed_extensions.observed)
+                    .then_some(&defs.extensions);
+                match self.observe_external_inputs(
+                    &targets,
+                    primary_len,
+                    mapping,
+                    survey,
+                    (&repos, &metadata),
+                    version,
+                ) {
+                    Ok(mut inputs) => {
+                        retain_supplemental_targets(&mut inputs.sources, &targets);
+                        transform(&mut inputs.sources, &[], None, None);
+                        targets.extend(inputs.sources);
+                        for rule in targets
+                            .iter_mut()
+                            .filter_map(|row| row.rule.as_option_mut())
+                        {
+                            if let Some(children) = inputs.bindings.remove(&rule.name) {
+                                rule.rule_input.extend(children);
+                                rule.rule_input.sort_unstable();
+                                rule.rule_input.dedup();
+                            }
+                        }
+                        observed = inputs.usages;
+                    }
+                    Err(error) => {
+                        self.check_cancelled()?;
+                        eprintln!("[Warn] retaining inferred external dependencies: {error:#}");
+                    }
+                }
+            }
+            let mapping = crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(
+                root_mapping.as_deref().unwrap_or_default(),
+            ));
+            for (target, (mut group, ordinary)) in repos.iter_mut().zip(metadata) {
+                let rule = target
+                    .rule
+                    .as_option_mut()
+                    .expect("synthetic repository rule");
+                rule.rule_input.retain(|input| {
+                    !toolchain_readers::removed_membership(
+                        input,
+                        ordinary.as_deref(),
+                        &mapping,
+                        &observed,
+                    )
+                });
+                if group
+                    .as_ref()
+                    .and_then(RepositoryInputs::siblings)
+                    .is_some_and(|siblings| observed.contains(&siblings.extension))
+                {
+                    group = Some(RepositoryInputs::DefinitionOnly);
+                }
+                transform(std::slice::from_mut(target), &[], group, ordinary);
+            }
+            targets.extend(repos);
+            targets = deduplicate_targets(targets)?;
         }
         self.check_failed_extension_references(
             &targets,
@@ -1626,7 +1712,6 @@ impl BazelOptions {
         &self,
         root_mapping: Option<Vec<u8>>,
         survey: ModuleSurvey,
-        transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>, Option<Vec<String>>),
     ) -> Result<BzlmodRepos> {
         let mut failed = FailedExtensions::default();
         // The initial probe returns stdout only on success. The fallback may be partial.
@@ -1743,25 +1828,13 @@ impl BazelOptions {
                 BTreeSet::new()
             },
         };
-        let targets = lower_repositories(
-            repositories,
-            &canonical_to_apparent,
-            ModuleDependencies {
-                edges: &module_edges,
-                mappings: &extension_repos.module_mappings,
-            },
-            // In query mode a toolchain is resolved, never declared, so the Go SDK repo behind
-            // `go_sdk.download(patches = ...)` is on no target's input list and the module that
-            // owns the extension stands in for it. cquery sees the resolved toolchain as a real
-            // input, so there the nodes alone carry the change and the stand-in edges would only
-            // widen the impacted set.
-            (!self.use_cquery).then_some(&extension_repos.imported),
-            &label_only,
-            &self.workspace,
-            transform,
-        );
         Ok(BzlmodRepos {
-            targets,
+            definitions: Some(RepositoryDefinitions {
+                repositories,
+                module_edges,
+                extensions: extension_repos,
+                label_only,
+            }),
             failed_extensions: failed,
             canonical_to_apparent,
             module_graph_json: module_graph,
@@ -3829,7 +3902,7 @@ enum CqueryCapture<'a> {
 /// nodes, with what it could not describe.
 #[derive(Default)]
 struct BzlmodRepos {
-    targets: Vec<Target>,
+    definitions: Option<RepositoryDefinitions>,
     scope: IsolatedRepoScope,
     /// Extension diagnostics and canonical repositories whose mappings failed.
     failed_extensions: FailedExtensions,
@@ -3841,6 +3914,36 @@ struct BzlmodRepos {
     module_graph_complete: bool,
     /// Unfiltered stdout from a successful initial Bzlmod probe, shared with external hashing.
     root_mapping: Option<Vec<u8>>,
+}
+
+/// Keep module definitions separate from ordinary rule inputs until their missing edges are known.
+struct RepositoryDefinitions {
+    repositories: Vec<Repository>,
+    module_edges: BTreeMap<String, BTreeSet<String>>,
+    extensions: ExtensionRepositories,
+    label_only: LabelOnlyRepositories,
+}
+
+impl RepositoryDefinitions {
+    fn lower(
+        &mut self,
+        bazel: &BazelOptions,
+        canonical_to_apparent: &BTreeMap<String, Vec<String>>,
+        transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>, Option<Vec<String>>),
+    ) -> Vec<Target> {
+        lower_repositories(
+            std::mem::take(&mut self.repositories),
+            canonical_to_apparent,
+            ModuleDependencies {
+                edges: &self.module_edges,
+                mappings: &self.extensions.module_mappings,
+            },
+            (!bazel.use_cquery).then_some(&self.extensions.imported),
+            &self.label_only,
+            &bazel.workspace,
+            transform,
+        )
+    }
 }
 
 /// Extension diagnostics and the canonical repositories whose mappings actually failed.
@@ -4036,7 +4139,9 @@ fn lower_repositories(
     // extension depends on everything it generates (every rules_go target names `@rules_go//`),
     // and each imported repository of an extension depends on the siblings nobody imports (the
     // `@bd_crates` hub reaches its `bd_crates__*` spokes). Spokes themselves stay leaves, so no
-    // cycle forms.
+    // cycle forms. Fine-grained hashing uses these edges to find affected callers. For usages
+    // whose configured inputs were observed, query_all_targets_inner removes the stand-ins
+    // before hashing the repository nodes.
     // An extension the user lists in `label_only_module_extensions` gets no owner edges: the user
     // asserts that its repositories are reached only through labels, which the query reports,
     // never through a resolved toolchain. Otherwise every target of the owning module, of every

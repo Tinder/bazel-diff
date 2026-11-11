@@ -332,9 +332,13 @@ fn generate_hashes_timed_inner(
             .bazel
             .query_all_targets_verified_with(|batch, inputs| prepare(batch, &[], inputs, None))?
     } else {
-        options
-            .bazel
-            .query_all_targets_encoded(true, &mut prepare)?
+        options.bazel.query_all_targets_encoded(
+            true,
+            options.partial_tree.is_none()
+                && options.content_hashes.is_none()
+                && options.modified_filepaths.is_empty(),
+            &mut prepare,
+        )?
     };
     let observations = if include_toolchain_inputs {
         match options.bazel.observed_toolchains(
@@ -3163,7 +3167,7 @@ fn external_input_repo<'a>(
 /// `canonical_repo_nodes` (canonical -> node name) translates. Without that translation every
 /// cquery-mode edge to a repository node was silently dropped, so a lock file or patch hashed into
 /// the node never reached any main-repository target.
-fn transform_external_input<'a>(
+pub(crate) fn transform_external_input<'a>(
     input: &'a str,
     fine_grained_repos: &BTreeSet<String>,
     canonical_repo_nodes: &HashMap<String, String>,
@@ -3897,19 +3901,22 @@ impl ExternalRepoResolver {
     /// behind another module, #510) are absent, and their node is named canonically, so callers
     /// fall back to the canonical name itself.
     fn canonical_repo_nodes(&self) -> &HashMap<String, String> {
-        self.canonical_repo_nodes.get_or_init(|| {
-            let mut nodes = HashMap::<String, String>::new();
-            for (apparent, canonical) in self.repo_mapping() {
-                match nodes.get(canonical) {
-                    Some(existing) if existing <= apparent => {}
-                    _ => {
-                        nodes.insert(canonical.clone(), apparent.clone());
-                    }
-                }
-            }
-            nodes
-        })
+        self.canonical_repo_nodes
+            .get_or_init(|| canonical_repo_nodes(self.repo_mapping()))
     }
+}
+
+pub(crate) fn canonical_repo_nodes(mapping: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut nodes = HashMap::<String, String>::new();
+    for (apparent, canonical) in mapping {
+        match nodes.get(canonical) {
+            Some(existing) if existing <= apparent => {}
+            _ => {
+                nodes.insert(canonical.clone(), apparent.clone());
+            }
+        }
+    }
+    nodes
 }
 
 /// Parses `bazel mod dump_repo_mapping` output, one JSON object of apparent ->

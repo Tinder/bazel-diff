@@ -470,12 +470,8 @@ genrule(name = "reads_build", srcs = ["@crates//:a_build"], outs = ["definition.
     }
 }
 
-// Module `ext`'s extension generates the `@crates` hub and its spokes, whose targets use a rule
-// `ext` defines. In query mode `//external:ext` stands in for everything its extensions generate,
-// so a fine-grained spoke target reaching `ext` through it changes whenever any other spoke does.
-// With the extension listed in `--labelOnlyModuleExtensions`, bumping spoke `b` impacts only
-// `//:uses_b`, while a change to `ext` itself still impacts both consumers. Without it, the
-// conservative edge stays and the bump impacts both.
+// The two generated repositories both use ext's rule, but only one provides the changed data.
+// The explicit label-only contract and the normal fine-grained query must preserve that distinction.
 #[test]
 fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
     if !supports_mod_show_repo() {
@@ -502,10 +498,7 @@ fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
     let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained));
     assert_eq!(impacted, BTreeSet::from(["//:uses_b".to_owned()]));
     let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained[..2]));
-    assert_eq!(
-        impacted,
-        BTreeSet::from(["//:uses_a".to_owned(), "//:uses_b".to_owned()])
-    );
+    assert_eq!(impacted, BTreeSet::from(["//:uses_b".to_owned()]));
 
     let changed_rule = copy_workspace("extension_spokes_through_owner");
     fs::write(changed_rule.path().join("ext/tool.sh"), "exit 1\n").unwrap();
@@ -514,6 +507,31 @@ fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
         impacted,
         BTreeSet::from(["//:uses_a".to_owned(), "//:uses_b".to_owned()])
     );
+
+    // The owner can also forward a real generated input without a toolchain or a fine alias.
+    for workspace in [&first, &bumped] {
+        edit(&workspace.path().join("ext/BUILD.bazel"), |build| {
+            format!(
+                r#"load(":defs.bzl", "crate")
+{build}
+crate(name = "data", srcs = ["@@ext++crates+crates__b//:lib"], visibility = ["//visibility:public"])
+"#
+            )
+        });
+        edit(&workspace.path().join("BUILD.bazel"), |build| {
+            format!(
+                r#"{build}
+genrule(name = "copy", srcs = ["@ext//:data"], outs = ["copied.txt"], cmd = "cp $< $@")
+"#
+            )
+        });
+    }
+    assert_product(first.path(), "//:copy", "copied.txt", "1.0");
+    assert_product(bumped.path(), "//:copy", "copied.txt", "2.0");
+    let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained[..2]));
+    assert!(impacted.contains("//:copy"), "{impacted:?}");
+    assert!(impacted.contains("//:uses_b"), "{impacted:?}");
+    assert!(!impacted.contains("//:uses_a"), "{impacted:?}");
 }
 
 // Issue #603. Module `ext` owns the `@crates` extension, whose spokes are named after their
@@ -1754,12 +1772,188 @@ fn toolchain_declarations_follow_their_implementations() {
     assert!(dep_edges(&edges)["//declaration:choice"].contains("//declaration:other"));
 }
 
-// Module `ext`'s extension generates `@app`, whose rule resolves a toolchain, and the repositories
-// that toolchain can come from. A query never shows a resolved toolchain as an input, so with
-// `@app` fine-grained the change has to reach `//:uses_app` through `ext`, however `ext` registers
-// the toolchain: from a repository it imports, through an alias whose toolchain lives in a
-// repository nobody imports, or by canonical label without importing anything. This is why
-// `--labelOnlyModuleExtensions` is opt-in: an extension like this one must not be listed.
+#[test]
+fn parent_transition_reaches_a_toolchain_outside_the_extension() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("extension_toolchain_through_owner");
+    let changed = copy_workspace("extension_toolchain_through_owner");
+    for workspace in [&first, &changed] {
+        edit(&workspace.path().join("MODULE.bazel"), |module| {
+            format!(
+                r#"{module}
+bazel_dep(name = "outside")
+local_path_override(module_name = "outside", path = "outside")
+register_toolchains("@outside//:registration")
+"#
+            )
+        });
+        edit(&workspace.path().join("BUILD.bazel"), |build| {
+            format!(
+                r#"load("//:generator.bzl", "forward")
+{build}
+forward(name = "switched", src = "@app//:lib")
+forward(name = "switched_main", src = "//declaration:consumer")
+genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "cat $< > $@")
+"#
+            )
+        });
+    }
+    edit(&changed.path().join("outside/BUILD.bazel"), |build| {
+        build.replace("outside-1", "outside-2")
+    });
+    for (workspace, content) in [(&first, "outside-1"), (&changed, "outside-2")] {
+        assert_product(workspace.path(), "//:normal", "normal.txt", "1.0");
+        assert_product(workspace.path(), "//:switched", "switched.txt", content);
+        assert_product(
+            workspace.path(),
+            "//:switched_main",
+            "switched_main.txt",
+            content,
+        );
+        assert_product(
+            workspace.path(),
+            "//declaration:consumer",
+            "declaration/consumer.txt",
+            "1.0",
+        );
+    }
+    let out = tempfile::tempdir().unwrap();
+    let edges = out.path().join("edges.json");
+    let changes = diff_local(
+        first.path(),
+        changed.path(),
+        &[
+            "--fineGrainedHashExternalRepos",
+            "@app",
+            "--depEdgesFile",
+            edges.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        changes
+            .iter()
+            .any(|label| label.trim_start_matches("@@") == "//:switched"),
+        "{changes:?}"
+    );
+    assert!(changes.contains("//:switched_main"), "{changes:?}");
+    let graph = dep_edges(&edges);
+    for reader in ["@app//:lib", "//declaration:consumer"] {
+        let inputs = &graph[reader];
+        assert!(inputs.contains("@outside//:impl"), "{reader}: {inputs:?}");
+        assert!(
+            inputs.contains("@@ext++tools+tc//:impl"),
+            "{reader}: {inputs:?}"
+        );
+    }
+}
+
+#[test]
+fn separate_toolchain_type_keeps_its_own_consumers() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("extension_toolchain_through_owner");
+    let changed = copy_workspace("extension_toolchain_through_owner");
+    for workspace in [&first, &changed] {
+        let root = workspace.path();
+        let bridge = root.join("bridge");
+        fs::create_dir(&bridge).unwrap();
+        fs::write(
+            bridge.join("MODULE.bazel"),
+            "module(name = \"bridge\")\nbazel_dep(name = \"ext\")\n",
+        )
+        .unwrap();
+        fs::write(
+            bridge.join("BUILD.bazel"),
+            r#"load(":rules.bzl", "bridge_lib")
+bridge_lib(name = "lib", visibility = ["//visibility:public"])
+"#,
+        )
+        .unwrap();
+        fs::write(
+            bridge.join("rules.bzl"),
+            r#"def _bridge(ctx):
+    out = ctx.actions.declare_file("bridge.txt")
+    ctx.actions.write(out, ctx.toolchains["@ext//:other_type"].version)
+    return [DefaultInfo(files = depset([out]))]
+
+bridge_lib = rule(implementation = _bridge, toolchains = ["@ext//:other_type"])
+"#,
+        )
+        .unwrap();
+        edit(&root.join("MODULE.bazel"), |module| {
+            format!("{module}\nbazel_dep(name = \"bridge\")\nlocal_path_override(module_name = \"bridge\", path = \"bridge\")\n")
+        });
+        edit(&root.join("ext/BUILD.bazel"), |build| {
+            format!("{build}\ntoolchain_type(name = \"other_type\", visibility = [\"//visibility:public\"])\n")
+        });
+        edit(&root.join("ext/defs.bzl"), |defs| {
+            format!(
+                r#"{defs}
+def _other(ctx):
+    out = ctx.actions.declare_file(ctx.label.name + ".txt")
+    ctx.actions.write(out, ctx.toolchains["@ext//:other_type"].version)
+    return [DefaultInfo(files = depset([out]))]
+
+other_lib = rule(
+    implementation = _other,
+    attrs = {{"_wrapper": attr.label(default = "@ext//:wrapper.sh", allow_single_file = True)}},
+    toolchains = ["@ext//:other_type"],
+)
+"#
+            )
+        });
+        edit(&root.join("ext/tools.bzl"), |extension| {
+            extension.replace(
+            "toolchain(name = \"tc\",",
+            "toolchain(name = \"other\", toolchain = \":impl\", toolchain_type = \"@ext//:other_type\", visibility = [\"//visibility:public\"])\ntoolchain(name = \"tc\",",
+        )
+        });
+        edit(&root.join("ext/MODULE.bazel"), |module| {
+            let module = module.replace("@tc//:all", "@tc//:tc");
+            format!("{module}\nuse_repo(tools, \"tc_impl\")\nregister_toolchains(\"@tc_impl//:other\")\n")
+        });
+        edit(&root.join("BUILD.bazel"), |build| {
+            format!(
+                r#"load("@ext//:defs.bzl", "other_lib")
+{build}
+other_lib(name = "other_reader")
+genrule(name = "bridge_reader", srcs = ["@bridge//:lib"], outs = ["bridge.txt"], cmd = "cat $< > $@")
+genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "cat $< > $@")
+"#
+            )
+        });
+    }
+    fs::write(
+        changed.path().join("versions.json"),
+        r#"{"toolchain":"1.0","alternate":"2.0"}"#,
+    )
+    .unwrap();
+    for (workspace, expected) in [(&first, "1.0"), (&changed, "2.0")] {
+        assert_product(
+            workspace.path(),
+            "//:other_reader",
+            "other_reader.txt",
+            expected,
+        );
+        assert_product(workspace.path(), "//:bridge_reader", "bridge.txt", expected);
+        assert_product(workspace.path(), "//:normal", "normal.txt", "1.0");
+    }
+    let selected = diff_local(
+        first.path(),
+        changed.path(),
+        &["--fineGrainedHashExternalRepos", "@app"],
+    );
+    assert!(selected.contains("//:other_reader"), "{selected:?}");
+    assert!(selected.contains("//:bridge_reader"), "{selected:?}");
+    assert!(!selected.contains("//:normal"), "{selected:?}");
+}
+
+// The generated @app resolves a toolchain also produced by its extension. An
+// ordinary query omits the resolved implementation. Exercise direct, aliased
+// and canonical registrations, and a sibling read through an ordinary label.
 #[test]
 fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
     if !supports_mod_show_repo() {
@@ -1795,6 +1989,69 @@ fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
                 .any(|label| label == "//:uses_app" || label == "@@//:uses_app"),
             "{registration}: {impacted:?}"
         );
+        assert_product(
+            first.path(),
+            "//declaration:consumer",
+            "declaration/consumer.txt",
+            "1.0",
+        );
+        assert_product(
+            bumped.path(),
+            "//declaration:consumer",
+            "declaration/consumer.txt",
+            "2.0",
+        );
+        assert!(
+            impacted.contains("//declaration:consumer"),
+            "{registration}: {impacted:?}"
+        );
+        if registration.starts_with(r#"use_repo(tools, "tc")"#) {
+            for workspace in [&first, &bumped] {
+                edit(&workspace.path().join("MODULE.bazel"), |module| {
+                    format!("{module}\nuse_repo(tools, \"tc_impl\")\nregister_toolchains(\"//:registration\")\n")
+                });
+                edit(&workspace.path().join("BUILD.bazel"), |build| {
+                    format!(
+                        r#"load("//:generator.bzl", "compiler", "generate")
+{build}
+toolchain_type(name = "generator_type")
+alias(name = "generator_alias", actual = ":generator_type")
+compiler(name = "compiler", src = "@tc_impl//:version.txt")
+toolchain(name = "registration", toolchain_type = ":generator_alias", toolchain = ":compiler")
+generate(name = "independent")
+genrule(
+    name = "read_versions",
+    srcs = [":uses_app", "@tc_impl//:version.txt"],
+    outs = ["versions.txt"],
+    cmd = "cat $(location :uses_app) $(location @tc_impl//:version.txt) > $@",
+)
+"#
+                    )
+                });
+            }
+            fs::write(
+                bumped.path().join("versions.json"),
+                r#"{"toolchain":"1.0","alternate":"2.0"}"#,
+            )
+            .unwrap();
+            assert_product(first.path(), "//:read_versions", "versions.txt", "1.01.0");
+            assert_product(bumped.path(), "//:read_versions", "versions.txt", "1.02.0");
+            assert_product(first.path(), "//:independent", "independent.txt", "1.0");
+            assert_product(bumped.path(), "//:independent", "independent.txt", "2.0");
+            let changes = diff_local(
+                first.path(),
+                bumped.path(),
+                &["--fineGrainedHashExternalRepos", "@app,@tc_impl"],
+            );
+            let selected = |name| {
+                changes
+                    .iter()
+                    .any(|label| label.trim_start_matches("@@") == name)
+            };
+            assert!(selected("//:independent"), "{changes:?}");
+            assert!(selected("//:read_versions"), "{changes:?}");
+            assert!(!selected("//:uses_app"), "{changes:?}");
+        }
         if registration.starts_with("register_toolchains") {
             // The assertion is specifically about consumers of @app. The distinct @tc_impl
             // repository selected via a registered toolchain must still invalidate its user.

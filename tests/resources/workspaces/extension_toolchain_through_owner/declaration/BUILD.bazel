@@ -20,4 +20,4 @@ toolchain(
     toolchain_type = "@ext//:toolchain_type",
 )
 
-app_lib(name = "consumer")
+app_lib(name = "consumer", visibility = ["//visibility:public"])

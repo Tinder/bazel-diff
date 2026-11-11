@@ -4572,6 +4572,18 @@ struct WireField<'a> {
 }
 
 fn read_wire_varint(bytes: &[u8], at: &mut usize) -> Option<u64> {
+    // Field keys below 16 and lengths below 128 fit in one byte: nearly every varint a query's
+    // attribute walk reads. Take that case without entering the loop.
+    let first = *bytes.get(*at)?;
+    if first & 0x80 == 0 {
+        *at += 1;
+        return Some(u64::from(first));
+    }
+    read_wire_varint_slow(bytes, at)
+}
+
+#[cold]
+fn read_wire_varint_slow(bytes: &[u8], at: &mut usize) -> Option<u64> {
     let mut value = 0u64;
     for shift in (0..64).step_by(7) {
         let byte = *bytes.get(*at)?;
@@ -4646,12 +4658,37 @@ impl<'a> Iterator for WireFields<'a> {
 
 /// The last occurrence of a length-delimited field (protobuf's last-one-wins for a singular
 /// field), or `None` when the message is malformed or the field is absent.
+///
+/// This runs once per attribute in each of the two attribute walks (to read its name), so it
+/// reads the wire directly instead of going through [`WireFields`]: same fields accepted, same
+/// result, without building a [`WireField`] for every field it skips.
 fn last_payload(bytes: &[u8], number: u32) -> Option<&[u8]> {
     let mut last = None;
-    for field in wire_fields(bytes) {
-        let field = field?;
-        if field.number == number {
-            last = Some(field.payload?);
+    let mut at = 0;
+    while at < bytes.len() {
+        let key = read_wire_varint(bytes, &mut at)?;
+        let field = u32::try_from(key >> 3).ok().filter(|field| *field != 0)?;
+        match key & 7 {
+            2 => {
+                let length = usize::try_from(read_wire_varint(bytes, &mut at)?).ok()?;
+                let end = at.checked_add(length)?;
+                let payload = bytes.get(at..end)?;
+                if field == number {
+                    last = Some(payload);
+                }
+                at = end;
+                continue;
+            }
+            _ if field == number => return None,
+            0 => {
+                read_wire_varint(bytes, &mut at)?;
+            }
+            1 => at = at.checked_add(8)?,
+            5 => at = at.checked_add(4)?,
+            _ => return None,
+        }
+        if at > bytes.len() {
+            return None;
         }
     }
     last
@@ -6603,6 +6640,98 @@ mod tests {
         assert!(read_message_length(&mut overflow.as_slice()).is_err());
         // 2 GiB is one byte over the protobuf limit.
         assert!(read_message_length(&mut [0x80, 0x80, 0x80, 0x80, 0x08].as_slice()).is_err());
+    }
+
+    /// The walk `last_payload` replaced, kept as the reference it must agree with.
+    fn last_payload_via_wire_fields(bytes: &[u8], number: u32) -> Option<&[u8]> {
+        let mut last = None;
+        for field in wire_fields(bytes) {
+            let field = field?;
+            if field.number == number {
+                last = Some(field.payload?);
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn wire_reader_matches_the_field_iterator_on_valid_and_malformed_input() {
+        let long_name = "n".repeat(200);
+        let mut repeated_name = lean_attribute("first", "a").encode_to_vec();
+        repeated_name.extend(lean_attribute("second", "b").encode_to_vec());
+        let mut messages = vec![
+            Vec::new(),
+            lean_attribute("srcs", "a").encode_to_vec(),
+            // A two-byte length prefix and a long value.
+            lean_attribute(&long_name, &long_name).encode_to_vec(),
+            Attribute {
+                name: "flag".into(),
+                r#type: crate::proto::blaze_query::attribute::Discriminator::Boolean,
+                int_value: Some(-1),
+                boolean_value: Some(true),
+                explicitly_specified: Some(true),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            // Protobuf's last-one-wins: the second name.
+            repeated_name,
+            // Field 1 as a varint, fixed64 and fixed32 instead of a string.
+            vec![0x08, 0x01],
+            vec![0x09, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![0x0d, 0, 0, 0, 0],
+            // Other fields of every wire type, then the name.
+            vec![
+                0x10, 0xac, 0x02, 0x19, 1, 2, 3, 4, 5, 6, 7, 8, 0x25, 1, 2, 3, 4, 0x0a, 1, b'x',
+            ],
+            // A multi-byte key (field 16).
+            vec![0x82, 0x01, 0x01, b'y', 0x0a, 0x01, b'z'],
+            // Field number 0, a group, truncations and an unterminated varint.
+            vec![0x02, 0x00],
+            vec![0x0b, 0x0c],
+            vec![0x0a, 0x05, b'a'],
+            vec![0x19, 1, 2, 3],
+            vec![0x25, 1],
+            vec![0x10, 0x80],
+            vec![0x80],
+            vec![0x80; 11],
+        ];
+        // Every prefix of a valid attribute, too.
+        let full = lean_attribute("visibility", "//visibility:public").encode_to_vec();
+        messages.extend((0..full.len()).map(|end| full[..end].to_vec()));
+        for bytes in &messages {
+            for number in [1, 2, 3, 16] {
+                assert_eq!(
+                    last_payload(bytes, number),
+                    last_payload_via_wire_fields(bytes, number),
+                    "field {number} of {bytes:?}"
+                );
+            }
+        }
+        assert_eq!(last_payload(&messages[4], 1), Some(b"second".as_slice()));
+    }
+
+    #[test]
+    fn wire_varints_read_one_and_many_bytes() {
+        for (bytes, value, used) in [
+            (vec![0x00], Some(0), 1),
+            (vec![0x7f], Some(127), 1),
+            (vec![0x80, 0x01], Some(128), 2),
+            (vec![0xac, 0x02, 0x55], Some(300), 2),
+            (
+                vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01],
+                Some(u64::MAX),
+                10,
+            ),
+            (vec![], None, 0),
+            (vec![0x80], None, 1),
+            (vec![0x80; 10], None, 10),
+        ] {
+            let mut at = 0;
+            assert_eq!(read_wire_varint(&bytes, &mut at), value, "{bytes:?}");
+            if value.is_some() {
+                assert_eq!(at, used, "{bytes:?}");
+            }
+        }
     }
 
     fn lean_attribute(name: &str, value: &str) -> Attribute {

@@ -330,10 +330,9 @@ impl BazelOptions {
             ]
             .map(str::to_owned),
         );
-        let (bindings, covered) =
-            options.resolved_toolchain_inputs(&graph, targets, mapping, version)?;
+        let bindings = options.resolved_toolchain_inputs(&graph, targets, mapping, version)?;
         let mut result = ExtensionInputs::default();
-        if let Some(repositories) = survey.filter(|_| covered) {
+        if let Some(repositories) = survey {
             let mut recovered = Vec::new();
             match options.extension_inputs(
                 graph,
@@ -531,7 +530,7 @@ impl BazelOptions {
         targets: &[Target],
         root_mapping: &[u8],
         version: BazelVersion,
-    ) -> Result<(Bindings, bool)> {
+    ) -> Result<Bindings> {
         let fine = graph
             .rows
             .keys()
@@ -541,11 +540,11 @@ impl BazelOptions {
             .collect();
         let reached = graph.ancestors(fine, |_| true);
         if graph.primary.is_empty() || reached.is_empty() {
-            return Ok((Bindings::new(), true));
+            return Ok(Bindings::new());
         }
         let observations = self.observed_toolchains(targets, Some(root_mapping), false)?;
         let mut implementations = BTreeMap::new();
-        let mut types = BTreeSet::new();
+        let mut by_type = Bindings::new();
         for declaration in observations.declarations.values() {
             for name in declaration
                 .implementations
@@ -554,24 +553,36 @@ impl BazelOptions {
             {
                 if let Some(actual) = graph.rows.get(name).and_then(|t| target_name(t)) {
                     implementations.insert(name.clone(), actual.to_owned());
-                    types.extend(declaration.types.iter().cloned());
+                    for ty in &declaration.types {
+                        by_type
+                            .entry(ty.clone())
+                            .or_default()
+                            .insert(actual.to_owned());
+                    }
                 }
             }
         }
-        if types.is_empty() {
-            return Ok((Bindings::new(), true));
+        let mut pending: BTreeSet<_> = by_type.keys().cloned().collect();
+        if pending.is_empty() {
+            return Ok(Bindings::new());
         }
-        let mut pending = types.clone();
         while !pending.is_empty() {
             let aliases = self.alias_actuals(&pending, version)?;
             pending.clear();
-            for actual in aliases.values().flat_map(super::scalar_label_values) {
-                let target = graph.canonical(actual);
-                if types.insert(target.clone()) {
-                    pending.insert(target);
+            for (alias, actual) in aliases {
+                let inputs = by_type[&graph.canonical(&alias)].clone();
+                for label in super::scalar_label_values(&actual) {
+                    let target = graph.canonical(label);
+                    let candidates = by_type.entry(target.clone()).or_default();
+                    let before = candidates.len();
+                    candidates.extend(inputs.iter().cloned());
+                    if candidates.len() != before {
+                        pending.insert(target);
+                    }
                 }
             }
         }
+        let types = by_type.keys().cloned().collect();
         let readers = self.readers_of(graph, &types)?;
         let mut bindings = Bindings::new();
         for name in readers.unknown {
@@ -581,37 +592,42 @@ impl BazelOptions {
                 implementations.values().cloned().collect(),
             );
         }
-        if readers.known.is_empty() {
-            return Ok((bindings, true));
-        }
         // This observation only adds real positive edges. A shared toolchain can be
         // forced onto different execution platforms with the same public checksum.
         // No whole-closure identity or negative follows from a reader's direct row.
-        let names = readers.known.keys().cloned().collect();
-        let mut configured = self.configured_children(graph, &query_set(&names)?, version)?;
-        let covered = readers
-            .known
-            .keys()
-            .all(|name| configured.contains_key(name));
-        for (id, _) in readers.known {
-            let name = target_name(graph.rows[&id])
-                .expect("primary rule")
-                .to_owned();
-            if let Some(inputs) = configured.remove(&id) {
-                let suppliers: BTreeSet<_> = inputs
+        let mut configured = Bindings::new();
+        self.query_available(
+            readers.known.keys().cloned().collect(),
+            |code| matches!(code, 1 | 3 | 7),
+            |query| {
+                for (name, children) in self.configured_children(graph, query, version)? {
+                    configured.entry(name).or_default().extend(children);
+                }
+                Ok(())
+            },
+        )?;
+        for (id, types) in readers.known {
+            let suppliers: BTreeSet<_> = match configured.get(&id) {
+                Some(inputs) => inputs
                     .iter()
                     .filter_map(|child| implementations.get(child).cloned())
-                    .collect();
-                if !suppliers.is_empty() {
-                    bindings.insert(name, suppliers);
-                }
+                    .collect(),
+                // This reader could not be analyzed. Preserve its declared types'
+                // possible suppliers without making an unrelated repository a dependency.
+                None => types
+                    .iter()
+                    .flat_map(|ty| by_type[ty].iter().cloned())
+                    .collect(),
+            };
+            if !suppliers.is_empty() {
+                let name = target_name(graph.rows[&id]).expect("primary rule");
+                bindings
+                    .entry(name.to_owned())
+                    .or_default()
+                    .extend(suppliers);
             }
         }
-        anyhow::ensure!(
-            !bindings.is_empty(),
-            "no resolved implementation on the nominated readers"
-        );
-        Ok((bindings, covered))
+        Ok(bindings)
     }
 }
 
@@ -991,18 +1007,40 @@ impl BazelOptions {
         version: BazelVersion,
     ) -> Result<Vec<Target>> {
         let mut result = Vec::new();
-        let names: Vec<_> = names.iter().cloned().collect();
+        self.query_available(
+            names.iter().cloned().collect(),
+            |code| matches!(code, 3 | 7),
+            |query| {
+                let expression = format!("let d = deps({query}) in $d + buildfiles($d)");
+                result.extend(self.query_with(
+                    &expression,
+                    false,
+                    Some(version),
+                    false,
+                    &mut |_, _| {},
+                )?);
+                Ok(())
+            },
+        )?;
+        super::deduplicate_targets(result)
+    }
+
+    fn query_available(
+        &self,
+        names: Vec<String>,
+        recoverable: impl Fn(i32) -> bool,
+        mut read: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
         let mut pending = vec![names.as_slice()];
         while let Some(batch) = pending.pop().filter(|batch| !batch.is_empty()) {
             let query = query_set(&batch.iter().cloned().collect())?;
-            let expression = format!("let d = deps({query}) in $d + buildfiles($d)");
-            match self.query_with(&expression, false, Some(version), false, &mut |_, _| {}) {
-                Ok(rows) => result.extend(rows),
+            match read(&query) {
+                Ok(()) => {}
                 Err(error) => {
                     self.check_cancelled()?;
                     if !error
                         .downcast_ref::<super::QueryFailure>()
-                        .is_some_and(|failure| matches!(failure.code, 3 | 7))
+                        .is_some_and(|failure| recoverable(failure.code))
                     {
                         return Err(error);
                     }
@@ -1011,14 +1049,14 @@ impl BazelOptions {
                         pending.extend([right, left]);
                     } else {
                         eprintln!(
-                            "[Warn] retaining repository inputs for {}: {error:#}",
+                            "[Warn] retaining fallback inputs for {}: {error:#}",
                             batch[0]
                         );
                     }
                 }
             }
         }
-        super::deduplicate_targets(result)
+        Ok(())
     }
 }
 

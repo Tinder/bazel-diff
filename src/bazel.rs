@@ -26,16 +26,12 @@ struct BazelVersion(u32, u32, u32);
 #[derive(Debug)]
 struct QueryFailure {
     code: i32,
-    stderr: String,
+    message: String,
 }
 
 impl std::fmt::Display for QueryFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Bazel query failed, exit code {}: {}",
-            self.code, self.stderr
-        )
+        f.write_str(&self.message)
     }
 }
 
@@ -2959,7 +2955,10 @@ impl BazelOptions {
         if code != 0 && !partial {
             return Err(QueryFailure {
                 code,
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                message: format!(
+                    "Bazel query failed, exit code {code}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
             }
             .into());
         }
@@ -3028,10 +3027,14 @@ impl BazelOptions {
             )
             .context("execute compatible-target cquery")?;
         if !output.status.success() {
-            bail!(
-                "compatible-target cquery failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            return Err(QueryFailure {
+                code: output.status.code().unwrap_or(-1),
+                message: format!(
+                    "compatible-target cquery failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            }
+            .into());
         }
         Ok(String::from_utf8_lossy(&output.stdout)
             .lines()

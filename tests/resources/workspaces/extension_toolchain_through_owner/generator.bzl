@@ -7,11 +7,17 @@ compiler = rule(
 )
 
 def _generate(ctx):
+    if ctx.attr.fail_analysis:
+        fail("the requested generator is unavailable")
     out = ctx.actions.declare_file(ctx.label.name + ".txt")
     ctx.actions.symlink(output = out, target_file = ctx.toolchains["//:generator_type"].file)
     return [DefaultInfo(files = depset([out]))]
 
-generate = rule(implementation = _generate, toolchains = ["//:generator_type"])
+generate = rule(
+    implementation = _generate,
+    attrs = {"fail_analysis": attr.bool()},
+    toolchains = ["//:generator_type"],
+)
 
 def _alternate(_settings, _attr):
     return {"//command_line_option:platforms": ["@outside//:platform"]}

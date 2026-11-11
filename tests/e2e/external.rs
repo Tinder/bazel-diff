@@ -2038,7 +2038,13 @@ toolchain_type(name = "generator_type")
 alias(name = "generator_alias", actual = ":generator_type")
 compiler(name = "compiler", src = "@tc_impl//:version.txt")
 toolchain(name = "registration", toolchain_type = ":generator_alias", toolchain = ":compiler")
+compiler(name = "unused_compiler", src = "@tc_impl//:version.txt")
+toolchain(name = "unused", toolchain_type = ":generator_alias", toolchain = ":unused_compiler")
+toolchain_type(name = "other_type")
+compiler(name = "other_compiler", src = "@tc_impl//:version.txt")
+toolchain(name = "other", toolchain_type = ":other_type", toolchain = ":other_compiler")
 generate(name = "independent")
+generate(name = "unbuildable", fail_analysis = True)
 filegroup(name = "unrelated", srcs = ["@unrelated//:partial"])
 filegroup(name = "removed_api", srcs = ["@app//:removed"])
 genrule(
@@ -2060,17 +2066,37 @@ genrule(
             assert_product(bumped.path(), "//:read_versions", "versions.txt", "1.02.0");
             assert_product(first.path(), "//:independent", "independent.txt", "1.0");
             assert_product(bumped.path(), "//:independent", "independent.txt", "2.0");
+            let out = tempfile::tempdir().unwrap();
+            let edges = out.path().join("edges.json");
             let changes = diff_local(
                 first.path(),
                 bumped.path(),
-                &["--fineGrainedHashExternalRepos", "@app,@tc_impl"],
+                &[
+                    "--fineGrainedHashExternalRepos",
+                    "@app,@tc_impl",
+                    "--depEdgesFile",
+                    edges.to_str().unwrap(),
+                ],
             );
+            let graph = dep_edges(&edges);
+            for (reader, expected) in [
+                ("//:independent", vec!["//:compiler"]),
+                ("//:unbuildable", vec!["//:compiler", "//:unused_compiler"]),
+            ] {
+                let compilers: Vec<_> = graph[reader]
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|child| child.ends_with("compiler"))
+                    .collect();
+                assert_eq!(compilers, expected, "{reader}");
+            }
             let selected = |name| {
                 changes
                     .iter()
                     .any(|label| label.trim_start_matches("@@") == name)
             };
             assert!(selected("//:independent"), "{changes:?}");
+            assert!(selected("//:unbuildable"), "{changes:?}");
             assert!(selected("//:read_versions"), "{changes:?}");
             assert!(selected("//partial:reader"), "{changes:?}");
             assert!(selected("//:removed_api"), "{changes:?}");

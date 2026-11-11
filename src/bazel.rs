@@ -2836,9 +2836,8 @@ impl BazelOptions {
         capture: CqueryCapture<'_>,
         retain: impl FnMut(&Target) -> bool,
     ) -> Result<QueryGraph> {
-        let available_readers = matches!(capture, CqueryCapture::AvailableReaders);
         let (mut roots, verify) = match capture {
-            CqueryCapture::Standard | CqueryCapture::AvailableReaders => (None, false),
+            CqueryCapture::Standard => (None, false),
             CqueryCapture::Roots(roots) => (Some(roots), false),
             CqueryCapture::Verification => (None, true),
         };
@@ -2848,7 +2847,7 @@ impl BazelOptions {
             None => self.version()?,
         };
         let compatible = if use_cquery && !verify {
-            Some(self.query_compatible_labels(expression, version, available_readers)?)
+            Some(self.query_compatible_labels(expression, version, false)?)
         } else {
             None
         };
@@ -2926,8 +2925,7 @@ impl BazelOptions {
         let code = output.status.code().unwrap_or(-1);
         // A formatter can emit its completion marker before a keep-going query returns 3.
         // Verification requires command success; ordinary partial positives keep their policy.
-        let partial = (self.keep_going && code == 3 && !verify)
-            || (available_readers && matches!(code, 1 | 3 | 7));
+        let partial = self.keep_going && code == 3 && !verify;
         if code != 0 && !partial {
             return Err(QueryFailure {
                 code,
@@ -3908,7 +3906,6 @@ impl QueryGraph {
 
 enum CqueryCapture<'a> {
     Standard,
-    AvailableReaders,
     Roots(&'a mut Vec<(String, String)>),
     Verification,
 }

@@ -2083,7 +2083,7 @@ genrule(
             );
             let graph = dep_edges(&edges);
             for (reader, expected) in [
-                ("//:independent", vec!["//:compiler"]),
+                ("//:independent", vec!["//:compiler", "//:unused_compiler"]),
                 ("//:unbuildable", vec!["//:compiler", "//:unused_compiler"]),
                 (
                     "//:also_unbuildable",

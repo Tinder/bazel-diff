@@ -61,6 +61,7 @@ struct OrdinaryGraph<'a> {
     rows: HashMap<String, &'a Target>,
     parents: HashMap<String, Vec<String>>,
     primary: BTreeMap<String, Option<usize>>,
+    metadata_classes: HashSet<usize>,
     alias_discovery_failed: bool,
 }
 
@@ -92,6 +93,10 @@ impl<'a> OrdinaryGraph<'a> {
             rows: HashMap::new(),
             parents: HashMap::new(),
             primary: primary.names,
+            metadata_classes: ["toolchain", "toolchain_type", "alias"]
+                .into_iter()
+                .filter_map(|key| primary.classes.get(key).copied())
+                .collect(),
             alias_discovery_failed: primary.alias_discovery_failed,
         };
         graph.index(targets);
@@ -414,6 +419,11 @@ impl BazelOptions {
         // execution groups. An absent class key gets its own observation.
         let mut classes = BTreeMap::<_, Vec<&str>>::new();
         for (name, class) in &graph.primary {
+            // These native rules describe or forward a toolchain. Their normal
+            // inputs already include the declaration or aliased target.
+            if class.is_some_and(|id| graph.metadata_classes.contains(&id)) {
+                continue;
+            }
             let Some(rule) = graph.rows.get(name).and_then(|row| row.rule.as_option()) else {
                 continue;
             };
@@ -604,39 +614,15 @@ impl BazelOptions {
                 implementations.values().cloned().collect(),
             );
         }
-        // This observation only adds real positive edges. A shared toolchain can be
-        // forced onto different execution platforms with the same public checksum.
-        // No whole-closure identity or negative follows from a reader's direct row.
-        let configured = if readers.known.is_empty() {
-            Bindings::new()
-        } else {
-            // A failed rule can coexist with fully emitted healthy reader rows.
-            // Missing readers retain their possible suppliers below.
-            let mut options = self.clone();
-            options.cquery_options.push("--keep_going".to_owned());
-            let query = query_set(&readers.known.keys().cloned().collect())?;
-            options.configured_children(graph, &query, version, CqueryCapture::AvailableReaders)?
-        };
+        // The ordinary graph combines configurations. An observed type can
+        // resolve to different suppliers under different incoming transitions.
+        // Keep possible suppliers without analyzing every main-repository reader.
         for (id, types) in readers.known {
-            let suppliers: BTreeSet<_> = match configured.get(&id) {
-                Some(inputs) => inputs
-                    .iter()
-                    .filter_map(|child| implementations.get(child).cloned())
-                    .collect(),
-                // This reader could not be analyzed. Preserve its declared types'
-                // possible suppliers without making an unrelated repository a dependency.
-                None => types
-                    .iter()
-                    .flat_map(|ty| by_type[ty].iter().cloned())
-                    .collect(),
-            };
-            if !suppliers.is_empty() {
-                let name = target_name(graph.rows[&id]).expect("primary rule");
-                bindings
-                    .entry(name.to_owned())
-                    .or_default()
-                    .extend(suppliers);
-            }
+            let name = target_name(graph.rows[&id]).expect("primary rule");
+            bindings
+                .entry(name.to_owned())
+                .or_default()
+                .extend(types.iter().flat_map(|ty| by_type[ty].iter().cloned()));
         }
         Ok(bindings)
     }

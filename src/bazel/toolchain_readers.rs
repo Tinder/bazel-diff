@@ -5,10 +5,6 @@ use super::{
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-type RepositoryRows<'a> = (
-    &'a [Target],
-    &'a [(Option<super::RepositoryInputs>, Option<Vec<String>>)],
-);
 type Bindings = BTreeMap<String, BTreeSet<String>>;
 
 #[derive(Default)]
@@ -224,60 +220,37 @@ fn direct_type_edges(
     Some(result)
 }
 
-/// A regular MODULE dependency remains an input even when an inferred edge has the same label.
-pub(super) fn removed_membership(
-    label: &str,
-    ordinary: Option<&[String]>,
-    mapping: &HashMap<String, String>,
-    usages: &BTreeSet<String>,
-) -> bool {
-    membership_usage(label, ordinary, mapping).is_some_and(|usage| usages.contains(usage))
-}
-
-fn membership_usage<'a>(
-    label: &'a str,
-    ordinary: Option<&[String]>,
-    mapping: &'a HashMap<String, String>,
-) -> Option<&'a str> {
-    if ordinary.is_some_and(|inputs| inputs.iter().any(|input| input == label)) {
-        return None;
-    }
-    let name = label.strip_prefix("//external:")?;
-    super::extension_usage_prefix(mapping.get(name).map_or(name, String::as_str))
-}
-
 /// Every path lost by removing a membership has a first removed edge. Compute its
 /// possible predecessors on the repository nodes actually returned by the lowerer.
 fn affected_repositories(
-    (rows, metadata): RepositoryRows<'_>,
-    mapping: &HashMap<String, String>,
+    rows: &[super::RepositoryRow],
     usages: &BTreeSet<String>,
 ) -> HashSet<String> {
     let mut parents = HashMap::<&str, Vec<&str>>::new();
     let mut groups = HashSet::new();
     let mut affected = HashSet::new();
-    for (row, (shared, ordinary)) in rows.iter().zip(metadata) {
-        let rule = row.rule.as_option().expect("repository");
+    for row in rows {
+        let rule = row.target.rule.as_option().expect("repository");
         let name = rule.name.as_str();
         for child in &rule.rule_input {
-            if removed_membership(child, ordinary.as_deref(), mapping, usages) {
-                affected.insert(name);
-            } else {
-                parents.entry(child).or_default().push(name);
-            }
+            parents.entry(child).or_default().push(name);
         }
-        if let Some(group) = shared.as_ref().and_then(super::RepositoryInputs::siblings) {
+        for group in &row.memberships {
             if usages.contains(&group.extension) {
-                if !group.labels.is_empty() {
+                if row.inferred(group).next().is_some() {
                     affected.insert(name);
                 }
-            } else {
+            } else if row.generated {
                 let key = group.extension.as_str();
                 parents.entry(key).or_default().push(name);
                 if groups.insert(key) {
                     for child in &group.labels {
                         parents.entry(child).or_default().push(key);
                     }
+                }
+            } else {
+                for child in &group.labels {
+                    parents.entry(child).or_default().push(name);
                 }
             }
         }
@@ -300,7 +273,7 @@ impl BazelOptions {
         primary: PrimaryRules,
         mapping: &[u8],
         survey: Option<&super::ExtensionRepositories>,
-        repository_rows: RepositoryRows<'_>,
+        repository_rows: &[super::RepositoryRow],
         version: Option<BazelVersion>,
     ) -> Result<ExtensionInputs> {
         let graph = OrdinaryGraph::new(self, targets, primary, mapping);
@@ -646,7 +619,7 @@ impl BazelOptions {
         &self,
         graph: OrdinaryGraph<'_>,
         repositories: &super::ExtensionRepositories,
-        repository_rows: RepositoryRows<'_>,
+        repository_rows: &[super::RepositoryRow],
         version: BazelVersion,
         recovered: &mut Vec<Target>,
     ) -> Result<ExtensionInputs> {
@@ -743,23 +716,13 @@ impl BazelOptions {
             let missing_families: BTreeSet<_> =
                 missing.iter().filter_map(|name| usage(name)).collect();
             let mut members: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-            for (row, (shared, ordinary)) in repository_rows.0.iter().zip(repository_rows.1) {
-                let rule = row.rule.as_option().expect("repository");
-                for child in &rule.rule_input {
-                    if let Some(family) =
-                        membership_usage(child, ordinary.as_deref(), &graph.mapping)
-                    {
-                        if missing_families.contains(family) {
-                            members.entry(family).or_default().insert(child);
-                        }
-                    }
-                }
-                if let Some(group) = shared.as_ref().and_then(super::RepositoryInputs::siblings) {
+            for row in repository_rows {
+                for group in &row.memberships {
                     if missing_families.contains(&group.extension) {
                         members
                             .entry(&group.extension)
                             .or_default()
-                            .extend(group.labels.iter().map(String::as_str));
+                            .extend(row.inferred(group));
                     }
                 }
             }
@@ -767,15 +730,14 @@ impl BazelOptions {
                 let family = usage(name).expect("missing extension input");
                 let children = members.get(family.as_str());
                 for parent in graph.parents.get(name).into_iter().flatten() {
-                    let rule = graph.rows.get(parent).and_then(|row| row.rule.as_option());
-                    let Some(rule) = rule else {
+                    if !graph.rows.get(parent).is_some_and(|row| row.rule.is_set()) {
                         anyhow::bail!(
                             "cannot retain repository inputs for {parent} reading {name}"
                         );
                     };
                     result
                         .bindings
-                        .entry(rule.name.clone())
+                        .entry(parent.clone())
                         .or_default()
                         .extend(children.into_iter().flatten().map(|s| (*s).to_owned()));
                 }
@@ -787,13 +749,13 @@ impl BazelOptions {
                 );
             }
         }
-        let canonical = |label: &str| graph.canonical(label);
+        let canonical = |label: &str| canonical_query_label(label, &graph.mapping).into_owned();
         if result.usages.is_empty() {
             return Ok(result);
         }
         // The direct consumer may itself be reached through a transition. Analyze the
         // callers that lead to it as well, asking Bazel to emit only the reached rows.
-        let affected = affected_repositories(repository_rows, &graph.mapping, &result.usages);
+        let affected = affected_repositories(repository_rows, &result.usages);
         let nodes = crate::hash::canonical_repo_nodes(&graph.mapping);
         let companion = |label: &str| {
             let target = crate::hash::transform_external_input(
@@ -897,29 +859,23 @@ impl BazelOptions {
                 {
                     continue;
                 }
-                match graph.rows.get(child).and_then(|row| target_name(row)) {
-                    Some(spelling) => {
-                        inputs.insert(spelling.to_owned());
-                    }
-                    None => {
-                        missing.insert(child.clone());
-                        inputs.insert(child.clone());
-                    }
+                if !graph.rows.contains_key(child) {
+                    missing.insert(child.clone());
                 }
+                inputs.insert(child.clone());
             }
             if !inputs.is_empty() {
-                let spelling = graph
-                    .rows
-                    .get(name)
-                    .and_then(|row| target_name(row))
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        missing.insert(name.clone());
-                        name.clone()
-                    });
-                result.bindings.entry(spelling).or_default().extend(inputs);
+                if !graph.rows.contains_key(name) {
+                    missing.insert(name.clone());
+                }
+                result
+                    .bindings
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(inputs);
             }
         }
+        let mut needed = BTreeSet::new();
         if !missing.is_empty() {
             // A selected toolchain can have dependencies on other platforms in its
             // ordinary rule. Ask for the configurations reached by these callers.
@@ -940,12 +896,12 @@ impl BazelOptions {
                     "missing configured prerequisite {child}"
                 );
             }
-            let names: BTreeSet<_> = selected
+            needed = selected
                 .keys()
                 .filter(|name| !graph.rows.contains_key(*name))
                 .cloned()
                 .collect();
-            let expression = format!("let d = {} in $d + buildfiles($d)", query_set(&names)?);
+            let expression = format!("let d = {} in $d + buildfiles($d)", query_set(&needed)?);
             result.sources =
                 self.query_with(&expression, false, Some(version), false, &mut |_, _| {})?;
             // Only these new rows were recovered from configured occurrences.
@@ -959,45 +915,41 @@ impl BazelOptions {
                     }
                 }
             }
-            let spellings: HashMap<_, _> = result
-                .sources
-                .iter()
-                .filter_map(target_name)
-                .map(|name| (canonical(name), name.to_owned()))
-                .collect();
-            for name in &names {
-                anyhow::ensure!(
-                    spellings.contains_key(name),
-                    "missing ordinary target for configured input {name}"
-                );
-            }
-            let spelling = |name: String| {
-                spellings
-                    .get(&name)
-                    .cloned()
-                    .or_else(|| {
-                        graph
-                            .rows
-                            .get(&name)
-                            .and_then(|row| target_name(row))
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or(name)
-            };
             for (name, children) in selected {
                 if !children.is_empty() {
                     result.bindings.entry(name).or_default().extend(children);
                 }
             }
-            let mut bindings = Bindings::new();
-            for (name, children) in result.bindings {
-                bindings
-                    .entry(spelling(name))
-                    .or_default()
-                    .extend(children.into_iter().map(&spelling));
-            }
-            result.bindings = bindings;
         }
+        // Configured labels are canonical. Install each edge using the names of
+        // the ordinary targets actually retained (including newly recovered rows).
+        let mut rows = graph.rows;
+        rows.extend(
+            result
+                .sources
+                .iter()
+                .filter_map(|row| Some((canonical(target_name(row)?), row))),
+        );
+        for name in needed {
+            anyhow::ensure!(
+                rows.contains_key(&name),
+                "missing ordinary target for configured input {name}"
+            );
+        }
+        let spelling = |name: String| {
+            rows.get(&name)
+                .and_then(|row| target_name(row))
+                .map(str::to_owned)
+                .unwrap_or(name)
+        };
+        let mut bindings = Bindings::new();
+        for (name, children) in result.bindings {
+            bindings
+                .entry(spelling(name))
+                .or_default()
+                .extend(children.into_iter().map(&spelling));
+        }
+        result.bindings = bindings;
         Ok(result)
     }
 

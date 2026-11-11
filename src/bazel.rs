@@ -586,13 +586,11 @@ impl BazelOptions {
             Vec::new()
         } else {
             definitions.take().map_or_else(Vec::new, |mut defs| {
-                defs.lower(
-                    self,
-                    &canonical_to_apparent,
-                    &mut |target, inputs, ordinary| {
+                defs.lower(self, &canonical_to_apparent, |row| {
+                    row.finish(&BTreeSet::new(), &mut |target, inputs, ordinary| {
                         transform(std::slice::from_mut(target), &[], inputs, ordinary);
-                    },
-                )
+                    })
+                })
             })
         };
         let configured_roots = self
@@ -754,10 +752,7 @@ impl BazelOptions {
             }
         }
         if let Some(mut defs) = definitions {
-            let mut metadata = Vec::new();
-            let mut repos = defs.lower(self, &canonical_to_apparent, &mut |_, group, ordinary| {
-                metadata.push((group, ordinary));
-            });
+            let repos = defs.lower(self, &canonical_to_apparent, std::convert::identity);
             let mut observed = BTreeSet::new();
             if let Some(mapping) = root_mapping.as_deref() {
                 let survey = (module_graph_complete
@@ -769,7 +764,7 @@ impl BazelOptions {
                     primary_rules,
                     mapping,
                     survey,
-                    (&repos, &metadata),
+                    &repos,
                     version,
                 ) {
                     Ok(mut inputs) => {
@@ -794,32 +789,11 @@ impl BazelOptions {
                     }
                 }
             }
-            let mapping = crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(
-                root_mapping.as_deref().unwrap_or_default(),
-            ));
-            for (target, (mut group, ordinary)) in repos.iter_mut().zip(metadata) {
-                let rule = target
-                    .rule
-                    .as_option_mut()
-                    .expect("synthetic repository rule");
-                rule.rule_input.retain(|input| {
-                    !toolchain_readers::removed_membership(
-                        input,
-                        ordinary.as_deref(),
-                        &mapping,
-                        &observed,
-                    )
-                });
-                if group
-                    .as_ref()
-                    .and_then(RepositoryInputs::siblings)
-                    .is_some_and(|siblings| observed.contains(&siblings.extension))
-                {
-                    group = Some(RepositoryInputs::DefinitionOnly);
-                }
-                transform(std::slice::from_mut(target), &[], group, ordinary);
-            }
-            targets.extend(repos);
+            targets.extend(repos.into_iter().map(|row| {
+                row.finish(&observed, &mut |target, group, ordinary| {
+                    transform(std::slice::from_mut(target), &[], group, ordinary)
+                })
+            }));
             targets = deduplicate_targets(targets)?;
         }
         self.check_failed_extension_references(
@@ -3959,13 +3933,13 @@ struct RepositoryDefinitions {
 }
 
 impl RepositoryDefinitions {
-    fn lower(
+    fn lower<T>(
         &mut self,
         bazel: &BazelOptions,
         canonical_to_apparent: &BTreeMap<String, Vec<String>>,
-        transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>, Option<Vec<String>>),
-    ) -> Vec<Target> {
-        lower_repositories(
+        process: impl FnMut(RepositoryRow) -> T,
+    ) -> Vec<T> {
+        repository_rows(
             std::mem::take(&mut self.repositories),
             canonical_to_apparent,
             ModuleDependencies {
@@ -3975,7 +3949,7 @@ impl RepositoryDefinitions {
             (!bazel.use_cquery).then_some(&self.extensions.imported),
             &self.label_only,
             &bazel.workspace,
-            transform,
+            process,
         )
     }
 }
@@ -4100,15 +4074,68 @@ struct ModuleDependencies<'a> {
     mappings: &'a BTreeMap<String, RepoMapping>,
 }
 
-fn lower_repositories(
+/// The base rule contains only real module inputs. Extension memberships
+/// stay grouped until observation determines which stand-ins are still needed.
+struct RepositoryRow {
+    target: Target,
+    memberships: Vec<Arc<RepositoryInputGroup>>,
+    generated: bool,
+    ordinary_complete: bool,
+}
+
+impl RepositoryRow {
+    fn inferred<'a>(&'a self, group: &'a RepositoryInputGroup) -> impl Iterator<Item = &'a str> {
+        let rule = self.target.rule.as_option().expect("repository");
+        group.labels.iter().filter_map(|child| {
+            (child != &rule.name && rule.rule_input.binary_search(child).is_err())
+                .then_some(child.as_str())
+        })
+    }
+
+    fn finish(
+        mut self,
+        observed: &BTreeSet<String>,
+        transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>, Option<Vec<String>>),
+    ) -> Target {
+        let rule = self.target.rule.as_option_mut().expect("repository");
+        let ordinary = self.ordinary_complete.then(|| rule.rule_input.clone());
+        let mut inputs = self.generated.then_some(RepositoryInputs::DefinitionOnly);
+        for group in self.memberships {
+            if observed.contains(&group.extension) {
+                continue;
+            }
+            if self.generated
+                && rule.rule_input.is_empty()
+                && group.labels.binary_search(&rule.name).is_err()
+            {
+                inputs = Some(RepositoryInputs::WithSiblings(group));
+            } else {
+                inputs = None;
+                rule.rule_input.extend(
+                    group
+                        .labels
+                        .iter()
+                        .filter(|child| **child != rule.name)
+                        .cloned(),
+                );
+            }
+        }
+        rule.rule_input.sort_unstable();
+        rule.rule_input.dedup();
+        transform(&mut self.target, inputs, ordinary);
+        self.target
+    }
+}
+
+fn repository_rows<T>(
     mut repositories: Vec<Repository>,
     canonical_to_apparent: &BTreeMap<String, Vec<String>>,
     modules: ModuleDependencies<'_>,
     extension_edges: Option<&BTreeSet<String>>,
     label_only: &LabelOnlyRepositories,
     workspace: &Path,
-    transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>, Option<Vec<String>>),
-) -> Vec<Target> {
+    mut process: impl FnMut(RepositoryRow) -> T,
+) -> Vec<T> {
     let ModuleDependencies {
         edges: module_edges,
         mappings: module_mappings,
@@ -4173,9 +4200,8 @@ fn lower_repositories(
     // extension depends on everything it generates (every rules_go target names `@rules_go//`),
     // and each imported repository of an extension depends on the siblings nobody imports (the
     // `@bd_crates` hub reaches its `bd_crates__*` spokes). Spokes themselves stay leaves, so no
-    // cycle forms. Fine-grained hashing uses these edges to find affected callers. For usages
-    // whose configured inputs were observed, query_all_targets_inner removes the stand-ins
-    // before hashing the repository nodes.
+    // cycle forms. Fine-grained hashing uses these groups to find affected callers.
+    // A repository row adds only the memberships that still lack observed replacement inputs.
     // An extension the user lists in `label_only_module_extensions` gets no owner edges: the user
     // asserts that its repositories are reached only through labels, which the query reports,
     // never through a resolved toolchain. Otherwise every target of the owning module, of every
@@ -4184,7 +4210,7 @@ fn lower_repositories(
     // resolved from one of them is invisible to a query, however it is registered.
     // An explicitly label-only imported repository needs no owner fallback. Its own node,
     // the hub-to-spoke inputs and the owner's edges to other generators remain.
-    let mut module_extension_repos = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut module_extension_repos = BTreeMap::<String, BTreeMap<String, BTreeSet<String>>>::new();
     let mut extension_spokes = BTreeMap::<String, BTreeSet<String>>::new();
     if let Some(imported) = extension_edges {
         for repository in &repositories {
@@ -4204,6 +4230,8 @@ fn lower_repositories(
                 module_extension_repos
                     .entry(module_repo.clone())
                     .or_default()
+                    .entry(extension.to_owned())
+                    .or_default()
                     .extend(node_names(canonical));
             }
             if !imported.contains(canonical) {
@@ -4216,8 +4244,24 @@ fn lower_repositories(
     }
 
     let mut targets = Vec::new();
-    let mut shared_groups = HashMap::<String, Arc<RepositoryInputGroup>>::new();
-    let empty = BTreeSet::new();
+    let group = |(extension, names): (String, BTreeSet<String>)| {
+        Arc::new(RepositoryInputGroup {
+            extension,
+            labels: names
+                .into_iter()
+                .map(|name| format!("//external:{name}"))
+                .collect(),
+        })
+    };
+    let owned: BTreeMap<_, Vec<_>> = module_extension_repos
+        .into_iter()
+        .map(|(module, usages)| (module, usages.into_iter().map(group).collect()))
+        .collect();
+    let spokes: BTreeMap<_, _> = extension_spokes
+        .into_iter()
+        .map(group)
+        .map(|group| (group.extension.clone(), group))
+        .collect();
     for (index, mut repository) in repositories.into_iter().enumerate() {
         let canonical = repository.canonical_name.as_deref().unwrap_or_default();
         let extension = extension_usage_prefix(canonical);
@@ -4265,21 +4309,13 @@ fn lower_repositories(
             .filter_map(|dependency| module_to_canonical.get(dependency))
             .flat_map(|canonical| node_names(canonical))
             .collect::<BTreeSet<_>>();
-        let mut dependencies = ordinary_dependencies.clone();
-        if let Some(repos) = module_extension_repos.get(canonical) {
-            dependencies.extend(repos.iter().cloned());
-        }
-        let spokes = extension
+        let mut memberships = owned.get(canonical).cloned().unwrap_or_default();
+        if let Some(group) = extension
             .filter(|_| extension_edges.is_some_and(|imported| imported.contains(canonical)))
-            .and_then(|extension| extension_spokes.get_key_value(extension));
-        let group = if dependencies.is_empty() {
-            spokes
-        } else {
-            if let Some((_, names)) = spokes {
-                dependencies.extend(names.iter().cloned());
-            }
-            None
-        };
+            .and_then(|usage| spokes.get(usage))
+        {
+            memberships.push(Arc::clone(group));
+        }
         let names = node_names(canonical);
         if names.is_empty() {
             continue;
@@ -4291,41 +4327,12 @@ fn lower_repositories(
         // All apparent names have the same definition. Move it into the final output.
         let mut rules = std::iter::repeat_n(rule, names.len());
         for apparent in names {
-            // Imported hubs of one extension share its ordered hidden siblings. Pass
-            // the same allocation to the hash traversal when no owner-specific edge
-            // needs adding or removing. Raw query callers expand it into the protobuf.
-            let (inputs, shared) = match group {
-                Some((extension, names)) if !names.contains(&apparent) => {
-                    let shared = shared_groups.entry(extension.clone()).or_insert_with(|| {
-                        Arc::new(RepositoryInputGroup {
-                            extension: extension.clone(),
-                            labels: names
-                                .iter()
-                                .map(|name| format!("//external:{name}"))
-                                .collect(),
-                        })
-                    });
-                    (&empty, Some(Arc::clone(shared)))
-                }
-                Some((_, names)) => (names, None),
-                None => (&dependencies, None),
-            };
-            let mut target = repository_target(rules.next().unwrap(), &apparent, inputs);
-            let ordinary_inputs = ordinary_complete.then(|| {
-                ordinary_dependencies
-                    .iter()
-                    .filter(|dependency| dependency.as_str() != apparent)
-                    .map(|dependency| format!("//external:{dependency}"))
-                    .collect()
-            });
-            let inputs = match shared {
-                Some(group) => Some(RepositoryInputs::WithSiblings(group)),
-                None => {
-                    (generated && inputs.is_empty()).then_some(RepositoryInputs::DefinitionOnly)
-                }
-            };
-            transform(&mut target, inputs, ordinary_inputs);
-            targets.push(target);
+            targets.push(process(RepositoryRow {
+                target: repository_target(rules.next().unwrap(), &apparent, &ordinary_dependencies),
+                memberships: memberships.clone(),
+                generated,
+                ordinary_complete,
+            }));
         }
     }
     targets
@@ -6340,6 +6347,47 @@ mod tests {
     use crate::proto::blaze_query::{
         attribute, EnvironmentGroup, GeneratedFile, LabelDictUnaryEntry, SourceFile,
     };
+    fn lower_repositories(
+        repositories: Vec<Repository>,
+        canonical_to_apparent: &BTreeMap<String, Vec<String>>,
+        modules: ModuleDependencies<'_>,
+        extension_edges: Option<&BTreeSet<String>>,
+        label_only: &LabelOnlyRepositories,
+        workspace: &Path,
+        transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>, Option<Vec<String>>),
+    ) -> Vec<Target> {
+        repository_rows(
+            repositories,
+            canonical_to_apparent,
+            modules,
+            extension_edges,
+            label_only,
+            workspace,
+            |row| row.finish(&BTreeSet::new(), transform),
+        )
+    }
+    #[test]
+    fn observing_a_membership_preserves_an_overlapping_module_dependency() {
+        let row = RepositoryRow {
+            target: repository_target(Rule::default(), "owner", &BTreeSet::from(["both".into()])),
+            memberships: vec![Arc::new(RepositoryInputGroup {
+                extension: "usage".into(),
+                labels: vec!["//external:both".into(), "//external:sibling".into()],
+            })],
+            generated: false,
+            ordinary_complete: false,
+        };
+        assert_eq!(
+            row.inferred(&row.memberships[0]).collect::<Vec<_>>(),
+            ["//external:sibling"]
+        );
+        let target = row.finish(&BTreeSet::from(["usage".into()]), &mut |_, _, _| {});
+        assert_eq!(
+            target.rule.as_option().unwrap().rule_input,
+            ["//external:both"]
+        );
+    }
+
     fn rule_target(name: &str) -> Target {
         let mut target = Target::default();
         target.r#type = target::Discriminator::Rule;

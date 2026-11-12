@@ -1789,7 +1789,10 @@ mod tests {
         file_only.fine_grained_hash_external_repos_file = Some(fine_file);
         let file_flags = fingerprint_flags(&file_only, false, &[]).unwrap();
         assert_eq!(file_flags["fineGrainedHashExternalRepos"], "abc,from_file");
-        assert_eq!(file_flags["fineAliasInputs"], "17");
+        assert_eq!(
+            file_flags["fineAliasInputs"],
+            bazel_diff::cache::FINE_ALIAS_INPUTS_VERSION.to_string()
+        );
         let mut rooted = hashing_args(directory.path());
         rooted.use_cquery = true;
         rooted.cquery_root_expression = Some("//app:lib".to_owned());

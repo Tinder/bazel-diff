@@ -769,7 +769,9 @@ impl BazelOptions {
                             .filter_map(|row| row.rule.as_option_mut())
                         {
                             if let Some(children) = inputs.bindings.remove(&rule.name) {
-                                rule.rule_input.extend(children);
+                                rule.rule_input.extend(
+                                    children.iter().flat_map(|group| group.iter().cloned()),
+                                );
                                 rule.rule_input.sort_unstable();
                                 rule.rule_input.dedup();
                             }
@@ -3791,7 +3793,7 @@ fn mod_argument_byte_budget_from(setting: Option<&str>) -> usize {
 #[derive(Clone, Default)]
 pub(crate) struct ScopedSources {
     /// Positive registration definitions and their forwarding aliases for observed rule types.
-    pub(crate) toolchain_declarations: BTreeMap<String, BTreeSet<String>>,
+    pub(crate) toolchain_declarations: BTreeMap<String, Arc<BTreeSet<String>>>,
     pub(crate) repositories: BTreeSet<String>,
     pub(crate) repository_inputs: BTreeSet<String>,
     pub(crate) queried_files: HashSet<String>,

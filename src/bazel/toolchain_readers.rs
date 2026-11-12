@@ -3,8 +3,19 @@ use super::{canonical_query_label, query_set, target_name, BazelOptions, BazelVe
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
+use std::sync::Arc;
 
 type Bindings = BTreeMap<String, BTreeSet<String>>;
+type SharedBindings = BTreeMap<String, Vec<Arc<BTreeSet<String>>>>;
+
+/// Rules with the same observed types have the same candidate resolution inputs.
+/// Resolve label spellings once before attaching them to their readers.
+struct SupplierReaders<'a> {
+    readers: Vec<&'a str>,
+    implementations: BTreeSet<String>,
+    declarations: BTreeSet<String>,
+}
 
 #[derive(Default)]
 struct RegisteredToolchains {
@@ -64,7 +75,7 @@ struct OrdinaryGraph<'a> {
     fine: BTreeSet<String>,
     coarse: HashMap<&'a str, Option<[u8; 32]>>,
     rows: HashMap<String, &'a Target>,
-    parents: HashMap<String, Vec<String>>,
+    parents: HashMap<String, Vec<Rc<String>>>,
     primary: BTreeMap<String, Option<usize>>,
     metadata_classes: HashSet<usize>,
     alias_discovery_failed: bool,
@@ -124,11 +135,12 @@ impl<'a> OrdinaryGraph<'a> {
                 continue;
             }
             self.rows.insert(id.clone(), target);
+            let id = Rc::new(id);
             for child in super::target_inputs(target) {
                 self.parents
                     .entry(self.canonical(child))
                     .or_default()
-                    .push(id.clone());
+                    .push(Rc::clone(&id));
             }
         }
     }
@@ -145,8 +157,8 @@ impl<'a> OrdinaryGraph<'a> {
         let mut pending: Vec<_> = names.iter().cloned().collect();
         while let Some(name) = pending.pop() {
             for parent in self.parents.get(&name).into_iter().flatten() {
-                if admit(parent) && names.insert(parent.clone()) {
-                    pending.push(parent.clone());
+                if admit(parent) && names.insert(parent.as_ref().clone()) {
+                    pending.push(parent.as_ref().clone());
                 }
             }
         }
@@ -262,7 +274,7 @@ fn affected_repositories(
 /// Keep the old membership only on callers whose ordinary input or configured
 /// analysis was unavailable. Ordinary module dependencies stay on their original nodes.
 fn retain_memberships(
-    bindings: &mut Bindings,
+    bindings: &mut SharedBindings,
     repositories: &[super::RepositoryRow],
     family: &str,
     callers: BTreeSet<String>,
@@ -278,12 +290,14 @@ fn retain_memberships(
                 .filter(|group| group.extension == family)
                 .flat_map(|group| row.inferred(group))
         })
+        .map(str::to_owned)
         .collect();
+    let members = Arc::new(members);
     for caller in callers {
         bindings
             .entry(caller)
             .or_default()
-            .extend(members.iter().map(|label| (*label).to_owned()));
+            .push(Arc::clone(&members));
     }
 }
 
@@ -323,8 +337,8 @@ impl BazelOptions {
             // this ordinary query. Keep their legacy repository inputs when the
             // producer cannot report the registrations.
             let mut result = ExtensionInputs::default();
-            (result.bindings, result.sources) = options.supplier_inputs(
-                &graph,
+            result.sources = options.supplier_inputs(
+                &mut graph,
                 mapping,
                 version,
                 &RegisteredToolchains::default(),
@@ -458,8 +472,8 @@ impl BazelOptions {
             None => ExtensionInputs::default(),
         };
         let mut unresolved = BTreeSet::new();
-        let (bindings, suppliers) = options.supplier_inputs(
-            &graph,
+        let suppliers = options.supplier_inputs(
+            &mut graph,
             mapping,
             version,
             &registrations,
@@ -473,9 +487,6 @@ impl BazelOptions {
                 family,
                 unresolved.clone(),
             );
-        }
-        for (reader, inputs) in bindings {
-            result.bindings.entry(reader).or_default().extend(inputs);
         }
         drop(graph);
         recovered.extend(suppliers);
@@ -765,13 +776,13 @@ impl BazelOptions {
 
     fn supplier_inputs(
         &self,
-        graph: &OrdinaryGraph<'_>,
+        graph: &mut OrdinaryGraph<'_>,
         root_mapping: &[u8],
         version: BazelVersion,
         registrations: &RegisteredToolchains,
         result: &mut ExtensionInputs,
         unresolved: &mut BTreeSet<String>,
-    ) -> Result<(Bindings, Vec<Target>)> {
+    ) -> Result<Vec<Target>> {
         let fine = graph
             .rows
             .keys()
@@ -780,8 +791,10 @@ impl BazelOptions {
             .cloned()
             .collect();
         let reached = graph.ancestors(fine, |_| true);
+        // No subsequent observation needs reverse adjacency.
+        graph.parents = HashMap::new();
         if graph.primary.is_empty() || reached.is_empty() {
-            return Ok((Bindings::new(), Vec::new()));
+            return Ok(Vec::new());
         }
         let observations = self.observed_toolchain_rows(
             graph.rows.values().copied(),
@@ -841,7 +854,7 @@ impl BazelOptions {
         }
         let mut pending: BTreeSet<_> = by_type.keys().cloned().collect();
         if pending.is_empty() {
-            return Ok((Bindings::new(), Vec::new()));
+            return Ok(Vec::new());
         }
         while !pending.is_empty() {
             let aliases = self.alias_actuals(&pending, version)?;
@@ -893,38 +906,76 @@ impl BazelOptions {
             }
             Some(<[u8; 32]>::from(hash.finalize()))
         };
+        let fine_implementations: BTreeSet<_> = implementations
+            .into_iter()
+            .filter(|(name, _)| reached.contains(name))
+            .map(|(_, spelling)| spelling)
+            .collect();
+        drop(reached);
         let readers = self.readers_of(graph, &types)?;
-        let mut bindings = Bindings::new();
-        let mut missing_declarations = BTreeSet::new();
+        let mut by_types = BTreeMap::<BTreeSet<String>, Vec<&str>>::new();
         for (id, types) in readers.known {
             let rule = graph.rows[&id].rule.as_option().expect("nominated rule");
-            if matches!(
+            if !matches!(
                 rule.rule_class_key.as_deref(),
                 Some("toolchain" | "toolchain_type" | "alias")
             ) {
-                continue;
+                by_types.entry(types).or_default().push(&rule.name);
             }
-            if let Some(order) = fingerprint(&types) {
-                result.registration_hashes.insert(rule.name.clone(), order);
-            }
-            let inputs = bindings.entry(rule.name.clone()).or_default();
-            inputs.extend(types.iter().flat_map(|ty| by_type[ty].iter().cloned()));
-            // Eligibility can change while registration order, type and actual
-            // implementation labels stay fixed. Hash the declared predicates
-            // and the forwarding alias as ordinary target definitions.
-            result
-                .declarations
-                .entry(rule.name.clone())
-                .or_default()
-                .extend(
-                    types
-                        .iter()
-                        .filter_map(|ty| predicates.get(ty))
-                        .flatten()
-                        .cloned(),
-                );
         }
-        let demanded: BTreeSet<_> = result.declarations.values().flatten().collect();
+        let mut groups = Vec::new();
+        let mut used = BTreeSet::new();
+        for (types, names) in by_types {
+            if let Some(order) = fingerprint(&types) {
+                for &name in &names {
+                    result.registration_hashes.insert(name.to_owned(), order);
+                }
+            }
+            let implementations: BTreeSet<_> = types
+                .iter()
+                .flat_map(|ty| by_type[ty].iter().cloned())
+                .collect();
+            used.extend(implementations.iter().cloned());
+            groups.push(SupplierReaders {
+                readers: names,
+                implementations,
+                // The selection predicates and forwarding aliases can change
+                // while the candidates and registration order remain fixed.
+                declarations: types
+                    .iter()
+                    .filter_map(|ty| predicates.get(ty))
+                    .flatten()
+                    .cloned()
+                    .collect(),
+            });
+        }
+        // An unavailable reader retains the observed candidates and known fine
+        // suppliers. It does not establish demand for every installed toolchain.
+        if !readers.unknown.is_empty() {
+            used.extend(fine_implementations);
+            let order = fingerprint(&types);
+            let mut names = Vec::new();
+            for name in readers.unknown {
+                let spelling = target_name(graph.rows[&name]).expect("primary rule");
+                unresolved.insert(spelling.to_owned());
+                if let Some(order) = order {
+                    result
+                        .registration_hashes
+                        .insert(spelling.to_owned(), order);
+                }
+                names.push(spelling);
+            }
+            groups.push(SupplierReaders {
+                readers: names,
+                implementations: used.clone(),
+                declarations: BTreeSet::new(),
+            });
+        }
+        let demanded: BTreeSet<_> = groups
+            .iter()
+            .flat_map(|group| &group.declarations)
+            .collect();
+        let mut missing_declarations = BTreeSet::new();
         for label in demanded {
             if let Some(row) = graph.rows.get(label) {
                 missing_declarations.extend(
@@ -936,31 +987,6 @@ impl BazelOptions {
                 missing_declarations.insert(label.clone());
             }
         }
-        // An unavailable ordinary reader does not establish demand for every
-        // toolchain installed by Bazel. Keep the known fine suppliers and the
-        // implementations already observed for the other readers.
-        let mut possible: BTreeSet<_> = bindings.values().flatten().cloned().collect();
-        possible.extend(
-            implementations
-                .iter()
-                .filter(|(name, _)| reached.contains(*name))
-                .map(|(_, spelling)| spelling.clone()),
-        );
-        let possible_order = (!readers.unknown.is_empty())
-            .then(|| fingerprint(&types))
-            .flatten();
-        for name in readers.unknown {
-            let spelling = target_name(graph.rows[&name]).expect("primary rule");
-            unresolved.insert(spelling.to_owned());
-            if let Some(hash) = possible_order {
-                result.registration_hashes.insert(spelling.to_owned(), hash);
-            }
-            bindings
-                .entry(spelling.to_owned())
-                .or_default()
-                .extend(possible.iter().cloned());
-        }
-        let used: BTreeSet<_> = bindings.values().flatten().cloned().collect();
         missing.retain(|name| used.contains(name));
         // The ordinary external-repository contract already represents separately
         // fetched payloads by their repository definition. Preserve each demanded
@@ -1048,8 +1074,10 @@ impl BazelOptions {
             .filter_map(target_name)
             .map(|name| (graph.canonical(name), name))
             .collect();
-        for (reader, definitions) in &mut result.declarations {
-            *definitions = std::mem::take(definitions)
+        for group in groups {
+            let mut implementations = group.implementations;
+            let definitions: BTreeSet<_> = group
+                .declarations
                 .into_iter()
                 .filter_map(|label| {
                     let row = graph
@@ -1058,33 +1086,46 @@ impl BazelOptions {
                         .and_then(|row| target_name(row))
                         .or_else(|| spellings.get(&label).copied());
                     if row.is_none() {
-                        bindings.entry(reader.clone()).or_default().insert(label);
+                        implementations.insert(label);
                     }
                     row.map(str::to_owned)
                 })
                 .collect();
+            let definitions = Arc::new(definitions);
+            let implementations = Arc::new(
+                implementations
+                    .into_iter()
+                    .map(|child| {
+                        spellings
+                            .get(&graph.canonical(&child))
+                            .map_or(child, |name| (*name).to_owned())
+                    })
+                    .collect(),
+            );
+            for reader in group.readers {
+                result
+                    .bindings
+                    .entry(reader.to_owned())
+                    .or_default()
+                    .push(Arc::clone(&implementations));
+                if !definitions.is_empty() {
+                    result
+                        .declarations
+                        .insert(reader.to_owned(), Arc::clone(&definitions));
+                }
+            }
         }
-        for children in bindings.values_mut() {
-            *children = std::mem::take(children)
-                .into_iter()
-                .map(|child| {
-                    spellings
-                        .get(&graph.canonical(&child))
-                        .map_or(child, |name| (*name).to_owned())
-                })
-                .collect();
-        }
-        Ok((bindings, sources))
+        Ok(sources)
     }
 }
 
 #[derive(Default)]
 pub(super) struct ExtensionInputs {
-    pub(super) declarations: Bindings,
+    pub(super) declarations: BTreeMap<String, Arc<BTreeSet<String>>>,
     pub(super) registration_hashes: BTreeMap<String, [u8; 32]>,
     pub(super) supplier_hashes: BTreeMap<String, [u8; 32]>,
     pub(super) usages: BTreeSet<String>,
-    pub(super) bindings: BTreeMap<String, BTreeSet<String>>,
+    pub(super) bindings: SharedBindings,
     pub(super) sources: Vec<Target>,
 }
 
@@ -1120,7 +1161,7 @@ impl BazelOptions {
                 usage(child).is_some()
                     && callers
                         .iter()
-                        .any(|parent| graph.primary.contains_key(parent))
+                        .any(|parent| graph.primary.contains_key(parent.as_ref()))
             })
             .map(|(child, _)| child.clone())
             .collect();
@@ -1165,7 +1206,7 @@ impl BazelOptions {
                             .any(|parent| {
                                 graph
                                     .rows
-                                    .get(parent)
+                                    .get(parent.as_ref())
                                     .and_then(|row| row.rule.as_option())
                                     .is_some_and(|rule| rule.rule_class == "alias")
                             })
@@ -1191,10 +1232,13 @@ impl BazelOptions {
                 let readers = callers.entry(family).or_default();
                 for parent in graph.parents.get(name).into_iter().flatten() {
                     anyhow::ensure!(
-                        graph.rows.get(parent).is_some_and(|row| row.rule.is_set()),
+                        graph
+                            .rows
+                            .get(parent.as_ref())
+                            .is_some_and(|row| row.rule.is_set()),
                         "cannot retain repository inputs for {parent} reading {name}"
                     );
-                    readers.insert(parent.clone());
+                    readers.insert(parent.as_ref().clone());
                 }
             }
             for (family, readers) in callers {
@@ -1285,6 +1329,49 @@ impl BazelOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_reverse_edges_keep_the_canonical_parent_key() {
+        use crate::proto::blaze_query::{target, Rule};
+
+        let rows: Vec<_> = [
+            ("@@//:consumer", "@app//:bridge"),
+            ("@app//:bridge", "//:file"),
+        ]
+        .into_iter()
+        .map(|(name, input)| Target {
+            r#type: target::Discriminator::Rule,
+            rule: buffa::MessageField::some(Rule {
+                name: name.into(),
+                rule_input: vec![input.into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .collect();
+        let mut graph = OrdinaryGraph {
+            mapping: HashMap::from([("app".into(), "ext++tools+app".into())]),
+            fine: BTreeSet::new(),
+            coarse: HashMap::new(),
+            rows: HashMap::new(),
+            parents: HashMap::new(),
+            primary: BTreeMap::from([("//:consumer".into(), None)]),
+            metadata_classes: HashSet::new(),
+            alias_discovery_failed: false,
+        };
+        graph.index(&rows);
+        let bridge = "@@ext++tools+app//:bridge";
+        assert!(graph
+            .primary
+            .contains_key(graph.parents[bridge][0].as_ref()));
+        assert!(graph
+            .rows
+            .contains_key(graph.parents["//:file"][0].as_ref()));
+        assert_eq!(
+            graph.ancestors(BTreeSet::from(["//:file".into()]), |_| true),
+            BTreeSet::from(["//:file".into(), bridge.into(), "//:consumer".into()])
+        );
+    }
 
     #[test]
     fn direct_type_edges_require_a_complete_unambiguous_node_record() {

@@ -1932,7 +1932,7 @@ impl Labels {
         fine: &BTreeSet<String>,
         mapping: &HashMap<String, String>,
         views: &RepositoryViews<'_>,
-        declarations: &BTreeMap<String, BTreeSet<String>>,
+        declarations: &BTreeMap<String, Arc<BTreeSet<String>>>,
     ) {
         let empty = HashMap::new();
         let canonical_fine = fine.iter().any(|repo| repo.starts_with("@@"));
@@ -1975,7 +1975,11 @@ impl Labels {
                     // These are returned definitions of the actual candidate declarations.
                     // An unrelated BUILD edit elsewhere in their repository cannot change
                     // eligibility. Authored inputs above retain their usual repository coverage.
-                    inputs.extend(declarations.into_iter().flatten().cloned());
+                    inputs.extend(
+                        declarations
+                            .into_iter()
+                            .flat_map(|group| group.iter().cloned()),
+                    );
                     inputs.sort_unstable();
                     inputs.dedup();
                     let positions = inputs

@@ -746,7 +746,6 @@ impl BazelOptions {
         let mut toolchain_declarations = BTreeMap::new();
         if let Some(mut defs) = definitions {
             let repos = defs.lower(self, &canonical_to_apparent, std::convert::identity);
-            let mut observed = BTreeSet::new();
             if let Some(mapping) = root_mapping.as_deref() {
                 let survey = (module_graph_complete
                     && defs.extensions.complete_mappings
@@ -776,7 +775,6 @@ impl BazelOptions {
                                 rule.rule_input.dedup();
                             }
                         }
-                        observed = inputs.usages;
                         registration_hashes = inputs.registration_hashes;
                         supplier_hashes = inputs.supplier_hashes;
                         toolchain_declarations = inputs.declarations;
@@ -787,8 +785,10 @@ impl BazelOptions {
                     }
                 }
             }
+            // MODULE registrations are positive compiler inputs. A build or test rc
+            // can register another toolchain that this ordinary query never loads.
             targets.extend(repos.into_iter().map(|row| {
-                row.finish(&observed, &mut |target, group, ordinary| {
+                row.finish(&BTreeSet::new(), &mut |target, group, ordinary| {
                     transform(std::slice::from_mut(target), &[], group, ordinary)
                 })
             }));
@@ -9590,7 +9590,8 @@ exit 1
         assert_eq!(changed(&base, &hashes()), [CLIENT]);
         fs::write(dir.join("version"), "1").unwrap();
 
-        // A sibling RepoSpec changes without changing the SDK that the application consumes.
+        // The observed SDK stays unchanged, but MODULE registrations cannot rule out
+        // a compiler from --extra_toolchains. Keep the sibling repository fallback.
         repos[2].attribute.push(Attribute {
             name: "sha256".into(),
             r#type: attribute::Discriminator::String,
@@ -9598,7 +9599,7 @@ exit 1
             ..Default::default()
         });
         write_delimited(&dir.join("show-repo.pb"), &repos);
-        assert_eq!(changed(&base, &hashes()), [DATA_CLIENT]);
+        assert_eq!(changed(&base, &hashes()), [CLIENT, DATA_CLIENT]);
 
         // An unavailable command or a partial registration listing cannot
         // establish the suppliers. Both keep the owner's membership edges.

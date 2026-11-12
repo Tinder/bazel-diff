@@ -471,7 +471,7 @@ genrule(name = "reads_build", srcs = ["@crates//:a_build"], outs = ["definition.
 }
 
 // The two generated repositories both use ext's rule, but only one provides the changed data.
-// The explicit label-only contract and the normal fine-grained query must preserve that distinction.
+// The explicit label-only contract can rule out a toolchain dependency between siblings.
 #[test]
 fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
     if !supports_mod_show_repo() {
@@ -499,12 +499,11 @@ fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
     assert_eq!(impacted, BTreeSet::from(["//:uses_b".to_owned()]));
     let registered = has_module_registrations(first.path());
     let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained[..2]));
-    let expected = if registered {
-        vec!["//:uses_b"]
-    } else {
-        vec!["//:uses_a", "//:uses_b"]
-    };
-    assert_eq!(impacted, expected.into_iter().map(str::to_owned).collect());
+    // A MODULE-only registration inventory cannot rule out a build or test option.
+    assert_eq!(
+        impacted,
+        BTreeSet::from(["//:uses_a".to_owned(), "//:uses_b".to_owned()])
+    );
 
     let changed_rule = copy_workspace("extension_spokes_through_owner");
     fs::write(changed_rule.path().join("ext/tool.sh"), "exit 1\n").unwrap();
@@ -594,9 +593,9 @@ filegroup(name = "unavailable", srcs = ["@crates//:a"], target_compatible_with =
     }
     assert!(impacted.contains("//:copy"), "{impacted:?}");
     assert!(impacted.contains("//:uses_b"), "{impacted:?}");
+    assert!(impacted.contains("//:uses_a"), "{impacted:?}");
     if registered {
-        assert!(!impacted.contains("//:unavailable"), "{impacted:?}");
-        assert!(!impacted.contains("//:uses_a"), "{impacted:?}");
+        assert!(impacted.contains("//:unavailable"), "{impacted:?}");
     }
 }
 
@@ -2010,6 +2009,72 @@ genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "ca
 }
 
 #[test]
+fn extra_toolchain_outside_the_ordinary_graph_reaches_its_reader() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("extension_toolchain_through_owner");
+    let changed = copy_workspace("extension_toolchain_through_owner");
+    for (workspace, version) in [(&first, "one"), (&changed, "two")] {
+        let root = workspace.path();
+        edit(&root.join("MODULE.bazel"), |module| {
+            format!(
+                r#"{module}
+bazel_dep(name = "outside")
+local_path_override(module_name = "outside", path = "outside")
+"#
+            )
+        });
+        fs::write(
+            root.join("outside/BUILD.bazel"),
+            r#"load("@ext//:defs.bzl", "tool")
+tool(name = "impl", runtime = "@@ext++tools+tc_impl//:version.txt", visibility = ["//visibility:public"])
+toolchain(name = "extra", toolchain = ":impl", toolchain_type = "@ext//:toolchain_type", visibility = ["//visibility:public"])
+"#,
+        )
+        .unwrap();
+        edit(&root.join("BUILD.bazel"), |build| {
+            format!(
+                r#"{build}
+genrule(name = "product", srcs = [":uses_app"], outs = ["product.txt"], cmd = "cat $< > $@")
+filegroup(name = "unrelated", srcs = ["@app//:copies"])
+"#
+            )
+        });
+        fs::write(
+            root.join(".bazelrc"),
+            "build --config=compiler\nbuild:compiler --extra_toolchains=@outside//:extra\nbuild:unused --extra_toolchains=@absent//:extra\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("versions.json"),
+            format!(r#"{{"toolchain":"1.0","alternate":"{version}"}}"#),
+        )
+        .unwrap();
+        assert_product(root, "//:product", "product.txt", version);
+    }
+    let out = tempfile::tempdir().unwrap();
+    let edges = out.path().join("edges.json");
+    let changes = diff_local(
+        first.path(),
+        changed.path(),
+        &[
+            "--fineGrainedHashExternalRepos",
+            "@app",
+            "--depEdgesFile",
+            edges.to_str().unwrap(),
+        ],
+    );
+    assert!(changes.contains("//:uses_app"), "{changes:?}");
+    assert!(changes.contains("//:product"), "{changes:?}");
+    assert!(!changes.contains("//:unrelated"), "{changes:?}");
+    if has_module_registrations(first.path()) {
+        // Keep positive MODULE compiler edges alongside the repository fallback.
+        assert!(dep_edges(&edges)["@app//:lib"].contains("@@ext++tools+tc//:impl"));
+    }
+}
+
+#[test]
 fn separate_toolchain_type_keeps_its_own_consumers() {
     if !supports_mod_show_repo() {
         return;
@@ -2114,9 +2179,9 @@ genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "ca
     );
     assert!(selected.contains("//:other_reader"), "{selected:?}");
     assert!(selected.contains("//:bridge_reader"), "{selected:?}");
-    if has_module_registrations(first.path()) {
-        assert!(!selected.contains("//:normal"), "{selected:?}");
-    }
+    // The MODULE registrations identify each reader's candidates, but another
+    // command-line registration can still use the shared extension.
+    assert!(selected.contains("//:normal"), "{selected:?}");
 }
 
 // The generated @app resolves a toolchain also produced by its extension. An

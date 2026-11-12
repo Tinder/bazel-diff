@@ -100,6 +100,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::extra_toolchain_outside_the_ordinary_graph_reaches_its_reader",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::fine_alias_follows_already_returned_aliases_to_its_library",
                 "timeout": "moderate",
             },

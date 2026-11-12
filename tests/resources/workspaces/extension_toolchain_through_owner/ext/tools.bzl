@@ -9,7 +9,9 @@ filegroup(name = "copies", srcs = ["copy.txt"], visibility = ["//visibility:publ
 app = repository_rule(implementation = _app_impl)
 
 def _tc_impl(rctx):
+    rctx.file("version.txt", rctx.attr.version, executable = False)
     rctx.file("BUILD.bazel", """load("@ext//:defs.bzl", "tool")
+exports_files(["version.txt"])
 tool(name = "impl", version = "{version}")
 toolchain(name = "tc", toolchain = ":impl", toolchain_type = "@ext//:toolchain_type", visibility = ["//visibility:public"])
 """.format(version = rctx.attr.version))
@@ -28,7 +30,7 @@ def _tools_impl(mctx):
             versions.update(json.decode(mctx.read(lock.file)))
     app(name = "app")
     tc(name = "tc", version = versions["toolchain"])
-    tc(name = "tc_impl", version = versions["toolchain"])
+    tc(name = "tc_impl", version = versions.get("alternate", versions["toolchain"]))
     tc_alias(name = "tc_alias")
 
 tools = module_extension(

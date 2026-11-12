@@ -184,6 +184,14 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::parent_transition_reaches_a_toolchain_outside_the_extension",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::registered_compiler_reads_fine_input_through_another_pinned_archive",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::remote_proto_bump_impacts_consumer",
                 "timeout": "moderate",
             },
@@ -193,6 +201,10 @@ RUST_E2E_SUITES = [
             },
             {
                 "name": "external::returned_external_source_reaches_consumer",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::separate_toolchain_type_keeps_its_own_consumers",
                 "timeout": "moderate",
             },
             {

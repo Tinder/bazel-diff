@@ -515,6 +515,14 @@ impl BazelOptions {
             let Some(rule) = graph.rows.get(name).and_then(|row| row.rule.as_option()) else {
                 continue;
             };
+            // External rows are enrolled separately from the main rule-class
+            // groups. Their exact native key has the same meaning here.
+            if matches!(
+                rule.rule_class_key.as_deref(),
+                Some("toolchain" | "toolchain_type" | "alias")
+            ) {
+                continue;
+            }
             let explicit: BTreeSet<_> = rule
                 .rule_input
                 .iter()
@@ -916,12 +924,7 @@ impl BazelOptions {
         let mut by_types = BTreeMap::<BTreeSet<String>, Vec<&str>>::new();
         for (id, types) in readers.known {
             let rule = graph.rows[&id].rule.as_option().expect("nominated rule");
-            if !matches!(
-                rule.rule_class_key.as_deref(),
-                Some("toolchain" | "toolchain_type" | "alias")
-            ) {
-                by_types.entry(types).or_default().push(&rule.name);
-            }
+            by_types.entry(types).or_default().push(&rule.name);
         }
         let mut groups = Vec::new();
         let mut used = BTreeSet::new();
@@ -1180,7 +1183,9 @@ impl BazelOptions {
                 }
                 result.usages.insert(family);
                 if let Some(rule) = row.rule.as_option() {
-                    if rule.rule_class != "alias" {
+                    // Starlark rules can also be exported as `alias`. Only the
+                    // native rule's key proves it forwards its actual.
+                    if rule.rule_class_key.as_deref() != Some("alias") {
                         readers.insert(name);
                     }
                     pending.extend(rule.rule_input.iter().map(|child| graph.canonical(child)));
@@ -1288,6 +1293,7 @@ impl BazelOptions {
         options.command_options.extend([
             "--keep_going".to_owned(),
             "--noproto:flatten_selects".to_owned(),
+            "--proto:rule_classes".to_owned(),
         ]);
         // A missing alias or inactive dependency can coexist with valid rule
         // and source rows. Missing operands retain their own fallback below.

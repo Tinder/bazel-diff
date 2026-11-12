@@ -2146,6 +2146,26 @@ fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
         );
         if registration.starts_with(r#"use_repo(tools, "tc")"#) {
             for workspace in [&first, &bumped] {
+                let generator = fs::read_to_string(workspace.path().join("generator.bzl")).unwrap();
+                fs::write(
+                    workspace.path().join("reader.bzl"),
+                    generator.replace("generate = rule(", "alias = rule("),
+                )
+                .unwrap();
+                edit(&workspace.path().join("ext/tools.bzl"), |tools| {
+                    tools.replace(
+                        r#"rctx.file("BUILD.bazel", 'alias(name = "tc", actual = "@tc_impl//:tc")')"#,
+                        r#"rctx.file("BUILD.bazel", """load("@@//:reader.bzl", reader = "alias")
+alias(name = "tc", actual = "@tc_impl//:tc")
+alias(name = "unavailable_alias", actual = "//absent:target")
+genrule(name = "relay", srcs = ["@hidden_reader//:late_reader"], outs = ["relay.txt"], cmd = "cat $(SRCS) > $@", visibility = ["//visibility:public"])
+reader(name = "late_reader", visibility = ["//visibility:public"])
+""")"#,
+                    ).replace(
+                        r#"tc_alias(name = "tc_alias")"#,
+                        "tc_alias(name = \"tc_alias\")\n    tc_alias(name = \"hidden_reader\")",
+                    )
+                });
                 let unrelated = workspace.path().join("unrelated");
                 fs::create_dir(&unrelated).unwrap();
                 fs::write(
@@ -2170,6 +2190,8 @@ fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
                     format!(
                         r#"load("//:generator.bzl", "compiler", "generate")
 {build}
+genrule(name = "via_unavailable_alias", srcs = ["@@ext++tools+tc_alias//:unavailable_alias"], outs = ["unavailable.out"], cmd = "cat $(SRCS) > $@")
+genrule(name = "deep_reader", srcs = ["@@ext++tools+tc_alias//:relay"], outs = ["deep.txt"], cmd = "cat $(SRCS) > $@")
 toolchain_type(name = "generator_type")
 alias(name = "generator_alias", actual = ":generator_type")
 compiler(name = "compiler", src = "@tc_impl//:version.txt")
@@ -2203,6 +2225,8 @@ genrule(
             assert_product(bumped.path(), "//:read_versions", "versions.txt", "1.02.0");
             assert_product(first.path(), "//:independent", "independent.txt", "1.0");
             assert_product(bumped.path(), "//:independent", "independent.txt", "2.0");
+            assert_product(first.path(), "//:deep_reader", "deep.txt", "1.0");
+            assert_product(bumped.path(), "//:deep_reader", "deep.txt", "2.0");
             let out = tempfile::tempdir().unwrap();
             let edges = out.path().join("edges.json");
             let changes = diff_local(
@@ -2246,6 +2270,17 @@ genrule(
             // Either visible declaration can be added by an incoming transition.
             // The ordinary snapshot keeps both candidates for this toolchain type.
             if has_module_registrations(first.path()) {
+                // The later, transitively reached Starlark reader and the native alias
+                // share a display name. Only the reader uses a compiler.
+                assert!(graph["@@ext++tools+hidden_reader//:late_reader"].contains("//:compiler"));
+                assert!(selected("//:deep_reader"), "{changes:?}");
+                let alias = &graph["@@ext++tools+tc_alias//:unavailable_alias"];
+                assert!(
+                    !alias
+                        .iter()
+                        .any(|input| input.ends_with(":impl") || input.ends_with("compiler")),
+                    "{alias:?}"
+                );
                 assert!(graph["@app//:lib"].contains("@tc_impl//:impl"));
                 assert!(graph["@app//:lib"].contains("@@ext++tools+tc//:impl"));
             }

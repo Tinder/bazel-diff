@@ -62,9 +62,20 @@ alias(
     actual = ":wrapper",
 )
 
+package_group(
+    name = "consumers",
+    packages = ["//..."],
+)
+
+package_group(
+    name = "observed_visibility",
+    includes = [":consumers"],
+)
+
 observed_copy(
     name = "observed",
     src = "fixed.txt",
+    visibility = [":observed_visibility"],
 )
 
 filegroup(

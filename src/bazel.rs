@@ -5328,23 +5328,16 @@ impl CqueryDecoder {
         self.ready
             .par_drain(..)
             .map(|(target, checksum)| {
-                let package_group = verify && target.r#type == target::Discriminator::PackageGroup;
+                // A package group has no configured rule implementation or BUILD location.
+                // Keep its typed row so the verifier can check membership and includes directly.
+                if verify && target.r#type == target::Discriminator::PackageGroup {
+                    return checksum.is_none().then_some(target);
+                }
                 let mut target = if verify {
                     lower_target_without_compaction(target)?
                 } else {
                     lower_target(target)?
                 };
-                if package_group {
-                    let rule = target.rule.as_option_mut()?;
-                    rule.configured_rule_input = rule
-                        .rule_input
-                        .iter()
-                        .map(|label| ConfiguredRuleInput {
-                            label: Some(label.clone()),
-                            ..Default::default()
-                        })
-                        .collect();
-                }
                 if let Some(checksum) = checksum {
                     configure_target(&mut target, &checksum);
                 }
@@ -5784,7 +5777,7 @@ fn compact_target(target: &mut Target) {
     }
 }
 
-fn package_group_rule(group: &PackageGroup) -> Rule {
+pub(crate) fn package_group_rule(group: &PackageGroup) -> Rule {
     let packages = Attribute {
         name: "packages".to_owned(),
         r#type: crate::proto::blaze_query::attribute::Discriminator::StringList,

@@ -1399,17 +1399,7 @@ impl BazelOptions {
                     .iter()
                     .filter_map(|name| name.rsplit_once(':').map(|(package, _)| package.to_owned()))
                     .collect();
-                // A literal all-targets target can shadow the wildcard. Separate siblings
-                // expressions also avoid released Bazel's cross-repository package-path dedup.
-                let expression = packages
-                    .iter()
-                    .map(|package| {
-                        let pattern = format!("{package}:all-targets");
-                        query_labels(std::iter::once(&pattern))
-                            .map(|label| format!("siblings({label})"))
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .join(" + ");
+                let expression = package_targets(&packages)?;
                 let records = supplemental.query_with(
                     &self.with_exclude_filter(expression),
                     false,
@@ -3287,6 +3277,19 @@ fn query_set(labels: &BTreeSet<String>) -> Result<String> {
         .map(|label| query_labels(std::iter::once(label)))
         .collect::<Result<Vec<_>>>()?;
     Ok(format!("set({})", operands.join(" ")))
+}
+
+fn package_targets(packages: &BTreeSet<String>) -> Result<String> {
+    // A literal all-targets target can shadow the wildcard. Separate siblings
+    // expressions also avoid released Bazel's cross-repository package-path dedup.
+    let expressions = packages
+        .iter()
+        .map(|package| {
+            let pattern = format!("{package}:all-targets");
+            query_labels(std::iter::once(&pattern)).map(|label| format!("siblings({label})"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(expressions.join(" + "))
 }
 
 /// Coverage of the retained primary targets followed by any accepted supplement.

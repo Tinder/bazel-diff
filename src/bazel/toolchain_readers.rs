@@ -365,26 +365,74 @@ impl BazelOptions {
                 .cloned()
                 .collect();
             let mut requested = BTreeSet::new();
+            let mut alias_rows = HashMap::new();
+            let mut alias_packages = BTreeSet::new();
+            let mut new_packages = BTreeSet::new();
             while !pending.is_empty() {
                 let names = std::mem::take(&mut pending);
                 requested.extend(names.iter().cloned());
-                let rows = options.ordinary_rows(&names, version, false)?;
-                for row in &rows {
-                    if let Some(name) = target_name(row) {
+                // buildfiles($d) must cover every package whose aliases we reuse.
+                // A queued input might already have arrived as a BUILD or load row.
+                new_packages.retain(|package: &String| {
+                    names
+                        .range(format!("{package}:")..)
+                        .next()
+                        .and_then(|name| super::external_query_package(name))
+                        == Some(package.as_str())
+                });
+                let rows = options.ordinary_rows(&names, version, false, Some(&new_packages))?;
+                new_packages.clear();
+                let mut reached = std::collections::VecDeque::new();
+                for row in rows {
+                    // The package inventory contains aliases only. Admitting an
+                    // unrequested alias here would also admit its unused inputs.
+                    if let Some(rule) = row
+                        .rule
+                        .as_option()
+                        .filter(|rule| rule.rule_class == "alias")
+                    {
+                        let name = graph.canonical(&rule.name);
+                        if !names.contains(&name) {
+                            alias_rows.insert(name, row);
+                            continue;
+                        }
+                    }
+                    reached.push_back(row);
+                }
+                while let Some(row) = reached.pop_front() {
+                    if let Some(name) = target_name(&row) {
                         requested.insert(graph.canonical(name));
                     }
-                    for child in super::target_inputs(row).map(|name| graph.canonical(name)) {
+                    let alias = row
+                        .rule
+                        .as_option()
+                        .filter(|rule| rule.rule_class == "alias")
+                        .map(|rule| graph.canonical(&rule.name));
+                    for child in super::target_inputs(&row).map(|name| graph.canonical(name)) {
                         if repository(&child).is_some()
                             && is_boundary(&child)
                             && !graph.rows.contains_key(&child)
                             && !requested.contains(&child)
                         {
-                            pending.insert(child);
+                            if let Some(cached) = alias_rows.remove(&child) {
+                                requested.insert(child);
+                                reached.push_back(cached);
+                            } else {
+                                if let Some(package) = super::external_query_package(&child) {
+                                    if alias.as_deref().and_then(super::external_query_package)
+                                        == Some(package)
+                                        && alias_packages.insert(package.to_owned())
+                                    {
+                                        new_packages.insert(package.to_owned());
+                                    }
+                                }
+                                pending.insert(child);
+                            }
                         }
                     }
+                    opaque.push(row);
                 }
                 pending.retain(|name| !requested.contains(name));
-                opaque.extend(rows);
             }
             let entries: Vec<_> = graph
                 .parents
@@ -943,7 +991,7 @@ impl BazelOptions {
                 .filter(|name| !graph.rows.contains_key(*name))
                 .cloned()
                 .collect();
-            let rows = self.ordinary_rows(&absent, version, false)?;
+            let rows = self.ordinary_rows(&absent, version, false, None)?;
             let existing = names
                 .iter()
                 .filter_map(|name| graph.rows.get(name).copied());
@@ -1170,7 +1218,7 @@ impl BazelOptions {
         names: &BTreeSet<String>,
         version: BazelVersion,
     ) -> Result<Vec<Target>> {
-        self.ordinary_rows(names, version, true)
+        self.ordinary_rows(names, version, true, None)
     }
 
     fn ordinary_rows(
@@ -1178,6 +1226,7 @@ impl BazelOptions {
         names: &BTreeSet<String>,
         version: BazelVersion,
         recursive: bool,
+        alias_packages: Option<&BTreeSet<String>>,
     ) -> Result<Vec<Target>> {
         if names.is_empty() {
             return Ok(Vec::new());
@@ -1190,20 +1239,46 @@ impl BazelOptions {
         };
         let expression = format!("let d = {roots} in $d + buildfiles($d)");
         let mut options = self.clone();
-        options.keep_going = true;
-        options.command_options.push("--keep_going".to_owned());
+        // Like alias acquisition, a missing input can lead to an arbitrary
+        // rule with concatenated dictionary selects.
+        options.command_options.extend([
+            "--keep_going".to_owned(),
+            "--noproto:flatten_selects".to_owned(),
+        ]);
         // A missing alias or inactive dependency can coexist with valid rule
         // and source rows. Missing operands retain their own fallback below.
-        let graph = options.query_with_capture(
-            &expression,
-            false,
-            Some(version),
-            false,
-            &mut |_, _| {},
-            super::CqueryCapture::AvailableOrdinaryInputs,
-            |_| true,
-        )?;
-        super::deduplicate_targets(graph.targets)
+        let query = |options: &Self, expression: &str| {
+            let graph = options.query_with_capture(
+                expression,
+                false,
+                Some(version),
+                false,
+                &mut |_, _| {},
+                super::CqueryCapture::AvailableOrdinaryInputs,
+                |_| true,
+            )?;
+            super::deduplicate_targets(graph.targets)
+        };
+        if let Some(packages) = alias_packages.filter(|packages| !packages.is_empty()) {
+            let inventory = super::package_targets(packages)?;
+            let combined = format!("{expression} + kind('^alias rule$', ({inventory}))");
+            // Only the original literal lookup may supply a partial answer:
+            // an error in the extra inventory must not suppress its BUILD or target rows.
+            options.keep_going = false;
+            match query(&options, &combined) {
+                Ok(rows) => return Ok(rows),
+                Err(error) => {
+                    self.check_cancelled()?;
+                    if self.verbose {
+                        eprintln!(
+                            "[Info] retrying ordinary inputs without package aliases: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        options.keep_going = true;
+        query(&options, &expression)
     }
 }
 

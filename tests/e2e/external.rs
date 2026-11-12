@@ -516,6 +516,16 @@ fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
 
     // The owner can also forward a real generated input without a toolchain or a fine alias.
     for workspace in [&first, &bumped] {
+        edit(&workspace.path().join("MODULE.bazel"), |module| {
+            format!(
+                r#"{module}
+archive = use_repo_rule("@ext//:crates.bzl", "forward")
+archive(name = "selected_archive", src = "@bridge_archive//:lib")
+archive(name = "bridge_archive", src = "@@ext++crates+crates__b//:lib")
+archive(name = "independent_archive")
+"#
+            )
+        });
         edit(&workspace.path().join("ext/BUILD.bazel"), |build| {
             format!(
                 r#"load(":defs.bzl", "crate")
@@ -528,6 +538,12 @@ crate(name = "data", srcs = ["@@ext++crates+crates__b//:lib"], visibility = ["//
             format!(
                 r#"{build}
 genrule(name = "copy", srcs = ["@ext//:data"], outs = ["copied.txt"], cmd = "cp $< $@")
+genrule(name = "via_hub", srcs = ["@crates//:relay"], outs = ["hub.txt"], cmd = "cp $< $@")
+genrule(name = "direct", srcs = ["@@ext++crates+crates__relay//:lib"], outs = ["direct.txt"], cmd = "cp $< $@")
+genrule(name = "through_chain", srcs = ["@@ext++crates+crates__chain//:hop_5"], outs = ["chain.txt"], cmd = "cp $< $@")
+genrule(name = "via_archives", srcs = ["@selected_archive//:lib"], outs = ["via_archives.txt"], cmd = "cp $< $@")
+genrule(name = "from_archive", srcs = ["@bridge_archive//:lib"], outs = ["from_archive.txt"], cmd = "cp $< $@")
+filegroup(name = "independent", srcs = ["@independent_archive//:lib"])
 filegroup(name = "unavailable", srcs = ["@crates//:a"], target_compatible_with = ["@platforms//:incompatible"])
 "#
             )
@@ -535,7 +551,47 @@ filegroup(name = "unavailable", srcs = ["@crates//:a"], target_compatible_with =
     }
     assert_product(first.path(), "//:copy", "copied.txt", "1.0");
     assert_product(bumped.path(), "//:copy", "copied.txt", "2.0");
-    let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained[..2]));
+    for (target, file) in [
+        ("//:via_hub", "hub.txt"),
+        ("//:direct", "direct.txt"),
+        ("//:through_chain", "chain.txt"),
+        ("//:via_archives", "via_archives.txt"),
+        ("//:from_archive", "from_archive.txt"),
+    ] {
+        assert_product(first.path(), target, file, "1.0");
+        assert_product(bumped.path(), target, file, "2.0");
+    }
+    let repos = [
+        "--fineGrainedHashExternalRepos",
+        "@crates,@@ext++crates+crates__a,@selected_archive",
+    ];
+    let impacted = main(diff_local(first.path(), bumped.path(), &repos));
+    assert!(impacted.contains("//:via_hub"), "{impacted:?}");
+    assert!(impacted.contains("//:direct"), "{impacted:?}");
+    assert!(!impacted.contains("//:independent"), "{impacted:?}");
+    if registered {
+        assert!(impacted.contains("//:through_chain"), "{impacted:?}");
+        // A requested archive can forward through another directly imported repository.
+        assert!(impacted.contains("//:via_archives"), "{impacted:?}");
+        assert!(impacted.contains("//:from_archive"), "{impacted:?}");
+        let output = tempfile::tempdir().unwrap();
+        let report = generate(
+            first.path(),
+            &output.path().join("hashes.json"),
+            &[repos[0], repos[1], "-v"],
+        );
+        let log = String::from_utf8_lossy(&report.stderr);
+        assert!(report.status.success(), "{log}");
+        let chain_queries = log
+            .lines()
+            .filter(|line| line.contains("let d = ") && line.contains("+crates__chain//:hop_"))
+            .collect::<Vec<_>>();
+        assert!(chain_queries.len() <= 2, "{chain_queries:?}");
+        let hashes = fs::read_to_string(output.path().join("hashes.json")).unwrap();
+        assert!(hashes.contains("+crates__chain//:hop_0"));
+        assert!(hashes.contains("+crates__chain//:alternate"));
+        assert!(!hashes.contains("+crates__chain//:unused"));
+    }
     assert!(impacted.contains("//:copy"), "{impacted:?}");
     assert!(impacted.contains("//:uses_b"), "{impacted:?}");
     if registered {

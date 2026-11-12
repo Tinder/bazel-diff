@@ -4105,7 +4105,6 @@ struct RepositoryRow {
     target: Target,
     memberships: Vec<Arc<RepositoryInputGroup>>,
     generated: bool,
-    remote_fetch: bool,
     setup_hash: Option<[u8; 32]>,
     ordinary_complete: bool,
 }
@@ -4450,7 +4449,6 @@ fn repository_rows<T>(
                 target: repository_target(rules.next().unwrap(), &apparent, &ordinary_dependencies),
                 memberships: memberships.clone(),
                 generated,
-                remote_fetch,
                 setup_hash,
                 ordinary_complete,
             }));
@@ -6601,7 +6599,6 @@ mod tests {
                 labels: vec!["//external:both".into(), "//external:sibling".into()],
             })],
             generated: false,
-            remote_fetch: false,
             setup_hash: None,
             ordinary_complete: false,
         };
@@ -7515,7 +7512,7 @@ mod tests {
     }
 
     #[test]
-    fn an_opaque_overlay_keeps_a_pinned_archive_in_the_supplier_query() {
+    fn an_archive_setup_hash_requires_known_fetch_inputs() {
         let mut archive = Repository {
             canonical_name: Some("sdk+".into()),
             repo_rule_name: Some("http_archive".into()),
@@ -7535,7 +7532,7 @@ mod tests {
             string_value: Some("@@overlay+//:build.tpl".into()),
             ..Default::default()
         });
-        let remote_fetch = |repos| {
+        let has_setup_hash = |repos| {
             repository_rows(
                 repos,
                 &BTreeMap::new(),
@@ -7546,16 +7543,19 @@ mod tests {
                 None,
                 &LabelOnlyRepositories::default(),
                 Path::new("."),
-                |row| row.remote_fetch,
+                |row| row.setup_hash.is_some(),
             )
         };
         assert_eq!(
-            remote_fetch(vec![archive.clone(), overlay.clone()]),
-            [true, true]
+            has_setup_hash(vec![archive.clone(), overlay.clone()]),
+            [true, false]
         );
         overlay.repo_rule_bzl_label = Some("@@defs+//:custom.bzl".into());
-        assert_eq!(remote_fetch(vec![archive.clone(), overlay]), [false, false]);
-        assert_eq!(remote_fetch(vec![archive]), [false]);
+        assert_eq!(
+            has_setup_hash(vec![archive.clone(), overlay]),
+            [false, false]
+        );
+        assert_eq!(has_setup_hash(vec![archive]), [false]);
     }
 
     #[test]

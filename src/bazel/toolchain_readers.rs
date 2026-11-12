@@ -73,7 +73,7 @@ impl PrimaryRules {
 struct OrdinaryGraph<'a> {
     mapping: HashMap<String, String>,
     fine: BTreeSet<String>,
-    coarse: HashMap<&'a str, Option<[u8; 32]>>,
+    archive_setups: HashMap<&'a str, [u8; 32]>,
     rows: HashMap<String, &'a Target>,
     parents: HashMap<String, Vec<Rc<String>>>,
     primary: BTreeMap<String, Option<usize>>,
@@ -107,10 +107,13 @@ impl<'a> OrdinaryGraph<'a> {
         let mut graph = Self {
             mapping,
             fine,
-            coarse: repositories
+            archive_setups: repositories
                 .iter()
-                .filter(|row| row.remote_fetch)
-                .filter_map(|row| target_name(&row.target).map(|name| (name, row.setup_hash)))
+                .filter_map(|row| {
+                    let setup = row.setup_hash?;
+                    let name = target_name(&row.target)?;
+                    Some((name, setup))
+                })
                 .collect(),
             rows: HashMap::new(),
             parents: HashMap::new(),
@@ -991,21 +994,8 @@ impl BazelOptions {
             }
         }
         missing.retain(|name| used.contains(name));
-        // The ordinary external-repository contract already represents separately
-        // fetched payloads by their repository definition. Preserve each demanded
-        // supplier's own rules, and follow fine-grained, local and otherwise
-        // unrepresented inputs. A recursive deps() here fetches SDKs for every
-        // platform merely to discover inputs of a small number of wrappers.
-        let owners: HashSet<_> = missing
-            .iter()
-            .filter_map(|name| repository(name))
-            .map(str::to_owned)
-            .collect();
-        let fine_families: HashSet<_> = graph
-            .fine
-            .iter()
-            .filter_map(|name| super::extension_usage_prefix(name))
-            .collect();
+        // Preserve the external setup inputs of pinned archives reached from
+        // a supplier. Their BUILD rules can have additional label dependencies.
         let nodes = crate::hash::canonical_repo_nodes(&graph.mapping);
         let mut pending = missing;
         pending.extend(missing_declarations);
@@ -1021,43 +1011,34 @@ impl BazelOptions {
                 .cloned()
                 .collect();
             let rows = self.ordinary_rows(&absent, version, false, None)?;
+            // A partial response contributes the actual rows it returned. An
+            // omitted child retains its caller's ordinary repository input and
+            // any known setup digest, but supplies no further target-level edges.
             let existing = names
                 .iter()
                 .filter_map(|name| graph.rows.get(name).copied());
             for row in existing.chain(rows.iter()) {
-                if !target_name(row).is_some_and(|name| names.contains(&graph.canonical(name))) {
+                let Some(parent) = target_name(row) else {
+                    continue;
+                };
+                if !names.contains(&graph.canonical(parent)) {
                     continue;
                 }
                 for child in super::target_inputs(row).map(|name| graph.canonical(name)) {
-                    if visited.contains(&child) || child.starts_with("//external:") {
-                        continue;
-                    }
-                    let boundary = repository(&child)
-                        .filter(|repo| {
-                            !owners.contains(*repo)
-                                && !graph.fine.contains(*repo)
-                                && !super::extension_usage_prefix(repo)
-                                    .is_some_and(|family| fine_families.contains(family))
+                    let companion = crate::hash::transform_external_input(
+                        &child,
+                        &self.fine_grained_external_repos,
+                        &nodes,
+                    );
+                    if let Some(digest) =
+                        graph.archive_setups.get(companion.as_ref()).filter(|_| {
+                            !repository(&child).is_some_and(|repo| graph.fine.contains(repo))
                         })
-                        .and_then(|_| {
-                            graph.coarse.get(
-                                crate::hash::transform_external_input(
-                                    &child,
-                                    &self.fine_grained_external_repos,
-                                    &nodes,
-                                )
-                                .as_ref(),
-                            )
-                        });
-                    match boundary.filter(|_| !graph.rows.contains_key(&child)) {
-                        Some(Some(digest)) => {
-                            let name = target_name(row).expect("named supplier");
-                            setups.entry(name.to_owned()).or_default().insert(*digest);
-                        }
-                        Some(None) => (),
-                        None => {
-                            pending.insert(child);
-                        }
+                    {
+                        setups.entry(parent.to_owned()).or_default().insert(*digest);
+                    }
+                    if !visited.contains(&child) && !child.starts_with("//external:") {
+                        pending.insert(child);
                     }
                 }
             }
@@ -1358,7 +1339,7 @@ mod tests {
         let mut graph = OrdinaryGraph {
             mapping: HashMap::from([("app".into(), "ext++tools+app".into())]),
             fine: BTreeSet::new(),
-            coarse: HashMap::new(),
+            archive_setups: HashMap::new(),
             rows: HashMap::new(),
             parents: HashMap::new(),
             primary: BTreeMap::from([("//:consumer".into(), None)]),

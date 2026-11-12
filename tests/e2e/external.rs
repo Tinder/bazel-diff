@@ -2350,6 +2350,76 @@ genrule(
     }
 }
 
+#[test]
+fn registered_compiler_reads_fine_input_through_another_pinned_archive() {
+    use sha2::{Digest, Sha256};
+
+    let base = copy_workspace("extension_toolchain_through_owner");
+    let head = copy_workspace("extension_toolchain_through_owner");
+    let files = tempfile::tempdir().unwrap();
+    let overlay = files.path().join("bridge.BUILD");
+    let contents = r#"filegroup(name = "forward", srcs = ["@tc_impl//:version.txt"], visibility = ["//visibility:public"])"#;
+    fs::write(&overlay, contents).unwrap();
+    let overlay_hash = hex::encode(Sha256::digest(contents));
+    let zip = fixture("integration-test-1.zip");
+    for workspace in [&base, &head] {
+        let root = workspace.path();
+        edit(&root.join("MODULE.bazel"), |module| {
+            format!(
+                r#"{module}
+use_repo(tools, "tc_impl")
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+http_file(name = "overlay", urls = ["file://{}"], sha256 = "{overlay_hash}", downloaded_file_path = "bridge.BUILD")
+archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+archive(name = "bridge", urls = ["file://{zip}"], sha256 = "{zip_hash}", build_file = "@overlay//file:bridge.BUILD")
+archive(name = "sdk", urls = ["file://{zip}"], sha256 = "{zip_hash}", build_file_content = """load("@@//:generator.bzl", "compiler")
+compiler(name = "impl", src = "@bridge//:forward")
+toolchain(name = "registration", toolchain_type = "@@//:generator_type", toolchain = ":impl")
+""")
+register_toolchains("@sdk//:registration")
+"#,
+                overlay.display(),
+                zip = zip.display(),
+                zip_hash = "f9acf346049358076827b799e95de4b5acf0556fd75991e0dd5363814bc85683",
+            )
+        });
+        edit(&root.join("BUILD.bazel"), |build| {
+            format!(
+                r#"load(":generator.bzl", "generate")
+{build}
+toolchain_type(name = "generator_type", visibility = ["//visibility:public"])
+generate(name = "archive_reader")
+"#
+            )
+        });
+    }
+    fs::write(
+        head.path().join("versions.json"),
+        r#"{"toolchain":"1.0","alternate":"2.0"}"#,
+    )
+    .unwrap();
+    assert_product(
+        base.path(),
+        "//:archive_reader",
+        "archive_reader.txt",
+        "1.0",
+    );
+    assert_product(
+        head.path(),
+        "//:archive_reader",
+        "archive_reader.txt",
+        "2.0",
+    );
+    if has_module_registrations(base.path()) {
+        let affected = diff_local(
+            base.path(),
+            head.path(),
+            &["--fineGrainedHashExternalRepos", "@app,@tc_impl"],
+        );
+        assert!(affected.contains("//:archive_reader"), "{affected:?}");
+    }
+}
+
 fn has_module_registrations(workspace: &std::path::Path) -> bool {
     let output = std::process::Command::new(bazel())
         .current_dir(workspace)

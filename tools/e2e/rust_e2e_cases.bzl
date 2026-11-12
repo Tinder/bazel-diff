@@ -188,6 +188,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::registered_compiler_reads_fine_input_through_another_pinned_archive",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::remote_proto_bump_impacts_consumer",
                 "timeout": "moderate",
             },

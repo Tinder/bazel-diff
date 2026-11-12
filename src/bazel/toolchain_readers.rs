@@ -23,6 +23,41 @@ struct RegisteredToolchains {
     order: Vec<(String, BTreeSet<String>)>,
 }
 
+/// `mod show_toolchains --output=json` returns one module per JSON record.
+fn module_registration_labels(output: &[u8]) -> serde_json::Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Module {
+        registrations: Vec<Registration>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Registration {
+        targets: Vec<RegisteredTarget>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RegisteredTarget {
+        label: String,
+        // A target with a resolution error has an error instead of a type.
+        #[serde(rename = "toolchain_type")]
+        _toolchain_type: String,
+    }
+
+    let mut labels = Vec::new();
+    let mut seen = HashSet::new();
+    for module in serde_json::Deserializer::from_slice(output).into_iter::<Module>() {
+        let module = module?;
+        for registration in module.registrations {
+            // Bazel considers a canonical label only on its first registration. The
+            // command reports each pattern separately, including overlapping matches.
+            for target in registration.targets {
+                if seen.insert(target.label.clone()) {
+                    labels.push(target.label);
+                }
+            }
+        }
+    }
+    Ok(labels)
+}
+
 #[derive(Default)]
 struct ReaderTypes {
     known: Bindings,
@@ -659,31 +694,28 @@ impl BazelOptions {
         version: BazelVersion,
         mapping: &HashMap<String, String>,
     ) -> Result<Option<RegisteredToolchains>> {
+        // An rc filter can hide registered toolchains even when this command succeeds.
+        // Clear only its display filter. Bazel rejects a second invocation policy.
         let output = self.run_capture(&[
+            r#"--invocation_policy=flag_policies { flag_name: "toolchain_type" commands: "mod" use_default {} }"#,
             "mod",
-            "graph",
+            "show_toolchains",
             "--output=json",
-            "--include_toolchain_registrations",
         ])?;
         if !output.status.success() {
             self.check_cancelled()?;
             let diagnostic = String::from_utf8_lossy(&output.stderr);
-            if self.verbose
-                || !diagnostic.contains("Unrecognized option: --include_toolchain_registrations")
-            {
+            if self.verbose || !diagnostic.contains("Invalid subcommand, choose one from") {
                 eprintln!("[Warn] retaining repository inputs because MODULE registration lookup failed ({}): {}", output.status, diagnostic.trim());
             }
             return Ok(None);
         }
-        #[derive(serde::Deserialize)]
-        struct RegistrationGraph {
-            #[serde(rename = "moduleToolchainRegistrations")]
-            registrations: Option<Vec<String>>,
-        }
-        let Some(registrations) =
-            serde_json::from_slice::<RegistrationGraph>(&output.stdout)?.registrations
-        else {
-            return Ok(None);
+        let registrations = match module_registration_labels(&output.stdout) {
+            Ok(labels) => labels,
+            Err(error) => {
+                eprintln!("[Warn] retaining repository inputs because MODULE registration output was incomplete: {error}");
+                return Ok(None);
+            }
         };
         let mut metadata = self.clone();
         metadata.command_options.extend(
@@ -1316,6 +1348,28 @@ impl BazelOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_registrations_preserve_first_occurrences_across_patterns_and_modules() {
+        let response = br#"
+{"module":"<root>","registrations":[{"pattern":"//:forward","targets":[{"label":"@@//:forward","toolchain_type":"@@tools+//:type"}]}]}
+{"module":"tools@1","registrations":[{"pattern":"//:all","targets":[{"label":"@@tools+//:z","toolchain_type":"@@tools+//:type"},{"label":"@@tools+//:a","toolchain_type":"@@tools+//:type"}]},{"pattern":"//:z","targets":[{"label":"@@tools+//:z","toolchain_type":"@@tools+//:type"}]}]}
+"#;
+        assert_eq!(
+            module_registration_labels(response).unwrap(),
+            ["@@//:forward", "@@tools+//:z", "@@tools+//:a"]
+        );
+        for incomplete in [
+            br#"{"registrations":[{"pattern":"//:all","error":"package error"}]}"#.as_slice(),
+            br#"{"registrations":[{"targets":[{"label":"@@//:forward","error":"configurable alias"}]}]}"#,
+        ] {
+            assert!(module_registration_labels(incomplete).is_err());
+        }
+        let mut truncated = response.to_vec();
+        truncated.extend_from_slice(br#"{"module":"incomplete""#);
+        assert!(module_registration_labels(&truncated).is_err());
+        assert!(module_registration_labels(b"").unwrap().is_empty());
+    }
 
     #[test]
     fn ordinary_reverse_edges_keep_the_canonical_parent_key() {

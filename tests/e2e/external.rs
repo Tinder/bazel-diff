@@ -1872,7 +1872,7 @@ bazel_dep(name = "outside")
 local_path_override(module_name = "outside", path = "outside")
 bazel_dep(name = "registrar")
 local_path_override(module_name = "registrar", path = "registrar")
-register_toolchains("@registrar//:registration", "@registrar//other:registration")
+register_toolchains("@registrar//:registration", "@registrar//:all", "@registrar//other:registration")
 "#
             )
         });
@@ -1975,6 +1975,35 @@ genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "ca
     assert!(!changes.contains("//:switched"), "{changes:?}");
     fs::copy(first.path().join(other), changed.path().join(other)).unwrap();
     update("registrar/BUILD.bazel");
+    assert_product(changed.path(), "//:switched", "switched.txt", "1.0");
+    let changes = diff_local(first.path(), changed.path(), &args);
+    assert!(changes.contains("//:switched"), "{changes:?}");
+
+    // The two orders contain exactly the same declarations. Registering the
+    // alias first changes the tool selected under the parent's transition.
+    let registrar = "registrar/BUILD.bazel";
+    fs::copy(first.path().join(registrar), changed.path().join(registrar)).unwrap();
+    for (workspace, order) in [
+        (
+            &first,
+            r#""@registrar//:registration", "@registrar//:all", "@@ext++tools+tc_alias//:tc""#,
+        ),
+        (
+            &changed,
+            r#""@@ext++tools+tc_alias//:tc", "@registrar//:registration", "@registrar//:all""#,
+        ),
+    ] {
+        // An ambient filter for the unrelated type would hide both compilers.
+        fs::write(
+            workspace.path().join(".bazelrc"),
+            "mod --toolchain_type=@registrar//:other_type\n",
+        )
+        .unwrap();
+        edit(&workspace.path().join("MODULE.bazel"), |module| {
+            module.replace(r#""@registrar//:registration", "@registrar//:all""#, order)
+        });
+    }
+    assert_product(first.path(), "//:switched", "switched.txt", "outside-1");
     assert_product(changed.path(), "//:switched", "switched.txt", "1.0");
     let changes = diff_local(first.path(), changed.path(), &args);
     assert!(changes.contains("//:switched"), "{changes:?}");
@@ -2421,19 +2450,13 @@ generate(name = "archive_reader")
 }
 
 fn has_module_registrations(workspace: &std::path::Path) -> bool {
-    let output = std::process::Command::new(bazel())
+    std::process::Command::new(bazel())
         .current_dir(workspace)
-        .args([
-            "mod",
-            "graph",
-            "--output=json",
-            "--include_toolchain_registrations",
-        ])
+        .args(["mod", "show_toolchains", "--output=json"])
         .output()
-        .unwrap();
-    output.status.success()
-        && serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .is_ok_and(|graph| graph["moduleToolchainRegistrations"].is_array())
+        .unwrap()
+        .status
+        .success()
 }
 
 fn diff_local(

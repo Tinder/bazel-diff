@@ -9379,9 +9379,21 @@ if [ "$1 $2" = "info output_base" ]; then
   pwd
   exit 0
 fi
-if [ -f registered.pb ] && echo "$args" | grep -q -- --include_toolchain_registrations; then
-  echo '{{"moduleToolchainRegistrations":["//:registration"]}}'
-  exit 0
+if [ "$2 $3" = "mod show_toolchains" ]; then
+  case "$1" in
+    --invocation_policy=*toolchain_type*use_default*) ;;
+    *) exit 1 ;;
+  esac
+  if [ -f registered.pb ] || [ -f partial-registrations ]; then
+    echo '{{"module":"<root>","registrations":[{{"pattern":"//:all","targets":[{{"label":"@@//:registration","toolchain_type":"@@//:type"}}]}}]}}'
+    if [ -f partial-registrations ]; then
+      echo 'failed to expand a registration pattern' >&2
+      exit 2
+    fi
+    exit 0
+  fi
+  echo 'Invalid subcommand, choose one from : graph, show_repo.' >&2
+  exit 2
 fi
 if echo "$args" | grep -q "mod graph --output=json"; then
   if [ -f omit-graph-hint ]; then
@@ -9588,10 +9600,14 @@ exit 1
         write_delimited(&dir.join("show-repo.pb"), &repos);
         assert_eq!(changed(&base, &hashes()), [DATA_CLIENT]);
 
-        // Without the producer field the ordinary snapshot retains legacy
-        // owner membership, protecting callers of hidden registrations.
+        // An unavailable command or a partial registration listing cannot
+        // establish the suppliers. Both keep the owner's membership edges.
         fs::remove_file(dir.join("registered.pb")).unwrap();
         let legacy = hashes();
+        fs::write(dir.join("partial-registrations"), "").unwrap();
+        let partial = hashes();
+        assert_eq!(partial.hashes, legacy.hashes);
+        assert_eq!(partial.dep_edges, legacy.dep_edges);
         repos[2].attribute.clear();
         write_delimited(&dir.join("show-repo.pb"), &repos);
         let changes = changed(&legacy, &hashes());

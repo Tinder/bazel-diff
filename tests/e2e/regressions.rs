@@ -79,6 +79,21 @@ fn package_group_change_impacts_consumers() {
         })
         .collect();
     assert_eq!(local_labels, ordinary.iter().map(String::as_str).collect());
+    let verified = diff_workspaces(
+        first.path(),
+        second.path(),
+        &[
+            "--useCquery",
+            "--cqueryRootExpression",
+            "//consumer:use_thing",
+            "--verifyConfiguredRoots",
+        ],
+    );
+    let labels: Vec<_> = verified
+        .iter()
+        .map(|label| label.trim_start_matches('@'))
+        .collect();
+    assert_eq!(labels, ["//consumer:use_thing"]);
 }
 
 #[test]

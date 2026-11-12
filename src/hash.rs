@@ -1114,7 +1114,32 @@ impl ConfiguredCoverage {
                 continue;
             };
             let normal = normal.get(key.as_str()).copied().flatten();
+            let definition = || {
+                prepared
+                    .ids
+                    .get(&key)
+                    .and_then(|&id| prepared.prepared.get(id))
+                    .and_then(Option::as_ref)
+                    .map(|rule| rule.definition_digest)
+            };
             let node = match target.r#type {
+                target::Discriminator::PackageGroup => {
+                    let Some(group) = target.package_group.into_option() else {
+                        continue;
+                    };
+                    let rule = crate::bazel::package_group_rule(&group);
+                    let digest = rule_definition_digest(&rule, &options.ignored_attributes);
+                    CoverageNode {
+                        covered: definition() == Some(digest)
+                            && normal
+                                .and_then(|target| target.rule.as_option())
+                                .is_some_and(|normal| {
+                                    normal.configured_rule_input == rule.configured_rule_input
+                                }),
+                        inputs: group.included_package_group,
+                        kind: CoverageKind::Rule(Some(digest)),
+                    }
+                }
                 target::Discriminator::Rule => {
                     let Some(rule) = target.rule.as_option() else {
                         continue;
@@ -1133,12 +1158,6 @@ impl ConfiguredCoverage {
                                     .map(encode_configured_input)
                                     .collect::<HashSet<_>>()
                             });
-                    let definition = prepared
-                        .ids
-                        .get(&key)
-                        .and_then(|&id| prepared.prepared.get(id))
-                        .and_then(Option::as_ref)
-                        .map(|rule| rule.definition_digest);
                     // The verification query requests definition stacks. A Starlark rule's
                     // implementation digest must be among the attributes the normal hash used.
                     let definition_observed = rule.definition_stack.is_empty()
@@ -1157,7 +1176,7 @@ impl ConfiguredCoverage {
                         covered: definition_observed
                             && rule.default_setting.is_empty()
                             && context.is_some()
-                            && definition
+                            && definition()
                                 == Some(rule_definition_digest(rule, &options.ignored_attributes))
                             && normal_inputs.is_some_and(|normal| {
                                 inputs.iter().all(|input| normal.contains(input))
@@ -4173,6 +4192,55 @@ mod tests {
             always_affected_tags: HashSet::new(),
             partial_tree: None,
         }
+    }
+
+    #[test]
+    fn verified_package_groups_require_the_hashed_membership_and_includes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let options = hash_options(workspace.path());
+        let group = crate::proto::blaze_query::PackageGroup {
+            name: "//lib:visible".into(),
+            contained_package: vec!["//consumer/...".into()],
+            included_package_group: vec!["//lib:other".into()],
+            ..Default::default()
+        };
+        let mut rule = crate::bazel::package_group_rule(&group);
+        let mut prepared = PreparedRules::default();
+        prepared.extend([(
+            rule.name.clone(),
+            PreparedRule {
+                definition_digest: prehash_rule(&mut rule, &options.ignored_attributes),
+                repository_inputs: None,
+                loading_inputs: Vec::new(),
+            },
+            None,
+        )]);
+        let normal = [rule_target(rule)];
+        let verify = |group| {
+            ConfiguredCoverage::new(
+                VerifiedQuery {
+                    targets: vec![Target {
+                        r#type: target::Discriminator::PackageGroup,
+                        package_group: buffa::MessageField::some(group),
+                        ..Default::default()
+                    }],
+                    aspects: vec![],
+                    source_locations: BTreeMap::new(),
+                },
+                &normal,
+                &prepared,
+                &options,
+            )
+        };
+        let covered = verify(group.clone());
+        assert!(covered.rule_context(&group.name).is_some());
+        assert!(covered.requires(&group.name, "//lib:other"));
+        let mut edited = group.clone();
+        edited.contained_package.clear();
+        assert!(verify(edited).rule_context(&group.name).is_none());
+        let mut edited = group.clone();
+        edited.included_package_group.push("//lib:missing".into());
+        assert!(verify(edited).rule_context(&group.name).is_none());
     }
 
     fn hash_targets_for_test(

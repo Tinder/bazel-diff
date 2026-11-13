@@ -2038,6 +2038,9 @@ toolchain(name = "extra", toolchain = ":impl", toolchain_type = "@ext//:toolchai
                 r#"{build}
 genrule(name = "product", srcs = [":uses_app"], outs = ["product.txt"], cmd = "cat $< > $@")
 filegroup(name = "unrelated", srcs = ["@app//:copies"])
+alias(name = "runtime", actual = "@@ext++tools+tc_impl//:version.txt")
+alias(name = "forward", actual = ":runtime")
+genrule(name = "copy", srcs = [":forward"], outs = ["copy.txt"], cmd = "cat $< > $@")
 "#
             )
         });
@@ -2052,6 +2055,7 @@ filegroup(name = "unrelated", srcs = ["@app//:copies"])
         )
         .unwrap();
         assert_product(root, "//:product", "product.txt", version);
+        assert_product(root, "//:copy", "copy.txt", version);
     }
     let out = tempfile::tempdir().unwrap();
     let edges = out.path().join("edges.json");
@@ -2072,6 +2076,33 @@ filegroup(name = "unrelated", srcs = ["@app//:copies"])
         // Keep positive MODULE compiler edges alongside the repository fallback.
         assert!(dep_edges(&edges)["@app//:lib"].contains("@@ext++tools+tc//:impl"));
     }
+
+    let compare_roots = || {
+        diff_local(
+            first.path(),
+            changed.path(),
+            &[
+                "--useCquery",
+                "--cqueryRootExpression=set(//:product //:copy //:unrelated)",
+            ],
+        )
+        .into_iter()
+        .map(|label| match label.strip_prefix("@@//") {
+            Some(target) => format!("//{target}"),
+            None => label,
+        })
+        .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        compare_roots(),
+        BTreeSet::from(["//:copy".into(), "//:product".into()])
+    );
+    for (workspace, version) in [(&first, "one"), (&changed, "two")] {
+        fs::remove_file(workspace.path().join(".bazelrc")).unwrap();
+        assert_product(workspace.path(), "//:product", "product.txt", "1.0");
+        assert_product(workspace.path(), "//:copy", "copy.txt", version);
+    }
+    assert_eq!(compare_roots(), BTreeSet::from(["//:copy".into()]));
 }
 
 #[test]

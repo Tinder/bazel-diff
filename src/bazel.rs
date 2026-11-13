@@ -599,6 +599,14 @@ impl BazelOptions {
                 initial_repositories,
                 server_info.external_package,
                 |expression, use_cquery| {
+                    let normal_view = if use_cquery
+                        && self.cquery_root_expression.is_some()
+                        && self.exclude_targets_query.is_none()
+                    {
+                        CqueryCapture::RootDependencies
+                    } else {
+                        CqueryCapture::Standard
+                    };
                     if let Some(strict) = &strict {
                         strict.query_with(
                             &self.with_exclude_filter(scope.expression(expression)),
@@ -613,10 +621,17 @@ impl BazelOptions {
                     } else if verify && use_cquery {
                         // Keep positive distances on the caller's normal view. The full typed
                         // view below qualifies coverage without adding positive impact paths.
-                        let targets =
-                            self.query_with(expression, true, version, false, &mut |batch, _| {
-                                transform(batch, &[], None, None)
-                            })?;
+                        let targets = self
+                            .query_with_capture(
+                                expression,
+                                true,
+                                version,
+                                false,
+                                &mut |batch, _| transform(batch, &[], None, None),
+                                normal_view,
+                                |_| true,
+                            )?
+                            .targets;
                         let graph = self.query_with_capture(
                             expression,
                             true,
@@ -636,18 +651,22 @@ impl BazelOptions {
                         }
                         Ok(targets)
                     } else {
-                        ordinary.query_with(
-                            expression,
-                            use_cquery,
-                            version,
-                            lean,
-                            &mut |batch, encoded| {
-                                if observe {
-                                    primary_rules.record(batch, encoded);
-                                }
-                                transform(batch, encoded, None, None);
-                            },
-                        )
+                        Ok(ordinary
+                            .query_with_capture(
+                                expression,
+                                use_cquery,
+                                version,
+                                lean,
+                                &mut |batch, encoded| {
+                                    if observe {
+                                        primary_rules.record(batch, encoded);
+                                    }
+                                    transform(batch, encoded, None, None);
+                                },
+                                normal_view,
+                                |_| true,
+                            )?
+                            .targets)
                     }
                 },
             )?
@@ -2852,8 +2871,11 @@ impl BazelOptions {
         retain: impl FnMut(&Target) -> bool,
     ) -> Result<QueryGraph> {
         let available_inputs = matches!(capture, CqueryCapture::AvailableOrdinaryInputs);
+        let full_scope = matches!(capture, CqueryCapture::RootDependencies);
         let (mut roots, verify) = match capture {
-            CqueryCapture::Standard | CqueryCapture::AvailableOrdinaryInputs => (None, false),
+            CqueryCapture::Standard
+            | CqueryCapture::RootDependencies
+            | CqueryCapture::AvailableOrdinaryInputs => (None, false),
             CqueryCapture::Roots(roots) => (Some(roots), false),
             CqueryCapture::Verification => (None, true),
         };
@@ -2954,9 +2976,6 @@ impl BazelOptions {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
         }
 
-        // A caller-supplied projection (or a root-only lookup) is not a dependency
-        // closure. Such a query may legitimately omit the inputs of an aspect.
-        let full_scope = rooted && roots.is_none() && self.exclude_targets_query.is_none();
         let mut graph = if use_cquery && (verify || full_scope) {
             let mut graph = decode_cquery_graph(
                 output_file.path(),
@@ -3988,6 +4007,8 @@ impl QueryGraph {
 
 enum CqueryCapture<'a> {
     Standard,
+    /// An unfiltered deps(config(roots, target)) can contain every selected aspect's inputs.
+    RootDependencies,
     AvailableOrdinaryInputs,
     Roots(&'a mut Vec<(String, String)>),
     Verification,

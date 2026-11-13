@@ -2954,16 +2954,23 @@ impl BazelOptions {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
         }
 
-        let mut graph = if use_cquery && verify {
-            decode_cquery_graph(
+        // A caller-supplied projection (or a root-only lookup) is not a dependency
+        // closure. Such a query may legitimately omit the inputs of an aspect.
+        let full_scope = rooted && roots.is_none() && self.exclude_targets_query.is_none();
+        let mut graph = if use_cquery && (verify || full_scope) {
+            let mut graph = decode_cquery_graph(
                 output_file.path(),
                 streamed_cquery,
                 &mut |batch| transform(batch, &[]),
                 roots.as_deref_mut(),
                 compatible.as_ref().filter(|_| rooted),
                 verify,
-                verify && rooted,
-            )?
+                rooted,
+            )?;
+            if !verify {
+                graph.expand_aspect_inputs()?;
+            }
+            graph
         } else if use_cquery {
             decode_cquery_stream(
                 output_file.path(),
@@ -3915,6 +3922,61 @@ impl From<Vec<Target>> for QueryGraph {
 }
 
 impl QueryGraph {
+    fn expand_aspect_inputs(&mut self) -> Result<()> {
+        let Some(aspects) = self.aspects.take() else {
+            return Ok(());
+        };
+        let applications: HashMap<_, _> = aspects.into_iter().map(|a| (a.key, a.inputs)).collect();
+        let targets: HashSet<_> = self
+            .targets
+            .iter()
+            .filter_map(target_name)
+            .map(str::to_owned)
+            .collect();
+        for target in &mut self.targets {
+            let Some(rule) = target.rule.as_option_mut() else {
+                continue;
+            };
+            if !rule.configured_rule_input.iter().any(|i| {
+                i.label
+                    .as_deref()
+                    .is_some_and(|label| label.starts_with(EXPLICIT_ASPECT_PREFIX))
+            }) {
+                continue;
+            }
+            // Aspects are transparent in the usual target-distance graph. Keep
+            // every terminal target's configuration when flattening nested applications.
+            let mut pending = rule
+                .configured_rule_input
+                .iter()
+                .map(encode_configured_input)
+                .collect::<Vec<_>>();
+            let mut seen = HashSet::new();
+            rule.configured_rule_input.clear();
+            while let Some(input) = pending.pop() {
+                if !seen.insert(input.clone()) {
+                    continue;
+                }
+                if let Some(children) = applications.get(&input) {
+                    pending.extend(children.iter().cloned());
+                } else if input.starts_with(EXPLICIT_ASPECT_PREFIX) {
+                    bail!(
+                        "missing explicit aspect inputs for configured rule {}",
+                        rule.name
+                    );
+                } else if !targets.contains(&input) && split_configured(&input).1.is_some() {
+                    bail!("missing configured input {input} for rule {}", rule.name);
+                } else {
+                    rule.configured_rule_input.push(ConfiguredRuleInput {
+                        label: Some(input),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn into_verified(self) -> Option<VerifiedQuery> {
         self.aspects.map(|aspects| VerifiedQuery {
             targets: self.targets,
@@ -5071,6 +5133,7 @@ fn decode_cquery_graph(
     let mut decoder = CqueryDecoder {
         root_labels: roots.as_ref().map(|_| Vec::new()),
         known_null_configurations: (compatible.is_some() || verify).then(HashSet::new),
+        capture_aspects: marker_expected || verify,
         verify,
         ..CqueryDecoder::default()
     };
@@ -5197,6 +5260,7 @@ struct CqueryDecoder {
     ambiguous_label: Option<String>,
     invalid_configuration: Option<u32>,
     verify: bool,
+    capture_aspects: bool,
     aspect_identities: Vec<ConfiguredAspect>,
     aspect_results: Vec<ConfiguredAspectResult>,
     observed_aspects: Option<Vec<ObservedAspect>>,
@@ -5207,7 +5271,7 @@ struct CqueryDecoder {
 
 impl CqueryDecoder {
     fn push(&mut self, result: CqueryResult, transform: &mut impl FnMut(&mut [Target])) {
-        if self.verify {
+        if self.capture_aspects {
             self.aspect_identities.extend(result.aspects);
             self.aspect_results.extend(result.aspect_results);
         }
@@ -5388,7 +5452,7 @@ impl CqueryDecoder {
                 "configured target {label} has a bare label ambiguous with the configured-key encoding"
             );
         }
-        if self.verify
+        if self.capture_aspects
             && !self.invalid_explicit_aspect_marker
             && (self.explicit_aspect_inputs
                 || !self.aspect_identities.is_empty()
@@ -10713,6 +10777,39 @@ exit 1
         };
         let before = decode(1, 7, &[("z", "one"), ("a", "two")]).unwrap();
         let after = decode(9, 3, &[("a", "two"), ("z", "one")]).unwrap();
+        // A projected query can name an aspect without selecting its result.
+        // Its existing base-only inputs are still usable. Dependency closures
+        // require the concrete operands of each reached aspect.
+        assert!(decode_cquery_stream(&path, true, &mut |_| {}, None, None).is_ok());
+        let mut public =
+            decode_cquery_graph(&path, true, &mut |_| {}, None, None, false, true).unwrap();
+        assert!(public.expand_aspect_inputs().is_err());
+        let mut public =
+            decode_cquery_graph(&path, true, &mut |_| {}, None, None, false, true).unwrap();
+        public.aspects.as_mut().unwrap().clear();
+        assert!(public.expand_aspect_inputs().is_err());
+        let mut public =
+            decode_cquery_graph(&path, true, &mut |_| {}, None, None, false, true).unwrap();
+        let predecessor = public.aspects.as_ref().unwrap()[0].inputs[1].clone();
+        public.aspects.as_mut().unwrap().push(ObservedAspect {
+            key: predecessor,
+            inputs: vec!["//a:base|abc123".to_owned()],
+        });
+        public.expand_aspect_inputs().unwrap();
+        let actual: BTreeSet<_> = public
+            .targets
+            .iter()
+            .filter_map(|t| t.rule.as_option())
+            .find(|r| r.name == "//a:root|abc123")
+            .unwrap()
+            .configured_rule_input
+            .iter()
+            .map(encode_configured_input)
+            .collect();
+        assert_eq!(
+            actual,
+            BTreeSet::from(["//a:base|abc123".to_owned(), "//a:tool|abc123".to_owned()])
+        );
         assert_eq!(before.aspects.len(), 1);
         assert_eq!(after.aspects.len(), 1);
         assert_eq!(before.aspects[0].key, after.aspects[0].key);

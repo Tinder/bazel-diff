@@ -830,6 +830,10 @@ fn fingerprint_flags(
     if let Some(expr) = args.root_expression()? {
         flags.insert("cqueryRootExpression".into(), expr);
         flags.insert(
+            "configuredAspectInputs".into(),
+            bazel_diff::cache::CONFIGURED_ASPECT_INPUTS_VERSION.to_string(),
+        );
+        flags.insert(
             "configuredRoots".into(),
             ConfiguredRoots::VERSION.to_string(),
         );
@@ -1798,6 +1802,7 @@ mod tests {
         rooted.cquery_root_expression = Some("//app:lib".to_owned());
         let rooted_flags = fingerprint_flags(&rooted, false, &[]).unwrap();
         assert_eq!(rooted_flags["configuredRoots"], "2");
+        assert_eq!(rooted_flags["configuredAspectInputs"], "1");
         assert_eq!(rooted_flags["cqueryRootExpression"], "//app:lib");
         let expression_file = directory.path().join("roots.query");
         fs::write(&expression_file, "//app:lib").unwrap();

@@ -15,6 +15,8 @@ use std::path::PathBuf;
 
 pub const FINE_ALIAS_INPUTS_VERSION: u32 = 19;
 pub const LOCAL_ARCHIVE_BUILD_FILE_VERSION: u32 = 2;
+/// Rooted cquery hashes include inputs of each explicitly serialized aspect application.
+pub const CONFIGURED_ASPECT_INPUTS_VERSION: u32 = 1;
 
 /// Digests the hash-affecting configuration: the package version, every query and hashing
 /// option, whether dependency edges are recorded, and, only when on, partial-graph mode (its
@@ -88,6 +90,9 @@ pub fn configuration_fingerprint(
     hasher.update(b"cycleComponents=1\0");
     if let Some(expr) = &options.bazel.cquery_root_expression {
         hasher.update(format!("configuredRoots={}\0", ConfiguredRoots::VERSION));
+        hasher.update(format!(
+            "configuredAspectInputs={CONFIGURED_ASPECT_INPUTS_VERSION}\0"
+        ));
         hasher.update(expr.as_bytes());
         hasher.update([0]);
     }

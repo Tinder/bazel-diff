@@ -62,7 +62,7 @@ mod tests {
     use super::*;
 
     fn to_vec(argv: &[&str]) -> Vec<String> {
-        argv.iter().map(|s| s.to_string()).collect()
+        argv.iter().map(ToString::to_string).collect()
     }
 
     #[test]

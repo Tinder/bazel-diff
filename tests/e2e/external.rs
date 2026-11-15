@@ -209,7 +209,7 @@ fn transitive_external_repo_change_reaches_consumer() {
 /// (`@inner//:data`). The synthetic `//external:inner` node is named by the apparent name, so
 /// until the canonical name was translated the edge from `@@outer+//:lib` to the node was dropped
 /// and a change inside `inner` never reached `//:consume` under `--useCquery`. hashbench
-/// (2026-10-18) hit the same gap on a rules_multitool lockfile bump.
+/// (2026-10-18) hit the same gap on a `rules_multitool` lockfile bump.
 #[test]
 fn transitive_external_repo_change_reaches_consumer_cquery() {
     if !supports_mod_show_repo() {

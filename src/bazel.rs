@@ -113,14 +113,11 @@ impl BazelOptions {
                 return (true, Some(output.stdout));
             }
         }
-        let enabled = self
-            .run_capture(&["mod", "graph"])
-            .map(|output| {
-                output.status.success()
-                    || extension_failure(&String::from_utf8_lossy(&output.stderr))
-                        .is_some_and(|failure| failure.answered)
-            })
-            .unwrap_or(false);
+        let enabled = self.run_capture(&["mod", "graph"]).is_ok_and(|output| {
+            output.status.success()
+                || extension_failure(&String::from_utf8_lossy(&output.stderr))
+                    .is_some_and(|failure| failure.answered)
+        });
         (enabled, None)
     }
 
@@ -208,7 +205,7 @@ impl BazelOptions {
             None => self.run_capture(&["mod", "graph", "--output=json"])?,
         };
         let complete = output.status.success();
-        let stdout = self.accept_mod_output(output, "graph --output=json", failed)?;
+        let stdout = failed.accept_mod_output(output, "graph --output=json")?;
         let json = if self.isolated_dependency_root.is_some() {
             String::from_utf8(stdout).context("module graph is not valid UTF-8")?
         } else {
@@ -276,12 +273,14 @@ impl BazelOptions {
     }
 
     fn with_exclude_filter(&self, query: String) -> String {
-        self.exclude_targets_query
-            .as_ref()
-            .filter(|query| !query.trim().is_empty())
-            .map_or(query.clone(), |exclude| {
-                format!("({query}) except ({exclude})")
-            })
+        match self
+            .exclude_targets_query
+            .as_deref()
+            .filter(|exclude| !exclude.trim().is_empty())
+        {
+            Some(exclude) => format!("({query}) except ({exclude})"),
+            None => query,
+        }
     }
 
     pub fn query_all_targets(&self) -> Result<Vec<Target>> {
@@ -390,7 +389,7 @@ impl BazelOptions {
                 )
             } else {
                 self.query_with(expression, use_cquery, version, &mut |batch| {
-                    transform(batch, None)
+                    transform(batch, None);
                 })
             }
         })?;
@@ -487,7 +486,7 @@ impl BazelOptions {
                 }
             }
             targets.extend(bzlmod_repos);
-            deduplicate_targets(targets)
+            Ok(deduplicate_targets(targets))
         } else {
             queries.push("'//...:all-targets'".to_owned());
             queries.extend(
@@ -499,7 +498,7 @@ impl BazelOptions {
             match query(&full, false) {
                 Ok(mut targets) => {
                     targets.extend(bzlmod_repos);
-                    deduplicate_targets(targets)
+                    Ok(deduplicate_targets(targets))
                 }
                 Err(error)
                     if !self.exclude_external_targets
@@ -517,7 +516,7 @@ impl BazelOptions {
                     );
                     let mut targets = query(&without_external, false)?;
                     targets.extend(bzlmod_repos);
-                    deduplicate_targets(targets)
+                    Ok(deduplicate_targets(targets))
                 }
                 Err(error) => Err(error),
             }
@@ -532,12 +531,11 @@ impl BazelOptions {
         let mut failed = FailedExtensions::default();
         // The initial probe returns stdout only on success. The fallback may be partial.
         let retain_root_mapping = root_mapping.is_some();
-        let root_mapping = match root_mapping {
-            Some(mapping) => mapping,
-            None => {
-                let output = self.run_capture(&["mod", "dump_repo_mapping", ""])?;
-                self.accept_mod_output(output, "dump_repo_mapping", &mut failed)?
-            }
+        let root_mapping = if let Some(mapping) = root_mapping {
+            mapping
+        } else {
+            let output = self.run_capture(&["mod", "dump_repo_mapping", ""])?;
+            failed.accept_mod_output(output, "dump_repo_mapping")?
         };
         let canonical_to_apparent = parse_repo_mapping(&String::from_utf8_lossy(&root_mapping));
         let (module_graph, complete_graph) =
@@ -578,7 +576,7 @@ impl BazelOptions {
         // so nothing above names them. Enumerate them from the extensions' own mappings (#522).
         let extension_repos = match self.extension_repositories(
             &canonical_to_apparent,
-            hidden_modules.values().cloned().collect(),
+            &hidden_modules.values().cloned().collect::<Vec<_>>(),
             survey.mappings,
             retain_root_mapping && complete_graph,
             &mut failed,
@@ -694,15 +692,14 @@ impl BazelOptions {
                 );
                 continue;
             };
-            let canonical = match repo.strip_prefix("@@") {
-                Some(canonical) => Some(canonical.to_owned()),
-                None => {
-                    let apparent = repo.trim_start_matches('@');
-                    canonical_to_apparent
-                        .iter()
-                        .find(|(_, names)| names.iter().any(|name| name == apparent))
-                        .map(|(canonical, _)| canonical.clone())
-                }
+            let canonical = if let Some(canonical) = repo.strip_prefix("@@") {
+                Some(canonical.to_owned())
+            } else {
+                let apparent = repo.trim_start_matches('@');
+                canonical_to_apparent
+                    .iter()
+                    .find(|(_, names)| names.iter().any(|name| name == apparent))
+                    .map(|(canonical, _)| canonical.clone())
             };
             let Some(prefix) = canonical
                 .map(|canonical| format!("{canonical}+{name}"))
@@ -859,21 +856,18 @@ impl BazelOptions {
             true
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            match extension_failure(&stderr) {
-                Some(failure) => {
-                    self.note_failed_extensions(failed, failure.extensions);
-                    failure.answered
+            if let Some(failure) = extension_failure(&stderr) {
+                failed.note(failure.extensions);
+                failure.answered
+            } else {
+                if self.verbose {
+                    eprintln!(
+                        "[Info] bazel mod show_repo --all_repos failed with {}, asking by name instead: {}",
+                        output.status,
+                        stderr.trim()
+                    );
                 }
-                None => {
-                    if self.verbose {
-                        eprintln!(
-                            "[Info] bazel mod show_repo --all_repos failed with {}, asking by name instead: {}",
-                            output.status,
-                            stderr.trim()
-                        );
-                    }
-                    false
-                }
+                false
             }
         };
         if !answered {
@@ -912,7 +906,7 @@ impl BazelOptions {
     fn extension_repositories(
         &self,
         canonical_to_apparent: &BTreeMap<String, Vec<String>>,
-        hidden_module_repos: Vec<String>,
+        hidden_module_repos: &[String],
         prefetched: BTreeMap<String, RepoMapping>,
         complete_inputs: bool,
         failed: &mut FailedExtensions,
@@ -973,36 +967,36 @@ impl BazelOptions {
         let mut complete_spoke_mappings = true;
         if !representatives.is_empty() {
             let names = representatives.values().cloned().collect::<Vec<_>>();
-            let mappings =
-                match self.dump_repo_mappings(&names, failed, &mut complete_spoke_mappings) {
-                    Ok(mappings) => mappings,
-                    Err(_) => {
-                        complete_spoke_mappings = false;
-                        // One extension that fails to evaluate should not hide the rest; retry
-                        // one at a time and report the ones Bazel cannot describe.
-                        let mut mappings = Vec::new();
-                        for name in &names {
-                            match self.dump_repo_mappings(
-                                std::slice::from_ref(name),
-                                failed,
-                                &mut complete_mappings,
-                            ) {
-                                Ok(mapping) => mappings.extend(mapping),
-                                Err(error) if self.keep_going => {
-                                    eprintln!(
-                                    "[Warn] skipping the module extension behind {name}: {error:#}"
-                                );
-                                }
-                                Err(error) => return Err(error),
-                            }
+            let mappings = if let Ok(mappings) =
+                self.dump_repo_mappings(&names, failed, &mut complete_spoke_mappings)
+            {
+                mappings
+            } else {
+                complete_spoke_mappings = false;
+                // One extension that fails to evaluate should not hide the rest; retry
+                // one at a time and report the ones Bazel cannot describe.
+                let mut mappings = Vec::new();
+                for name in &names {
+                    match self.dump_repo_mappings(
+                        std::slice::from_ref(name),
+                        failed,
+                        &mut complete_mappings,
+                    ) {
+                        Ok(mapping) => mappings.extend(mapping),
+                        Err(error) if self.keep_going => {
+                            eprintln!(
+                                "[Warn] skipping the module extension behind {name}: {error:#}"
+                            );
                         }
-                        mappings
+                        Err(error) => return Err(error),
                     }
-                };
+                }
+                mappings
+            };
             generated.extend(
                 mappings
                     .into_iter()
-                    .flat_map(|mapping| mapping.into_values())
+                    .flat_map(std::collections::BTreeMap::into_values)
                     .filter(|canonical| {
                         canonical
                             .rsplit_once('+')
@@ -1126,7 +1120,7 @@ impl BazelOptions {
                     stderr.trim()
                 );
             };
-            self.note_failed_extensions(failed, failure.extensions);
+            failed.note(failure.extensions);
             if failure.answered {
                 return Ok(Some(value));
             }
@@ -1177,7 +1171,7 @@ impl BazelOptions {
                 );
             };
             if let [repo] = repos {
-                self.note_failed_extensions(failed, failure.extensions);
+                failed.note(failure.extensions);
                 failed.unavailable.insert(repo.clone());
             } else {
                 let (left, right) = repos.split_at(repos.len() / 2);
@@ -1186,42 +1180,6 @@ impl BazelOptions {
             }
         }
         Ok(())
-    }
-
-    /// The stdout of a `bazel mod` invocation that takes no repository names, kept when the
-    /// invocation only failed because a module extension in the graph cannot be evaluated.
-    fn accept_mod_output(
-        &self,
-        output: Output,
-        subcommand: &str,
-        failed: &mut FailedExtensions,
-    ) -> Result<Vec<u8>> {
-        if output.status.success() {
-            return Ok(output.stdout);
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        match extension_failure(&stderr) {
-            Some(failure) if failure.answered => {
-                self.note_failed_extensions(failed, failure.extensions);
-                Ok(output.stdout)
-            }
-            _ => bail!(
-                "bazel mod {subcommand} failed with {}: {}",
-                output.status,
-                stderr.trim()
-            ),
-        }
-    }
-
-    fn note_failed_extensions(&self, failed: &mut FailedExtensions, extensions: BTreeSet<String>) {
-        failed.observed = true;
-        for extension in extensions {
-            if failed.extensions.insert(extension.clone()) {
-                eprintln!(
-                    "[Warn] Bazel reported that module extension {extension} cannot be evaluated"
-                );
-            }
-        }
     }
 
     /// `bazel query //...:all-targets` lists repository inputs without loading their
@@ -1481,11 +1439,8 @@ impl BazelOptions {
 
     fn canonical_bzlmod_repo_names(&self) -> Result<Vec<String>> {
         let mapping_output = self.run_capture(&["mod", "dump_repo_mapping", ""])?;
-        let mapping = self.accept_mod_output(
-            mapping_output,
-            "dump_repo_mapping",
-            &mut FailedExtensions::default(),
-        )?;
+        let mapping =
+            FailedExtensions::default().accept_mod_output(mapping_output, "dump_repo_mapping")?;
         Ok(parse_repo_mapping(&String::from_utf8_lossy(&mapping))
             .keys()
             .filter(|name| name.contains('+') || name.contains('~'))
@@ -2184,6 +2139,40 @@ struct FailedExtensions {
 }
 
 impl FailedExtensions {
+    /// Records the extensions Bazel could not evaluate, warning once per extension.
+    fn note(&mut self, extensions: BTreeSet<String>) {
+        self.observed = true;
+        for extension in extensions {
+            if self.extensions.insert(extension.clone()) {
+                eprintln!(
+                    "[Warn] Bazel reported that module extension {extension} cannot be evaluated"
+                );
+            }
+        }
+    }
+
+    /// The stdout of a `bazel mod` invocation that takes no repository names, kept when the
+    /// invocation only failed because a module extension in the graph cannot be evaluated.
+    fn accept_mod_output(&mut self, output: Output, subcommand: &str) -> Result<Vec<u8>> {
+        if output.status.success() {
+            return Ok(output.stdout);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match extension_failure(&stderr) {
+            Some(failure) if failure.answered => {
+                self.note(failure.extensions);
+                Ok(output.stdout)
+            }
+            _ => bail!(
+                "bazel mod {subcommand} failed with {}: {}",
+                output.status,
+                stderr.trim()
+            ),
+        }
+    }
+}
+
+impl FailedExtensions {
     fn is_empty(&self) -> bool {
         !self.observed && self.extensions.is_empty() && self.unavailable.is_empty()
     }
@@ -2264,7 +2253,12 @@ fn materialize_repository_inputs_for_batch(batch: &mut [Target], inputs: Option<
 
 fn materialize_repository_inputs(target: &mut Target, shared: Option<RepositoryInputs>) {
     if let Some(inputs) = shared {
-        target.rule.as_option_mut().unwrap().rule_input = inputs.labels.clone();
+        target
+            .rule
+            .as_option_mut()
+            .unwrap()
+            .rule_input
+            .clone_from(&inputs.labels);
     }
 }
 
@@ -2483,7 +2477,7 @@ fn is_external_package_error(message: &str) -> bool {
         || message.contains("//external package is not available")
 }
 
-fn deduplicate_targets(mut targets: Vec<Target>) -> Result<Vec<Target>> {
+fn deduplicate_targets(mut targets: Vec<Target>) -> Vec<Target> {
     // Decide which targets to keep while their names can still be borrowed.
     let mut keep = {
         let mut seen = HashSet::new();
@@ -2494,7 +2488,7 @@ fn deduplicate_targets(mut targets: Vec<Target>) -> Result<Vec<Target>> {
             .into_iter()
     };
     targets.retain(|_| keep.next().expect("one decision per target"));
-    Ok(targets)
+    targets
 }
 
 pub fn decode_delimited<M: Message>(path: &Path) -> Result<Vec<M>> {
@@ -2861,14 +2855,13 @@ fn package_group_rule(group: &PackageGroup) -> Rule {
         string_list_value: group.contained_package.clone(),
         ..Default::default()
     };
-    let mut rule = Rule {
+    Rule {
         name: group.name.clone(),
         rule_class: "package_group".to_owned(),
+        attribute: vec![packages],
+        rule_input: group.included_package_group.clone(),
         ..Default::default()
-    };
-    rule.attribute.push(packages);
-    rule.rule_input = group.included_package_group.clone();
-    rule
+    }
 }
 
 struct RepositoryFiles {
@@ -2903,11 +2896,12 @@ fn repository_rule(
         ..Default::default()
     };
     let mut push_attribute = |name: &str, value: String| {
-        let mut attribute = Attribute::default();
-        attribute.name = name.to_owned();
-        attribute.r#type = crate::proto::blaze_query::attribute::Discriminator::String;
-        attribute.string_value = Some(value);
-        rule.attribute.push(attribute);
+        rule.attribute.push(Attribute {
+            name: name.to_owned(),
+            r#type: crate::proto::blaze_query::attribute::Discriminator::String,
+            string_value: Some(value),
+            ..Default::default()
+        });
     };
     if let Some(content_hash) = files.tree_hash {
         push_attribute("_bazel_diff_content_hash", content_hash);
@@ -2961,7 +2955,7 @@ pub(crate) fn attribute_main_repo_labels(attributes: &[Attribute]) -> impl Itera
 }
 
 /// The slots that can name targets after the caller checks the attribute discriminator.
-/// LABEL_DICT_UNARY is string -> label and LABEL_KEYED_STRING_DICT is label -> string.
+/// `LABEL_DICT_UNARY` is string -> label and `LABEL_KEYED_STRING_DICT` is label -> string.
 fn attribute_label_values(attribute: &Attribute) -> impl Iterator<Item = &str> {
     attribute
         .string_value
@@ -3233,7 +3227,7 @@ fn parse_module_dependency_edges(json: &str) -> BTreeMap<String, BTreeSet<String
     };
     let mut edges = BTreeMap::new();
     walk(&value, &mut edges);
-    break_module_cycles(edges)
+    break_module_cycles(&edges)
 }
 
 /// Every module in the resolved graph whose repository is not in the root's repo mapping, as
@@ -3274,7 +3268,7 @@ fn hidden_module_repo_names(
     module_repo_names(&keys, canonical_to_apparent, false)
 }
 
-/// Decode the fields JsonOutputFormatter uses for repository enumeration. Repeated and cycle
+/// Decode the fields `JsonOutputFormatter` uses for repository enumeration. Repeated and cycle
 /// references may be unexpanded, but every module must expand somewhere to reveal its children.
 fn isolated_module_repo_names(
     json: &str,
@@ -3396,7 +3390,7 @@ fn module_repo_names(
 const WELL_KNOWN_MODULES: [&str; 3] = ["bazel_tools", "local_config_platform", "platforms"];
 
 fn break_module_cycles(
-    edges: BTreeMap<String, BTreeSet<String>>,
+    edges: &BTreeMap<String, BTreeSet<String>>,
 ) -> BTreeMap<String, BTreeSet<String>> {
     fn visit(
         node: &str,
@@ -3424,13 +3418,7 @@ fn break_module_cycles(
     let mut result = BTreeMap::new();
     let mut visited = BTreeSet::new();
     for node in edges.keys() {
-        visit(
-            node,
-            &edges,
-            &mut visited,
-            &mut BTreeSet::new(),
-            &mut result,
-        );
+        visit(node, edges, &mut visited, &mut BTreeSet::new(), &mut result);
     }
     result
 }
@@ -3450,6 +3438,7 @@ mod tests {
     use crate::proto::analysis::{Configuration, ConfiguredTarget, CqueryResult};
     use crate::proto::blaze_query::{
         attribute, EnvironmentGroup, GeneratedFile, LabelDictUnaryEntry, SourceFile,
+        StringListDictEntry,
     };
     fn rule_target(name: &str) -> Target {
         let mut target = Target::default();
@@ -3674,7 +3663,7 @@ mod tests {
         duplicate.rule.as_option_mut().unwrap().rule_class = "other".into();
         let last = rule_target("//b:b");
         let targets = vec![first.clone(), Target::default(), last.clone(), duplicate];
-        assert_eq!(deduplicate_targets(targets).unwrap(), [first, last]);
+        assert_eq!(deduplicate_targets(targets), [first, last]);
         assert!(is_external_package_error("no such package 'external'"));
         assert!(is_external_package_error(
             "//external package is not available"
@@ -4738,7 +4727,7 @@ exit 1
         let workspace = tempfile::tempdir().unwrap();
         let script = workspace.path().join("bazel");
         fs::write(&script, "#!/bin/sh\ncat reply\n").unwrap();
-        let options = probe_options(workspace.path(), script);
+        let options = probe_options(workspace.path(), &script);
         let names = ["first+", "second+"].map(str::to_owned);
         for (reply, rows, expected_complete) in [
             ("{}\n{}\n", 2, true),
@@ -4783,7 +4772,7 @@ exit 1
             "#!/bin/sh\nshift 2\necho \"$*\" >> calls\nfor name do cat \"$name\" || exit 1; done\n",
         )
         .unwrap();
-        let options = probe_options(workspace.path(), script);
+        let options = probe_options(workspace.path(), &script);
         let root = BTreeMap::from([
             ("dep+".into(), vec!["dep".into()]),
             (first.into(), vec!["hub".into()]),
@@ -4791,7 +4780,7 @@ exit 1
         let result = options
             .extension_repositories(
                 &root,
-                Vec::new(),
+                &[],
                 BTreeMap::new(),
                 true,
                 &mut FailedExtensions::default(),
@@ -5004,7 +4993,7 @@ exit 1
         use std::os::unix::process::ExitStatusExt;
 
         let workspace = tempfile::tempdir().unwrap();
-        let mut options = probe_options(workspace.path(), PathBuf::from("unused"));
+        let mut options = probe_options(workspace.path(), Path::new("unused"));
         let output = || Output {
             status: ExitStatus::from_raw(0),
             stdout: b"{\"key\":\"<root>\",\"name\":\"\xff\",\"dependencies\":[]}".to_vec(),
@@ -5164,7 +5153,7 @@ exit 1
         ]
         .map(str::to_owned)
         .into();
-        let mut options = probe_options(Path::new("."), PathBuf::from("unused"));
+        let mut options = probe_options(Path::new("."), Path::new("unused"));
         options.label_only_module_extensions = [
             "@rules_rs//rs:extensions.bzl%crate",
             "@rs//rs:extensions.bzl%crate",
@@ -5255,7 +5244,7 @@ exit 1
             r#type: target::Discriminator::SourceFile,
             source_file: buffa::MessageField::some(SourceFile {
                 name: name.to_owned(),
-                subinclude: loads.iter().map(|s| s.to_string()).collect(),
+                subinclude: loads.iter().map(std::string::ToString::to_string).collect(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -5302,7 +5291,8 @@ exit 1
             r#type: Kind::LabelDictUnary,
             ..Default::default()
         };
-        attr.label_dict_unary_value.push(Default::default());
+        attr.label_dict_unary_value
+            .push(LabelDictUnaryEntry::default());
         let entry = &mut attr.label_dict_unary_value[0];
         entry.key = "//:string".into();
         entry.value = "//:label".into();
@@ -5422,7 +5412,8 @@ exit 1
             r#type: attribute::Discriminator::StringListDict,
             ..Default::default()
         };
-        dict.string_list_dict_value.push(Default::default());
+        dict.string_list_dict_value
+            .push(StringListDictEntry::default());
         dict.string_list_dict_value[0].key = "//:text".into();
         dict.string_list_dict_value[0].value = vec![format!("@@{config}//:dl")];
         outside[4].attribute = vec![dict];
@@ -5852,7 +5843,7 @@ exit 1
             repo_rule_name: Some("http_archive".into()),
             ..Default::default()
         };
-        let options = probe_options(path, extension_flow_script(path, &[repo], None));
+        let options = probe_options(path, &extension_flow_script(path, &[repo], None));
         let original = options
             .query_all_targets_with(materialize_repository_inputs_for_batch)
             .unwrap();
@@ -5988,13 +5979,13 @@ exit 1
         // global owner on that survey, even if the visible module read succeeded.
         let visible = BTreeMap::from([("rules_python+".into(), vec!["rules_python".into()])]);
         let mut failed = FailedExtensions::default();
-        let resolved = |hidden, failed: &mut FailedExtensions| {
+        let resolved = |hidden: &[String], failed: &mut FailedExtensions| {
             options
                 .extension_repositories(&visible, hidden, BTreeMap::new(), true, failed)
                 .unwrap()
         };
-        assert!(resolved(Vec::new(), &mut failed).complete_mappings);
-        let recovered = resolved(vec!["unknown_hidden+".into()], &mut failed);
+        assert!(resolved(&[], &mut failed).complete_mappings);
+        let recovered = resolved(&["unknown_hidden+".into()], &mut failed);
         assert!(!recovered.complete_mappings);
         assert!(failed.is_empty());
     }
@@ -6169,7 +6160,7 @@ exit 1
     }
 
     #[cfg(unix)]
-    fn probe_options(workspace: &Path, script: PathBuf) -> BazelOptions {
+    fn probe_options(workspace: &Path, script: &Path) -> BazelOptions {
         BazelOptions {
             workspace: workspace.to_path_buf(),
             bazel: PathBuf::from("/bin/sh"),
@@ -6215,18 +6206,19 @@ exit 1
             "echo '{\"\":\"\",\"dep\":\"dep+\"}'; exit 0",
             marker,
         );
-        assert!(probe_options(workspace.path(), mapping_answers_graph_fails).is_bzlmod_enabled());
+        assert!(probe_options(workspace.path(), &mapping_answers_graph_fails).is_bzlmod_enabled());
 
         let no_dump_repo_mapping = script(
             "probe-b.sh",
             "echo \"ERROR: Unknown command 'dump_repo_mapping'\" >&2; exit 2",
             "echo '<root>'; exit 0",
         );
-        assert!(probe_options(workspace.path(), no_dump_repo_mapping).is_bzlmod_enabled());
+        assert!(probe_options(workspace.path(), &no_dump_repo_mapping).is_bzlmod_enabled());
 
         let no_dump_repo_mapping_graph_partial = script("probe-c.sh", "exit 2", marker);
         assert!(
-            probe_options(workspace.path(), no_dump_repo_mapping_graph_partial).is_bzlmod_enabled()
+            probe_options(workspace.path(), &no_dump_repo_mapping_graph_partial)
+                .is_bzlmod_enabled()
         );
 
         let bzlmod_disabled = script(
@@ -6234,7 +6226,7 @@ exit 1
             "echo 'ERROR: Bzlmod has to be enabled for mod command to work.' >&2; exit 2",
             "echo 'ERROR: Bzlmod has to be enabled for mod command to work.' >&2; exit 2",
         );
-        assert!(!probe_options(workspace.path(), bzlmod_disabled).is_bzlmod_enabled());
+        assert!(!probe_options(workspace.path(), &bzlmod_disabled).is_bzlmod_enabled());
     }
 
     /// Fake Bazel for a workspace whose transitive module `transitive_dep` imports
@@ -6340,7 +6332,7 @@ exit 1
     fn query_bzlmod_repos_skips_a_failed_extension() {
         let workspace = tempfile::tempdir().unwrap();
         let script = failed_extension_script(workspace.path(), &[rule_target("//app:lib")]);
-        let options = probe_options(workspace.path(), script);
+        let options = probe_options(workspace.path(), &script);
 
         let targets = options.query_all_targets().unwrap();
         let names = targets
@@ -6376,9 +6368,8 @@ exit 1
         let refuses = |options: &BazelOptions, expected: &str| {
             let mut transformed = false;
             let result = options.query_all_targets_with(|_, _| transformed = true);
-            let error = match result {
-                Ok(_) => panic!("isolated root unexpectedly accepted"),
-                Err(error) => error,
+            let Err(error) = result else {
+                panic!("isolated root unexpectedly accepted")
             };
             let error = format!("{error:#}");
             assert!(error.contains(expected), "{error}");
@@ -6396,7 +6387,7 @@ exit 1
         };
         let workspace = tempfile::tempdir().unwrap();
         let script = failed_extension_script(workspace.path(), &[rule_target("//app:lib")]);
-        let mut options = probe_options(workspace.path(), script.clone());
+        let mut options = probe_options(workspace.path(), &script);
         options.isolated_dependency_root = Some("@missing_repo".into());
         refuses(
             &options,
@@ -6430,7 +6421,7 @@ exit 1
 
         let disabled = tempfile::tempdir().unwrap();
         let script = query_script(disabled.path(), "8.7.0", &[], 0);
-        let mut options = probe_options(disabled.path(), script);
+        let mut options = probe_options(disabled.path(), &script);
         options.isolated_dependency_root = Some("@hub".into());
         refuses(&options, "Bzlmod repository discovery is unavailable");
     }
@@ -6452,7 +6443,7 @@ exit 1
                 ),
             ],
         );
-        let mut options = probe_options(workspace.path(), script);
+        let mut options = probe_options(workspace.path(), &script);
 
         let error = options.query_all_targets().unwrap_err().to_string();
         assert!(
@@ -6550,7 +6541,7 @@ exit 1
         write_delimited(&streamed, &messages);
         let mut seen = Vec::new();
         let targets = decode_cquery_stream(&streamed, true, &mut |target| {
-            seen.push(target_name(target).unwrap().to_owned())
+            seen.push(target_name(target).unwrap().to_owned());
         })
         .unwrap();
         let names = targets.iter().filter_map(target_name).collect::<Vec<_>>();
@@ -6572,7 +6563,7 @@ exit 1
                 .generating_rule,
             "//a:a|abc123"
         );
-        assert_eq!(deduplicate_targets(targets).unwrap().len(), 4);
+        assert_eq!(deduplicate_targets(targets).len(), 4);
 
         let non_streamed = directory.path().join("cquery.pb");
         let mut combined = results(vec![configured(rule_target("//a:a"), None, 2)]);
@@ -6664,8 +6655,11 @@ exit 1
             calls = workspace.join("calls.log").display(),
             compatible = compatible
                 .iter()
-                .map(|label| format!("{label}\n"))
-                .collect::<String>()
+                .fold(String::new(), |mut acc, label| {
+                    acc.push_str(label);
+                    acc.push('\n');
+                    acc
+                })
                 .replacen('\n', "\n\n", 1),
             streamed = streamed_proto.display(),
             proto = proto.display(),
@@ -6699,7 +6693,7 @@ exit 1
         ] {
             let workspace = tempfile::tempdir().unwrap();
             let script = query_script(workspace.path(), version, &["//app:lib", "//app:tool"], 0);
-            let mut options = probe_options(workspace.path(), script);
+            let mut options = probe_options(workspace.path(), &script);
             options.use_cquery = true;
             options.cquery_options = vec!["--define=flavor=test".into()];
             options.command_options = vec!["--query-only".into()];
@@ -6751,7 +6745,7 @@ exit 1
     fn query_surfaces_bazel_failures_and_tolerates_partial_answers_with_keep_going() {
         let workspace = tempfile::tempdir().unwrap();
         let script = query_script(workspace.path(), "8.7.0", &[], 1);
-        let mut options = probe_options(workspace.path(), script);
+        let mut options = probe_options(workspace.path(), &script);
         options.command_options = vec!["--noimplicit_deps".into()];
 
         let error = options.query("//app:all", false).unwrap_err().to_string();
@@ -6781,7 +6775,7 @@ exit 1
 
         let partial = tempfile::tempdir().unwrap();
         let script = query_script(partial.path(), "8.7.0", &[], 3);
-        let mut options = probe_options(partial.path(), script);
+        let mut options = probe_options(partial.path(), &script);
         let error = options.query("//app:all", false).unwrap_err().to_string();
         assert!(error.contains("Bazel query failed, exit code 3"), "{error}");
         options.keep_going = true;
@@ -6799,7 +6793,7 @@ exit 1
             "#!/bin/sh\necho \"$*\" >> calls.log\nif [ \"$1\" = version ]; then echo 'Build label: 8.7.0'; exit 0; fi\necho 'ERROR: no such target' >&2\nexit 1\n",
         )
         .unwrap();
-        let mut options = probe_options(incompatible.path(), script);
+        let mut options = probe_options(incompatible.path(), &script);
         options.use_cquery = true;
         let error = options
             .query("deps(//app:all)", true)

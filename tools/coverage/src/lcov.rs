@@ -1,7 +1,7 @@
 //! LCOV tracefile parsing, merging, and emission.
 //!
 //! Bazel's per-test coverage post-processor receives a directory of raw
-//! per-runner LCOV tracefiles (Jacoco for JVM targets, rules_go's native LCOV
+//! per-runner LCOV tracefiles (Jacoco for JVM targets, `rules_go`'s native LCOV
 //! conversion for Go, llvm-cov's LCOV export for Rust) and must merge them
 //! into the single tracefile Bazel publishes as the test's `coverage.dat`.
 //!
@@ -81,14 +81,14 @@ pub fn parse(text: &str) -> (Report, Vec<String>) {
         if let Some(path) = line.strip_prefix("SF:") {
             if let Some((prev_path, prev)) = current.take() {
                 // Tolerate a missing end_of_record before the next SF.
-                merge_into(&mut report, prev_path, prev);
+                merge_into(&mut report, prev_path, &prev);
             }
             current = Some((path.to_string(), FileCoverage::default()));
             continue;
         }
         if line == "end_of_record" {
             if let Some((path, cov)) = current.take() {
-                merge_into(&mut report, path, cov);
+                merge_into(&mut report, path, &cov);
             }
             continue;
         }
@@ -112,7 +112,7 @@ pub fn parse(text: &str) -> (Report, Vec<String>) {
                         cov.function_lines.entry(name.to_string()).or_insert(n);
                     }
                     Err(_) => {
-                        warnings.push(format!("line {}: unparseable FN record '{line}'", idx + 1))
+                        warnings.push(format!("line {}: unparseable FN record '{line}'", idx + 1));
                     }
                 },
                 None => warnings.push(format!("line {}: unparseable FN record '{line}'", idx + 1)),
@@ -150,13 +150,13 @@ pub fn parse(text: &str) -> (Report, Vec<String>) {
         // else (e.g. lcov 2.x extensions) is intentionally ignored.
     }
     if let Some((path, cov)) = current.take() {
-        merge_into(&mut report, path, cov);
+        merge_into(&mut report, path, &cov);
     }
     (report, warnings)
 }
 
-fn merge_into(report: &mut Report, path: String, cov: FileCoverage) {
-    report.entry(path).or_default().merge(&cov);
+fn merge_into(report: &mut Report, path: String, cov: &FileCoverage) {
+    report.entry(path).or_default().merge(cov);
 }
 
 /// `DA:<line>,<hits>[,<checksum>]`
@@ -183,12 +183,12 @@ fn parse_brda(rest: &str) -> Option<((u64, String, String), BranchTaken)> {
 /// Merge `incoming` into `merged`.
 pub fn merge_reports(merged: &mut Report, incoming: Report) {
     for (path, cov) in incoming {
-        merge_into(merged, path, cov);
+        merge_into(merged, path, &cov);
     }
 }
 
 /// Serialise a report back to LCOV text, mirroring the record order of
-/// Bazel's built-in CoverageOutputGenerator (SF, FN, FNDA, FNF, FNH, BRDA,
+/// Bazel's built-in `CoverageOutputGenerator` (SF, FN, FNDA, FNF, FNH, BRDA,
 /// BRF, BRH, DA, LH, LF) so downstream consumers see no format change.
 pub fn emit(report: &Report) -> String {
     let mut out = String::new();

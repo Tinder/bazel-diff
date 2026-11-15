@@ -37,14 +37,14 @@ fn decode_lowercase_hex(value: &str) -> Option<[u8; 32]> {
     const INVALID: u8 = 0xff;
     const TABLE: [u8; 256] = {
         let mut table = [INVALID; 256];
-        let mut digit = 0;
+        let mut digit: u8 = 0;
         while digit < 10 {
-            table[b'0' as usize + digit] = digit as u8;
+            table[b'0' as usize + digit as usize] = digit;
             digit += 1;
         }
-        let mut letter = 0;
+        let mut letter: u8 = 0;
         while letter < 6 {
-            table[b'a' as usize + letter] = 10 + letter as u8;
+            table[b'a' as usize + letter as usize] = 10 + letter;
             letter += 1;
         }
         table
@@ -594,10 +594,10 @@ pub fn impacted_types(
             None => Some((label.clone(), ImpactType::Direct)),
             Some(starting_hash) if !starting_hash.same_as(final_hash) => Some((
                 label.clone(),
-                if starting_hash.direct_hash != final_hash.direct_hash {
-                    ImpactType::Direct
-                } else {
+                if starting_hash.direct_hash == final_hash.direct_hash {
                     ImpactType::Indirect
+                } else {
+                    ImpactType::Direct
                 },
             )),
             _ => None,

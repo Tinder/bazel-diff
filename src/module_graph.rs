@@ -520,7 +520,7 @@ mod tests {
         };
         let reformatted = graph("0.50.1")
             .replace("noise before JSON", "INFO: Invocation ID: 1234")
-            .replace("\n", "")
+            .replace('\n', "")
             .replace("  ", " ");
         assert_ne!(reformatted, graph("0.50.1"));
         let to = HashFileData {

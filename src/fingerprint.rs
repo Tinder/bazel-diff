@@ -155,7 +155,7 @@ pub fn write_json(
     let json = serde_json::to_string_pretty(&value)? + "\n";
     match path {
         Some(path) if path != Path::new("-") => {
-            fs::write(path, json).with_context(|| format!("failed to write {}", path.display()))?
+            fs::write(path, json).with_context(|| format!("failed to write {}", path.display()))?;
         }
         _ => print!("{json}"),
     }

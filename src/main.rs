@@ -1,3 +1,28 @@
+#![warn(clippy::pedantic)]
+// Pedantic lints this crate does not adopt:
+// - The doc lints: this is a CLI crate whose module API is not a stability
+//   commitment (see lib.rs), so `# Errors`/`# Panics` sections and `#[must_use]`
+//   on every accessor would be noise rather than a contract.
+// - too_many_lines: the long functions are linear CLI and pipeline glue;
+//   splitting them to satisfy a line count would not make them clearer.
+// - similar_names / struct_excessive_bools: the names mirror Bazel's own
+//   vocabulary and the bool-heavy structs are clap argument groups.
+// - case_sensitive_file_extension_comparisons: Bazel labels and workspace
+//   paths are case-sensitive, so the case-insensitive comparison the lint
+//   proposes would change which files a rule is seen to own.
+// - implicit_hasher: the target-type filters are only ever std `HashSet`s;
+//   a `BuildHasher` parameter would be generality nobody uses.
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::struct_excessive_bools,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::implicit_hasher
+)]
+
 use anyhow::{bail, Context, Result};
 use bazel_diff::bazel::BazelOptions;
 use bazel_diff::explain::{self, ExplainFormat, ExplainLimits};
@@ -494,7 +519,7 @@ struct ServeArgs {
     #[arg(long = "nexusPrefix", default_value = "")]
     nexus_prefix: String,
 
-    /// Basic-auth user; the password is read from the BAZEL_DIFF_NEXUS_PASSWORD environment variable
+    /// Basic-auth user; the password is read from the `BAZEL_DIFF_NEXUS_PASSWORD` environment variable
     #[arg(long = "nexusUsername", env = "BAZEL_DIFF_NEXUS_USERNAME")]
     nexus_username: Option<String>,
 
@@ -518,7 +543,7 @@ fn flatten_options(values: &[String]) -> Vec<String> {
 /// Folds `.` and `..` away lexically. Only meaningful on an absolute path:
 /// applied to a relative one, `.` and a leading `..` have nothing to resolve
 /// against and simply vanish, so callers go through [`parse_normalized_path`].
-fn normalize_path(path: PathBuf) -> PathBuf {
+fn normalize_path(path: &Path) -> PathBuf {
     path.components()
         .fold(PathBuf::new(), |mut normalized, component| {
             match component {
@@ -546,7 +571,7 @@ fn normalize_path(path: PathBuf) -> PathBuf {
 fn parse_normalized_path(value: &str) -> Result<PathBuf, String> {
     let absolute = std::path::absolute(value)
         .map_err(|error| format!("failed to resolve path {value:?}: {error}"))?;
-    Ok(normalize_path(absolute))
+    Ok(normalize_path(&absolute))
 }
 
 fn read_lines(path: Option<&Path>) -> Result<BTreeSet<PathBuf>> {
@@ -954,8 +979,11 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
             exclude_external,
         )?
         .into_iter()
-        .map(|label| format!("{label}\n"))
-        .collect()
+        .fold(String::new(), |mut acc, label| {
+            acc.push_str(&label);
+            acc.push('\n');
+            acc
+        })
     };
     match &args.output {
         Some(path) => fs::write(path, output)?,
@@ -1306,7 +1334,7 @@ mod tests {
             ["a", "b", "c", "d"]
         );
         assert_eq!(
-            normalize_path(PathBuf::from("/home/../some-dir")),
+            normalize_path(Path::new("/home/../some-dir")),
             PathBuf::from("/some-dir")
         );
     }
@@ -1799,7 +1827,7 @@ mod tests {
             config
                 .partial_graph_rebuild_patterns
                 .iter()
-                .map(|glob| glob.pattern())
+                .map(bazel_diff::partial::Glob::pattern)
                 .collect::<Vec<_>>(),
             ["*.lock", "tools/**", "requirements.txt"]
         );

@@ -8,6 +8,16 @@
 //! `bazel test` runs never see it — so enforcement engages exclusively in
 //! coverage runs. See `README.md` in this package for the user-facing story.
 
+#![warn(clippy::pedantic)]
+// See src/lib.rs in the root crate for why these pedantic lints are not adopted.
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::similar_names,
+    clippy::case_sensitive_file_extension_comparisons
+)]
+
 pub mod args;
 pub mod enforce;
 pub mod lcov;
@@ -184,13 +194,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A unique scratch directory per test, under TEST_TMPDIR when Bazel
+    /// A unique scratch directory per test, under `TEST_TMPDIR` when Bazel
     /// provides it.
     fn scratch_dir(label: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let base = std::env::var("TEST_TMPDIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir());
+        let base =
+            std::env::var("TEST_TMPDIR").map_or_else(|_| std::env::temp_dir(), PathBuf::from);
         let dir = base.join(format!(
             "lcov_merger_test_{}_{label}_{}",
             std::process::id(),
@@ -206,8 +215,8 @@ mod tests {
         merged: String,
     }
 
-    /// Drive `run()` against a synthetic COVERAGE_DIR the way
-    /// collect_coverage.sh would.
+    /// Drive `run()` against a synthetic `COVERAGE_DIR` the way
+    /// `collect_coverage.sh` would.
     fn invoke(
         label: &str,
         tracefiles: &[(&str, &str)],
@@ -234,7 +243,7 @@ mod tests {
                 manifest_path.display()
             ));
         }
-        argv.extend(extra_args.iter().map(|s| s.to_string()));
+        argv.extend(extra_args.iter().map(ToString::to_string));
         let env: BTreeMap<String, String> = env
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))

@@ -37,8 +37,7 @@ pub(crate) fn hash_pool() -> &'static rayon::ThreadPool {
             .filter(|threads| *threads > 0)
             .unwrap_or_else(|| {
                 std::thread::available_parallelism()
-                    .map(usize::from)
-                    .unwrap_or(1)
+                    .map_or(1, usize::from)
                     .min(DEFAULT_HASH_THREADS)
             });
         rayon::ThreadPoolBuilder::new()
@@ -189,8 +188,10 @@ pub struct GenerationTimings {
     pub target_hash_millis: u64,
 }
 
-fn elapsed_millis(started: Instant) -> u64 {
-    started.elapsed().as_millis() as u64
+/// Milliseconds since `started`, saturating rather than truncating past `u64::MAX` (about 584
+/// million years).
+pub(crate) fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
@@ -1372,6 +1373,10 @@ fn hash_seed_files(workspace: &Path, paths: &BTreeSet<PathBuf>) -> Result<Digest
 
 fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<()> {
     let mut file = File::open(path)?;
+    // One 64 KiB read buffer per call. It stays on the stack because this runs once per
+    // tracked file on the hash pool's threads, where a heap allocation per file would cost more
+    // than the stack space.
+    #[allow(clippy::large_stack_arrays)]
     let mut buffer = [0; FILE_HASH_BUFFER_SIZE];
     loop {
         let read = file.read(&mut buffer)?;
@@ -1389,6 +1394,8 @@ pub(crate) fn hash_directory_into(hasher: &mut Sha256, root: &Path) -> Result<()
     hash_directory_tree(hasher, root, false)
 }
 
+// Only the non-Unix branch can fail; the Unix one hashes the raw bytes.
+#[allow(clippy::unnecessary_wraps)]
 fn hash_directory_entry_path(hasher: &mut Sha256, path: &Path, strict: bool) -> Result<()> {
     for (index, component) in path.components().enumerate() {
         if index != 0 {
@@ -2298,7 +2305,7 @@ impl ExternalRepoResolver {
                 }
             }
         }
-        Ok(external.join(canonical.map(String::as_str).unwrap_or(repo)))
+        Ok(external.join(canonical.map_or(repo, String::as_str)))
     }
 
     /// Returns the main repository's apparent -> canonical repository mapping,

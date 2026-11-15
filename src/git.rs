@@ -37,6 +37,7 @@ impl Git {
         }
     }
 
+    #[must_use]
     pub fn with_cancellation(mut self, cancellation: Option<Arc<Cancellation>>) -> Self {
         self.cancellation = cancellation;
         self

@@ -20,9 +20,14 @@ load(":defs.bzl", "define_consumers")
 
 define_consumers(name = "consumers")
 
+package_group(
+    name = "allowed",
+    includes = [":consumers"],
+)
+
 genrule(
     name = "thing",
     outs = ["thing.txt"],
     cmd = "echo thing > $@",
-    visibility = [":consumers"],
+    visibility = [":allowed"],
 )

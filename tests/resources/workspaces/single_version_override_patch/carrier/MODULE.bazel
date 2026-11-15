@@ -1,0 +1,6 @@
+module(
+    name = "carrier",
+    version = "1.0",
+)
+
+bazel_dep(name = "dep", version = "1.0")

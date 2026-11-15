@@ -1,0 +1,3 @@
+module(name = "outside")
+
+bazel_dep(name = "ext")

@@ -15,14 +15,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .files(&[&build_proto, &analysis_proto])
         .includes(&[include])
         .include_file("proto.rs")
-        // Box optional payloads to reduce the inline size of retained query targets.
+        // Box target payloads to shrink the targets kept for the whole run: inline, every target
+        // was as large as its biggest payload (a Rule), though most are files. Box the attribute
+        // fields that are rarely set too, so each decoded Attribute is smaller to move and grow.
         .box_type_in(
             buffa_build::PointerRepr::Box,
             &[
+                ".blaze_query.Target.rule",
+                ".blaze_query.Target.source_file",
                 ".blaze_query.Target.generated_file",
                 ".blaze_query.Target.package_group",
                 ".blaze_query.Target.environment_group",
                 ".blaze_query.SourceFile.license",
+                ".blaze_query.Attribute.license",
+                ".blaze_query.Attribute.selector_list",
             ],
         )
         .generate_views(false)

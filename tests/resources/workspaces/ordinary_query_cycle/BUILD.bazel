@@ -1,0 +1,37 @@
+config_setting(
+    name = "unused",
+    values = {"compilation_mode": "opt"},
+)
+
+filegroup(
+    name = "leaf",
+    srcs = ["leaf.txt"],
+)
+
+# The default build follows a -> leaf. Ordinary query also includes a -> c.
+alias(
+    name = "a",
+    actual = select({
+        ":unused": ":c",
+        "//conditions:default": ":leaf",
+    }),
+)
+
+alias(
+    name = "b",
+    actual = ":a",
+)
+
+alias(
+    name = "c",
+    actual = ":b",
+)
+
+genrule(
+    name = "consumer",
+    srcs = [":c"],
+    outs = ["consumer.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+filegroup(name = "unrelated")

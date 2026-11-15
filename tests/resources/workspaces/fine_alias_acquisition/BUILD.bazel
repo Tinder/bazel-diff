@@ -1,0 +1,12 @@
+genrule(
+    name = "consumer",
+    srcs = ["@public//:forward"],
+    outs = ["consumer.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+# A stale public label must not become a query root without a returned alias row.
+filegroup(
+    name = "stale",
+    srcs = ["@public//:missing_version"],
+)

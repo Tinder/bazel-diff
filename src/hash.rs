@@ -1,18 +1,22 @@
 use crate::bazel::{
-    encode_configured_input, split_configured, target_label, BazelOptions, QueriedTargets,
-    RepositoryInputGroup, RepositoryInputs, ScopedSources,
+    encode_configured_input, encoded_rule_attributes, split_configured, target_label, target_name,
+    AliasSource, BazelOptions, EncodedAttribute, EncodedTargets, FilegroupWitness, QueriedTargets,
+    RepositoryInputGroup, RepositoryInputs, ScopedSources, VerifiedQuery,
 };
 use crate::cancel::{self, Cancellation};
-use crate::model::{HashFileData, TargetHash};
+use crate::components::{component_digest, member_digest, Completion, Components, Visit};
+use crate::model::{ConfiguredRoots, HashFileData, TargetHash, REPOSITORY_DEFINITION_KIND};
 use crate::partial::{self, RecipeRecorder, RuleRecipe, TreeIndex};
-use crate::proto::blaze_query::{target, Rule, Target};
+use crate::proto::blaze_query::{attribute::Discriminator as AttributeKind, target, Rule, Target};
 use anyhow::{anyhow, bail, Context, Result};
 use buffa::{EncodeSink, Message, SizeCache};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::{
+    btree_map::Entry as BTreeEntry, hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet,
+};
 use std::fs::{self, File};
 use std::io::Read;
 use std::num::NonZeroUsize;
@@ -78,6 +82,8 @@ struct TargetDigestBuilder {
     direct: Sha256,
     deps: Vec<String>,
     track_deps: bool,
+    // Keep verification storage out of every cached normal target digest.
+    verification: Option<Box<Sha256>>,
     /// Partial-graph mode: the recipe under construction. Every direct contribution that is not
     /// a source digest also feeds `static`; source inputs and dependency keys are listed in
     /// contribution order.
@@ -97,6 +103,7 @@ impl TargetDigestBuilder {
             direct: Sha256::new(),
             deps: Vec::new(),
             track_deps,
+            verification: None,
             recipe: record_recipe.then(|| RecipeBuilder {
                 fixed: Sha256::new(),
                 sources: Vec::new(),
@@ -130,12 +137,41 @@ impl TargetDigestBuilder {
         bytes: impl AsRef<[u8]>,
     ) {
         self.overall.update(bytes);
+        self.dependency(label, canonical);
+    }
+
+    /// Records an edge and its recipe input independently of its digest.
+    fn dependency(&mut self, label: &str, canonical: impl FnOnce() -> String) {
         if self.track_deps {
             self.deps.push(label.to_owned());
         }
         if let Some(recipe) = &mut self.recipe {
             recipe.deps.push(canonical());
         }
+    }
+
+    fn start_verification(&mut self, context: DigestBytes) {
+        let mut verification = Sha256::new();
+        verification.update(b"verified configured context\0");
+        verification.update(context);
+        self.verification = Some(Box::new(verification));
+    }
+
+    fn verification_input(&mut self, label: &str, context: Option<DigestBytes>) {
+        match (&mut self.verification, context) {
+            (Some(verification), Some(context)) => {
+                verification.update((label.len() as u64).to_le_bytes());
+                verification.update(label.as_bytes());
+                verification.update(context);
+            }
+            _ => self.verification = None,
+        }
+    }
+
+    fn finish_verification(&mut self) -> Option<DigestBytes> {
+        self.verification
+            .take()
+            .map(|digest| (*digest).finalize().into())
     }
 
     fn finish(mut self) -> (TargetDigest, Option<RuleRecipe>) {
@@ -157,6 +193,7 @@ impl TargetDigestBuilder {
 
 enum HashTarget {
     Rule(String),
+    RepositoryDefinition(String),
     Generated {
         name: String,
         generating_rule: String,
@@ -167,8 +204,13 @@ enum HashTarget {
 impl HashTarget {
     fn label(&self) -> &str {
         match self {
-            HashTarget::Rule(label) | HashTarget::Source(label) => label,
-            HashTarget::Generated { name, .. } => name,
+            HashTarget::Rule(label)
+            | HashTarget::RepositoryDefinition(label)
+            | HashTarget::Source(label) => label,
+            HashTarget::Generated {
+                name,
+                generating_rule: _,
+            } => name,
         }
     }
 }
@@ -199,6 +241,40 @@ pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
 }
 
 pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, GenerationTimings)> {
+    generate_hashes_timed_inner(options, false, false)
+}
+
+/// Retains supplemental loading-phase facts while generating a fresh ordinary graph.
+pub fn generate_hashes_with_toolchain_inputs(options: &HashOptions) -> Result<HashFileData> {
+    if options.bazel.use_cquery || options.partial_tree.is_some() {
+        anyhow::bail!("--includeToolchainInputs requires fresh ordinary generation");
+    }
+    generate_hashes_timed_inner(options, false, true).map(|(file, _)| file)
+}
+
+/// Captures a fresh configured graph to verify normal input coverage and retain the additional
+/// context needed for a stable comparison. Historical, partial, or caller-overridden source
+/// hashes cannot establish this coverage.
+pub fn generate_verified_hashes(options: &HashOptions) -> Result<HashFileData> {
+    if options.content_hashes.is_some()
+        || !options.modified_filepaths.is_empty()
+        || options.partial_tree.is_some()
+        || !options.ignored_attributes.is_empty()
+        || options.bazel.exclude_targets_query.is_some()
+        || options.bazel.exclude_external_targets
+    {
+        bail!(
+            "--verifyConfiguredRoots requires full physical hashes without ignored attributes or excluded targets"
+        );
+    }
+    generate_hashes_timed_inner(options, true, false).map(|(data, _)| data)
+}
+
+fn generate_hashes_timed_inner(
+    options: &HashOptions,
+    verify: bool,
+    include_toolchain_inputs: bool,
+) -> Result<(HashFileData, GenerationTimings)> {
     if options.bazel.isolated_dependency_root.is_some()
         && (options.content_hashes.is_some()
             || !options.modified_filepaths.is_empty()
@@ -209,48 +285,111 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
     let mut definition_digests = PreparedRules::default();
     let mut digests = Vec::new();
     let query_started = Instant::now();
-    let QueriedTargets {
-        targets,
-        module_graph_json,
-        root_mapping,
-        scoped_sources,
-    } = options.bazel.query_all_targets_with(|batch, inputs| {
-        let prehash = |target: &mut Target, shared_inputs| {
+    let mut prepare = |batch: &mut [Target],
+                       encoded: &EncodedTargets<'_>,
+                       inputs,
+                       ordinary_inputs: Option<Vec<String>>| {
+        let prehash = |target: &mut Target,
+                       encoded: &[EncodedAttribute<'_>],
+                       repository_inputs,
+                       ordinary_inputs| {
             let rule = target.rule.as_option_mut()?;
             // Read before `prehash_rule` drops the attributes they come from.
             let loading_inputs = partial_loading_inputs(options, rule);
             Some((
                 rule.name.clone(),
                 PreparedRule {
-                    definition_digest: prehash_rule(rule, &options.ignored_attributes),
-                    shared_inputs,
+                    definition_digest: prehash_encoded_rule(
+                        rule,
+                        encoded,
+                        &options.ignored_attributes,
+                    ),
+                    repository_inputs,
                     loading_inputs,
                 },
+                ordinary_inputs,
             ))
         };
+        // Attributes the decoder left encoded, read back per target into a reused buffer.
+        let encoded_for = |index: usize| encoded.get(index).copied().unwrap_or_default();
         if let [target] = batch {
-            definition_digests.extend(prehash(target, inputs));
+            let mut attributes = Vec::new();
+            encoded_rule_attributes(encoded_for(0), &mut attributes);
+            definition_digests.extend(prehash(target, &attributes, inputs, ordinary_inputs));
         } else {
             // Keep query order for duplicate names, even when the hashes complete out of order.
             batch
                 .par_iter_mut()
-                .map(|target| prehash(target, inputs.clone()))
+                .enumerate()
+                .map_init(Vec::new, |attributes, (index, target)| {
+                    attributes.clear();
+                    encoded_rule_attributes(encoded_for(index), attributes);
+                    prehash(target, attributes, inputs.clone(), ordinary_inputs.clone())
+                })
                 .collect_into_vec(&mut digests);
             definition_digests.extend(digests.drain(..).flatten());
         }
-    })?;
+    };
+    let queried = if verify {
+        options
+            .bazel
+            .query_all_targets_verified_with(|batch, inputs| prepare(batch, &[], inputs, None))?
+    } else {
+        options.bazel.query_all_targets_encoded(
+            true,
+            options.partial_tree.is_none()
+                && options.content_hashes.is_none()
+                && options.modified_filepaths.is_empty(),
+            &mut prepare,
+        )?
+    };
+    for (kind, fingerprints) in [
+        ("toolchain registration order", &queried.registration_hashes),
+        (
+            "toolchain supplier repository inputs",
+            &queried.supplier_hashes,
+        ),
+    ] {
+        for (name, fingerprint) in fingerprints {
+            if let Some(prepared) = definition_digests
+                .ids
+                .get(name)
+                .and_then(|&id| definition_digests.prepared[id].as_mut())
+            {
+                let mut hash = Sha256::new();
+                hash.update(prepared.definition_digest);
+                hash.update(kind);
+                hash.update(fingerprint);
+                prepared.definition_digest = hash.finalize().into();
+            }
+        }
+    }
+    let observations = if include_toolchain_inputs {
+        match options.bazel.observed_toolchains(
+            &queried.targets,
+            queried.root_mapping.as_deref(),
+            options.track_deps,
+        ) {
+            Ok(index) => Some(index),
+            Err(error) => {
+                options.bazel.check_cancelled()?;
+                eprintln!("[Warn] toolchain declaration observation unavailable: {error:#}");
+                Some(crate::toolchain_candidates::ObservedToolchains {
+                    version: 1,
+                    unresolved: BTreeSet::from(["declaration observation unavailable".into()]),
+                    ..Default::default()
+                })
+            }
+        }
+    } else {
+        None
+    };
     let bazel_query_millis = elapsed_millis(query_started);
     // The query is the phase worth cancelling; a request abandoned during it stops here instead
     // of hashing targets nobody will read.
     options.bazel.check_cancelled()?;
-    let (data, mut timings) = hash_targets_with_digests(
-        options,
-        targets,
-        definition_digests,
-        module_graph_json,
-        root_mapping,
-        scoped_sources,
-    )?;
+    let (mut data, mut timings) = hash_targets_with_digests(options, queried, definition_digests)?;
+    data.observed_toolchains = observations;
     timings.bazel_query_millis = bazel_query_millis;
     Ok((data, timings))
 }
@@ -259,28 +398,52 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
     options.bazel.check_raw_targets_supported()?;
     hash_targets_with_digests(
         options,
-        targets,
+        QueriedTargets {
+            registration_hashes: BTreeMap::new(),
+            supplier_hashes: BTreeMap::new(),
+            targets,
+            verification: None,
+            configured_roots: None,
+            module_graph_json: None,
+            module_graph_complete: false,
+            root_mapping: None,
+            scoped_sources: ScopedSources::default(),
+            output_base: None,
+        },
         PreparedRules::default(),
-        None,
-        None,
-        ScopedSources::default(),
     )
     .map(|(data, _)| data)
 }
 
 fn hash_targets_with_digests(
     options: &HashOptions,
-    targets: Vec<Target>,
+    queried: QueriedTargets,
     definition_digests: PreparedRules,
-    module_graph_json: Option<String>,
-    root_mapping: Option<Vec<u8>>,
-    scoped_sources: ScopedSources,
 ) -> Result<(HashFileData, GenerationTimings)> {
+    let QueriedTargets {
+        registration_hashes: _,
+        supplier_hashes: _,
+        targets,
+        verification,
+        configured_roots,
+        module_graph_json,
+        module_graph_complete,
+        root_mapping,
+        scoped_sources,
+        output_base,
+    } = queried;
     let hash_started = Instant::now();
-    let mut external_resolver = ExternalRepoResolver::new(&options.bazel, root_mapping)?;
+    let mut external_resolver =
+        ExternalRepoResolver::new(&options.bazel, root_mapping, output_base)?;
     external_resolver.scoped_sources = scoped_sources;
     let module_graph_started = Instant::now();
     let module_graph_json = module_graph_json.or_else(|| options.bazel.module_graph_json());
+    let verification = verification.filter(|_| {
+        module_graph_complete
+            && module_graph_json
+                .as_deref()
+                .is_some_and(crate::module_graph::usable_module_graph)
+    });
     options.bazel.check_cancelled()?;
     let module_graph_millis = elapsed_millis(module_graph_started);
     let data = hash_targets_with_environment(
@@ -289,6 +452,8 @@ fn hash_targets_with_digests(
         definition_digests,
         external_resolver,
         module_graph_json,
+        configured_roots,
+        verification,
     )?;
     let timings = GenerationTimings {
         bazel_query_millis: 0,
@@ -304,11 +469,15 @@ fn hash_targets_with_environment(
     definition_digests: PreparedRules,
     external_resolver: ExternalRepoResolver,
     module_graph_json: Option<String>,
+    configured_roots: Option<BTreeMap<String, String>>,
+    verification: Option<VerifiedQuery>,
 ) -> Result<HashFileData> {
     if options.partial_tree.is_some() && options.bazel.use_cquery {
         bail!("partial graph mode does not support --useCquery");
     }
-    let source_hasher = SourceHasher {
+    let mut verification = verification
+        .map(|query| ConfiguredCoverage::new(query, &targets, &definition_digests, options));
+    let mut source_hasher = SourceHasher {
         workspace: &options.bazel.workspace,
         tree: options.partial_tree.as_deref(),
         content_hashes: options.content_hashes.as_ref(),
@@ -328,6 +497,24 @@ fn hash_targets_with_environment(
             .collect(),
         external_resolver,
     };
+    if !options.bazel.use_cquery
+        && options.bazel.isolated_dependency_root.is_none()
+        && !options.bazel.fine_grained_external_repos.is_empty()
+        && (options.partial_tree.is_some() || options.content_hashes.is_none())
+        && options.modified_filepaths.is_empty()
+    {
+        source_hasher
+            .external_resolver
+            .scoped_sources
+            .queried_files
+            .extend(
+                targets
+                    .iter()
+                    .filter_map(|target| target.source_file.as_option())
+                    .filter(|source| !is_main_repo(&source.name))
+                    .map(|source| source.name.clone()),
+            );
+    }
     let seed_hash = hash_seed_files(&options.bazel.workspace, &options.seed_filepaths)?;
     let has_instantiation_stacks = targets.iter().any(|target| {
         target.r#type == target::Discriminator::Rule
@@ -337,6 +524,7 @@ fn hash_targets_with_environment(
                 .is_some_and(|rule| !rule.instantiation_stack.is_empty())
     });
     let package_bzl_seeds = if has_instantiation_stacks {
+        source_hasher.record_stack_sources(&targets, options.bazel.use_cquery)?;
         BTreeMap::new()
     } else {
         package_bzl_seeds(&targets, &source_hasher)?
@@ -349,11 +537,16 @@ fn hash_targets_with_environment(
     let PreparedRules {
         mut ids,
         mut prepared,
+        ordinary_inputs,
     } = definition_digests;
     ids.reserve(targets.len().saturating_sub(ids.len()));
     let mut slots = Vec::with_capacity(targets.len());
     slots.resize_with(ids.len(), LabelSlot::default);
-    let mut rules = Labels { ids, slots };
+    let mut rules = Labels {
+        ids,
+        slots,
+        ordinary_inputs,
+    };
     let mut decoded_rules = Vec::<(String, Rule)>::new();
     let mut source_targets = Vec::new();
     let mut hash_targets = Vec::with_capacity(targets.len());
@@ -364,15 +557,17 @@ fn hash_targets_with_environment(
                     hash_targets.push(HashTarget::Rule(rule.name.clone()));
                     // Generated targets are prehashed and deduplicated; raw callers provide no
                     // digests and retain the ordered fallback below, including duplicate names.
-                    match rules
+                    if let Some((id, prepared)) = rules
                         .ids
                         .get(&rule.name)
                         .and_then(|&id| prepared.get_mut(id)?.take().map(|value| (id, value)))
                     {
-                        Some((id, prepared)) => {
-                            rules.slots[id].rule = Some(Rc::new(RuleNode::new(rule, prepared)));
+                        rules.slots[id].rule = Some(Rc::new(RuleNode::new(rule, prepared)));
+                    } else {
+                        if let Some(id) = rules.ids.get(&rule.name) {
+                            rules.ordinary_inputs.remove(id);
                         }
-                        None => decoded_rules.push((rule.name.clone(), rule)),
+                        decoded_rules.push((rule.name.clone(), rule));
                     }
                 }
             }
@@ -401,20 +596,121 @@ fn hash_targets_with_environment(
         }
     }
     drop(prepared);
+    let observe_repository_inputs = options.partial_tree.is_none()
+        && options.content_hashes.is_none()
+        && options.modified_filepaths.is_empty()
+        && !options.bazel.use_cquery;
+    // Both strict inventories must agree when they observe the same InputFile.
+    let mut source_observations = HashMap::<&str, Option<&AliasSource>>::new();
+    if observe_repository_inputs {
+        let scoped = &source_hasher.external_resolver.scoped_sources;
+        for source in scoped
+            .alias_sources
+            .values()
+            .chain(scoped.filegroup_sources.values())
+        {
+            let AliasSource {
+                label,
+                location: _,
+                visibility: _,
+            } = source;
+            match source_observations.entry(label.as_str()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Some(source));
+                }
+                Entry::Occupied(mut entry) => {
+                    if *entry.get() != Some(source) {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+    }
     let physical = hash_pool().install(|| {
         source_targets
             .into_par_iter()
             .map(|source| {
                 let seed = source_seed(&source);
+                let observation = verification
+                    .as_ref()
+                    .and_then(|coverage| {
+                        Some((
+                            coverage.canonical_workspace.as_deref()?,
+                            coverage.source_locations.get(&source.name)?.as_deref()?,
+                        ))
+                    })
+                    .or_else(|| {
+                        source_observations
+                            .get(source.name.as_str())
+                            .and_then(|source| *source)
+                            .map(|source| (source_hasher.workspace, source.location.as_str()))
+                    });
                 source_hasher
-                    .digest_source(&source.name, &seed, options.bazel.use_cquery)
-                    .map(|digest| (source.name, digest))
+                    .digest_source_with_observation(
+                        &source.name,
+                        &seed,
+                        options.bazel.use_cquery,
+                        observation,
+                    )
+                    .map(|(digest, observed)| (source.name, digest, observed))
             })
             .collect::<Result<Vec<_>>>()
     })?;
+    if let Some(recorder) = &mut recorder {
+        // Evaluation reads main-repository sources from the git tree, which has no external
+        // repository's files; keep what was read from disk. An unresolved label's empty digest
+        // is what evaluation computes anyway, so it is left out.
+        let unresolved: DigestBytes = Sha256::digest([]).into();
+        for (label, digest, _) in &physical {
+            if !is_main_repo(label) && *digest != unresolved {
+                recorder.record_external_source(label, *digest);
+            }
+        }
+    }
     let mut source_digests = Vec::with_capacity(physical.len());
-    for (label, digest) in physical {
+    let mut observed_sources = HashSet::new();
+    for (label, digest, observed) in physical {
+        if observed {
+            if let Some(coverage) = &mut verification {
+                coverage.observed_sources.insert(label.clone());
+            } else if source_observations.contains_key(label.as_str()) {
+                observed_sources.insert(label.clone());
+            }
+        }
         rules.slot(label).set_source(&mut source_digests, digest);
+    }
+    if options.bazel.verbose {
+        if let Some(coverage) = &verification {
+            let mut gaps = coverage
+                .nodes
+                .iter()
+                .filter(|(key, node)| {
+                    !node.covered
+                        || (matches!(node.kind, CoverageKind::Source)
+                            && !coverage.observed_sources.contains(*key))
+                })
+                .collect::<Vec<_>>();
+            gaps.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            let first = gaps
+                .iter()
+                .take(8)
+                .map(|(key, node)| {
+                    if node.covered {
+                        format!(
+                            "{key}: source location {:?} was not observed",
+                            coverage.source_locations.get(*key)
+                        )
+                    } else {
+                        format!("{key}: input or context was not verified")
+                    }
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "[Info] configured verification has {} direct gaps; first: {:?}",
+                gaps.len(),
+                first
+            );
+        }
     }
     let processed_rules = hash_pool().install(|| {
         decoded_rules
@@ -427,7 +723,7 @@ fn hash_targets_with_environment(
                     rule,
                     PreparedRule {
                         definition_digest,
-                        shared_inputs: None,
+                        repository_inputs: None,
                         loading_inputs,
                     },
                 )
@@ -507,10 +803,43 @@ fn hash_targets_with_environment(
     }
     // An already captured mapping can be reused without a new Bazel call.
     // Configured inputs retain their on-demand lookup.
-    if !options.bazel.use_cquery && source_hasher.external_resolver.repo_mapping.get().is_some() {
+    if !options.bazel.use_cquery
+        && (source_hasher.external_resolver.repo_mapping.get().is_some()
+            || (!observed_sources.is_empty()
+                && source_hasher.external_resolver.root_mapping.is_some()))
+    {
+        let mapping = source_hasher.external_resolver.canonical_repo_nodes();
+        let fine = &options.bazel.fine_grained_external_repos;
+        let views = if observe_repository_inputs {
+            let mut qualified = rules.bind_alias_sources(
+                &source_hasher.external_resolver.scoped_sources.alias_sources,
+                &observed_sources,
+                fine,
+                mapping,
+            );
+            rules.bind_filegroup_inputs(
+                &source_hasher.external_resolver.scoped_sources.filegroups,
+                &source_hasher
+                    .external_resolver
+                    .scoped_sources
+                    .filegroup_parents,
+                &source_observations,
+                &observed_sources,
+                &options.ignored_attributes,
+                &mut qualified,
+            );
+            rules.repository_views(&qualified, fine, mapping, &mut hash_targets)
+        } else {
+            RepositoryViews::default()
+        };
         rules.prepare_inputs(
-            &options.bazel.fine_grained_external_repos,
-            source_hasher.external_resolver.canonical_repo_nodes(),
+            fine,
+            mapping,
+            &views,
+            &source_hasher
+                .external_resolver
+                .scoped_sources
+                .toolchain_declarations,
         );
     }
 
@@ -572,6 +901,7 @@ fn hash_targets_with_environment(
     let mut context = HashContext {
         options,
         source_hasher: &source_hasher,
+        verification: verification.as_ref().map(VerificationState::new),
         source_digests,
         rules,
         label_instances,
@@ -580,11 +910,11 @@ fn hash_targets_with_environment(
         package_bzl_seeds,
         bzl_digests: HashMap::new(),
         always_affected_seed: unique_invocation_seed(),
-        cycle_warnings: HashSet::new(),
+        components: Components::default(),
         recorder,
     };
-    // `--order_output=no` makes the query order arbitrary. Acyclic hashes do not care, but the
-    // digest of a cycle depends on which member is entered first, so fix the traversal order.
+    // `--order_output=no` makes the query order arbitrary. Keep output and fallback resolution
+    // deterministic even though component digests are independent of their entry point.
     hash_targets.sort_by(|left, right| left.label().cmp(right.label()));
     let mut digests = Vec::with_capacity(hash_targets.len());
     for target in hash_targets {
@@ -593,11 +923,26 @@ fn hash_targets_with_environment(
                 let digest = context.rule_digest(&key, &mut Vec::new())?;
                 (key, "Rule", digest)
             }
+            HashTarget::RepositoryDefinition(key) => {
+                let digest = context.rule_digest(&key, &mut Vec::new())?;
+                (key, REPOSITORY_DEFINITION_KIND, digest)
+            }
             HashTarget::Generated {
                 name,
                 generating_rule,
             } => {
                 let mut digest = context.rule_digest(&generating_rule, &mut Vec::new())?;
+                if let Some(state) = &mut context.verification {
+                    let verified = state.coverage.resolved_context(
+                        &name,
+                        &name,
+                        &generating_rule,
+                        state.contexts.get(&generating_rule).copied(),
+                    );
+                    if let Some(verified) = verified {
+                        state.contexts.insert(name.clone(), verified);
+                    }
+                }
                 digest.deps = options.track_deps.then(|| Rc::new(vec![generating_rule]));
                 (name, "GeneratedFile", digest)
             }
@@ -615,6 +960,11 @@ fn hash_targets_with_environment(
                     hasher.update(seed);
                 }
                 let digest = hasher.finalize().into();
+                if let Some(state) = &mut context.verification {
+                    if let Some(verified) = state.coverage.source_context(&label) {
+                        state.contexts.insert(label.clone(), verified);
+                    }
+                }
                 (
                     label,
                     "SourceFile",
@@ -629,8 +979,43 @@ fn hash_targets_with_environment(
         digests.push((key, kind, digest));
     }
     let recorder = context.recorder.take();
+    let verified_contexts = context.verification.take().map(|state| {
+        debug_assert!(state.pending.is_empty());
+        state.contexts
+    });
     drop(context);
-    let (mut hashes, dep_edges) = aggregate_by_label(digests, options.track_deps);
+    if configured_roots.is_some() != options.bazel.cquery_root_expression.is_some() {
+        bail!("configured-root hashing requires Bazel-resolved roots for the requested mode");
+    }
+    let (mut hashes, dep_edges, configured_roots) = if let Some(roots) = configured_roots {
+        let verified_roots = verified_contexts.map(|contexts| {
+            roots
+                .iter()
+                .filter(|(label, _)| {
+                    is_main_repo(label)
+                        && !crate::bazel::main_repo_label_key(label).starts_with("//external:")
+                })
+                .filter_map(|(label, key)| {
+                    contexts
+                        .get(key)
+                        .map(|context| (label.clone(), hex::encode(context)))
+                })
+                .collect()
+        });
+        let configured = configured_root_hashes(digests, options.track_deps, &roots)?;
+        (
+            configured.roots,
+            configured.dep_edges,
+            Some(ConfiguredRoots {
+                verified_roots,
+                roots,
+                hashes: configured.instances,
+            }),
+        )
+    } else {
+        let (hashes, dep_edges) = aggregate_by_label(digests, options.track_deps);
+        (hashes, dep_edges, None)
+    };
     let mut partial = None;
     if let (Some(recorder), Some(tree)) = (recorder, &options.partial_tree) {
         // The traversal above only recorded the recipes; the hashes an entry in this mode
@@ -645,7 +1030,9 @@ fn hash_targets_with_environment(
         partial = Some(recipes);
     }
     Ok(HashFileData {
+        observed_toolchains: None,
         hashes,
+        configured_roots,
         module_graph_json,
         dependency_fingerprint: None,
         dep_edges,
@@ -655,6 +1042,262 @@ fn hash_targets_with_environment(
             .as_ref()
             .and_then(|tree| tree.id().map(str::to_owned)),
     })
+}
+
+struct ConfiguredCoverage {
+    nodes: HashMap<String, CoverageNode>,
+    canonical_workspace: Option<PathBuf>,
+    source_locations: BTreeMap<String, Option<String>>,
+    observed_sources: HashSet<String>,
+}
+
+struct VerificationState<'a> {
+    coverage: &'a ConfiguredCoverage,
+    /// Contexts awaiting the normal component traversal's completion.
+    pending: HashMap<String, DigestBytes>,
+    /// Completed contexts, keyed by the exact configured identity.
+    contexts: HashMap<String, DigestBytes>,
+}
+
+impl<'a> VerificationState<'a> {
+    fn new(coverage: &'a ConfiguredCoverage) -> Self {
+        Self {
+            coverage,
+            pending: HashMap::new(),
+            contexts: HashMap::new(),
+        }
+    }
+}
+
+struct CoverageNode {
+    inputs: Vec<String>,
+    covered: bool,
+    kind: CoverageKind,
+}
+
+enum CoverageKind {
+    Rule(Option<DigestBytes>),
+    Generated(String),
+    Source,
+    Unresolved,
+}
+
+impl ConfiguredCoverage {
+    /// Relates every prerequisite in the full verification view to the exact input the normal
+    /// configured hash consumes. Source edges are retained here before hashing folds their bytes
+    /// into the parent and removes those edges from the distance graph.
+    fn new(
+        query: VerifiedQuery,
+        targets: &[Target],
+        prepared: &PreparedRules,
+        options: &HashOptions,
+    ) -> Self {
+        let mut normal = HashMap::new();
+        for target in targets {
+            let Some(key) = target_name(target) else {
+                continue;
+            };
+            match normal.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Some(target));
+                }
+                Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+        let mut nodes = HashMap::with_capacity(query.targets.len() + query.aspects.len());
+        for target in query.targets {
+            let Some(key) = target_name(&target).map(str::to_owned) else {
+                continue;
+            };
+            let normal = normal.get(key.as_str()).copied().flatten();
+            let definition = || {
+                prepared
+                    .ids
+                    .get(&key)
+                    .and_then(|&id| prepared.prepared.get(id))
+                    .and_then(Option::as_ref)
+                    .map(|rule| rule.definition_digest)
+            };
+            let node = match target.r#type {
+                target::Discriminator::PackageGroup => {
+                    let Some(group) = target.package_group.into_option() else {
+                        continue;
+                    };
+                    let rule = crate::bazel::package_group_rule(&group);
+                    let digest = rule_definition_digest(&rule, &options.ignored_attributes);
+                    CoverageNode {
+                        covered: definition() == Some(digest)
+                            && normal
+                                .and_then(|target| target.rule.as_option())
+                                .is_some_and(|normal| {
+                                    normal.configured_rule_input == rule.configured_rule_input
+                                }),
+                        inputs: group.included_package_group,
+                        kind: CoverageKind::Rule(Some(digest)),
+                    }
+                }
+                target::Discriminator::Rule => {
+                    let Some(rule) = target.rule.as_option() else {
+                        continue;
+                    };
+                    let inputs = rule
+                        .configured_rule_input
+                        .iter()
+                        .map(encode_configured_input)
+                        .collect::<Vec<_>>();
+                    let normal_inputs =
+                        normal
+                            .and_then(|target| target.rule.as_option())
+                            .map(|rule| {
+                                rule.configured_rule_input
+                                    .iter()
+                                    .map(encode_configured_input)
+                                    .collect::<HashSet<_>>()
+                            });
+                    // The verification query requests definition stacks. A Starlark rule's
+                    // implementation digest must be among the attributes the normal hash used.
+                    let definition_observed = rule.definition_stack.is_empty()
+                        || rule.attribute.iter().any(|attribute| {
+                            attribute.name == "$rule_implementation_hash"
+                                && attribute.r#type
+                                    == crate::proto::blaze_query::attribute::Discriminator::String
+                                && attribute.string_value.as_ref().is_some_and(|digest| {
+                                    !digest.is_empty()
+                                        && digest.len() % 2 == 0
+                                        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                })
+                        });
+                    let context = verified_rule_context(rule);
+                    CoverageNode {
+                        covered: definition_observed
+                            && rule.default_setting.is_empty()
+                            && context.is_some()
+                            && definition()
+                                == Some(rule_definition_digest(rule, &options.ignored_attributes))
+                            && normal_inputs.is_some_and(|normal| {
+                                inputs.iter().all(|input| normal.contains(input))
+                            }),
+                        inputs,
+                        kind: CoverageKind::Rule(context),
+                    }
+                }
+                target::Discriminator::GeneratedFile => {
+                    let Some(file) = target.generated_file.as_option() else {
+                        continue;
+                    };
+                    CoverageNode {
+                        inputs: vec![file.generating_rule.clone()],
+                        covered: normal
+                            .and_then(|target| target.generated_file.as_option())
+                            .is_some_and(|normal| normal.generating_rule == file.generating_rule),
+                        kind: CoverageKind::Generated(file.generating_rule.clone()),
+                    }
+                }
+                target::Discriminator::SourceFile => {
+                    let Some(source) = target.source_file.as_option() else {
+                        continue;
+                    };
+                    CoverageNode {
+                        inputs: Vec::new(),
+                        covered: source.subinclude.is_empty()
+                            && source.feature.is_empty()
+                            && source.package_contains_errors != Some(true)
+                            && normal
+                                .and_then(|target| target.source_file.as_option())
+                                .is_some_and(|normal| normal.subinclude == source.subinclude),
+                        kind: CoverageKind::Source,
+                    }
+                }
+                _ => continue,
+            };
+            let mut node = node;
+            node.inputs.sort_unstable();
+            node.inputs.dedup();
+            match nodes.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(node);
+                }
+                Entry::Occupied(mut entry) => entry.get_mut().covered = false,
+            }
+        }
+        for mut aspect in query.aspects {
+            aspect.inputs.sort_unstable();
+            aspect.inputs.dedup();
+            nodes.insert(
+                aspect.key,
+                CoverageNode {
+                    inputs: aspect.inputs,
+                    covered: false,
+                    kind: CoverageKind::Unresolved,
+                },
+            );
+        }
+        Self {
+            nodes,
+            canonical_workspace: fs::canonicalize(&options.bazel.workspace).ok(),
+            source_locations: query.source_locations,
+            observed_sources: HashSet::new(),
+        }
+    }
+
+    fn rule_context(&self, key: &str) -> Option<DigestBytes> {
+        let node = self.nodes.get(key).filter(|node| node.covered)?;
+        match &node.kind {
+            CoverageKind::Rule(context) => *context,
+            _ => None,
+        }
+    }
+
+    fn requires(&self, parent: &str, input: &str) -> bool {
+        self.nodes.get(parent).is_some_and(|node| {
+            node.inputs
+                .binary_search_by(|key| key.as_str().cmp(input))
+                .is_ok()
+        })
+    }
+
+    fn source_context(&self, key: &str) -> Option<DigestBytes> {
+        (self.observed_sources.contains(key)
+            && self
+                .nodes
+                .get(key)
+                .is_some_and(|node| node.covered && matches!(node.kind, CoverageKind::Source)))
+        .then(|| Sha256::digest(b"verified source context\0").into())
+    }
+
+    fn resolved_context(
+        &self,
+        input: &str,
+        resolved: &str,
+        canonical: &str,
+        context: Option<DigestBytes>,
+    ) -> Option<DigestBytes> {
+        let node = self.nodes.get(input).filter(|node| node.covered)?;
+        let exact = match &node.kind {
+            CoverageKind::Rule(_) => resolved == input && canonical == input,
+            CoverageKind::Generated(generator) => resolved == input && canonical == generator,
+            _ => false,
+        };
+        exact.then_some(context).flatten()
+    }
+}
+
+/// Rule context outside the normal digest. Keeping it separate preserves ordinary comparisons
+/// when only one endpoint has verification data.
+fn verified_rule_context(rule: &Rule) -> Option<DigestBytes> {
+    let location = starlark_stack_path(rule.location.as_deref()?);
+    let build_file = Path::new(location).file_name()?.to_str()?;
+    if !matches!(build_file, "BUILD" | "BUILD.bazel") {
+        return None;
+    }
+    let class = rule
+        .rule_class_key
+        .as_deref()
+        .filter(|key| !key.is_empty())?;
+    let encoded = serde_json::to_vec(&(class, build_file)).ok()?;
+    Some(Sha256::digest(encoded).into())
 }
 
 /// Groups the keys that carry a configuration checksum by label, each group sorted.
@@ -674,6 +1317,61 @@ fn configured_label_instances<'a>(
         keys.sort_unstable();
     }
     instances
+}
+
+struct ConfiguredRootHashes {
+    roots: BTreeMap<String, TargetHash>,
+    instances: BTreeMap<String, TargetHash>,
+    dep_edges: BTreeMap<String, Vec<String>>,
+}
+
+/// Retains configured instances and reports each Bazel-resolved root under its bare label.
+/// A root uses its instance's immediate children, preserving cause distances without a new hop.
+fn configured_root_hashes(
+    digests: Vec<(String, &'static str, TargetDigest)>,
+    track_deps: bool,
+    roots: &BTreeMap<String, String>,
+) -> Result<ConfiguredRootHashes> {
+    let mut instances = BTreeMap::new();
+    let mut dep_edges = BTreeMap::new();
+    for (key, kind, digest) in digests {
+        let hash = TargetHash {
+            kind: kind.to_owned(),
+            hash: digest.overall.into(),
+            direct_hash: digest.direct.into(),
+        };
+        if instances.insert(key.clone(), hash).is_some() {
+            bail!("duplicate configured target key {key}");
+        }
+        if track_deps {
+            dep_edges.insert(
+                key,
+                digest.deps.map(Rc::unwrap_or_clone).unwrap_or_default(),
+            );
+        }
+    }
+    let mut hashes = BTreeMap::new();
+    for (label, key) in roots {
+        let hash = instances
+            .get(key)
+            .with_context(|| format!("configured root {label} was not returned as {key}"))?
+            .clone();
+        if label != key && instances.contains_key(label) {
+            bail!("configured root view collides with target {label}");
+        }
+        hashes.insert(label.clone(), hash);
+        if track_deps && label != key {
+            dep_edges.insert(
+                label.clone(),
+                dep_edges.get(key).cloned().unwrap_or_default(),
+            );
+        }
+    }
+    Ok(ConfiguredRootHashes {
+        roots: hashes,
+        instances,
+        dep_edges,
+    })
 }
 
 /// Folds per-key digests into the per-label hashes the hash file is keyed by.
@@ -782,16 +1480,38 @@ fn label_hash(
 struct PreparedRules {
     ids: HashMap<String, usize>,
     prepared: Vec<Option<PreparedRule>>,
+    /// Complete ordinary module inputs, stored only for their prepared repository rule.
+    ordinary_inputs: HashMap<usize, Vec<String>>,
 }
 
-impl Extend<(String, PreparedRule)> for PreparedRules {
-    fn extend<I: IntoIterator<Item = (String, PreparedRule)>>(&mut self, rules: I) {
-        for (name, prepared) in rules {
-            let id = self.ids.entry(name).or_insert_with(|| {
-                self.prepared.push(None);
-                self.prepared.len() - 1
-            });
-            self.prepared[*id] = Some(prepared);
+impl Extend<(String, PreparedRule, Option<Vec<String>>)> for PreparedRules {
+    fn extend<I: IntoIterator<Item = (String, PreparedRule, Option<Vec<String>>)>>(
+        &mut self,
+        rules: I,
+    ) {
+        let Self {
+            ids,
+            prepared: slots,
+            ordinary_inputs,
+        } = self;
+        for (name, prepared, ordinary) in rules {
+            let id = match ids.entry(name) {
+                Entry::Vacant(entry) => {
+                    let id = slots.len();
+                    slots.push(Some(prepared));
+                    entry.insert(id);
+                    id
+                }
+                Entry::Occupied(entry) => {
+                    let id = *entry.get();
+                    slots[id] = Some(prepared);
+                    ordinary_inputs.remove(&id);
+                    id
+                }
+            };
+            if let Some(inputs) = ordinary {
+                ordinary_inputs.insert(id, inputs);
+            }
         }
     }
 }
@@ -801,10 +1521,436 @@ impl Extend<(String, PreparedRule)> for PreparedRules {
 struct Labels {
     ids: HashMap<String, usize>,
     slots: Vec<LabelSlot>,
+    ordinary_inputs: HashMap<usize, Vec<String>>,
+}
+
+const REPOSITORY_DEFINITION_PREFIX: &str = "//external:__bazel_diff_repository_definition__/";
+
+fn repository_definition_label(repository: &str) -> String {
+    format!(
+        "{REPOSITORY_DEFINITION_PREFIX}{}",
+        hex::encode(repository.as_bytes())
+    )
+}
+
+type QualifiedInputs<'a> = HashMap<usize, BTreeSet<&'a str>>;
+type RepositoryViews<'a> = HashMap<usize, BTreeMap<&'a str, Arc<str>>>;
+
+enum RepositoryDefinitionState {
+    Visiting,
+    Unavailable,
+    Complete {
+        label: String,
+        definition_digest: DigestBytes,
+        inputs: Vec<String>,
+    },
 }
 
 impl Labels {
-    fn prepare_inputs(&mut self, fine: &BTreeSet<String>, mapping: &HashMap<String, String>) {
+    /// Attach effective visibility to an observed literal alias destination and retain its
+    /// exact operand for repository projection. The file digest is already a normal input.
+    fn bind_alias_sources<'a>(
+        &mut self,
+        aliases: &'a HashMap<String, AliasSource>,
+        observed: &HashSet<String>,
+        fine: &BTreeSet<String>,
+        mapping: &HashMap<String, String>,
+    ) -> QualifiedInputs<'a> {
+        let mut qualified = QualifiedInputs::new();
+        for (
+            name,
+            AliasSource {
+                label,
+                visibility,
+                location: _,
+            },
+        ) in aliases
+        {
+            if !observed.contains(label) {
+                continue;
+            }
+            let Cow::Owned(_) = transform_external_input(label, fine, mapping) else {
+                continue;
+            };
+            let Some(id) = self.ids.get(name) else {
+                continue;
+            };
+            let id = *id;
+            let Some(node) = self.slots[id].rule.as_mut().and_then(Rc::get_mut) else {
+                continue;
+            };
+            if !node.rule.rule_input.contains(label) {
+                continue;
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(b"native alias source visibility");
+            hasher.update(node.prepared.definition_digest);
+            for visibility in visibility {
+                hasher.update((visibility.len() as u64).to_le_bytes());
+                hasher.update(visibility.as_bytes());
+            }
+            node.prepared.definition_digest = hasher.finalize().into();
+            qualified.entry(id).or_default().insert(label.as_str());
+        }
+        qualified
+    }
+
+    /// A native filegroup needs a strict native declaration, a matching ordinary definition,
+    /// and an observed `InputFile` or complete filegroup for every input. The definition matches
+    /// either the full declaration or a fresh caller-projected row with synthetic hash evidence.
+    /// Cycles and other rule kinds remain unresolved. Native genrule parents additionally require
+    /// complete direct children and an explicitly returned empty toolchains attribute.
+    fn bind_filegroup_inputs<'a>(
+        &mut self,
+        filegroups: &'a BTreeMap<String, FilegroupWitness>,
+        parents: &'a BTreeMap<String, FilegroupWitness>,
+        sources: &HashMap<&str, Option<&AliasSource>>,
+        observed: &HashSet<String>,
+        ignored: &HashSet<String>,
+        qualified: &mut QualifiedInputs<'a>,
+    ) {
+        if !ignored.is_empty() || observed.is_empty() {
+            return;
+        }
+        let mut pending = filegroups
+            .iter()
+            .filter_map(|(name, witness)| {
+                let rule = &witness.declaration;
+                let id = self.ids.get(name)?;
+                let id = *id;
+                let node = self.slots[id].rule.as_ref()?;
+                if Rc::strong_count(node) != 1
+                    || rule.rule_class_key.as_deref() != Some("filegroup")
+                    || node.rule.rule_class_key.as_deref() != Some("filegroup")
+                    || !witness.matches_definition(node.prepared.definition_digest, ignored)
+                {
+                    return None;
+                }
+                let expected = rule.rule_input.iter().collect::<BTreeSet<_>>();
+                let actual = node.rule.rule_input.iter().collect::<BTreeSet<_>>();
+                (expected == actual).then_some((name.as_str(), (rule, id)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut complete = BTreeSet::<&str>::new();
+        loop {
+            let ready = pending
+                .iter()
+                .filter_map(|(name, candidate)| {
+                    let (rule, _) = candidate;
+                    rule.rule_input
+                        .iter()
+                        .all(|input| {
+                            complete.contains(input.as_str())
+                                || (observed.contains(input)
+                                    && sources.get(input.as_str()).is_some_and(Option::is_some)
+                                    && self.get(input).is_some_and(|slot| slot.rule.is_none()))
+                        })
+                        .then_some(*name)
+                })
+                .collect::<Vec<_>>();
+            if ready.is_empty() {
+                break;
+            }
+            for name in ready {
+                let (rule, id) = pending.remove(name).expect("ready filegroup");
+                let visibility = rule
+                    .rule_input
+                    .iter()
+                    .filter(|input| {
+                        observed.contains(*input)
+                            && self.get(input).is_some_and(|slot| slot.rule.is_none())
+                    })
+                    .filter_map(|input| {
+                        let source = sources.get(input.as_str()).and_then(|source| *source)?;
+                        Some((input, &source.visibility))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let node = self.slots[id]
+                    .rule
+                    .as_mut()
+                    .and_then(Rc::get_mut)
+                    .expect("unique filegroup owner");
+                if !visibility.is_empty() {
+                    let mut hasher = Sha256::new();
+                    hasher.update(b"native filegroup source visibility");
+                    hasher.update(node.prepared.definition_digest);
+                    for (input, visibility) in visibility {
+                        hasher.update((input.len() as u64).to_le_bytes());
+                        hasher.update(input.as_bytes());
+                        for label in visibility {
+                            hasher.update((label.len() as u64).to_le_bytes());
+                            hasher.update(label.as_bytes());
+                        }
+                    }
+                    node.prepared.definition_digest = hasher.finalize().into();
+                }
+                qualified
+                    .entry(id)
+                    .or_default()
+                    .extend(rule.rule_input.iter().map(String::as_str));
+                complete.insert(name);
+            }
+        }
+        for (name, witness) in parents {
+            let parent = &witness.declaration;
+            let Some(id) = self.ids.get(name) else {
+                continue;
+            };
+            let id = *id;
+            let Some(node) = self.slots[id].rule.as_ref() else {
+                continue;
+            };
+            // Native genrule adds resolver requirements through this nonconfigurable attribute.
+            if parent.rule_class_key.as_deref() != Some("genrule")
+                || parent.rule_class != node.rule.rule_class
+                || !witness.matches_definition(node.prepared.definition_digest, ignored)
+                || !parent.attribute.iter().any(|attribute| {
+                    attribute.name == "toolchains"
+                        && attribute.r#type == AttributeKind::LabelList
+                        && attribute.selector_list.as_option().is_none()
+                        && attribute.string_list_value.is_empty()
+                })
+            {
+                continue;
+            }
+            let expected = parent.rule_input.iter().collect::<BTreeSet<_>>();
+            let actual = node.rule.rule_input.iter().collect::<BTreeSet<_>>();
+            if expected != actual {
+                continue;
+            }
+            // A Rule child can itself use a hidden compiler. Keep the fallback until every
+            // direct input has a completed ordinary witness.
+            if !parent.rule_input.iter().all(|input| {
+                complete.contains(input.as_str())
+                    || (observed.contains(input)
+                        && sources.get(input.as_str()).is_some_and(Option::is_some)
+                        && self.get(input).is_some_and(|slot| slot.rule.is_none()))
+            }) {
+                continue;
+            }
+            let forwarded = parent
+                .attribute
+                .iter()
+                .filter(|attribute| {
+                    matches!(attribute.name.as_str(), "srcs" | "tools")
+                        && attribute.r#type == AttributeKind::LabelList
+                        && attribute.selector_list.as_option().is_none()
+                })
+                .flat_map(|attribute| &attribute.string_list_value)
+                .filter(|label| actual.contains(label) && complete.contains(label.as_str()))
+                .map(String::as_str);
+            qualified.entry(id).or_default().extend(forwarded);
+        }
+    }
+
+    /// Build closed intrinsic repository views only for qualified occurrences. Every ordinary
+    /// module child uses its own intrinsic view, so a real module edge cannot reintroduce the
+    /// child's inferred generated members. An incomplete chain keeps the original occurrence.
+    fn repository_views<'a>(
+        &mut self,
+        qualified: &QualifiedInputs<'a>,
+        fine: &BTreeSet<String>,
+        mapping: &HashMap<String, String>,
+        targets: &mut Vec<HashTarget>,
+    ) -> RepositoryViews<'a> {
+        let mut requested = BTreeMap::<String, Vec<(usize, &str)>>::new();
+        for (id, operands) in qualified {
+            let Some(node) = self.slots.get(*id).and_then(|slot| slot.rule.as_ref()) else {
+                continue;
+            };
+            for operand in operands {
+                if !node
+                    .rule
+                    .rule_input
+                    .iter()
+                    .any(|input| input.as_str() == *operand)
+                {
+                    continue;
+                }
+                let Cow::Owned(repository) = transform_external_input(operand, fine, mapping)
+                else {
+                    continue;
+                };
+                requested
+                    .entry(repository)
+                    .or_default()
+                    .push((*id, *operand));
+            }
+        }
+        if requested.is_empty() {
+            return RepositoryViews::default();
+        }
+        let (states, roots) = {
+            let occupied = targets
+                .iter()
+                .filter_map(|target| {
+                    let HashTarget::Generated {
+                        name,
+                        generating_rule: _,
+                    } = target
+                    else {
+                        return None;
+                    };
+                    name.starts_with(REPOSITORY_DEFINITION_PREFIX)
+                        .then_some(name.as_str())
+                })
+                .collect::<HashSet<_>>();
+            let mut states = BTreeMap::new();
+            let roots = requested
+                .into_iter()
+                .filter_map(|(repository, uses)| {
+                    self.plan_repository_definition(&repository, &occupied, &mut states)
+                        .then_some((repository, uses))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (states, roots)
+        };
+        let mut needed = BTreeSet::new();
+        let mut pending = roots.keys().cloned().collect::<Vec<_>>();
+        while let Some(repository) = pending.pop() {
+            if !needed.insert(repository.clone()) {
+                continue;
+            }
+            match states.get(&repository).expect("planned repository") {
+                RepositoryDefinitionState::Complete {
+                    label: _,
+                    definition_digest: _,
+                    inputs,
+                } => pending.extend(inputs.iter().cloned()),
+                RepositoryDefinitionState::Visiting | RepositoryDefinitionState::Unavailable => {
+                    unreachable!("closed repository graph")
+                }
+            }
+        }
+        let mut definitions = HashMap::new();
+        for repository in needed {
+            let (definition, definition_digest, inputs) =
+                match states.get(&repository).expect("planned repository") {
+                    RepositoryDefinitionState::Complete {
+                        label,
+                        definition_digest,
+                        inputs,
+                    } => (label, *definition_digest, inputs),
+                    RepositoryDefinitionState::Visiting
+                    | RepositoryDefinitionState::Unavailable => {
+                        unreachable!("closed repository graph")
+                    }
+                };
+            let inputs = inputs
+                .iter()
+                .map(
+                    |input| match states.get(input).expect("planned module child") {
+                        RepositoryDefinitionState::Complete {
+                            label,
+                            definition_digest: _,
+                            inputs: _,
+                        } => label.clone(),
+                        RepositoryDefinitionState::Visiting
+                        | RepositoryDefinitionState::Unavailable => {
+                            unreachable!("closed repository graph")
+                        }
+                    },
+                )
+                .collect();
+            let rule = Rule {
+                name: definition.clone(),
+                rule_class: "repository_definition".into(),
+                rule_input: inputs,
+                ..Default::default()
+            };
+            let prepared = PreparedRule {
+                definition_digest,
+                repository_inputs: None,
+                loading_inputs: Vec::new(),
+            };
+            self.slot(definition.clone()).rule = Some(Rc::new(RuleNode::new(rule, prepared)));
+            targets.push(HashTarget::RepositoryDefinition(definition.clone()));
+            definitions.insert(repository, Arc::<str>::from(definition.as_str()));
+        }
+        let mut views = RepositoryViews::new();
+        for (repository, uses) in roots {
+            let definition = definitions
+                .get(&repository)
+                .expect("installed repository view");
+            for (id, operand) in uses {
+                views
+                    .entry(id)
+                    .or_default()
+                    .insert(operand, Arc::clone(definition));
+            }
+        }
+        views
+    }
+
+    fn plan_repository_definition(
+        &self,
+        repository: &str,
+        occupied: &HashSet<&str>,
+        states: &mut BTreeMap<String, RepositoryDefinitionState>,
+    ) -> bool {
+        match states.entry(repository.to_owned()) {
+            BTreeEntry::Vacant(entry) => {
+                entry.insert(RepositoryDefinitionState::Visiting);
+            }
+            BTreeEntry::Occupied(entry) => {
+                return match entry.get() {
+                    RepositoryDefinitionState::Visiting
+                    | RepositoryDefinitionState::Unavailable => false,
+                    RepositoryDefinitionState::Complete {
+                        label: _,
+                        definition_digest: _,
+                        inputs: _,
+                    } => true,
+                };
+            }
+        }
+        let fail = |states: &mut BTreeMap<String, RepositoryDefinitionState>| {
+            *states.get_mut(repository).expect("visiting repository") =
+                RepositoryDefinitionState::Unavailable;
+            false
+        };
+        let label = repository_definition_label(repository);
+        if occupied.contains(label.as_str()) || self.ids.contains_key(&label) {
+            return fail(states);
+        }
+        let candidate = self.ids.get(repository).and_then(|id| {
+            let node = self.slots[*id].rule.as_ref()?;
+            let inputs = if let Some(inputs) = self.ordinary_inputs.get(id) {
+                inputs.clone()
+            } else {
+                match node.prepared.repository_inputs.as_ref()? {
+                    RepositoryInputs::DefinitionOnly | RepositoryInputs::WithSiblings(_) => {
+                        Vec::new()
+                    }
+                }
+            };
+            Some((node.prepared.definition_digest, inputs))
+        });
+        let Some(candidate) = candidate else {
+            return fail(states);
+        };
+        let (definition_digest, inputs) = candidate;
+        for input in &inputs {
+            if !self.plan_repository_definition(input, occupied, states) {
+                return fail(states);
+            }
+        }
+        *states.get_mut(repository).expect("visiting repository") =
+            RepositoryDefinitionState::Complete {
+                label,
+                definition_digest,
+                inputs,
+            };
+        true
+    }
+
+    fn prepare_inputs(
+        &mut self,
+        fine: &BTreeSet<String>,
+        mapping: &HashMap<String, String>,
+        views: &RepositoryViews<'_>,
+        declarations: &BTreeMap<String, Arc<BTreeSet<String>>>,
+    ) {
         let empty = HashMap::new();
         let canonical_fine = fine.iter().any(|repo| repo.starts_with("@@"));
         let work: Vec<_> = self
@@ -813,25 +1959,44 @@ impl Labels {
             .enumerate()
             .filter_map(|(index, slot)| {
                 let node = Rc::get_mut(slot.rule.as_mut()?)?;
-                Some((index, std::mem::take(&mut node.rule.rule_input)))
+                Some((
+                    index,
+                    std::mem::take(&mut node.rule.rule_input),
+                    declarations.get(&node.rule.name),
+                ))
             })
             .collect();
         let ids = &self.ids;
         let prepared = hash_pool().install(|| {
             work.into_par_iter()
-                .map(|(index, mut inputs)| {
+                .map(|(index, mut inputs, declarations)| {
                     let canonical = if needs_repo_nodes(&inputs, canonical_fine) {
                         mapping
                     } else {
                         &empty
                     };
                     for i in 0..inputs.len() {
+                        if let Some(definition) = views
+                            .get(&index)
+                            .and_then(|operands| operands.get(inputs[i].as_str()))
+                        {
+                            inputs.push(definition.to_string());
+                            continue;
+                        }
                         if let Cow::Owned(synthetic) =
                             transform_external_input(&inputs[i], fine, canonical)
                         {
                             inputs.push(synthetic);
                         }
                     }
+                    // These are returned definitions of the actual candidate declarations.
+                    // An unrelated BUILD edit elsewhere in their repository cannot change
+                    // eligibility. Authored inputs above retain their usual repository coverage.
+                    inputs.extend(
+                        declarations
+                            .into_iter()
+                            .flat_map(|group| group.iter().cloned()),
+                    );
                     inputs.sort_unstable();
                     inputs.dedup();
                     let positions = inputs
@@ -922,6 +2087,7 @@ enum Input<'a> {
 struct HashContext<'a> {
     options: &'a HashOptions,
     source_hasher: &'a SourceHasher<'a>,
+    verification: Option<VerificationState<'a>>,
     source_digests: Vec<DigestBytes>,
     rules: Labels,
     /// Keys in `rules` grouped by label, sorted, for configured keys only: the fallback when
@@ -932,10 +2098,9 @@ struct HashContext<'a> {
     repository_input_digests: HashMap<String, (Vec<u8>, Sha256)>,
     seed_hash: DigestBytes,
     package_bzl_seeds: BTreeMap<String, DigestBytes>,
-    bzl_digests: HashMap<String, Option<DigestBytes>>,
+    bzl_digests: HashMap<String, Option<(String, DigestBytes)>>,
     always_affected_seed: DigestBytes,
-    /// Targets already reported as the entry of a cycle, so each is warned about once.
-    cycle_warnings: HashSet<String>,
+    components: Components<Rc<RuleNode>, (TargetDigest, Option<RuleRecipe>)>,
     /// Partial-graph mode: collects every rule's recipe as it is hashed.
     recorder: Option<RecipeRecorder>,
 }
@@ -1006,50 +2171,38 @@ impl HashContext<'_> {
             .rule
             .clone()
             .ok_or_else(|| anyhow!("Unable to find rule {key}"))?;
-        self.node_digest(&rule, path)
+        match self.node_digest(&rule, path)? {
+            Visit::Complete(digest) => Ok(digest),
+            Visit::Pending(_) => unreachable!("a top-level rule completes its component"),
+        }
     }
 
     fn node_digest(
         &mut self,
         rule: &Rc<RuleNode>,
         path: &mut Vec<Rc<RuleNode>>,
-    ) -> Result<TargetDigest> {
+    ) -> Result<Visit<TargetDigest>> {
         if let Some(digest) = rule.digest.get() {
-            return Ok(digest.clone());
+            return Ok(Visit::Complete(digest.clone()));
         }
         let canonical_key = &rule.rule.name;
-        if let Some(index) = path.iter().position(|entry| Rc::ptr_eq(entry, rule)) {
-            // A back edge: the query graph can hold cycles a build never sees (rules_go's
-            // `go_context_data` and the nogo analyzers reference each other through non-dependency
-            // attributes). The target is still being hashed, so stand in with a digest of its own
-            // definition. Which member of the cycle is entered first is fixed by the sorted
-            // traversal in `hash_targets_with_environment`, so the result is deterministic.
-            if self.cycle_warnings.insert(canonical_key.clone()) {
-                let cycle = path[index..]
-                    .iter()
-                    .map(|node| &node.rule.name)
-                    .chain(std::iter::once(canonical_key))
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" -> ");
-                eprintln!(
-                    "[Warn] Circular dependency detected: {cycle}; the back edge to {canonical_key} is hashed from its own definition only"
-                );
-            }
-            let mut hasher = Sha256::new();
-            hasher.update(b"cycle");
-            hasher.update(rule.prepared.definition_digest);
-            let placeholder: DigestBytes = hasher.finalize().into();
-            return Ok(TargetDigest {
-                overall: placeholder,
-                direct: placeholder,
-                deps: None,
-            });
+        if let Some(position) = rule.component.get() {
+            return Ok(Visit::Pending(position.get() - 1));
         }
+        let component_position = self.components.enter(Rc::clone(rule));
+        rule.component
+            .set(NonZeroUsize::new(component_position + 1));
         path.push(Rc::clone(rule));
 
         let mut builder =
             TargetDigestBuilder::new(self.options.track_deps, self.recorder.is_some());
+        if let Some(context) = self
+            .verification
+            .as_ref()
+            .and_then(|state| state.coverage.rule_context(canonical_key))
+        {
+            builder.start_verification(context);
+        }
         builder.direct(rule.prepared.definition_digest);
         builder.direct(self.seed_hash);
         if let Some(seed) = self.rule_bzl_seed(&rule.rule)? {
@@ -1068,12 +2221,6 @@ impl HashContext<'_> {
             builder.direct(self.always_affected_seed);
         }
 
-        // Only a listed extension has views, so a run without the flag never resolves the
-        // rule's repository, which can cost a `bazel mod` call.
-        let extension = (!self.options.bazel.use_cquery
-            && !self.options.bazel.label_only_module_extensions.is_empty())
-        .then(|| self.rule_extension(&rule.rule.name))
-        .flatten();
         let mut inputs: Vec<Cow<'_, str>> = if rule.input_positions.is_some() {
             rule.rule
                 .rule_input
@@ -1107,7 +2254,12 @@ impl HashContext<'_> {
                 canonical_repo_nodes,
             )
         };
-        if let Some(group) = &rule.prepared.shared_inputs {
+        if let Some(group) = rule
+            .prepared
+            .repository_inputs
+            .as_ref()
+            .and_then(RepositoryInputs::siblings)
+        {
             if !self.apply_repository_inputs(group, &mut builder) {
                 inputs.extend(
                     group
@@ -1118,44 +2270,80 @@ impl HashContext<'_> {
             }
         }
         for (position, encoded_input) in inputs.into_iter().enumerate() {
-            let mut input_slot = rule
+            let input_slot = rule
                 .input_positions
                 .as_ref()
                 .and_then(|ids| ids.get(position).copied().flatten());
-            // A target in an extension's repository reaches its owning module through the view
-            // without that extension's repositories, when there is one (query mode only).
-            let encoded_input = match extension.as_deref().and_then(|extension| {
-                let node = encoded_input.strip_prefix("//external:")?;
-                let view = format!(
-                    "//external:{}",
-                    crate::bazel::extension_view_node(node, extension)
-                );
-                self.rules
-                    .get(&view)
-                    .is_some_and(|slot| slot.rule.is_some())
-                    .then_some(view)
-            }) {
-                Some(view) => {
-                    input_slot = None;
-                    Cow::Owned(view)
-                }
-                None => encoded_input,
-            };
             builder.direct(encoded_input.as_bytes());
             let input_label = target_label(&encoded_input);
+            let verify_input = builder.verification.is_some()
+                && self
+                    .verification
+                    .as_ref()
+                    .is_some_and(|state| state.coverage.requires(canonical_key, &encoded_input));
             match self.resolve_input(&encoded_input, input_label, input_slot, path) {
-                Some(Input::Source(digest)) => builder.source(input_label, digest),
+                Some(Input::Source(digest)) => {
+                    builder.source(input_label, digest);
+                    if verify_input {
+                        let context = (encoded_input == input_label)
+                            .then(|| {
+                                self.verification
+                                    .as_ref()
+                                    .and_then(|state| state.coverage.source_context(input_label))
+                            })
+                            .flatten();
+                        builder.verification_input(&encoded_input, context);
+                    }
+                }
                 Some(Input::Rule(dependency, node, prior))
                     if dependency.as_ref() != canonical_key =>
                 {
-                    let digest =
-                        match prior.or_else(|| node.digest.get().map(|digest| digest.overall)) {
-                            Some(digest) => digest,
-                            None => self.node_digest(&node, path)?.overall,
+                    let cached = node.digest.get();
+                    let cached_verified = if verify_input && prior.is_none() && cached.is_some() {
+                        self.verification
+                            .as_ref()
+                            .and_then(|state| state.contexts.get(&node.rule.name).copied())
+                    } else {
+                        None
+                    };
+                    let (digest, verified) =
+                        match prior.or_else(|| cached.map(|digest| digest.overall)) {
+                            Some(digest) => (Some(digest), cached_verified),
+                            None => match self.node_digest(&node, path)? {
+                                Visit::Complete(digest) => {
+                                    let verified = self.verification.as_ref().and_then(|state| {
+                                        state.contexts.get(&node.rule.name).copied()
+                                    });
+                                    (Some(digest.overall), verified)
+                                }
+                                Visit::Pending(dependency) => {
+                                    self.components.reaches(component_position, dependency);
+                                    (None, None)
+                                }
+                            },
                         };
-                    builder.transitive(&dependency, || node.rule.name.clone(), digest);
+                    match digest {
+                        Some(digest) => {
+                            builder.transitive(&dependency, || node.rule.name.clone(), digest);
+                        }
+                        None => builder.dependency(&dependency, || node.rule.name.clone()),
+                    }
+                    if verify_input {
+                        let context = self.verification.as_ref().and_then(|state| {
+                            state.coverage.resolved_context(
+                                &encoded_input,
+                                &dependency,
+                                &node.rule.name,
+                                verified,
+                            )
+                        });
+                        builder.verification_input(&encoded_input, context);
+                    }
                 }
                 _ => {
+                    if verify_input {
+                        builder.verification_input(&encoded_input, None);
+                    }
                     if let Some(digest) = self.source_hasher.soft_digest(input_label, &[])? {
                         self.rules
                             .slot(input_label.to_owned())
@@ -1190,22 +2378,88 @@ impl HashContext<'_> {
                     .completed(package_group)
                     .or_else(|| group.digest.get())
                 {
-                    Some(digest) => digest.overall,
-                    None => self.node_digest(&Rc::clone(group), path)?.overall,
+                    Some(digest) => Some(digest.overall),
+                    None => match self.node_digest(&Rc::clone(group), path)? {
+                        Visit::Complete(digest) => Some(digest.overall),
+                        Visit::Pending(dependency) => {
+                            self.components.reaches(component_position, dependency);
+                            None
+                        }
+                    },
                 };
-                builder.transitive(package_group, || package_group.to_owned(), digest);
+                match digest {
+                    Some(digest) => {
+                        builder.transitive(package_group, || package_group.to_owned(), digest);
+                    }
+                    None => builder.dependency(package_group, || package_group.to_owned()),
+                }
             }
         }
 
         path.pop().expect("rule path contains the current rule");
-        let (digest, recipe) = builder.finish();
+        // Publish a context only when the normal node completes. A required edge to an
+        // unfinished component has already made its parent unverified.
+        if let Some(verified) = builder.finish_verification() {
+            self.verification
+                .as_mut()
+                .expect("verification context has a capture")
+                .pending
+                .insert(canonical_key.clone(), verified);
+        }
+        match self.components.finish(component_position, builder.finish()) {
+            Completion::Pending(lowlink) => Ok(Visit::Pending(lowlink)),
+            Completion::Single(node, (digest, recipe)) => {
+                self.complete_rule(&node, &digest, recipe);
+                Ok(Visit::Complete(digest))
+            }
+            Completion::Cycle(members) => {
+                let component = component_digest(
+                    members
+                        .iter()
+                        .map(|(node, (digest, _))| (node.rule.name.as_str(), digest.overall)),
+                );
+                let count = members.len();
+                let representative = members
+                    .iter()
+                    .map(|(node, _)| node.rule.name.as_str())
+                    .min()
+                    .expect("a cycle has members")
+                    .to_owned();
+                for (node, (mut digest, recipe)) in members {
+                    digest.overall = member_digest(component, &node.rule.name, digest.overall);
+                    self.complete_rule(&node, &digest, recipe);
+                }
+                eprintln!(
+                    "[Warn] Circular dependency detected among {count} rules including {representative}; hashing their contributions together"
+                );
+                Ok(Visit::Complete(
+                    rule.digest
+                        .get()
+                        .expect("the component root is complete")
+                        .clone(),
+                ))
+            }
+        }
+    }
+
+    fn complete_rule(
+        &mut self,
+        rule: &Rc<RuleNode>,
+        digest: &TargetDigest,
+        recipe: Option<RuleRecipe>,
+    ) {
+        if let Some(state) = &mut self.verification {
+            if let Some((key, verified)) = state.pending.remove_entry(&rule.rule.name) {
+                state.contexts.insert(key, verified);
+            }
+        }
         if let (Some(recorder), Some(recipe)) = (&mut self.recorder, recipe) {
-            recorder.record_rule(canonical_key, recipe);
+            recorder.record_rule(&rule.rule.name, recipe);
         }
         rule.digest
             .set(digest.clone())
             .expect("a completed rule is returned from its node");
-        Ok(digest)
+        rule.component.set(None);
     }
 
     /// The key of the rule a rule input resolves to.
@@ -1262,24 +2516,6 @@ impl HashContext<'_> {
             .and_then(|slot| slot.resolving(Cow::Owned(fallback.clone())))
     }
 
-    /// The usage prefix of the module extension that generated the repository `label` is in
-    /// (`rules_rs++crate` for `@@rules_rs++crate+crates__anyhow//:anyhow`), if any.
-    fn rule_extension(&self, label: &str) -> Option<String> {
-        let label = target_label(label);
-        let repo = label.strip_prefix('@')?.split_once("//")?.0;
-        let canonical = match repo.strip_prefix('@') {
-            Some("") => return None,
-            Some(canonical) => canonical,
-            None => self
-                .source_hasher
-                .external_resolver
-                .repo_mapping()
-                .get(repo)?
-                .as_str(),
-        };
-        crate::bazel::extension_usage_prefix(canonical).map(str::to_owned)
-    }
-
     fn rule_bzl_seed(&mut self, rule: &Rule) -> Result<Option<DigestBytes>> {
         if rule.instantiation_stack.is_empty() {
             return Ok(None);
@@ -1287,28 +2523,23 @@ impl HashContext<'_> {
         let paths = rule
             .instantiation_stack
             .iter()
-            .filter_map(|frame| frame.split(':').next())
-            .filter(|path| {
-                (path.ends_with(".bzl") || path.ends_with(".scl"))
-                    && !Path::new(path).is_absolute()
-                    && !path.starts_with("external/")
-                    && !path.starts_with('@')
-                    && !path.starts_with("../")
-            })
+            .map(|frame| starlark_stack_path(frame))
+            .filter(|path| path.ends_with(".bzl") || path.ends_with(".scl"))
             .collect::<BTreeSet<_>>();
-        let mut hasher = Sha256::new();
+        let mut sources = BTreeMap::new();
         for path in paths {
-            let digest = if let Some(cached) = self.bzl_digests.get(path) {
-                *cached
-            } else {
-                let digest = self.source_hasher.soft_digest(&format!("//{path}"), &[])?;
-                self.bzl_digests.insert(path.to_owned(), digest);
-                digest
+            let source = match self.bzl_digests.entry(path.to_owned()) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(self.source_hasher.stack_source(path)?),
             };
-            if let Some(digest) = digest {
-                hasher.update(path.as_bytes());
-                hasher.update(digest);
+            if let Some((label, digest)) = source {
+                sources.insert(label.clone(), *digest);
             }
+        }
+        let mut hasher = Sha256::new();
+        for (label, digest) in sources {
+            hasher.update(label.as_bytes());
+            hasher.update(digest);
         }
         Ok(Some(hasher.finalize().into()))
     }
@@ -1318,6 +2549,8 @@ struct RuleNode {
     rule: Rule,
     prepared: PreparedRule,
     digest: OnceCell<TargetDigest>,
+    /// One-based position in the unfinished component stack.
+    component: Cell<Option<NonZeroUsize>>,
     input_positions: Option<Box<[Option<NonZeroUsize>]>>,
 }
 
@@ -1327,6 +2560,7 @@ impl RuleNode {
             rule,
             prepared,
             digest: OnceCell::new(),
+            component: Cell::new(None),
             input_positions: None,
         }
     }
@@ -1334,7 +2568,7 @@ impl RuleNode {
 
 struct PreparedRule {
     definition_digest: DigestBytes,
-    shared_inputs: Option<RepositoryInputs>,
+    repository_inputs: Option<RepositoryInputs>,
     /// Partial-graph mode: the workspace paths a repository rule's definition digest folds in
     /// (see [`partial::rule_loading_inputs`]); empty for every other rule.
     loading_inputs: Vec<String>,
@@ -1357,6 +2591,21 @@ fn source_seed(source: &SourceTarget) -> DigestBytes {
     hasher.finalize().into()
 }
 
+/// A stack location can omit its column and line; paths can contain colons.
+fn starlark_stack_path(frame: &str) -> &str {
+    let mut path = frame.rsplit_once(": ").map_or(frame, |(path, _)| path);
+    for _ in 0..2 {
+        let Some((prefix, suffix)) = path.rsplit_once(':') else {
+            break;
+        };
+        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            break;
+        }
+        path = prefix;
+    }
+    path
+}
+
 fn hash_seed_files(workspace: &Path, paths: &BTreeSet<PathBuf>) -> Result<DigestBytes> {
     let mut hasher = Sha256::new();
     for path in paths {
@@ -1371,20 +2620,25 @@ fn hash_seed_files(workspace: &Path, paths: &BTreeSet<PathBuf>) -> Result<Digest
     Ok(hasher.finalize().into())
 }
 
-fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<()> {
-    let mut file = File::open(path)?;
-    // One 64 KiB read buffer per call. It stays on the stack because this runs once per
-    // tracked file on the hash pool's threads, where a heap allocation per file would cost more
-    // than the stack space.
-    #[allow(clippy::large_stack_arrays)]
-    let mut buffer = [0; FILE_HASH_BUFFER_SIZE];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(());
-        }
-        hasher.update(&buffer[..read]);
+fn hash_file_into(hasher: &mut Sha256, path: &Path) -> Result<File> {
+    // One read buffer per thread, zeroed once. A fresh `[0; FILE_HASH_BUFFER_SIZE]` per call
+    // zeroed 64 KiB for every hashed file, and most source files are far smaller than that.
+    thread_local! {
+        static BUFFER: RefCell<Box<[u8]>> =
+            RefCell::new(vec![0; FILE_HASH_BUFFER_SIZE].into_boxed_slice());
     }
+    let mut file = File::open(path)?;
+    BUFFER.with(|buffer| -> Result<()> {
+        let mut buffer = buffer.borrow_mut();
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(());
+            }
+            hasher.update(&buffer[..read]);
+        }
+    })?;
+    Ok(file)
 }
 
 /// Hashes a directory tree deterministically: every entry's workspace-independent relative path
@@ -1467,12 +2721,9 @@ fn hash_directory_tree(hasher: &mut Sha256, root: &Path, strict: bool) -> Result
     Ok(())
 }
 
-/// Repository rules address the label's physical path, even when query calls it an alias.
-fn repository_input_digest(
-    workspace: &Path,
-    output_base: &Path,
-    label: &str,
-) -> Result<DigestBytes> {
+/// Resolve only complete canonical labels. Both ordinary archive overlays and
+/// isolated repository inputs use the physical path denoted by the label.
+pub(crate) fn repository_input_path(label: &str) -> Result<(&str, PathBuf)> {
     let (repo, target) = label
         .strip_prefix("@@")
         .and_then(|s| s.split_once("//"))
@@ -1493,6 +2744,16 @@ fn repository_input_digest(
     {
         bail!("invalid repository input path {label}");
     }
+    Ok((repo, external_label_path(target)))
+}
+
+/// Repository rules address the label's physical path, even when query calls it an alias.
+fn repository_input_digest(
+    workspace: &Path,
+    output_base: &Path,
+    label: &str,
+) -> Result<DigestBytes> {
+    let (repo, relative) = repository_input_path(label)?;
     let root = if repo.is_empty() {
         workspace.to_owned()
     } else {
@@ -1510,7 +2771,7 @@ fn repository_input_digest(
             root.display()
         );
     }
-    let path = root.join(external_label_path(target));
+    let path = root.join(relative);
     let mut digest = Sha256::new();
     match fs::metadata(&path) {
         Ok(metadata) => {
@@ -1538,7 +2799,7 @@ fn repository_input_digest(
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("inspecting repository input {label} at {}", path.display())
-            })
+            });
         }
     }
     Ok(digest.finalize().into())
@@ -1704,7 +2965,115 @@ pub(crate) fn without_integrity_pinned_urls(
     Some(stripped)
 }
 
+/// Bazel emits this STRING attribute for its synthetic rule hash, which includes
+/// selector mappings omitted from a filtered attribute list. Its value is opaque
+/// and is already part of the caller's ordinary definition digest.
+pub(crate) fn projected_filegroup_definition(rule: &Rule) -> Option<DigestBytes> {
+    let mut attributes = rule
+        .attribute
+        .iter()
+        .filter(|attr| attr.name == "$internal_attr_hash");
+    let hash = attributes.next()?;
+    (attributes.next().is_none()
+        && hash.r#type == AttributeKind::String
+        && hash
+            .string_value
+            .as_ref()
+            .is_some_and(|value| !value.is_empty()))
+    .then(|| rule_definition_digest(rule, &HashSet::new()))
+}
+
+impl FilegroupWitness {
+    fn matches_definition(&self, actual: DigestBytes, ignored: &HashSet<String>) -> bool {
+        let Self {
+            declaration,
+            projected_definition,
+        } = self;
+        *projected_definition == Some(actual)
+            || rule_definition_digest(declaration, ignored) == actual
+    }
+}
+
 fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes {
+    rule_definition_digest_encoded(rule, &[], ignored)
+}
+
+/// One of a rule's attributes as the definition digest covers it: its message encoding.
+enum HashedAttribute<'r, 'e> {
+    Decoded(&'r crate::proto::blaze_query::Attribute),
+    Encoded(&'e EncodedAttribute<'e>),
+}
+
+impl HashedAttribute<'_, '_> {
+    fn name(&self) -> &str {
+        match self {
+            Self::Decoded(attribute) => &attribute.name,
+            Self::Encoded(attribute) => attribute.name,
+        }
+    }
+}
+
+/// [`rule_definition_digest`] of the rule that `rule` and `encoded` together describe: `rule`
+/// holds the attributes that were decoded and `encoded` the ones left encoded, each at its
+/// position among all of the rule's attributes (see [`crate::bazel::EncodedAttribute`]). An
+/// encoded attribute hashes Bazel's bytes, which are the bytes re-encoding the decoded attribute
+/// produces, so the digest does not depend on which attributes were decoded.
+fn rule_definition_digest_encoded(
+    rule: &Rule,
+    encoded: &[EncodedAttribute<'_>],
+    ignored: &HashSet<String>,
+) -> DigestBytes {
+    if encoded.is_empty() {
+        return rule_definition_digest_decoded(rule, ignored);
+    }
+    // Encoded attributes only come from rules outside `//external`, so URL skipping and
+    // integrity-pinned stripping (repository rules only) never apply here.
+    debug_assert!(!rule.name.starts_with("//external:"));
+    let mut hasher = Sha256::new();
+    hasher.update(rule.rule_class.as_bytes());
+    hasher.update(target_label(&rule.name).as_bytes());
+    if let Some(environment_hash) = &rule.skylark_environment_hash_code {
+        hasher.update(environment_hash.as_bytes());
+    }
+    let total = rule.attribute.len() + encoded.len();
+    let mut attributes = Vec::with_capacity(total);
+    let mut decoded = rule.attribute.iter();
+    let mut pending = encoded.iter().peekable();
+    for position in 0..total {
+        match pending.next_if(|attribute| attribute.position == position) {
+            Some(attribute) => attributes.push(HashedAttribute::Encoded(attribute)),
+            None => attributes.extend(decoded.next().map(HashedAttribute::Decoded)),
+        }
+    }
+    // Stable, like the decoded path: equal names keep query order.
+    if !attributes
+        .windows(2)
+        .all(|pair| pair[0].name() <= pair[1].name())
+    {
+        attributes.sort_by(|left, right| left.name().cmp(right.name()));
+    }
+    let mut size_cache = SizeCache::new();
+    for attribute in attributes {
+        match attribute {
+            HashedAttribute::Decoded(attribute) => hash_attribute(
+                attribute,
+                ignored,
+                false,
+                None,
+                &mut size_cache,
+                &mut hasher,
+            ),
+            HashedAttribute::Encoded(attribute) => {
+                if attribute.name != "generator_location" && !ignored.contains(attribute.name) {
+                    hasher.update(attribute.bytes);
+                }
+            }
+        }
+    }
+    hasher.finalize().into()
+}
+
+fn rule_definition_digest_decoded(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes {
     let mut hasher = Sha256::new();
     hasher.update(rule.rule_class.as_bytes());
     hasher.update(target_label(&rule.name).as_bytes());
@@ -1749,13 +3118,24 @@ fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes
     hasher.finalize().into()
 }
 
+#[cfg(test)]
 fn prehash_rule(rule: &mut Rule, ignored: &HashSet<String>) -> DigestBytes {
-    let digest = rule_definition_digest(rule, ignored);
+    prehash_encoded_rule(rule, &[], ignored)
+}
+
+/// [`prehash_rule`] for a rule some of whose attributes were left encoded by the query decoder.
+fn prehash_encoded_rule(
+    rule: &mut Rule,
+    encoded: &[EncodedAttribute<'_>],
+    ignored: &HashSet<String>,
+) -> DigestBytes {
+    let digest = rule_definition_digest_encoded(rule, encoded, ignored);
     rule.attribute
         .retain(|attribute| attribute.name == "tags" || attribute.name == "visibility");
-    if rule.attribute.is_empty() {
-        rule.attribute = Vec::new();
-    }
+    // `retain` keeps the buffer it was decoded into. An `Attribute` is several hundred bytes and a
+    // rule carries dozens of them (every implicit attribute is in the proto), so without this each
+    // queried rule pins tens of kilobytes of dead capacity until hashing ends.
+    rule.attribute.shrink_to_fit();
     digest
 }
 
@@ -1854,7 +3234,7 @@ fn external_input_repo<'a>(
 /// `canonical_repo_nodes` (canonical -> node name) translates. Without that translation every
 /// cquery-mode edge to a repository node was silently dropped, so a lock file or patch hashed into
 /// the node never reached any main-repository target.
-fn transform_external_input<'a>(
+pub(crate) fn transform_external_input<'a>(
     input: &'a str,
     fine_grained_repos: &BTreeSet<String>,
     canonical_repo_nodes: &HashMap<String, String>,
@@ -1956,14 +3336,25 @@ impl SourceHasher<'_> {
         seed: &[u8],
         configured_source: bool,
     ) -> Result<DigestBytes> {
+        self.digest_source_with_observation(label, seed, configured_source, None)
+            .map(|(digest, _)| digest)
+    }
+
+    fn digest_source_with_observation(
+        &self,
+        label: &str,
+        seed: &[u8],
+        configured_source: bool,
+        observation: Option<(&Path, &str)>,
+    ) -> Result<(DigestBytes, bool)> {
         if let Some(tree) = self.tree {
             if is_main_repo(label) {
-                return Ok(partial::source_digest(tree, label, seed));
+                return Ok((partial::source_digest(tree, label, seed), false));
             }
         }
         let Some((path, content_key, materialized)) = self.resolve(label, configured_source)?
         else {
-            return Ok(Sha256::digest([]).into());
+            return Ok((Sha256::digest([]).into(), false));
         };
         let absolute = if path.is_absolute() {
             path
@@ -1973,6 +3364,7 @@ impl SourceHasher<'_> {
         let metadata = fs::metadata(&absolute).ok();
         let executable = metadata.as_ref().is_some_and(metadata_owner_executable);
         let mut hasher = Sha256::new();
+        let mut observed = false;
         if let Some(content_hash) = self
             .content_hashes
             .and_then(|hashes| hashes.get(&content_key))
@@ -1989,9 +3381,30 @@ impl SourceHasher<'_> {
                         .eq(absolute.components())
                 });
             if should_hash {
-                hash_file_into(&mut hasher, &absolute).with_context(|| {
+                let file = hash_file_into(&mut hasher, &absolute).with_context(|| {
                     format!("failed to read source {} ({label})", absolute.display())
                 })?;
+                observed = observation.is_some_and(|(workspace, location)| {
+                    if !is_main_repo(label) {
+                        return self.observed_external_file(
+                            label,
+                            location,
+                            &absolute,
+                            &file,
+                            metadata.as_ref(),
+                        );
+                    }
+                    let Ok(relative) = absolute.strip_prefix(self.workspace) else {
+                        return false;
+                    };
+                    // Bazel canonicalizes the workspace root (for example /var on macOS).
+                    // Rebuild only that prefix so a symlink inside the workspace stays unknown.
+                    let expected = workspace.join(relative);
+                    let selected = Path::new(starlark_stack_path(location));
+                    (selected == absolute || selected == expected)
+                        && fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_file())
+                        && fs::canonicalize(&absolute).is_ok_and(|canonical| canonical == expected)
+                });
             }
             hasher.update([1]);
             hasher.update([u8::from(executable)]);
@@ -2028,7 +3441,89 @@ impl SourceHasher<'_> {
         }
         hasher.update(seed);
         hasher.update(label.as_bytes());
-        Ok(hasher.finalize().into())
+        Ok((hasher.finalize().into(), observed))
+    }
+
+    /// Verify the very file read for the normal digest. Bazel may mount the repository
+    /// itself through a symlink; links below that boundary do not establish a regular source.
+    #[cfg(unix)]
+    fn observed_external_file(
+        &self,
+        label: &str,
+        location: &str,
+        path: &Path,
+        file: &File,
+        before: Option<&fs::Metadata>,
+    ) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let label = self.external_resolver.canonical_source_label(label);
+        let Some((repo, target)) = label
+            .strip_prefix("@@")
+            .and_then(|name| name.split_once("//"))
+        else {
+            return false;
+        };
+        let relative = external_label_path(target);
+        if !matches!(
+            Path::new(repo).components().next(),
+            Some(std::path::Component::Normal(_))
+        ) || repo.contains('/')
+            || relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return false;
+        }
+        let root = self
+            .external_resolver
+            .output_base
+            .join("external")
+            .join(repo);
+        if path != root.join(&relative) {
+            return false;
+        }
+        let (Ok(root), Ok(actual), Ok(current), Ok(opened), Some(before)) = (
+            fs::canonicalize(&root),
+            fs::canonicalize(path),
+            fs::symlink_metadata(path),
+            file.metadata(),
+            before,
+        ) else {
+            return false;
+        };
+        let selected = Path::new(starlark_stack_path(location));
+        let snapshot = |m: &fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.size(),
+                m.mode(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        current.is_file()
+            && opened.is_file()
+            && actual == root.join(relative)
+            && (selected == path || selected == actual)
+            && snapshot(before) == snapshot(&opened)
+            && snapshot(&opened) == snapshot(&current)
+    }
+
+    #[cfg(not(unix))]
+    fn observed_external_file(
+        &self,
+        _label: &str,
+        _location: &str,
+        _path: &Path,
+        _file: &File,
+        _before: Option<&fs::Metadata>,
+    ) -> bool {
+        false
     }
 
     fn soft_digest(&self, label: &str, seed: &[u8]) -> Result<Option<DigestBytes>> {
@@ -2047,6 +3542,79 @@ impl SourceHasher<'_> {
             return Ok(None);
         }
         self.digest(label, seed).map(Some)
+    }
+
+    /// Resolves a Starlark stack path to a stable identifier and the existing source digest.
+    fn stack_source(&self, path: &str) -> Result<Option<(String, DigestBytes)>> {
+        if !Path::new(path).is_absolute() {
+            if path.starts_with("external/") || path.starts_with('@') || path.starts_with("../") {
+                return Ok(None);
+            }
+            return Ok(self
+                .soft_digest(&format!("//{path}"), &[])?
+                .map(|digest| (path.to_owned(), digest)));
+        }
+        if let Some(label) = self.external_resolver.stack_sources.get(Path::new(path)) {
+            let digest = self.digest_source(label, &[], true)?;
+            return Ok((digest != <DigestBytes>::from(Sha256::digest([])))
+                .then(|| (label.clone(), digest)));
+        }
+        let (Ok(absolute), Ok(workspace)) =
+            (fs::canonicalize(path), fs::canonicalize(self.workspace))
+        else {
+            return Ok(None);
+        };
+        let Ok(relative) = absolute.strip_prefix(workspace) else {
+            return Ok(None);
+        };
+        let Some(relative) = relative.to_str() else {
+            return Ok(None);
+        };
+        let relative = relative.replace('\\', "/");
+        Ok(self
+            .soft_digest(&format!("//{relative}"), &[])?
+            .map(|digest| (relative, digest)))
+    }
+
+    /// Binds resolved external stack paths to actual returned source labels.
+    fn record_stack_sources(&mut self, targets: &[Target], configured: bool) -> Result<()> {
+        self.external_resolver.stack_sources.clear();
+        if self.tree.is_some()
+            || self.content_hashes.is_some()
+            || !self.modified_filepaths.is_empty()
+        {
+            return Ok(());
+        }
+        let mut sources = HashMap::new();
+        for source in targets
+            .iter()
+            .filter_map(|target| target.source_file.as_option())
+        {
+            let label = &source.name;
+            if is_main_repo(label) || !(label.ends_with(".bzl") || label.ends_with(".scl")) {
+                continue;
+            }
+            let Some((path, _, _)) = self.resolve(label, configured)? else {
+                continue;
+            };
+            let path = self.workspace.join(path);
+            if !path.is_file() {
+                continue;
+            }
+            let label = self.external_resolver.canonical_source_label(label);
+            match sources.entry(path) {
+                Entry::Occupied(mut entry) => {
+                    if &label < entry.get() {
+                        entry.insert(label);
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(label);
+                }
+            }
+        }
+        self.external_resolver.stack_sources = sources;
+        Ok(())
     }
 
     fn resolve(
@@ -2072,31 +3640,57 @@ impl SourceHasher<'_> {
                 let key = PathBuf::from("external").join(repo).join(&relative);
                 (relative, key)
             };
-            // A canonical source returned by cquery can be read directly, even when the
-            // repository was not queried as a fine-grained root.
-            if configured_source
-                && canonical
-                && !repo.is_empty()
-                && self.tree.is_none()
-                && self.content_hashes.is_none()
-                && self.modified_filepaths.is_empty()
-            {
-                let (_, key) = paths();
-                let path = self.external_resolver.output_base.join(&key);
-                match fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_file() => {
-                        return Ok(Some((path, key.to_string_lossy().into_owned(), true)));
-                    }
-                    Ok(_) => {}
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                        ) => {}
-                    Err(e) => {
-                        return Err(e).with_context(|| {
-                            format!("failed to inspect source {} ({label})", path.display())
-                        })
+            // Read physical files for returned dependency targets, including ordinary
+            // aliases whose destinations are outside the fine repository list. Soft labels
+            // and source overrides continue to use their normal resolver.
+            let observed = self
+                .external_resolver
+                .scoped_sources
+                .queried_files
+                .contains(label);
+            let read_physical = if self.tree.is_some() {
+                observed
+            } else {
+                self.content_hashes.is_none() && (observed || (configured_source && canonical))
+            };
+            if read_physical && !repo.is_empty() && self.modified_filepaths.is_empty() {
+                let canonical_repo = if canonical {
+                    Some(repo)
+                } else {
+                    self.external_resolver
+                        .repo_mapping()
+                        .get(repo)
+                        .map(String::as_str)
+                };
+                if let Some(canonical_repo) = canonical_repo {
+                    let key = PathBuf::from("external")
+                        .join(canonical_repo)
+                        .join(external_label_path(target));
+                    // A partial snapshot supplies Git blobs through the content map. Keep
+                    // its existing resolver when either spelling names a tracked content key.
+                    let from_git = self.content_hashes.is_some_and(|hashes| {
+                        hashes.contains_key(key.to_string_lossy().as_ref())
+                            || hashes.contains_key(paths().1.to_string_lossy().as_ref())
+                    });
+                    if !from_git {
+                        let path = self.external_resolver.output_base.join(&key);
+                        match fs::metadata(&path) {
+                            Ok(metadata) if metadata.is_file() => {
+                                return Ok(Some((path, key.to_string_lossy().into_owned(), true)));
+                            }
+                            Ok(_) => {}
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::NotFound
+                                        | std::io::ErrorKind::NotADirectory
+                                ) => {}
+                            Err(e) => {
+                                return Err(e).with_context(|| {
+                                    format!("failed to inspect source {} ({label})", path.display())
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -2181,6 +3775,8 @@ fn metadata_owner_executable(metadata: &fs::Metadata) -> bool {
 #[derive(Clone, Default)]
 struct ExternalRepoResolver {
     scoped_sources: ScopedSources,
+    /// Resolved paths of returned external Starlark source files.
+    stack_sources: HashMap<PathBuf, String>,
     workspace: PathBuf,
     bazel: PathBuf,
     output_base: PathBuf,
@@ -2203,21 +3799,47 @@ struct ExternalRepoResolver {
 }
 
 impl ExternalRepoResolver {
-    fn new(options: &BazelOptions, root_mapping: Option<Vec<u8>>) -> Result<Self> {
-        let mut command = options.command_for_hashing();
-        command.arg("info").arg("output_base").stdin(Stdio::null());
-        let output = cancel::output(options.cancellation.as_deref(), &mut command)
-            .context("failed to determine Bazel output_base")?;
-        if !output.status.success() {
-            bail!(
-                "bazel info output_base failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+    fn canonical_source_label(&self, label: &str) -> String {
+        let Some((repo, target)) = label
+            .strip_prefix('@')
+            .and_then(|rest| rest.split_once("//"))
+        else {
+            return label.to_owned();
+        };
+        if repo.starts_with('@') {
+            return label.to_owned();
         }
+        let Some(canonical) = self.repo_mapping().get(repo) else {
+            return label.to_owned();
+        };
+        format!("@@{canonical}//{target}")
+    }
+
+    /// `output_base` is the one the query already got from `bazel info`; without it this asks.
+    fn new(
+        options: &BazelOptions,
+        root_mapping: Option<Vec<u8>>,
+        output_base: Option<PathBuf>,
+    ) -> Result<Self> {
+        let output_base = if let Some(output_base) = output_base {
+            output_base
+        } else {
+            let mut command = options.command_for_hashing();
+            command.arg("info").arg("output_base").stdin(Stdio::null());
+            let output = cancel::output(options.cancellation.as_deref(), &mut command)
+                .context("failed to determine Bazel output_base")?;
+            if !output.status.success() {
+                bail!(
+                    "bazel info output_base failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+        };
         Ok(Self {
             workspace: options.workspace.clone(),
             bazel: options.bazel.clone(),
-            output_base: PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()),
+            output_base,
             startup_options: options.startup_options.clone(),
             no_bazelrc: options.no_bazelrc,
             cancellation: options.cancellation.clone(),
@@ -2345,24 +3967,27 @@ impl ExternalRepoResolver {
     /// behind another module, #510) are absent, and their node is named canonically, so callers
     /// fall back to the canonical name itself.
     fn canonical_repo_nodes(&self) -> &HashMap<String, String> {
-        self.canonical_repo_nodes.get_or_init(|| {
-            let mut nodes = HashMap::<String, String>::new();
-            for (apparent, canonical) in self.repo_mapping() {
-                match nodes.get(canonical) {
-                    Some(existing) if existing <= apparent => {}
-                    _ => {
-                        nodes.insert(canonical.clone(), apparent.clone());
-                    }
-                }
-            }
-            nodes
-        })
+        self.canonical_repo_nodes
+            .get_or_init(|| canonical_repo_nodes(self.repo_mapping()))
     }
+}
+
+pub(crate) fn canonical_repo_nodes(mapping: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut nodes = HashMap::<String, String>::new();
+    for (apparent, canonical) in mapping {
+        match nodes.get(canonical) {
+            Some(existing) if existing <= apparent => {}
+            _ => {
+                nodes.insert(canonical.clone(), apparent.clone());
+            }
+        }
+    }
+    nodes
 }
 
 /// Parses `bazel mod dump_repo_mapping` output, one JSON object of apparent ->
 /// canonical repository names per line, into a flat map.
-fn parse_apparent_repo_mapping(text: &str) -> HashMap<String, String> {
+pub(crate) fn parse_apparent_repo_mapping(text: &str) -> HashMap<String, String> {
     let mut mapping = HashMap::new();
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
@@ -2458,6 +4083,7 @@ mod tests {
             cquery_options: Vec::new(),
             use_cquery: false,
             cquery_expression: None,
+            cquery_root_expression: None,
             keep_going: false,
             fine_grained_external_repos: BTreeSet::new(),
             label_only_module_extensions: BTreeSet::new(),
@@ -2567,6 +4193,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn verified_package_groups_require_the_hashed_membership_and_includes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let options = hash_options(workspace.path());
+        let group = crate::proto::blaze_query::PackageGroup {
+            name: "//lib:visible".into(),
+            contained_package: vec!["//consumer/...".into()],
+            included_package_group: vec!["//lib:other".into()],
+            ..Default::default()
+        };
+        let mut rule = crate::bazel::package_group_rule(&group);
+        let mut prepared = PreparedRules::default();
+        prepared.extend([(
+            rule.name.clone(),
+            PreparedRule {
+                definition_digest: prehash_rule(&mut rule, &options.ignored_attributes),
+                repository_inputs: None,
+                loading_inputs: Vec::new(),
+            },
+            None,
+        )]);
+        let normal = [rule_target(rule)];
+        let verify = |group| {
+            ConfiguredCoverage::new(
+                VerifiedQuery {
+                    targets: vec![Target {
+                        r#type: target::Discriminator::PackageGroup,
+                        package_group: buffa::MessageField::some(group),
+                        ..Default::default()
+                    }],
+                    aspects: vec![],
+                    source_locations: BTreeMap::new(),
+                },
+                &normal,
+                &prepared,
+                &options,
+            )
+        };
+        let covered = verify(group.clone());
+        assert!(covered.rule_context(&group.name).is_some());
+        assert!(covered.requires(&group.name, "//lib:other"));
+        let mut edited = group.clone();
+        edited.contained_package.clear();
+        assert!(verify(edited).rule_context(&group.name).is_none());
+        let mut edited = group.clone();
+        edited.included_package_group.push("//lib:missing".into());
+        assert!(verify(edited).rule_context(&group.name).is_none());
+    }
+
     fn hash_targets_for_test(
         options: &HashOptions,
         targets: Vec<Target>,
@@ -2583,6 +4258,8 @@ mod tests {
                 ..Default::default()
             },
             Some(r#"{"name":"root"}"#.to_owned()),
+            None,
+            None,
         )
     }
 
@@ -2604,6 +4281,8 @@ mod tests {
                 ..Default::default()
             },
             Some(r#"{"name":"root"}"#.to_owned()),
+            None,
+            None,
         )?;
         assert_eq!(indexed.hashes, reference.hashes);
         assert_eq!(indexed.dep_edges, reference.dep_edges);
@@ -2655,12 +4334,20 @@ mod tests {
     #[cfg(unix)]
     fn generation_reuses_discovery_outputs() {
         let graph = r#"{"key":"<root>","name":"root","dependencies":[]}"#;
-        for extension_failure in [false, true] {
+        for (extension_failure, source_repo) in [
+            (false, "tool"),
+            (true, "tool"),
+            (false, "hidden"),
+            (true, "hidden"),
+        ] {
             let workspace = tempfile::tempdir().unwrap();
-            let external = workspace.path().join("external/local_config_tool");
+            let external = workspace
+                .path()
+                .join(format!("external/local_config_{source_repo}"));
             fs::create_dir_all(&external).unwrap();
             fs::write(external.join("input"), "mapped input").unwrap();
-            let target = source_target("@tool//:input", &[]);
+            let label = format!("@{source_repo}//:input");
+            let target = source_target(&label, &[]);
             let mut encoded = Vec::new();
             target.encode_length_delimited(&mut encoded);
             fs::write(workspace.path().join("targets.pb"), encoded).unwrap();
@@ -2677,7 +4364,7 @@ mod tests {
 case "$1 $2" in
   "mod dump_repo_mapping")
     printf '%s\n' mapping >> "$PWD/mapping-calls"
-    printf '%s\n' '{{"tool":"local_config_tool"}}'
+    printf '%s\n' '{{"tool":"local_config_tool","hidden":"local_config_hidden"}}'
     ;;
   "mod graph")
     printf '%s\n' graph >> "$PWD/graph-calls"
@@ -2713,7 +4400,7 @@ esac
             assert_eq!(
                 fs::read_to_string(&calls).unwrap().lines().count(),
                 1,
-                "extension_failure={extension_failure}"
+                "extension_failure={extension_failure}, source_repo={source_repo}"
             );
             assert_eq!(
                 fs::read_to_string(&mapping_calls).unwrap().lines().count(),
@@ -2721,7 +4408,7 @@ esac
                 "the resolver reuses the unfiltered root mapping"
             );
 
-            let direct = hash_targets(&options, vec![target]).unwrap();
+            let direct = hash_targets(&options, vec![target.clone()]).unwrap();
             assert_eq!(direct.hashes, generated.hashes);
             assert_eq!(direct.module_graph_json, generated.module_graph_json);
             assert_eq!(
@@ -2733,6 +4420,12 @@ esac
                 fs::read_to_string(&mapping_calls).unwrap().lines().count(),
                 2,
                 "direct hashing still reads the root mapping"
+            );
+            fs::write(external.join("input"), "changed input").unwrap();
+            let changed = hash_targets(&options, vec![target]).unwrap();
+            assert_ne!(
+                direct.hashes[&label].direct_hash,
+                changed.hashes[&label].direct_hash
             );
         }
     }
@@ -2804,6 +4497,91 @@ esac
     }
 
     #[test]
+    fn encoded_attributes_hash_like_decoded_ones() {
+        let string_list = |name: &str, values: &[&str]| Attribute {
+            name: name.into(),
+            r#type: attribute::Discriminator::StringList,
+            string_list_value: values.iter().map(|value| (*value).into()).collect(),
+            ..Default::default()
+        };
+        let full = Rule {
+            name: "//pkg:x".into(),
+            rule_class: "genrule".into(),
+            skylark_environment_hash_code: Some("env".into()),
+            // Unsorted, with an ignored attribute and generator_location, which are skipped.
+            attribute: vec![
+                string_list("srcs", &["a.txt"]),
+                string_list("tags", &["manual"]),
+                string_list("ignored_attr", &["x"]),
+                string_list("generator_location", &["pkg/BUILD:1"]),
+                string_list("visibility", &["//visibility:public"]),
+                Attribute {
+                    name: "cmd".into(),
+                    r#type: attribute::Discriminator::String,
+                    string_value: Some("echo hi".into()),
+                    explicitly_specified: Some(true),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let ignored = HashSet::from(["ignored_attr".to_owned()]);
+        let encodings = full
+            .attribute
+            .iter()
+            .map(|attribute| (attribute.name.clone(), attribute.encode_to_vec()))
+            .collect::<Vec<_>>();
+        let encoded = encodings
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _))| name != "tags" && name != "visibility")
+            .map(|(position, (name, bytes))| EncodedAttribute {
+                position,
+                name,
+                bytes,
+            })
+            .collect::<Vec<_>>();
+        let mut lean = full.clone();
+        lean.attribute
+            .retain(|attribute| attribute.name == "tags" || attribute.name == "visibility");
+
+        let expected = rule_definition_digest(&full, &ignored);
+        assert_eq!(
+            rule_definition_digest_encoded(&lean, &encoded, &ignored),
+            expected
+        );
+        assert_eq!(
+            prehash_encoded_rule(&mut lean, &encoded, &ignored),
+            expected
+        );
+        assert_eq!(
+            lean.attribute
+                .iter()
+                .map(|attribute| attribute.name.as_str())
+                .collect::<Vec<_>>(),
+            ["tags", "visibility"]
+        );
+        // Every attribute encoded gives the same digest too.
+        let all_encoded = encodings
+            .iter()
+            .enumerate()
+            .map(|(position, (name, bytes))| EncodedAttribute {
+                position,
+                name,
+                bytes,
+            })
+            .collect::<Vec<_>>();
+        let bare = Rule {
+            attribute: Vec::new(),
+            ..full.clone()
+        };
+        assert_eq!(
+            rule_definition_digest_encoded(&bare, &all_encoded, &ignored),
+            expected
+        );
+    }
+
+    #[test]
     fn streamed_rule_preprocessing_preserves_definition_digest() {
         let mut rule = Rule {
             name: "//:x".into(),
@@ -2842,6 +4620,32 @@ esac
                 .collect::<Vec<_>>(),
             ["tags", "visibility"]
         );
+        // The dropped attributes' slots are released, not just their contents.
+        assert_eq!(rule.attribute.capacity(), rule.attribute.len());
+    }
+
+    #[test]
+    fn projected_filegroup_definition_requires_synthetic_attribute_evidence() {
+        let mut rule = Rule::default();
+        assert_eq!(projected_filegroup_definition(&rule), None);
+        rule.attribute.push(Attribute {
+            name: "$internal_attr_hash".into(),
+            r#type: AttributeKind::String,
+            ..Default::default()
+        });
+        assert_eq!(projected_filegroup_definition(&rule), None);
+        rule.attribute[0].string_value = Some(String::new());
+        assert_eq!(projected_filegroup_definition(&rule), None);
+        rule.attribute[0].string_value = Some("opaque".into());
+        assert_eq!(
+            projected_filegroup_definition(&rule),
+            Some(rule_definition_digest(&rule, &HashSet::new()))
+        );
+        rule.attribute[0].r#type = AttributeKind::Label;
+        assert_eq!(projected_filegroup_definition(&rule), None);
+        rule.attribute[0].r#type = AttributeKind::String;
+        rule.attribute.push(rule.attribute[0].clone());
+        assert_eq!(projected_filegroup_definition(&rule), None);
     }
 
     #[test]
@@ -3007,6 +4811,8 @@ esac
                     ..Default::default()
                 },
                 Some(r#"{"name":"root"}"#.to_owned()),
+                None,
+                None,
             )
             .unwrap()
         };
@@ -3087,6 +4893,116 @@ esac
     }
 
     #[test]
+    fn starlark_stack_paths_preserve_optional_locations() {
+        for (frame, expected) in [
+            ("tools/defs.bzl:12:4: macro", "tools/defs.bzl"),
+            ("tools/defs.bzl:12: macro", "tools/defs.bzl"),
+            ("tools/defs.bzl: macro", "tools/defs.bzl"),
+            ("tools/defs.bzl", "tools/defs.bzl"),
+            (
+                r"C:\repo\tools\defs.bzl:12:4: macro",
+                r"C:\repo\tools\defs.bzl",
+            ),
+        ] {
+            assert_eq!(starlark_stack_path(frame), expected, "{frame}");
+        }
+    }
+
+    #[test]
+    fn absolute_stack_sources_use_stable_labels() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("tools")).unwrap();
+        let workspace_source = workspace.path().join("tools/defs.bzl");
+        fs::write(&workspace_source, "workspace").unwrap();
+        let external_source = output.path().join("external/dep+/defs.bzl");
+        fs::create_dir_all(external_source.parent().unwrap()).unwrap();
+        fs::write(&external_source, "external").unwrap();
+        let modified = BTreeSet::new();
+        let mut hasher = SourceHasher {
+            tree: None,
+            workspace: workspace.path(),
+            content_hashes: None,
+            modified_filepaths: &modified,
+            fine_grained_external_repos: BTreeSet::from(["dep_alias".to_owned()]),
+            external_resolver: ExternalRepoResolver {
+                output_base: output.path().to_path_buf(),
+                repo_mapping: Arc::new(OnceLock::from(HashMap::from([(
+                    "dep_alias".to_owned(),
+                    "dep+".to_owned(),
+                )]))),
+                ..Default::default()
+            },
+        };
+        let relative = hasher.stack_source("tools/defs.bzl").unwrap().unwrap();
+        assert_eq!(relative.0, "tools/defs.bzl");
+        assert_eq!(
+            relative,
+            hasher
+                .stack_source(workspace_source.to_str().unwrap())
+                .unwrap()
+                .unwrap()
+        );
+        hasher
+            .record_stack_sources(
+                &[
+                    source_target("@dep_alias//:defs.bzl", &[]),
+                    source_target("@@dep+//:defs.bzl", &[]),
+                ],
+                true,
+            )
+            .unwrap();
+        let (label, before) = hasher
+            .stack_source(external_source.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(label, "@@dep+//:defs.bzl");
+        fs::write(&external_source, "changed").unwrap();
+        let (_, after) = hasher
+            .stack_source(external_source.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_ne!(before, after);
+        #[cfg(unix)]
+        {
+            let alias = output.path().join("external/alias+/defs.bzl");
+            fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink("../dep+/defs.bzl", &alias).unwrap();
+            hasher
+                .record_stack_sources(
+                    &[
+                        source_target("@@dep+//:defs.bzl", &[]),
+                        source_target("@@alias+//:defs.bzl", &[]),
+                    ],
+                    true,
+                )
+                .unwrap();
+            assert_eq!(
+                hasher
+                    .stack_source(external_source.to_str().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                after
+            );
+            assert_eq!(
+                hasher
+                    .stack_source(alias.to_str().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                "@@alias+//:defs.bzl"
+            );
+        }
+        let outside = output.path().join("outside.bzl");
+        fs::write(&outside, "outside").unwrap();
+        assert!(hasher
+            .stack_source(outside.to_str().unwrap())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn canonical_repo_nodes_invert_the_repo_mapping_deterministically() {
         let resolver = ExternalRepoResolver {
             repo_mapping: Arc::new(OnceLock::from(HashMap::from([
@@ -3163,6 +5079,8 @@ esac
                     ..Default::default()
                 },
                 Some(r#"{"name":"root"}"#.to_owned()),
+                None,
+                None,
             )
             .unwrap()
         };
@@ -3292,6 +5210,28 @@ esac
     }
 
     #[test]
+    fn file_hashing_reuses_its_buffer_across_files_of_any_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let large: Vec<u8> = (0..FILE_HASH_BUFFER_SIZE * 2 + 7)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        let cases: [&[u8]; 4] = [&large, b"short", b"", &large[..FILE_HASH_BUFFER_SIZE]];
+        for (index, content) in cases.into_iter().enumerate() {
+            let path = directory.path().join(format!("file{index}"));
+            fs::write(&path, content).unwrap();
+            let mut hasher = Sha256::new();
+            hash_file_into(&mut hasher, &path).unwrap();
+            assert_eq!(
+                <[u8; 32]>::from(hasher.finalize()),
+                <[u8; 32]>::from(Sha256::digest(content)),
+                "file {index}"
+            );
+        }
+        let mut hasher = Sha256::new();
+        assert!(hash_file_into(&mut hasher, &directory.path().join("missing")).is_err());
+    }
+
+    #[test]
     fn tags_visibility_and_external_inputs_are_normalized() {
         let rule = Rule {
             attribute: vec![
@@ -3404,10 +5344,494 @@ esac
     }
 
     #[test]
+    fn a_verified_source_replaces_only_its_own_repository_operand() {
+        let mut labels = Labels {
+            ids: HashMap::new(),
+            slots: Vec::new(),
+            ordinary_inputs: HashMap::new(),
+        };
+        let mut targets = Vec::new();
+        let file = "@@ext++files+data//:value.txt";
+        let other = "@@ext++files+data//:other";
+        let repository = "//external:ext++files+data";
+        let group = Arc::new(RepositoryInputGroup {
+            extension: "ext++files".into(),
+            labels: vec!["//external:ext++files+sibling".into()],
+        });
+        for (name, inputs, shared_inputs) in [
+            (repository, vec![], Some(group)),
+            ("@hub//:file", vec![file], None),
+            ("@hub//:mixed", vec![file, other], None),
+            ("@hub//:unobserved", vec![other], None),
+        ] {
+            targets.push(HashTarget::Rule(name.into()));
+            let rule = Rule {
+                name: name.into(),
+                rule_input: inputs.into_iter().map(str::to_owned).collect(),
+                ..Default::default()
+            };
+            labels.slot(name.into()).rule = Some(Rc::new(RuleNode::new(
+                rule,
+                PreparedRule {
+                    definition_digest: [1; 32],
+                    repository_inputs: shared_inputs.map(RepositoryInputs::WithSiblings),
+                    loading_inputs: Vec::new(),
+                },
+            )));
+        }
+        let aliases = [
+            ("@hub//:file", file),
+            ("@hub//:mixed", file),
+            ("@hub//:unobserved", other),
+        ]
+        .into_iter()
+        .map(|(name, input)| {
+            (
+                name.to_owned(),
+                AliasSource {
+                    label: input.to_owned(),
+                    location: input.to_owned(),
+                    visibility: vec!["//visibility:public".into()],
+                },
+            )
+        })
+        .collect();
+        let fine = BTreeSet::from(["@hub".to_owned()]);
+        let mapping = HashMap::new();
+        let observed = HashSet::from([file.to_owned()]);
+        let unobserved = labels
+            .get("@hub//:unobserved")
+            .unwrap()
+            .rule
+            .as_ref()
+            .unwrap();
+        let unobserved_inputs = rule_inputs(&unobserved.rule, false, &fine, &mapping)
+            .into_iter()
+            .map(Cow::into_owned)
+            .collect::<Vec<_>>();
+        let unobserved_definition = unobserved.prepared.definition_digest;
+        let qualified = labels.bind_alias_sources(&aliases, &observed, &fine, &mapping);
+        let views = labels.repository_views(&qualified, &fine, &mapping, &mut targets);
+        let definition = views[&labels.ids["@hub//:file"]][file].to_string();
+        labels.prepare_inputs(&fine, &mapping, &views, &BTreeMap::new());
+        let node = |name| labels.get(name).unwrap().rule.as_ref().unwrap();
+        assert_eq!(
+            node("@hub//:file").rule.rule_input,
+            [definition.as_str(), file]
+        );
+        assert_eq!(
+            node("@hub//:mixed").rule.rule_input,
+            [definition.as_str(), repository, other, file]
+        );
+        assert_eq!(node("@hub//:unobserved").rule.rule_input, unobserved_inputs);
+        assert!(node(repository)
+            .prepared
+            .repository_inputs
+            .as_ref()
+            .and_then(RepositoryInputs::siblings)
+            .is_some());
+        assert!(node(&definition).prepared.repository_inputs.is_none());
+        assert_eq!(
+            node(repository).prepared.definition_digest,
+            node(&definition).prepared.definition_digest
+        );
+        assert_eq!(
+            node("@hub//:unobserved").prepared.definition_digest,
+            unobserved_definition
+        );
+        assert_ne!(node("@hub//:file").prepared.definition_digest, [1; 32]);
+    }
+
+    // The external product verifies Bazel's rows and physical files. This checks
+    // the graph projection from those accepted observations.
+    #[test]
+    fn filegroup_projection_requires_complete_parent_inputs() {
+        let file = "@@ext++files+data//:value.txt";
+        let nested = "@@ext++files+data//:nested";
+        let group = "@@ext++files+data//:group";
+        let unobserved = "@@ext++files+data//:unobserved";
+        let setup = "@bazel_tools//tools/genrule:genrule-setup.sh";
+        let opaque = "//:opaque";
+        let repository = "//external:ext++files+data";
+        let label_list = |name: &str, values: &[&str]| Attribute {
+            name: name.into(),
+            r#type: AttributeKind::LabelList,
+            string_list_value: values.iter().map(|value| (*value).into()).collect(),
+            ..Default::default()
+        };
+        let filegroups = [
+            (nested, vec![file]),
+            (group, vec![nested]),
+            (unobserved, vec!["@@ext++files+data//:missing.txt"]),
+        ]
+        .into_iter()
+        .map(|(name, inputs)| {
+            (
+                name.to_owned(),
+                Rule {
+                    name: name.into(),
+                    rule_class: "filegroup".into(),
+                    rule_class_key: Some("filegroup".into()),
+                    attribute: vec![label_list("srcs", &inputs)],
+                    rule_input: inputs.into_iter().map(str::to_owned).collect(),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+        let parents = [
+            ("//:complete", group, vec![group, setup], vec![]),
+            (
+                "//:opaque_parent",
+                group,
+                vec![group, setup, opaque],
+                vec![opaque],
+            ),
+            (
+                "//:filtered",
+                group,
+                vec![group, setup, opaque],
+                vec![opaque],
+            ),
+            ("//:unobserved", unobserved, vec![unobserved, setup], vec![]),
+        ]
+        .into_iter()
+        .map(|(name, forwarded, inputs, tools)| {
+            (
+                name.to_owned(),
+                Rule {
+                    name: name.into(),
+                    rule_class: "genrule".into(),
+                    rule_class_key: Some("genrule".into()),
+                    attribute: vec![
+                        label_list("toolchains", &[]),
+                        label_list("srcs", &[forwarded]),
+                        label_list("tools", &tools),
+                    ],
+                    rule_input: inputs.into_iter().map(str::to_owned).collect(),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+        let mut labels = Labels {
+            ids: HashMap::new(),
+            slots: Vec::new(),
+            ordinary_inputs: HashMap::new(),
+        };
+        let mut targets = Vec::new();
+        let ignored = HashSet::new();
+        let mut install = |rule: Rule, repository_inputs| {
+            let name = rule.name.clone();
+            let prepared = PreparedRule {
+                definition_digest: rule_definition_digest(&rule, &ignored),
+                repository_inputs,
+                loading_inputs: Vec::new(),
+            };
+            labels.slot(name.clone()).rule = Some(Rc::new(RuleNode::new(rule, prepared)));
+            targets.push(HashTarget::Rule(name));
+        };
+        install(
+            Rule {
+                name: repository.into(),
+                ..Default::default()
+            },
+            Some(RepositoryInputs::WithSiblings(Arc::new(
+                RepositoryInputGroup {
+                    extension: "ext++files".into(),
+                    labels: vec!["//external:ext++files+sibling".into()],
+                },
+            ))),
+        );
+        for rule in filegroups.values().chain(parents.values()) {
+            let mut ordinary = rule.clone();
+            if ordinary.name == "//:filtered" {
+                ordinary.rule_input.retain(|input| input == group);
+            }
+            if ordinary.rule_class == "genrule" {
+                ordinary.rule_class_key = None;
+            }
+            install(ordinary, None);
+        }
+        install(
+            Rule {
+                name: opaque.into(),
+                rule_class: "custom".into(),
+                ..Default::default()
+            },
+            None,
+        );
+        for name in [file, setup] {
+            let _ = labels.slot(name.into());
+        }
+        let witnesses = [file, setup].map(|label| AliasSource {
+            label: label.into(),
+            location: label.into(),
+            visibility: vec!["//visibility:public".into()],
+        });
+        let sources = witnesses
+            .iter()
+            .map(|source| (source.label.as_str(), Some(source)))
+            .collect();
+        let observed = HashSet::from([file.into(), setup.into()]);
+        let fine = BTreeSet::from(["@hub".to_owned()]);
+        let mapping = HashMap::new();
+        let names = [
+            nested,
+            group,
+            "//:complete",
+            "//:opaque_parent",
+            "//:filtered",
+            "//:unobserved",
+        ];
+        let original = names
+            .into_iter()
+            .map(|name| {
+                let rule = &labels.get(name).unwrap().rule.as_ref().unwrap().rule;
+                let inputs = rule_inputs(rule, false, &fine, &mapping)
+                    .into_iter()
+                    .map(Cow::into_owned)
+                    .collect::<BTreeSet<_>>();
+                assert!(inputs.contains(repository));
+                (name, inputs)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut qualified = QualifiedInputs::new();
+        let filegroups = filegroups
+            .into_iter()
+            .map(|(name, rule)| (name, FilegroupWitness::new(rule)))
+            .collect();
+        let parents = parents
+            .into_iter()
+            .map(|(name, rule)| (name, FilegroupWitness::new(rule)))
+            .collect();
+        labels.bind_filegroup_inputs(
+            &filegroups,
+            &parents,
+            &sources,
+            &observed,
+            &ignored,
+            &mut qualified,
+        );
+        let views = labels.repository_views(&qualified, &fine, &mapping, &mut targets);
+        labels.prepare_inputs(&fine, &mapping, &views, &BTreeMap::new());
+        let definition = repository_definition_label(repository);
+        for name in names {
+            let mut expected = original[name].clone();
+            if [nested, group, "//:complete"].contains(&name) {
+                expected.remove(repository);
+                expected.insert(definition.clone());
+            }
+            let actual = labels
+                .get(name)
+                .unwrap()
+                .rule
+                .as_ref()
+                .unwrap()
+                .rule
+                .rule_input
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_occupied_definition_name_keeps_the_original_repository() {
+        let repository = "//external:ext++files+data";
+        let file = "@@ext++files+data//:value.txt";
+        let definition = repository_definition_label(repository);
+        let mut labels = Labels {
+            ids: HashMap::new(),
+            slots: Vec::new(),
+            ordinary_inputs: HashMap::new(),
+        };
+        let group = Arc::new(RepositoryInputGroup {
+            extension: "ext++files".into(),
+            labels: vec!["//external:ext++files+sibling".into()],
+        });
+        for (name, inputs, shared_inputs) in [
+            (repository, vec![], Some(group)),
+            ("@hub//:file", vec![file], None),
+        ] {
+            labels.slot(name.into()).rule = Some(Rc::new(RuleNode::new(
+                Rule {
+                    name: name.into(),
+                    rule_input: inputs.into_iter().map(str::to_owned).collect(),
+                    ..Default::default()
+                },
+                PreparedRule {
+                    definition_digest: [1; 32],
+                    repository_inputs: shared_inputs.map(RepositoryInputs::WithSiblings),
+                    loading_inputs: Vec::new(),
+                },
+            )));
+        }
+        let aliases = HashMap::from([(
+            "@hub//:file".into(),
+            AliasSource {
+                label: file.into(),
+                location: file.into(),
+                visibility: vec!["//visibility:public".into()],
+            },
+        )]);
+        let mut targets = vec![HashTarget::Generated {
+            name: definition,
+            generating_rule: "//:generator".into(),
+        }];
+        let observed = HashSet::from([file.to_owned()]);
+        let fine = BTreeSet::from(["@hub".to_owned()]);
+        let mapping = HashMap::new();
+        let qualified = labels.bind_alias_sources(&aliases, &observed, &fine, &mapping);
+        let views = labels.repository_views(&qualified, &fine, &mapping, &mut targets);
+        assert!(views.is_empty());
+        labels.prepare_inputs(&fine, &mapping, &views, &BTreeMap::new());
+        let repository = labels.get(repository).unwrap().rule.as_ref().unwrap();
+        assert!(repository
+            .prepared
+            .repository_inputs
+            .as_ref()
+            .and_then(RepositoryInputs::siblings)
+            .is_some());
+        assert_eq!(
+            labels
+                .get("@hub//:file")
+                .unwrap()
+                .rule
+                .as_ref()
+                .unwrap()
+                .rule
+                .rule_input,
+            ["//external:ext++files+data", file]
+        );
+    }
+
+    #[test]
+    fn repository_views_require_a_complete_ordinary_module_path() {
+        let root = "//external:root";
+        let child = "//external:child";
+        let leaf = "//external:leaf";
+        let sibling = "//external:sibling";
+        let file = "@@root+//:value.txt";
+        let other = "@@root+//:other";
+        let mut stable_qualified = None;
+        for (leaf_complete, cycle, has_sibling) in [
+            (true, false, false),
+            (true, false, true),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let mut labels = Labels {
+                ids: HashMap::new(),
+                slots: Vec::new(),
+                ordinary_inputs: HashMap::new(),
+            };
+            let mut targets = Vec::new();
+            let child_input = if cycle { root } else { leaf };
+            let mut child_inputs = vec![child_input];
+            if has_sibling {
+                child_inputs.push(sibling);
+            }
+            for (name, inputs, ordinary) in [
+                (root, vec![child], Some(vec![child])),
+                (child, child_inputs.clone(), Some(vec![child_input])),
+                (leaf, vec![], leaf_complete.then(Vec::new)),
+                (sibling, vec![], Some(vec![])),
+            ] {
+                targets.push(HashTarget::Rule(name.into()));
+                labels.slot(name.into()).rule = Some(Rc::new(RuleNode::new(
+                    Rule {
+                        name: name.into(),
+                        rule_input: inputs.into_iter().map(str::to_owned).collect(),
+                        ..Default::default()
+                    },
+                    PreparedRule {
+                        definition_digest: Sha256::digest(name.as_bytes()).into(),
+                        repository_inputs: None,
+                        loading_inputs: Vec::new(),
+                    },
+                )));
+                if let Some(inputs) = ordinary {
+                    labels.ordinary_inputs.insert(
+                        labels.ids[name],
+                        inputs.into_iter().map(str::to_owned).collect(),
+                    );
+                }
+            }
+            for (name, input) in [("@hub//:file", file), ("@hub//:unqualified", other)] {
+                targets.push(HashTarget::Rule(name.into()));
+                labels.slot(name.into()).rule = Some(Rc::new(RuleNode::new(
+                    Rule {
+                        name: name.into(),
+                        rule_input: vec![input.into()],
+                        ..Default::default()
+                    },
+                    PreparedRule {
+                        definition_digest: [1; 32],
+                        repository_inputs: None,
+                        loading_inputs: Vec::new(),
+                    },
+                )));
+            }
+            let fine = BTreeSet::from(["@hub".to_owned()]);
+            let mapping = HashMap::from([("root+".to_owned(), "root".to_owned())]);
+            let qualified =
+                QualifiedInputs::from([(labels.ids["@hub//:file"], BTreeSet::from([file]))]);
+            let views = labels.repository_views(&qualified, &fine, &mapping, &mut targets);
+            labels.prepare_inputs(&fine, &mapping, &views, &BTreeMap::new());
+            let inputs = |name: &str| {
+                &labels
+                    .get(name)
+                    .unwrap()
+                    .rule
+                    .as_ref()
+                    .unwrap()
+                    .rule
+                    .rule_input
+            };
+            assert_eq!(inputs(root), &[child]);
+            assert_eq!(inputs(child), &child_inputs);
+            assert_eq!(inputs("@hub//:unqualified"), &[root, other]);
+            if leaf_complete && !cycle {
+                let root_view = repository_definition_label(root);
+                let child_view = repository_definition_label(child);
+                let leaf_view = repository_definition_label(leaf);
+                assert_eq!(inputs("@hub//:file"), &[root_view.as_str(), file]);
+                assert_eq!(inputs(&root_view), std::slice::from_ref(&child_view));
+                assert_eq!(inputs(&child_view), std::slice::from_ref(&leaf_view));
+                assert!(inputs(&leaf_view).is_empty());
+                assert!(labels.get(&repository_definition_label(sibling)).is_none());
+                let state = (
+                    inputs("@hub//:file").clone(),
+                    labels
+                        .get("@hub//:file")
+                        .unwrap()
+                        .rule
+                        .as_ref()
+                        .unwrap()
+                        .prepared
+                        .definition_digest,
+                );
+                if let Some(prior) = &stable_qualified {
+                    assert_eq!(&state, prior);
+                } else {
+                    stable_qualified = Some(state);
+                }
+            } else {
+                assert!(views.is_empty());
+                assert_eq!(inputs("@hub//:file"), &[root, file]);
+                assert!(labels.get(&repository_definition_label(root)).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn preparing_apparent_inputs_uses_mapping_only_when_the_rule_needs_it() {
         let mut labels = Labels {
             ids: HashMap::new(),
             slots: Vec::new(),
+            ordinary_inputs: HashMap::new(),
         };
         let fine = BTreeSet::from(["@canonical".to_owned()]);
         let canonical = HashMap::from([("canonical".to_owned(), "apparent".to_owned())]);
@@ -3441,12 +5865,17 @@ esac
             );
             let prepared = PreparedRule {
                 definition_digest: prehash_rule(&mut rule, &HashSet::new()),
-                shared_inputs: None,
+                repository_inputs: None,
                 loading_inputs: Vec::new(),
             };
             labels.slot(name.to_owned()).rule = Some(Rc::new(RuleNode::new(rule, prepared)));
         }
-        labels.prepare_inputs(&fine, &canonical);
+        labels.prepare_inputs(
+            &fine,
+            &canonical,
+            &RepositoryViews::default(),
+            &BTreeMap::new(),
+        );
         let inputs = |name| {
             &labels
                 .get(name)
@@ -3562,6 +5991,82 @@ esac
         );
         assert_eq!(derived.hashes, rebuilt.hashes);
         assert_eq!(derived.dep_edges, rebuilt.dep_edges);
+    }
+
+    /// A fine-grained external source is not in the git tree, so the full generation records
+    /// the digest it read from the output base and a derivation reuses it: derived and full
+    /// entries stay identical, and a full generation still sees an edit to the external file.
+    #[test]
+    fn partial_recipe_records_fine_grained_external_sources() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        let repo_root = output_base
+            .join("external")
+            .join("rules_jvm_external++maven+maven");
+        fs::create_dir_all(&repo_root).unwrap();
+        let jar = repo_root.join("guava.jar");
+        fs::write(&jar, "first").unwrap();
+        let external = "@maven//:guava.jar";
+        let targets = vec![
+            source_target("//:src", &[]),
+            source_target(external, &[]),
+            rule_target(Rule {
+                name: "//:consumer".into(),
+                rule_class: "genrule".into(),
+                rule_input: vec!["//:src".into(), external.into()],
+                ..Default::default()
+            }),
+        ];
+        let full = |tree: &TreeIndex| {
+            let mut options = hash_options(workspace.path());
+            options
+                .bazel
+                .fine_grained_external_repos
+                .insert("@maven".into());
+            options.partial_tree = Some(Arc::new(tree.clone()));
+            let resolver = ExternalRepoResolver {
+                workspace: workspace.path().to_path_buf(),
+                bazel: PathBuf::from("bazel"),
+                output_base: output_base.clone(),
+                repo_mapping: Arc::new(OnceLock::from(HashMap::from([(
+                    "maven".to_owned(),
+                    "rules_jvm_external++maven+maven".to_owned(),
+                )]))),
+                ..Default::default()
+            };
+            hash_targets_with_environment(
+                &options,
+                targets.clone(),
+                PreparedRules::default(),
+                resolver,
+                Some(r#"{"name":"root"}"#.to_owned()),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let tree = TreeIndex::parse_ls_tree(b"100644 blob a\tsrc\0");
+        let before = full(&tree);
+        let recipes = before.partial.as_ref().unwrap();
+        assert_eq!(
+            recipes.external_sources.keys().collect::<Vec<_>>(),
+            [external]
+        );
+
+        let edited_tree = TreeIndex::parse_ls_tree(b"100644 blob b\tsrc\0");
+        let derived = partial::derive(&before, &edited_tree).unwrap();
+        let rebuilt = full(&edited_tree);
+        assert_eq!(derived.hashes, rebuilt.hashes);
+        assert_eq!(derived.partial, rebuilt.partial);
+        assert_eq!(derived.hashes[external], before.hashes[external]);
+
+        fs::write(&jar, "second").unwrap();
+        let changed = full(&tree);
+        assert_ne!(before.hashes[external].hash, changed.hashes[external].hash);
+        assert_ne!(
+            before.hashes["//:consumer"].hash,
+            changed.hashes["//:consumer"].hash
+        );
     }
 
     #[cfg(unix)]
@@ -3755,9 +6260,10 @@ esac
                     rule.name.clone(),
                     PreparedRule {
                         definition_digest: prehash_rule(rule, &options.ignored_attributes),
-                        shared_inputs: Some(Arc::clone(&group)),
+                        repository_inputs: Some(RepositoryInputs::WithSiblings(Arc::clone(&group))),
                         loading_inputs: Vec::new(),
                     },
+                    None,
                 )]);
             }
         }
@@ -3766,6 +6272,8 @@ esac
             targets,
             prepared,
             ExternalRepoResolver::default(),
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -3792,7 +6300,7 @@ esac
 
     #[test]
     fn cycles_hash_deterministically_and_changes_propagate_through_them() {
-        fn cyclic_targets(a_cmd: &str, b_cmd: &str) -> Vec<Target> {
+        fn cyclic_targets(a_cmd: &str, b_cmd: &str, c_cmd: &str, leaf_cmd: &str) -> Vec<Target> {
             let attribute = |value: &str| Attribute {
                 name: "cmd".into(),
                 r#type: attribute::Discriminator::String,
@@ -3803,13 +6311,13 @@ esac
                 rule_target(Rule {
                     name: "//:consumer".into(),
                     rule_class: "alias".into(),
-                    rule_input: vec!["//:a".into()],
+                    rule_input: vec!["//:b".into()],
                     ..Default::default()
                 }),
                 rule_target(Rule {
                     name: "//:a".into(),
                     rule_class: "genrule".into(),
-                    rule_input: vec!["//:b".into()],
+                    rule_input: vec!["//:b".into(), "//:c".into()],
                     attribute: vec![attribute(a_cmd)],
                     ..Default::default()
                 }),
@@ -3820,6 +6328,19 @@ esac
                     attribute: vec![attribute(b_cmd)],
                     ..Default::default()
                 }),
+                rule_target(Rule {
+                    name: "//:c".into(),
+                    rule_class: "genrule".into(),
+                    rule_input: vec!["//:b".into(), "//:leaf".into()],
+                    attribute: vec![attribute(c_cmd)],
+                    ..Default::default()
+                }),
+                rule_target(Rule {
+                    name: "//:leaf".into(),
+                    rule_class: "genrule".into(),
+                    attribute: vec![attribute(leaf_cmd)],
+                    ..Default::default()
+                }),
             ]
         }
         let workspace = tempfile::tempdir().unwrap();
@@ -3827,28 +6348,133 @@ esac
         fs::create_dir_all(output_base.join("external")).unwrap();
         let options = hash_options(workspace.path());
 
-        let baseline =
-            hash_targets_for_test(&options, cyclic_targets("a", "b"), &output_base).unwrap();
+        let baseline = hash_targets_for_test(
+            &options,
+            cyclic_targets("a", "b", "c", "leaf"),
+            &output_base,
+        )
+        .unwrap();
         // The query order is arbitrary; the hashes must not depend on it.
-        let mut reversed = cyclic_targets("a", "b");
+        let mut reversed = cyclic_targets("a", "b", "c", "leaf");
         reversed.reverse();
         let shuffled = hash_targets_for_test(&options, reversed, &output_base).unwrap();
         assert_eq!(baseline.hashes, shuffled.hashes);
         assert_eq!(baseline.dep_edges, shuffled.dep_edges);
         // The dependency edges inside the cycle survive for distance metrics and `explain`.
-        assert_eq!(baseline.dep_edges["//:a"], ["//:b"]);
+        assert_eq!(baseline.dep_edges["//:a"], ["//:b", "//:c"]);
         assert_eq!(baseline.dep_edges["//:b"], ["//:a"]);
-        assert_eq!(baseline.dep_edges["//:consumer"], ["//:a"]);
+        assert_eq!(baseline.dep_edges["//:c"], ["//:b", "//:leaf"]);
+        assert_eq!(baseline.dep_edges["//:consumer"], ["//:b"]);
 
-        // A change to either member reaches both members and everything downstream.
-        for changed in [cyclic_targets("a2", "b"), cyclic_targets("a", "b2")] {
+        // The overlapping cycles include a completed recursive child reached by another arm.
+        // A change entering through any member reaches the whole component and its consumers.
+        for (name, changed) in [
+            ("a", cyclic_targets("a2", "b", "c", "leaf")),
+            ("b", cyclic_targets("a", "b2", "c", "leaf")),
+            ("c", cyclic_targets("a", "b", "c2", "leaf")),
+            ("leaf", cyclic_targets("a", "b", "c", "leaf2")),
+        ] {
             let hashes = hash_targets_for_test(&options, changed, &output_base)
                 .unwrap()
                 .hashes;
-            for label in ["//:a", "//:b", "//:consumer"] {
-                assert_ne!(hashes[label].hash, baseline.hashes[label].hash, "{label}");
+            for label in ["//:a", "//:b", "//:c", "//:consumer"] {
+                assert_ne!(
+                    hashes[label].hash, baseline.hashes[label].hash,
+                    "{name} -> {label}"
+                );
+            }
+            let direct_label = format!("//:{name}");
+            for label in ["//:a", "//:b", "//:c", "//:consumer", "//:leaf"] {
+                assert_eq!(
+                    hashes[label].direct_hash != baseline.hashes[label].direct_hash,
+                    label == direct_label,
+                    "direct {name} -> {label}"
+                );
             }
         }
+
+        let mut untracked = options.clone();
+        untracked.track_deps = false;
+        for targets in [
+            cyclic_targets("a", "b", "c", "leaf"),
+            cyclic_targets("a", "b", "c", "leaf2"),
+        ] {
+            let tracked = hash_targets_for_test(&options, targets.clone(), &output_base).unwrap();
+            let untracked = hash_targets_for_test(&untracked, targets, &output_base).unwrap();
+            assert_eq!(untracked.hashes, tracked.hashes);
+            assert!(untracked.dep_edges.is_empty());
+        }
+    }
+
+    #[test]
+    fn shallow_wide_cycles_propagate_outside_changes() {
+        fn targets(width: usize, value: &str) -> Vec<Target> {
+            let leaves = (0..width)
+                .map(|index| format!("//:b{index:04}"))
+                .collect::<Vec<_>>();
+            let mut inputs = leaves.clone();
+            inputs.push("//:outside".into());
+            let mut targets = leaves
+                .into_iter()
+                .map(|name| {
+                    rule_target(Rule {
+                        name,
+                        rule_class: "alias".into(),
+                        rule_input: vec!["//:a_root".into()],
+                        ..Default::default()
+                    })
+                })
+                .collect::<Vec<_>>();
+            targets.push(rule_target(Rule {
+                name: "//:a_root".into(),
+                rule_class: "genrule".into(),
+                rule_input: inputs,
+                ..Default::default()
+            }));
+            targets.push(rule_target(Rule {
+                name: "//:outside".into(),
+                rule_class: "genrule".into(),
+                attribute: vec![Attribute {
+                    name: "cmd".into(),
+                    r#type: attribute::Discriminator::String,
+                    string_value: Some(value.into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }));
+            targets.push(rule_target(Rule {
+                name: "//:z_consumer".into(),
+                rule_class: "alias".into(),
+                rule_input: vec![format!("//:b{:04}", width - 1)],
+                ..Default::default()
+            }));
+            targets
+        }
+
+        const WIDTH: usize = 4096;
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        fs::create_dir_all(output_base.join("external")).unwrap();
+        let mut options = hash_options(workspace.path());
+        options.track_deps = false;
+        let before =
+            hash_targets_for_test(&options, targets(WIDTH, "before"), &output_base).unwrap();
+        let after = hash_targets_for_test(&options, targets(WIDTH, "after"), &output_base).unwrap();
+        for label in (0..WIDTH)
+            .map(|index| format!("//:b{index:04}"))
+            .chain(["//:a_root".into(), "//:z_consumer".into()])
+        {
+            assert_ne!(
+                before.hashes[&label].hash, after.hashes[&label].hash,
+                "{label}"
+            );
+            assert_eq!(
+                before.hashes[&label].direct_hash, after.hashes[&label].direct_hash,
+                "{label}"
+            );
+        }
+        assert!(before.dep_edges.is_empty());
+        assert!(after.dep_edges.is_empty());
     }
 
     #[cfg(unix)]
@@ -3888,13 +6514,7 @@ esac
         let log = workspace.path().join("bazel.log");
         // No mapping at all, as in a WORKSPACE build: the directory is guessed from the
         // apparent name, with no `query` fallback for a guess that exists.
-        let bazel = stub_bazel(workspace.path(), &log, "");
-        let resolver = ExternalRepoResolver {
-            workspace: workspace.path().to_path_buf(),
-            bazel,
-            output_base,
-            ..Default::default()
-        };
+        let resolver = stub_resolver(workspace.path(), output_base, &log, "");
         assert_eq!(
             resolver.resolve("existing").unwrap(),
             external.join("existing+")
@@ -3923,17 +6543,12 @@ esac
         fs::create_dir_all(external.join("dep+")).unwrap();
         fs::create_dir_all(external.join("+_repo_rules+dep")).unwrap();
         let log = workspace.path().join("bazel.log");
-        let bazel = stub_bazel(
+        let resolver = stub_resolver(
             workspace.path(),
+            output_base,
             &log,
             r#"{"dep": "+_repo_rules+dep", "module_dep": "dep+"}"#,
         );
-        let resolver = ExternalRepoResolver {
-            workspace: workspace.path().to_path_buf(),
-            bazel,
-            output_base,
-            ..Default::default()
-        };
         assert_eq!(
             resolver.resolve("dep").unwrap(),
             external.join("+_repo_rules+dep")
@@ -3994,20 +6609,34 @@ esac
         );
     }
 
-    /// A stub `bazel` that appends its argv to `log` and prints `stdout`.
+    /// Invoke the installed shell instead of executing a just-written file while other
+    /// tests are spawning processes. The stub records only arguments sent by the resolver.
     #[cfg(unix)]
-    fn stub_bazel(directory: &Path, log: &Path, stdout: &str) -> PathBuf {
-        let script = directory.join("stub-bazel");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\necho \"$@\" >> {log}\ncat <<'STUB_EOF'\n{stdout}\nSTUB_EOF\n",
-                log = log.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        script
+    fn stub_resolver(
+        workspace: &Path,
+        output_base: PathBuf,
+        log: &Path,
+        stdout: &str,
+    ) -> ExternalRepoResolver {
+        ExternalRepoResolver {
+            workspace: workspace.to_owned(),
+            output_base,
+            bazel: "/bin/sh".into(),
+            startup_options: vec![
+                "-c".to_owned(),
+                r#"log=$1
+stdout=$2
+shift 2
+printf '%s\n' "$*" >> "$log"
+printf '%s\n' "$stdout"
+"#
+                .to_owned(),
+                "stub-bazel".to_owned(),
+                log.to_str().unwrap().to_owned(),
+                stdout.to_owned(),
+            ],
+            ..Default::default()
+        }
     }
 
     #[cfg(unix)]
@@ -4020,17 +6649,12 @@ esac
         let canonical = external.join("rules_req_compile++requirements+pip_deps");
         fs::create_dir_all(&canonical).unwrap();
         let log = workspace.path().join("bazel.log");
-        let bazel = stub_bazel(
+        let resolver = stub_resolver(
             workspace.path(),
+            output_base,
             &log,
             r#"{"pip_deps": "rules_req_compile++requirements+pip_deps"}"#,
         );
-        let resolver = ExternalRepoResolver {
-            workspace: workspace.path().to_path_buf(),
-            bazel,
-            output_base,
-            ..Default::default()
-        };
 
         for _ in 0..5 {
             assert_eq!(resolver.resolve("pip_deps").unwrap(), canonical);
@@ -4054,21 +6678,18 @@ esac
         let log = workspace.path().join("bazel.log");
         // The mapping has no entry for `queried`, so resolution falls through to
         // `bazel query`; the stub answers both with the same location line.
-        let bazel = stub_bazel(
+        let mut resolver = stub_resolver(
             workspace.path(),
+            output_base,
             &log,
             &format!(
                 "{}/queried+1.0/pkg/BUILD:1:1: source file @queried//pkg:BUILD",
                 external.display()
             ),
         );
-        let resolver = ExternalRepoResolver {
-            workspace: workspace.path().to_path_buf(),
-            bazel,
-            output_base,
-            startup_options: vec!["--max_idle_secs=17".to_owned()],
-            ..Default::default()
-        };
+        resolver
+            .startup_options
+            .push("--max_idle_secs=17".to_owned());
 
         for _ in 0..3 {
             assert_eq!(
@@ -4161,10 +6782,25 @@ esac
             fine_grained_external_repos: BTreeSet::new(),
             external_resolver: resolver,
         };
+        let canonical = fs::canonicalize(workspace.path()).unwrap();
+        let observe = |label: &str, relative: &str| {
+            let location = format!("{}:1:1", canonical.join(relative).display());
+            hasher
+                .digest_source_with_observation(label, b"seed", true, Some((&canonical, &location)))
+                .unwrap()
+        };
         let existing = hasher.digest("//path/to:empty.txt", b"seed").unwrap();
+        assert_eq!(
+            observe("//path/to:empty.txt", "path/to/empty.txt"),
+            (existing, true)
+        );
         fs::remove_file(&file).unwrap();
         let missing = hasher.digest("//path/to:empty.txt", b"seed").unwrap();
         assert_ne!(existing, missing);
+        assert_eq!(
+            observe("//path/to:empty.txt", "path/to/empty.txt"),
+            (missing, false)
+        );
         assert_eq!(
             hasher.digest("@not_a_valid_label", b"seed").unwrap(),
             <DigestBytes>::from(Sha256::digest([]))
@@ -4173,6 +6809,7 @@ esac
             hasher.digest("not-a-bazel-label", b"seed").unwrap(),
             <DigestBytes>::from(Sha256::digest([]))
         );
+        assert!(!observe("not-a-bazel-label", "path/to/empty.txt").1);
         assert!(hasher
             .soft_digest("//path/to:empty.txt", b"seed")
             .unwrap()
@@ -4181,6 +6818,105 @@ esac
             .soft_digest("@repo//:file", b"seed")
             .unwrap()
             .is_none());
+        fs::create_dir(workspace.path().join("path/to/directory")).unwrap();
+        assert!(!observe("//path/to:directory", "path/to/directory").1);
+        #[cfg(unix)]
+        {
+            let referent = workspace.path().join("path/to/real.txt");
+            fs::write(&referent, "").unwrap();
+            std::os::unix::fs::symlink(&referent, &file).unwrap();
+            assert_eq!(
+                observe("//path/to:empty.txt", "path/to/empty.txt"),
+                (existing, false)
+            );
+            std::os::unix::fs::symlink(
+                workspace.path().join("path/to"),
+                workspace.path().join("path/linked"),
+            )
+            .unwrap();
+            assert!(!observe("//path/linked:real.txt", "path/linked/real.txt").1);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn verified_external_regular_file_is_the_file_read_by_the_normal_hash() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(workspace.path()).unwrap();
+        let output_base = canonical.join("output");
+        let mount = output_base.join("external/module++extension+repo");
+        let tree = canonical.join("contents/selected");
+        fs::create_dir_all(tree.join("pkg")).unwrap();
+        fs::create_dir_all(mount.parent().unwrap()).unwrap();
+        symlink(&tree, &mount).unwrap();
+        let file = mount.join("pkg/input");
+        fs::write(&file, "first").unwrap();
+        let modified = BTreeSet::new();
+        let resolver = ExternalRepoResolver {
+            output_base,
+            repo_mapping: Arc::new(OnceLock::from(HashMap::from([(
+                "alias".to_owned(),
+                "module++extension+repo".to_owned(),
+            )]))),
+            ..Default::default()
+        };
+        let hasher = SourceHasher {
+            tree: None,
+            workspace: &canonical,
+            content_hashes: None,
+            modified_filepaths: &modified,
+            fine_grained_external_repos: BTreeSet::new(),
+            external_resolver: resolver,
+        };
+        let observe = |label, selected: &Path| {
+            let location = format!("{}:1:1", selected.display());
+            hasher
+                .digest_source_with_observation(label, b"seed", true, Some((&canonical, &location)))
+                .unwrap()
+        };
+        let label = "@@module++extension+repo//pkg:input";
+        let original = hasher.digest_source(label, b"seed", true).unwrap();
+        assert_eq!(observe(label, &file), (original, true));
+        assert_eq!(observe(label, &tree.join("pkg/input")), (original, true));
+        assert_eq!(observe(label, &tree.join("other")), (original, false));
+        assert!(!observe("@absent//pkg:input", &file).1);
+        // The normal hasher did not read an unenrolled apparent spelling under this projection.
+        assert!(!observe("@alias//pkg:input", &file).1);
+        fs::write(&file, "second").unwrap();
+        let (changed, observed) = observe(label, &file);
+        assert!(observed);
+        assert_ne!(changed, original);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        let (executable, observed) = observe(label, &file);
+        assert!(observed);
+        assert_ne!(executable, changed);
+        let opened = File::open(&file).unwrap();
+        let before = opened.metadata().unwrap();
+        fs::rename(&file, tree.join("saved")).unwrap();
+        fs::write(&file, "second").unwrap();
+        assert!(!hasher.observed_external_file(
+            label,
+            file.to_str().unwrap(),
+            &file,
+            &opened,
+            Some(&before)
+        ));
+        symlink("pkg", mount.join("indirect")).unwrap();
+        assert!(
+            !observe(
+                "@@module++extension+repo//indirect:input",
+                &mount.join("indirect/input")
+            )
+            .1
+        );
+        fs::remove_file(&file).unwrap();
+        symlink("../saved", &file).unwrap();
+        assert!(!observe(label, &file).1);
+        fs::remove_file(&file).unwrap();
+        assert!(!observe(label, &file).1);
+        fs::create_dir(&file).unwrap();
+        assert!(!observe(label, &file).1);
     }
 
     #[test]

@@ -1,0 +1,13 @@
+exports_files(["defs.bzl", "left.txt", "right.txt"])
+
+config_setting(name = "alternate", values = {"define": "alternate=true"}, visibility = ["//visibility:public"])
+
+filegroup(name = "uses_bridge", srcs = ["@bridge//:lib"])
+filegroup(name = "unrelated", srcs = ["left.txt"])
+
+genrule(
+    name = "product",
+    srcs = [":uses_bridge"],
+    outs = ["product.txt"],
+    cmd = "cat $(SRCS) > $@",
+)

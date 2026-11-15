@@ -68,6 +68,149 @@ See https://github.com/aspect-extensions/impacted
 
 * We run `bazel-diff` on the starting and final JSON hash filepaths to get our impacted set of targets. This impacted set of targets is written to a file.
 
+## Possible toolchain readers
+
+For ordinary queries, pass `--includeToolchainInputs` to a fresh `generate-hashes` at both revisions and request `--depEdgesFile` at the final revision. The hash file records the native toolchain declarations the query returned. Shallow metadata reads recover their implementation and type attributes and follow literal type aliases already in the query result. Partial derivation cannot establish these supplemental observations and omits the index. The head file also preserves references to those types before external inputs are mapped to repository nodes.
+
+Pass the head edge file and `--toolchainCandidatesFile=possible.json` to `get-impacted-targets`. Its usual impact output retains its existing format. The additional file lists `possibleTypes`, `possibleReaders`, and unresolved observations. A type belongs in the result when its observed declaration bindings or the associated hashes differ or cannot be compared. A change to the recorded module graph also makes the observed types possible. A reader can reference a type as ordinary data, and its configured build may stay unchanged.
+
+These observations supplement an existing selection. The file reports `complete: false` even when `unresolved` is empty. Bazel versions differ in which implicit type dependencies they emit, and a registration priority change can switch the selected compiler while every observed target hash stays equal. Absence from this file cannot exclude a job.
+
+## Configured Root Hashing
+
+`--useCquery` normally combines every configured instance of a label into one
+hash. This can select a stable requested target when another root
+uses the same label with a different compiler or `select()` result.
+
+Use `--cqueryRootExpression` to report the instances Bazel selects for the
+requested roots:
+
+```bash
+bazel-diff generate-hashes -w /path/to/workspace -b bazel --useCquery \
+  --cqueryRootExpression='set(//app:test //lib:test)' \
+  --depEdgesFile deps.json final_hashes.json
+```
+
+Bazel resolves `config((expression), target)` separately at each revision;
+`bazel-diff` hashes their dependencies together. Root sets and fine repository
+lists may differ as targets and repositories appear or disappear. Keep different
+build or test profiles in separate comparisons, using their corresponding
+`--cqueryCommandOptions`. If Bazel returns distinct targets with the same label
+and configuration checksum, generation fails. This can happen when toolchain
+resolution forces the same implementation onto different execution platforms.
+
+For a large expression, use `--cqueryRootExpressionFile roots.query`. Its UTF-8
+contents feed the same query and cache identity as the inline form. The file
+form keeps the expression out of the process argument list; a literal
+`--universe_scope` still uses that list, so omit it only when Bazel's inferred
+universe describes the intended profile. Both root options require
+`--useCquery` and conflict with `--cqueryExpression` and each other.
+
+The hash JSON contains only resolved bare root labels in `hashes`.
+`metadata.configuredRoots` version 2 stores the mapping from roots to instances
+and configured hashes; the usual flat edge file retains configured dependencies.
+Native impact results remain bare root labels, while distance and `explain`
+walks retain configured causes. Direct JSON consumers need the configured
+metadata and edge file to calculate distances. The edge file keeps its existing
+trusted companion contract. Native commands reject comparisons between legacy
+and configured root hashes.
+
+A verified empty selection produces an empty root artifact. Unresolved root
+identities and ambiguous bare keys fail generation. `bazel-diff` controls the
+cquery serialization needed for this model; other query filters still apply.
+Partial graph mode remains incompatible with cquery.
+
+### Verified Configured Roots
+
+Add `--verifyConfiguredRoots` to both rooted generations when a caller needs to
+distinguish a verified stable configured input graph from an unknown result:
+
+```bash
+bazel-diff generate-hashes -w /path/to/base -b bazel --useCquery \
+  --cqueryRootExpressionFile roots.query --verifyConfiguredRoots \
+  --includeTargetType base_hashes.json
+bazel-diff generate-hashes -w /path/to/head -b bazel --useCquery \
+  --cqueryRootExpressionFile roots.query --verifyConfiguredRoots \
+  --includeTargetType --depEdgesFile deps.json final_hashes.json
+```
+
+This opt-in mode keeps the normal configured hashes and dependency edges. It
+also runs a fresh cquery with the same workspace, startup options and cquery
+options. The verification view enables `implicit_deps`, `tool_deps`,
+`nodep_deps`, and `include_aspects` so a filtered dependency cannot be mistaken
+for an absent one. It requests the full attributes and typed explicit aspect
+serialization needed to check coverage. These extra edges establish coverage;
+they do not become positive impact paths.
+
+Verification requires a Bazel producer with typed explicit aspect output, such
+as [Bazel #32496](https://github.com/bazelbuild/bazel/pull/32496). Its completion
+marker can establish that the requested view contains no aspects; streamed output
+must end with the separate marker frame. Older output still requires an actual
+typed aspect record, which may be independent of a supported root. Verification
+also requires a successful query: partial or failed output leaves the normal
+hashes available without negative authority, even when it contains a marker.
+
+The initial supported roots are in the main repository and reach no aspect
+application. Each prerequisite in the full view must match the exact input used by
+the normal hash. A source qualifies only when that hash read a real regular file
+in the main workspace at the location Bazel returned. Missing files, directories,
+internal symlinks and external source views remain unknown. Package features and
+SourceFile rows for BUILD files with loads also remain unknown. The verifier
+separately binds the rule class and BUILD filename. A BUILD rename cannot be
+certified stable when the normal hash stays equal.
+
+`metadata.configuredRoots.verifiedRoots` maps covered endpoint roots to opaque
+context digests. The comparator uses these with the normal hashes, full configured
+root identities, and successful usable module snapshots. Historical files have no
+such authority. This mode requires fresh physical hashes and rejects partial/base
+reuse, overrides for content or modified files, ignored attributes, and target
+exclusions. It is available only on `generate-hashes`.
+
+Use the same worker for both captures and each revision's actual workspace and
+build configuration, including consistent repository options for
+supplementary commands. This verification covers the reported configured inputs;
+caller policy must still account for inputs outside that graph, such as
+workspace status action artifacts. A context difference withholds a stable verdict
+and does not claim a measured direct edit.
+
+## Impact Graph Output
+
+Use `--reportImpactGraph` when a caller applies its own policy to dependency
+paths. Supply the same head dependency file used for native distance output:
+
+```bash
+bazel-diff get-impacted-targets -w /path/to/workspace -b bazel \
+  -sh base_hashes.json -fh final_hashes.json --depEdgesFile deps.json \
+  --reportImpactGraph -o impact_graph.json
+```
+
+The version 1 JSON contains `targets`, the eligible labels and their target and
+package distances, and `paths`, the native changed graph for those outputs.
+Each path contains `kind`, `changed`, `direct`, and `roots`. The changed and
+direct values are keys in the supplied head dependency file; `roots` maps each
+public output label to its graph key. Intermediate nodes remain available when
+`--targetType` filters the outputs. Apply a path policy to this adjacency so a
+longer allowed path remains available.
+
+`unaffectedRoots` contains only roots whose covered inputs and context are equal
+in both verified captures for this configuration, with no positive or MODULE
+obligation. An absent label is unknown. A caller may remove an ordinary or
+independent candidate only when that label appears here for the job's own
+configuration; candidates in other profiles remain eligible.
+
+`ordinary` and `configured` paths use the corresponding hash graph. `shared`
+paths use direct changes on configured instances present in both files;
+they can select a root first requested at the head without treating enrollment as
+a change. An omitted head-only root remains unknown, so callers must retain any
+ordinary or independent nomination for it. Keep each build profile's comparison
+and dependency file together.
+
+`forced` paths are independent MODULE obligations. Each contains one root at
+distance zero and must be handled independently of the supplied adjacency. A
+root can also have an ordinary or configured path. For those path kinds, `direct`
+records the origins used by native distance calculation, including its existing
+distance-zero fallback for an incomplete dependency file.
+
 ## Partial Graph Updates
 
 A full `generate-hashes` pays for a `bazel query` over the whole graph even when the change
@@ -89,9 +232,10 @@ skips that query when it can:
   the content of regular files -- no `bazel query`, no Bazel at all. Anything else falls back to a
   full generation: an added, deleted, renamed or type-changed path; a symlink or submodule on
   either side; a change to a file Bazel reads while loading (`BUILD`, `BUILD.bazel`, `*.bzl`,
-  `*.scl`, `MODULE.bazel`, `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`, `VENDOR.bazel`,
-  `*bazelrc`, `.bazelversion`, `.bazelignore`, `.bazeliskrc`, `tools/bazel`, `*.BUILD`,
-  `BUILD.*`, `*.patch`, `*.diff`); a file `MODULE.bazel` or a `WORKSPACE` file names by label;
+  `*.scl`, `MODULE.bazel`, the `*.MODULE.bazel` segments it can include, `MODULE.bazel.lock`,
+  `WORKSPACE*`, `REPO.bazel`, `VENDOR.bazel`, `*bazelrc`, `.bazelversion`, `.bazelignore`,
+  `.bazeliskrc`, `tools/bazel`, `*.BUILD`, `BUILD.*`, `*.patch`, `*.diff`); a file one of
+  those module files or a `WORKSPACE` file names by label;
   anything a repository rule read from the workspace while the graph was generated; a
   `--seed-filepaths` file; a path matching `--partialGraphRebuildPattern` (a glob: `*` within a
   path segment, `**` across, a pattern without `/` matches the file name; repeatable); or a base
@@ -105,11 +249,13 @@ skips that query when it can:
   cannot feed `--depEdgesFile` and forces a full generation.
 * Hashes under the flag follow a slightly different formula from the default mode's, so
   `get-impacted-targets` and `explain` refuse a pair of files of which only one carries recipes.
-  Not supported together with `--useCquery`, `--fineGrainedHashExternalRepos`,
-  `--alwaysAffectedTags`, `--contentHashPath`, `--modified-filepaths` or `--targetType` (a file
-  missing targets cannot be derived from; filter in `get-impacted-targets` instead): a derivation
-  reads only the git tree and keys recipes by bare label. The workspace must be the repository
-  root, and `--gitPath` names the git binary (default `git`).
+  Not supported together with `--useCquery`, `--alwaysAffectedTags`, `--contentHashPath`,
+  `--modified-filepaths` or `--targetType` (a file missing targets cannot be derived from;
+  filter in `get-impacted-targets` instead): a derivation reads only the git tree and keys
+  recipes by bare label. With `--fineGrainedHashExternalRepos`, the digests of those
+  repositories' source files are recorded with the recipes and reused by a derivation, since
+  any change that could alter them forces a full generation. The workspace must be the
+  repository root, and `--gitPath` names the git binary (default `git`).
 
 A typical CI job hashes the merge base once on the main branch and keeps the file; a pull
 request run then needs no Bazel for the common case of a source-only change:
@@ -279,7 +425,9 @@ Endpoints:
   balancer should use this to route only to ready instances. If a fatal git error occurs at startup
   the instance "lame-ducks" itself by continuing to report `503` so the load balancer removes it.
 * `GET /impacted_targets?from=<rev>&to=<rev>` — returns the impacted targets as JSON. The optional
-  `targetType` parameter (e.g. `&targetType=Rule,SourceFile`) filters by target type.
+  `targetType` parameter (e.g. `&targetType=Rule,SourceFile`) filters by target type. On a server
+  that serves several repositories, `repo=<name>` names the one to query (see [Serving several
+  repositories](#serving-several-repositories)).
 
 ```bash
 curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
@@ -359,7 +507,9 @@ curl 'http://localhost:8080/dependency_edges?from=main&to=my-feature-branch'
   the queries accepted and not yet finished (queued, running, or abandoned by a client that stopped
   waiting), and `workspaceBusy` is `true` while any operation holds `--workspacePath` (a query's
   checkout and `bazel query`, or a startup warmup). A tool that shares the checkout with the server
-  should wait for `workspaceBusy` to be `false` before touching it.
+  should wait for `workspaceBusy` to be `false` before touching it. `repositories` breaks the
+  per-workspace figures down by repository (see [Serving several
+  repositories](#serving-several-repositories)).
 
 ```bash
 curl 'http://localhost:8080/metrics'
@@ -374,10 +524,48 @@ curl 'http://localhost:8080/metrics'
   "workspaceBusy": true,
   "gitEngine": "subprocess",
   "trackDeps": false,
+  "repositories": {"default": {"workspace": "/path/to/workspace-clone", "ready": true, "activeQueries": 1, "workspaceBusy": true, "partialGraph": {"derived": 0, "fullGenerations": 0}, "untrackedPackages": {"rejections": 0}}},
   "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB", "memory": {"entries": 2, "sizeBytes": 75374, "maxBytes": 536870912}},
   "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
 }
 ```
+
+### Serving several repositories
+
+One instance can answer for several git clones. `bazel-diff serve-multi` takes every `serve`
+flag except `--workspacePath`, which `--repo NAME=PATH` (repeatable) replaces, and a request
+addresses one repository with `repo=NAME`: a query-string parameter on `GET` and `POST`, or a
+`repo` field in the `POST` body, which wins over the query string.
+
+```bash
+bazel-diff serve-multi \
+  --repo app=/clones/app \
+  --repo lib=/clones/lib \
+  --cacheDir /var/cache/bazel-diff \
+  --port 8080
+
+curl 'http://localhost:8080/impacted_targets?repo=lib&from=main&to=my-feature-branch'
+```
+
+* Every repository shares the hashing flags (`--bazelPath`, `--bazelStartupOptions`,
+  `--trackDeps`, `--partialGraph`, ...), the cache (local disk, memory and the shared tier) and
+  the port. A cache entry is keyed by the git tree and the hashing configuration, never by the
+  clone it came from, so two clones that hold the same tree share one entry, and the cache a
+  single-repository instance built stays valid.
+* Each repository has its own working tree, git, Bazel server, workspace lock and readiness, so
+  queries against different repositories run concurrently, while queries against the same
+  repository are serialised as before. Size the instance for that many Bazel servers at once.
+* A request that names no `repo` is answered when the server serves exactly one repository and
+  refused with `400` otherwise; an unknown name is `404`. Either error lists the repositories
+  served. `serve` serves its one `--workspacePath` repository under the name `default`.
+* `--warmupRevision` warms every repository; a revision one clone lacks logs a warning for that
+  repository and does not stop the others.
+* `/health` reports `200` only once every repository's initial fetch succeeded, so a load
+  balancer never routes to an instance that can answer for some of its repositories but not
+  all. `/metrics` reports each repository under `repositories` with its own `ready`,
+  `activeQueries`, `workspaceBusy` and partial-graph counts, while the top-level fields
+  aggregate over all of them (`activeQueries` summed, `workspaceBusy` when any workspace is
+  held).
 
 ### Shared S3 cache for multi-instance deployments
 
@@ -404,6 +592,13 @@ through the standard AWS default provider chains (environment variables, profile
 identity on EKS, IMDS), or pin the region with `--s3Region`. `--s3Endpoint` plus
 `--s3ForcePathStyle` point the client at an S3-compatible store (MinIO, LocalStack) for local
 testing.
+
+S3-compatible stores that serve STS themselves (MinIO, SeaweedFS) can take a web identity token
+too, such as a Kubernetes ServiceAccount token. Set `--s3StsEndpoint` (or `AWS_ENDPOINT_URL_STS`)
+along with `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`, and `serve` sends
+`AssumeRoleWithWebIdentity` to that endpoint instead of `sts.amazonaws.com`. It renews the session
+five minutes before it expires, re-reading the token file each time, since kubelet rotates
+projected tokens. `AWS_ROLE_SESSION_NAME` names the session (default `bazel-diff`).
 
 S3 errors never fail a request: a failed read is treated as a cache miss (the revision is
 regenerated — slower, but correct) and a failed write leaves the entry local-only, so an S3 outage
@@ -506,7 +701,9 @@ Notes and operational guidance:
   the revision's git tree (packages below a tracked symlink or a submodule are not checked);
   otherwise the request fails, the error names the packages, and nothing is cached.
   `--allowUntrackedPackages` turns that into a warning for workspaces that generate `BUILD` files
-  outside git. `/metrics` counts rejections under `untrackedPackages`.
+  outside git. Use `--allowUntrackedPackages=//generated,//other` to allow only those exact
+  packages; other untracked packages still cause a rejection. `/metrics` counts rejections under
+  `untrackedPackages`.
 
 * Dependency fingerprinting (`--dependencyFingerprint`) is opt-in. When enabled, every generated
   cache entry records a fingerprint of the workspace's external-dependency state (the bzlmod module
@@ -529,10 +726,11 @@ Notes and operational guidance:
   -- when `git diff` between the two only modifies the content of regular files. Anything else
   falls back to a full generation: an added, deleted, renamed or type-changed path; a symlink or
   submodule on either side; a change to a file Bazel reads while loading (`BUILD`, `BUILD.bazel`,
-  `*.bzl`, `*.scl`, `MODULE.bazel`, `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`,
-  `VENDOR.bazel`, `*bazelrc`, `.bazelversion`, `.bazelignore`, `.bazeliskrc`, `tools/bazel`,
-  `*.BUILD`, `BUILD.*`, `*.patch`, `*.diff`); a file `MODULE.bazel` or a `WORKSPACE` file names
-  by label (a requirements or lock file a module extension reads); anything a repository rule
+  `*.bzl`, `*.scl`, `MODULE.bazel`, the `*.MODULE.bazel` segments it can include,
+  `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`, `VENDOR.bazel`, `*bazelrc`, `.bazelversion`,
+  `.bazelignore`, `.bazeliskrc`, `tools/bazel`, `*.BUILD`, `BUILD.*`, `*.patch`, `*.diff`); a
+  file one of those module files or a `WORKSPACE` file names by label (a requirements or lock
+  file a module extension reads); anything a repository rule
   read from the workspace while the graph was generated (the root of a `local_repository` or
   `local_path_override`, the files its attributes name, and the files Bazel's repository marker
   files record as read), which every entry records; a `--seed-filepaths` file; or
@@ -547,8 +745,8 @@ Notes and operational guidance:
   produced (`generation.mode` is `derived` or `full`, with `partialFallbackReason`, `changedSources`,
   `unmatchedPaths`, `classifyMillis` and `deriveMillis`), `/metrics` counts both under
   `partialGraph`, and the server log says which path each generation took. Not supported together
-  with `--useCquery`, `--fineGrainedHashExternalRepos` or `--alwaysAffectedTags` (the server
-  refuses to start): a derivation reads only the git tree and keys recipes by bare label. The
+  with `--useCquery` or `--alwaysAffectedTags` (the server refuses to start): a derivation reads
+  only the git tree and the recorded external source digests, and keys recipes by bare label. The
   nightly [`partial-graph-bench`](.github/workflows/partial-graph-bench.yml) workflow checks the
   mode's speed and its exact agreement with the default mode (see `tools/perf/README.md`). The
   one-shot `generate-hashes --partialGraph` writes the same entries (see [Partial Graph
@@ -618,6 +816,7 @@ Commands:
   warmup                Warm Bazel and write snapshot hashes and fingerprint metadata
   fingerprint           Compute the snapshot/cache fingerprint for the current workspace
   serve                 Run the HTTP impacted-target query service
+  serve-multi           Run the HTTP impacted-target query service for several repositories at once
   help                  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -656,11 +855,15 @@ Options:
       --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
           
       --labelOnlyModuleExtensions <LABEL_ONLY_MODULE_EXTENSIONS>
-          Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories use each other only through labels, never by resolving a toolchain from one another. A fine-grained target in one of their repositories then does not change whenever any other repository of the extension does
+          Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories are used only through labels, never by resolving a toolchain from one of them. The module that owns such an extension then does not stand in for its repositories, so a lockfile bump impacts only the targets that depend on the bumped repository
       --isolatedDependencyRoot <ISOLATED_DEPENDENCY_ROOT>
           Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
+      --cqueryRootExpression <CQUERY_ROOT_EXPRESSION>
+          Hash and report the configured top-level targets in this expression
+      --cqueryRootExpressionFile <CQUERY_ROOT_EXPRESSION_FILE>
+          Read the configured root expression from this file
       --cqueryExpression <CQUERY_EXPRESSION>
           
   -k, --keep_going[=<KEEP_GOING>]
@@ -684,13 +887,17 @@ Options:
   -m, --modified-filepaths <MODIFIED_FILEPATHS>
           
       --partialGraph[=<PARTIAL_GRAPH>]
-          Opt-in: hash the workspace's git tree (the working tree as it is, committed or not) and record every rule's hashing recipe, so a later run can derive a revision's hashes from this file with --baseHashes and no `bazel query` when the diff between the two only edits regular source files. The file always includes target types. Incompatible with --useCquery, --fineGrainedHashExternalRepos, --alwaysAffectedTags, --contentHashPath, --modified-filepaths and --targetType [default: false] [possible values: true, false]
+          Opt-in: hash the workspace's git tree (the working tree as it is, committed or not) and record every rule's hashing recipe, so a later run can derive a revision's hashes from this file with --baseHashes and no `bazel query` when the diff between the two only edits regular source files. The file always includes target types. Incompatible with --useCquery, --alwaysAffectedTags, --contentHashPath, --modified-filepaths and --targetType [default: false] [possible values: true, false]
       --partialGraphRebuildPattern <PARTIAL_GRAPH_REBUILD_PATTERNS>
           Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file name) of workspace paths whose change always forces a full generation under --partialGraph
       --baseHashes <BASE_HASHES>
           A hash file written with --partialGraph to derive this revision's hashes from, when the diff between its tree and the workspace's allows it; otherwise a full generation runs
       --gitPath <GIT_PATH>
           Path to the git executable --partialGraph reads the workspace's tree with [default: git]
+      --includeToolchainInputs
+          Preserve observed native declaration bindings and, with -d, ordinary type references
+      --verifyConfiguredRoots
+          Verify configured hash input coverage using a fresh full dependency query
   -h, --help
           Print help
   -V, --version
@@ -702,7 +909,7 @@ Options:
 ```terminal
 Compare two hash files and report impacted targets
 
-Usage: bazel-diff get-impacted-targets [OPTIONS] --startingHashes <STARTING_HASHES> --finalHashes <FINAL_HASHES> --workspacePath <WORKSPACE_PATH>
+Usage: bazel-diff get-impacted-targets [OPTIONS] --startingHashes <STARTING_HASHES> --finalHashes <FINAL_HASHES>
 
 Options:
       --startingHashes <STARTING_HASHES>
@@ -713,12 +920,14 @@ Options:
           
   -d, --depEdgesFile <DEP_EDGES_FILE>
           
+      --reportImpactGraph
+          Include the native changed graph and origins for downstream path policies
       --targetType <TARGET_TYPE>
           
   -o, --output <OUTPUT>
           
   -w, --workspacePath <WORKSPACE_PATH>
-          
+          Directory from which to run Bazel queries; defaults to the current directory [default: .]
   -b, --bazelPath <BAZEL_PATH>
           [default: bazel]
       --bazelStartupOptions <BAZEL_STARTUP_OPTIONS>
@@ -727,6 +936,8 @@ Options:
           [default: false] [possible values: true, false]
       --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
           [possible values: true, false]
+      --toolchainCandidatesFile <TOOLCHAIN_CANDIDATES_FILE>
+          Write positive toolchain reader observations. Absence cannot exclude a scheduled target
   -h, --help
           Print help
   -V, --version
@@ -814,11 +1025,15 @@ Options:
       --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
           
       --labelOnlyModuleExtensions <LABEL_ONLY_MODULE_EXTENSIONS>
-          Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories use each other only through labels, never by resolving a toolchain from one another. A fine-grained target in one of their repositories then does not change whenever any other repository of the extension does
+          Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories are used only through labels, never by resolving a toolchain from one of them. The module that owns such an extension then does not stand in for its repositories, so a lockfile bump impacts only the targets that depend on the bumped repository
       --isolatedDependencyRoot <ISOLATED_DEPENDENCY_ROOT>
           Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
       --useCquery[=<USE_CQUERY>]
           [default: false] [possible values: true, false]
+      --cqueryRootExpression <CQUERY_ROOT_EXPRESSION>
+          Hash and report the configured top-level targets in this expression
+      --cqueryRootExpressionFile <CQUERY_ROOT_EXPRESSION_FILE>
+          Read the configured root expression from this file
       --cqueryExpression <CQUERY_EXPRESSION>
           
   -k, --keep_going[=<KEEP_GOING>]
@@ -837,6 +1052,8 @@ Options:
           [default: 8080]
       --requestTimeout <REQUEST_TIMEOUT>
           [default: 0]
+      --computeSlotDemandAvgWindow <COMPUTE_SLOT_DEMAND_AVG_WINDOW>
+          Enable Prometheus workspace demand tracking with this rolling window (e.g. 5s)
       --cacheDir <CACHE_DIR>
           
       --trackDeps[=<TRACK_DEPS>]
@@ -844,11 +1061,11 @@ Options:
       --dependencyFingerprint[=<DEPENDENCY_FINGERPRINT>]
           Opt-in: only serve cached entries whose external-dependency fingerprint still matches [default: false] [possible values: true, false]
       --partialGraph[=<PARTIAL_GRAPH>]
-          Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query` when the diff between them only edits regular source files; every entry then also records the hashing recipes that makes possible. Incompatible with --useCquery, --fineGrainedHashExternalRepos and --alwaysAffectedTags [default: false] [possible values: true, false]
+          Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query` when the diff between them only edits regular source files; every entry then also records the hashing recipes that makes possible. Incompatible with --useCquery and --alwaysAffectedTags [default: false] [possible values: true, false]
       --partialGraphRebuildPattern <PARTIAL_GRAPH_REBUILD_PATTERNS>
           Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file name) of workspace paths whose change always forces a full generation under --partialGraph
-      --allowUntrackedPackages
-          Cache a revision whose bazel query loaded packages its git tree does not contain (untracked or ignored BUILD files in the working tree) instead of failing the request
+      --allowUntrackedPackages[=<ALLOW_UNTRACKED_PACKAGES>]
+          Allow all untracked packages, or only the comma-separated package labels provided
       --no-initial-fetch
           
       --warmupRevision <WARMUP_REVISIONS>
@@ -873,6 +1090,122 @@ Options:
           
       --s3ForcePathStyle
           
+      --s3StsEndpoint <S3_STS_ENDPOINT>
+          STS endpoint where AWS_WEB_IDENTITY_TOKEN_FILE is exchanged for AWS_ROLE_ARN's credentials (MinIO, SeaweedFS) [env: AWS_ENDPOINT_URL_STS=]
+      --gcsBucket <GCS_BUCKET>
+          Google Cloud Storage bucket used as the shared cache tier (Application Default Credentials)
+      --gcsPrefix <GCS_PREFIX>
+          Object-name prefix for cache entries in --gcsBucket [default: ""]
+      --nexusUrl <NEXUS_URL>
+          Base URL of a Sonatype Nexus Repository instance used as the shared cache tier
+      --nexusRepository <NEXUS_REPOSITORY>
+          Raw hosted repository on --nexusUrl that holds cache entries
+      --nexusPrefix <NEXUS_PREFIX>
+          [default: ""]
+      --nexusUsername <NEXUS_USERNAME>
+          Basic-auth user; the password is read from the BAZEL_DIFF_NEXUS_PASSWORD environment variable [env: BAZEL_DIFF_NEXUS_USERNAME=]
+      --nexusCaCert <NEXUS_CA_CERT>
+          PEM bundle of extra CA certificates to trust for --nexusUrl
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
+
+### `serve-multi` command
+
+```terminal
+Run the HTTP impacted-target query service for several repositories at once
+
+Usage: bazel-diff serve-multi [OPTIONS] --repo <NAME=PATH> --cacheDir <CACHE_DIR>
+
+Options:
+      --repo <NAME=PATH>
+          A repository to serve, as NAME=PATH (repeatable). Queries address one with `repo=NAME`. Every repository shares the hashing flags, the cache and the port
+  -v, --verbose
+          
+  -b, --bazelPath <BAZEL_PATH>
+          Path to the Bazel or Bazelisk executable [default: bazel]
+  -s, --seed-filepaths <SEED_FILEPATHS>
+          File containing workspace-relative paths whose contents seed every target hash
+      --bazelStartupOptions <BAZEL_STARTUP_OPTIONS>
+          Additional space-separated Bazel startup options
+      --bazelCommandOptions <BAZEL_COMMAND_OPTIONS>
+          Additional space-separated `bazel query` options
+      --cqueryCommandOptions <CQUERY_COMMAND_OPTIONS>
+          Additional space-separated `bazel cquery` options
+      --fineGrainedHashExternalRepos <FINE_GRAINED_HASH_EXTERNAL_REPOS>
+          
+      --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
+          
+      --labelOnlyModuleExtensions <LABEL_ONLY_MODULE_EXTENSIONS>
+          Module extensions (`@rules_rs//rs:extensions.bzl%crate`) whose repositories are used only through labels, never by resolving a toolchain from one of them. The module that owns such an extension then does not stand in for its repositories, so a lockfile bump impacts only the targets that depend on the bumped repository
+      --isolatedDependencyRoot <ISOLATED_DEPENDENCY_ROOT>
+          Assert that consumers outside this root-isolated usage reach it through ordinary target inputs or BUILD loads. The named root import must cover every generated repository. Keep the whole usage on each such consumer
+      --useCquery[=<USE_CQUERY>]
+          [default: false] [possible values: true, false]
+      --cqueryRootExpression <CQUERY_ROOT_EXPRESSION>
+          Hash and report the configured top-level targets in this expression
+      --cqueryRootExpressionFile <CQUERY_ROOT_EXPRESSION_FILE>
+          Read the configured root expression from this file
+      --cqueryExpression <CQUERY_EXPRESSION>
+          
+  -k, --keep_going[=<KEEP_GOING>]
+          [default: false] [possible values: true, false]
+      --ignoredRuleHashingAttributes <IGNORED_RULE_HASHING_ATTRIBUTES>
+          
+      --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
+          [default: false] [possible values: true, false]
+      --excludeTargetsQuery <EXCLUDE_TARGETS_QUERY>
+          
+      --alwaysAffectedTags <ALWAYS_AFFECTED_TAGS>
+          
+      --gitPath <GIT_PATH>
+          [default: git]
+      --port <PORT>
+          [default: 8080]
+      --requestTimeout <REQUEST_TIMEOUT>
+          [default: 0]
+      --computeSlotDemandAvgWindow <COMPUTE_SLOT_DEMAND_AVG_WINDOW>
+          Enable Prometheus workspace demand tracking with this rolling window (e.g. 5s)
+      --cacheDir <CACHE_DIR>
+          
+      --trackDeps[=<TRACK_DEPS>]
+          [default: false] [possible values: true, false]
+      --dependencyFingerprint[=<DEPENDENCY_FINGERPRINT>]
+          Opt-in: only serve cached entries whose external-dependency fingerprint still matches [default: false] [possible values: true, false]
+      --partialGraph[=<PARTIAL_GRAPH>]
+          Opt-in: derive a revision's hashes from the cached `from` entry without a `bazel query` when the diff between them only edits regular source files; every entry then also records the hashing recipes that makes possible. Incompatible with --useCquery and --alwaysAffectedTags [default: false] [possible values: true, false]
+      --partialGraphRebuildPattern <PARTIAL_GRAPH_REBUILD_PATTERNS>
+          Glob (`*` within a path segment, `**` across, a pattern without `/` matches the file name) of workspace paths whose change always forces a full generation under --partialGraph
+      --allowUntrackedPackages[=<ALLOW_UNTRACKED_PACKAGES>]
+          Allow all untracked packages, or only the comma-separated package labels provided
+      --no-initial-fetch
+          
+      --warmupRevision <WARMUP_REVISIONS>
+          
+      --cacheMaxAge <CACHE_MAX_AGE>
+          
+      --cacheMaxEntries <CACHE_MAX_ENTRIES>
+          
+      --cacheMaxSize <CACHE_MAX_SIZE>
+          
+      --cachePruneInterval <CACHE_PRUNE_INTERVAL>
+          [default: 1h]
+      --cacheMemoryMax <CACHE_MEMORY_MAX>
+          [default: 512MB]
+      --s3Bucket <S3_BUCKET>
+          
+      --s3Prefix <S3_PREFIX>
+          [default: ""]
+      --s3Region <S3_REGION>
+          
+      --s3Endpoint <S3_ENDPOINT>
+          
+      --s3ForcePathStyle
+          
+      --s3StsEndpoint <S3_STS_ENDPOINT>
+          STS endpoint where AWS_WEB_IDENTITY_TOKEN_FILE is exchanged for AWS_ROLE_ARN's credentials (MinIO, SeaweedFS) [env: AWS_ENDPOINT_URL_STS=]
       --gcsBucket <GCS_BUCKET>
           Google Cloud Storage bucket used as the shared cache tier (Application Default Credentials)
       --gcsPrefix <GCS_PREFIX>
@@ -906,6 +1239,28 @@ A few inputs are normalized or extended on the way in:
 
 * A source label that names a **directory** hashes the whole tree (entry names, kinds, file
   contents and executable bits, symlink targets), so an edit inside it impacts its consumers.
+* Outside `--isolatedDependencyRoot`, ordinary query checks native aliases in repositories named
+  by `--fineGrainedHashExternalRepos` or `--fineGrainedHashExternalReposFile` when returned inputs
+  reach them. On Bazel 8 and later, a metadata query identifies missing `actual` targets and a
+  dependency query adds their dependencies and build files. A literal binding on a reached fine
+  alias is followed through literal ordinary aliases already returned by the primary query until
+  the first missing destination.
+  A configurable ordinary alias already in the primary query contributes missing branches only
+  through the package inventory below. Each reached native alias hashes its evaluated `actual`
+  binding, including the destination for each `select()` condition. Acquired library rules also
+  hash the BUILD and Starlark files that define them.
+  When that dependency query returns rules from external packages, the same input walk also checks
+  reached ordinary aliases for missing `actual` targets in those packages. One query inventories
+  the matching packages; only the named targets and their dependencies returned by that inventory
+  enter the graph. Newly acquired aliases use the same binding hash, and inputs absent from the
+  inventory retain the existing repository fallback.
+  Earlier Bazel versions skip this alias acquisition. Full source hashing with these repository
+  options reads every returned regular external source file from Bazel's output base, including
+  files in the primary query. The same read applies when no alias query runs. Partial generation
+  records these digests for offline reuse. Source overrides use repository inputs for files
+  outside the named repositories.
+  A supplemental query failure stops strict generation. With `--keep_going`, generation reports
+  the failure and uses the primary target graph.
 * A **repository rule** (`//external:*`) that pins its download with `sha256` or `integrity` is
   hashed without its `url`/`urls`, since a mirror or registry move cannot change what it fetches.
   The main-repository files its attributes name -- patches, build files, lock files -- are hashed
@@ -914,13 +1269,16 @@ A few inputs are normalized or extended on the way in:
   in the workspace, a `file://%workspace%` registry URL) is hashed relative to the workspace, so
   identical checkouts at different paths hash the same.
   In query mode the module that owns a module extension stands in for every repository the
-  extension generates, because a toolchain resolved from one of them is not a query input. A
-  fine-grained target inside one of those repositories that uses a rule from the owning module
-  therefore changes whenever any repository of the extension does. Listing the extension in
-  `--labelOnlyModuleExtensions` (for example `@rules_rs//rs:extensions.bzl%crate`) asserts that
-  its repositories use each other only through labels, so such a target reaches the owning module
-  without them. Do not list an extension whose targets resolve a toolchain the same extension
-  generates: that change would be missed. An extension whose name another `.bzl` file of the same
+  extension generates, because a toolchain resolved from one of them is not a query input. Every
+  target that uses a rule of the owning module, every target of a module with a `bazel_dep` path
+  to it, and every fine-grained target inside one of those repositories therefore changes whenever
+  any repository of the extension does: a `go.mod` bump through gazelle's `go_deps` or a
+  `pnpm-lock.yaml` bump through rules_js's `npm` impacts most of the workspace. Listing the
+  extension in `--labelOnlyModuleExtensions` (for example
+  `@gazelle//:extensions.bzl%go_deps` or `@rules_rs//rs:extensions.bzl%crate`) asserts that its
+  repositories are used only through labels, which the query reports, so the owning module no
+  longer stands in for them. Do not list an extension that generates a toolchain, such as
+  `rules_go`'s `go_sdk`: a change to it would be missed. An extension whose name another `.bzl` file of the same
   module also exports is reported and ignored, since Bazel tells their repositories apart only by
   a numeric suffix.
   `--isolatedDependencyRoot=@crates` asserts that every outside consumer of this
@@ -947,6 +1305,11 @@ A few inputs are normalized or extended on the way in:
   a `--bazelPath` naming a batch file, or Bazelisk running a workspace's `tools/bazel.bat`
   wrapper -- so on Windows each invocation is given at most 6 KiB of names. Set
   `BAZEL_DIFF_MOD_ARGUMENT_BYTE_BUDGET` to a byte count to change that on any platform.
+* A rule's **Starlark instantiation stack** hashes the `.bzl` and `.scl` files that instantiated it.
+  Absolute workspace paths are normalized to workspace-relative names. During full physical source
+  hashing, a returned and resolved external Starlark source is matched by its path and hashed under
+  its repository label. This preserves macro changes when a `select()` keeps the same input labels
+  but changes their branches. Unknown paths outside the workspace remain ignored.
 * A **dependency cycle** in the query graph (which a build never sees, but which rules_go's
   `go_context_data` and nogo analyzers form through non-dependency attributes) no longer fails
   hashing. The back edge is hashed from the entered target's own definition, with a one-line
@@ -982,7 +1345,7 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "70.0.1")
+bazel_dep(name = "bazel-diff", version = "78.0.0")
 ```
 
 You can now run the tool with:
@@ -1039,64 +1402,70 @@ bazel run :bazel-diff --config=verbose -- --help
     <td align="center"><a href="https://github.com/tgeng"><img src="https://avatars.githubusercontent.com/u/29584386?s=64" width="64" alt="Tianyu Geng"/><br/><sub><b>Tianyu Geng</b></sub></a></td>
   </tr>
   <tr>
+    <td align="center"><a href="https://github.com/Spikhalskiy"><img src="https://avatars.githubusercontent.com/u/532108?s=64" width="64" alt="Dmitry Spikhalsky"/><br/><sub><b>Dmitry Spikhalsky</b></sub></a></td>
     <td align="center"><a href="https://github.com/BalestraPatrick"><img src="https://avatars.githubusercontent.com/u/3658887?s=64" width="64" alt="Patrick Balestra"/><br/><sub><b>Patrick Balestra</b></sub></a></td>
     <td align="center"><a href="https://github.com/purkhusid"><img src="https://avatars.githubusercontent.com/u/5622403?s=64" width="64" alt="Daniel P. Purkhus"/><br/><sub><b>Daniel P. Purkhus</b></sub></a></td>
-    <td align="center"><a href="https://github.com/Spikhalskiy"><img src="https://avatars.githubusercontent.com/u/532108?s=64" width="64" alt="Dmitry Spikhalsky"/><br/><sub><b>Dmitry Spikhalsky</b></sub></a></td>
     <td align="center"><a href="https://github.com/alexeagle"><img src="https://avatars.githubusercontent.com/u/47395?s=64" width="64" alt="Alex Eagle"/><br/><sub><b>Alex Eagle</b></sub></a></td>
     <td align="center"><a href="https://github.com/Malinskiy"><img src="https://avatars.githubusercontent.com/u/2089114?s=64" width="64" alt="Anton Malinskiy"/><br/><sub><b>Anton Malinskiy</b></sub></a></td>
     <td align="center"><a href="https://github.com/rdark"><img src="https://avatars.githubusercontent.com/u/260691?s=64" width="64" alt="rdark"/><br/><sub><b>rdark</b></sub></a></td>
   </tr>
   <tr>
+    <td align="center"><a href="https://github.com/lukasmi93"><img src="https://avatars.githubusercontent.com/u/194943870?s=64" width="64" alt="lukasmi93"/><br/><sub><b>lukasmi93</b></sub></a></td>
+    <td align="center"><a href="https://github.com/alexnovak"><img src="https://avatars.githubusercontent.com/u/7763722?s=64" width="64" alt="Alex Novak"/><br/><sub><b>Alex Novak</b></sub></a></td>
+    <td align="center"><a href="https://github.com/BarrettStephen"><img src="https://avatars.githubusercontent.com/u/9559818?s=64" width="64" alt="Stephen Barrett"/><br/><sub><b>Stephen Barrett</b></sub></a></td>
     <td align="center"><a href="https://github.com/ViggedalZenseact"><img src="https://avatars.githubusercontent.com/u/174004696?s=64" width="64" alt="ViggedalZenseact"/><br/><sub><b>ViggedalZenseact</b></sub></a></td>
     <td align="center"><a href="https://github.com/corypaik"><img src="https://avatars.githubusercontent.com/u/36490981?s=64" width="64" alt="Cory Paik"/><br/><sub><b>Cory Paik</b></sub></a></td>
     <td align="center"><sub><b>Ted Kaplan</b></sub></td>
+  </tr>
+  <tr>
     <td align="center"><a href="https://github.com/sharmila-oai"><img src="https://avatars.githubusercontent.com/u/257629015?s=64" width="64" alt="Sharmila"/><br/><sub><b>Sharmila</b></sub></a></td>
     <td align="center"><a href="https://github.com/dkostyrev"><img src="https://avatars.githubusercontent.com/u/183590?s=64" width="64" alt="Dmitrii Kostyrev"/><br/><sub><b>Dmitrii Kostyrev</b></sub></a></td>
     <td align="center"><a href="https://github.com/jmthvt"><img src="https://avatars.githubusercontent.com/u/1737199?s=64" width="64" alt="Jérémy Mathevet"/><br/><sub><b>Jérémy Mathevet</b></sub></a></td>
-  </tr>
-  <tr>
     <td align="center"><a href="https://github.com/nikhilbirmiwal"><img src="https://avatars.githubusercontent.com/u/65141192?s=64" width="64" alt="Nikhil Birmiwal"/><br/><sub><b>Nikhil Birmiwal</b></sub></a></td>
     <td align="center"><a href="https://github.com/morozov"><img src="https://avatars.githubusercontent.com/u/59683?s=64" width="64" alt="Sergei Morozov"/><br/><sub><b>Sergei Morozov</b></sub></a></td>
     <td align="center"><a href="https://github.com/fahhem"><img src="https://avatars.githubusercontent.com/u/306100?s=64" width="64" alt="Fahrzin Hemmati"/><br/><sub><b>Fahrzin Hemmati</b></sub></a></td>
-    <td align="center"><a href="https://github.com/JaimeLennox"><img src="https://avatars.githubusercontent.com/u/1424638?s=64" width="64" alt="Jaime Lennox"/><br/><sub><b>Jaime Lennox</b></sub></a></td>
-    <td align="center"><a href="https://github.com/ahewitson-ops"><img src="https://avatars.githubusercontent.com/u/285948060?s=64" width="64" alt="Andrew Hewitson"/><br/><sub><b>Andrew Hewitson</b></sub></a></td>
-    <td align="center"><a href="https://github.com/dzbarsky"><img src="https://avatars.githubusercontent.com/u/1565842?s=64" width="64" alt="David Zbarsky"/><br/><sub><b>David Zbarsky</b></sub></a></td>
   </tr>
   <tr>
+    <td align="center"><a href="https://github.com/JaimeLennox"><img src="https://avatars.githubusercontent.com/u/1424638?s=64" width="64" alt="Jaime Lennox"/><br/><sub><b>Jaime Lennox</b></sub></a></td>
+    <td align="center"><a href="https://github.com/bala-evani-ai"><img src="https://avatars.githubusercontent.com/u/241827517?s=64" width="64" alt="Balasubramanyam Evani"/><br/><sub><b>Balasubramanyam Evani</b></sub></a></td>
+    <td align="center"><a href="https://github.com/ekohlwey"><img src="https://avatars.githubusercontent.com/u/472537?s=64" width="64" alt="Ed Kohlwey"/><br/><sub><b>Ed Kohlwey</b></sub></a></td>
+    <td align="center"><a href="https://github.com/ahewitson-ops"><img src="https://avatars.githubusercontent.com/u/285948060?s=64" width="64" alt="Andrew Hewitson"/><br/><sub><b>Andrew Hewitson</b></sub></a></td>
+    <td align="center"><a href="https://github.com/dzbarsky"><img src="https://avatars.githubusercontent.com/u/1565842?s=64" width="64" alt="David Zbarsky"/><br/><sub><b>David Zbarsky</b></sub></a></td>
     <td align="center"><a href="https://github.com/q4rk"><img src="https://avatars.githubusercontent.com/u/214901060?s=64" width="64" alt="Eje Daniel"/><br/><sub><b>Eje Daniel</b></sub></a></td>
-    <td align="center"><a href="https://github.com/lukasmi93"><img src="https://avatars.githubusercontent.com/u/194943870?s=64" width="64" alt="lukasmi93"/><br/><sub><b>lukasmi93</b></sub></a></td>
+  </tr>
+  <tr>
     <td align="center"><a href="https://github.com/tinder-cwybranowski"><img src="https://avatars.githubusercontent.com/u/40372184?s=64" width="64" alt="Connor Wybranowski"/><br/><sub><b>Connor Wybranowski</b></sub></a></td>
     <td align="center"><a href="https://github.com/ihasdapie"><img src="https://avatars.githubusercontent.com/u/54821716?s=64" width="64" alt="Brian"/><br/><sub><b>Brian</b></sub></a></td>
     <td align="center"><a href="https://github.com/hazel-sudzilouski-ai"><img src="https://avatars.githubusercontent.com/u/291898786?s=64" width="64" alt="hazel-sudzilouski-ai"/><br/><sub><b>hazel-sudzilouski-ai</b></sub></a></td>
     <td align="center"><a href="https://github.com/csmoe"><img src="https://avatars.githubusercontent.com/u/35686186?s=64" width="64" alt="csmoe"/><br/><sub><b>csmoe</b></sub></a></td>
-  </tr>
-  <tr>
     <td align="center"><a href="https://github.com/SimonFoobar648"><img src="https://avatars.githubusercontent.com/u/245426116?s=64" width="64" alt="SimonFoobar648"/><br/><sub><b>SimonFoobar648</b></sub></a></td>
     <td align="center"><a href="https://github.com/dgollahon-plaid"><img src="https://avatars.githubusercontent.com/u/179647366?s=64" width="64" alt="dgollahon-plaid"/><br/><sub><b>dgollahon-plaid</b></sub></a></td>
+  </tr>
+  <tr>
     <td align="center"><a href="https://github.com/jmwachtel"><img src="https://avatars.githubusercontent.com/u/1046228?s=64" width="64" alt="jmwachtel"/><br/><sub><b>jmwachtel</b></sub></a></td>
     <td align="center"><a href="https://github.com/Ahajha"><img src="https://avatars.githubusercontent.com/u/44127594?s=64" width="64" alt="Alex Trotta"/><br/><sub><b>Alex Trotta</b></sub></a></td>
     <td align="center"><a href="https://github.com/nollbit"><img src="https://avatars.githubusercontent.com/u/99957?s=64" width="64" alt="Johan Mjönes"/><br/><sub><b>Johan Mjönes</b></sub></a></td>
     <td align="center"><a href="https://github.com/lucasteixeira-cb"><img src="https://avatars.githubusercontent.com/u/116316841?s=64" width="64" alt="Lucas Teixeira"/><br/><sub><b>Lucas Teixeira</b></sub></a></td>
-  </tr>
-  <tr>
     <td align="center"><a href="https://github.com/GuillaumeVW"><img src="https://avatars.githubusercontent.com/u/53425033?s=64" width="64" alt="Guillaume Van Wassenhove"/><br/><sub><b>Guillaume Van Wassenhove</b></sub></a></td>
     <td align="center"><a href="https://github.com/fmeum"><img src="https://avatars.githubusercontent.com/u/4312191?s=64" width="64" alt="Fabian Meumertzheim"/><br/><sub><b>Fabian Meumertzheim</b></sub></a></td>
+  </tr>
+  <tr>
     <td align="center"><a href="https://github.com/blockjon-dd"><img src="https://avatars.githubusercontent.com/u/117850895?s=64" width="64" alt="Jonathan Block"/><br/><sub><b>Jonathan Block</b></sub></a></td>
     <td align="center"><a href="https://github.com/alex-torok"><img src="https://avatars.githubusercontent.com/u/8749956?s=64" width="64" alt="Alex Torok"/><br/><sub><b>Alex Torok</b></sub></a></td>
     <td align="center"><a href="https://github.com/naveenOnarayanan"><img src="https://avatars.githubusercontent.com/u/3528131?s=64" width="64" alt="Naveen Narayanan"/><br/><sub><b>Naveen Narayanan</b></sub></a></td>
     <td align="center"><a href="https://github.com/OniOni"><img src="https://avatars.githubusercontent.com/u/385657?s=64" width="64" alt="Mathieu Sabourin"/><br/><sub><b>Mathieu Sabourin</b></sub></a></td>
-  </tr>
-  <tr>
     <td align="center"><a href="https://github.com/andre-alves"><img src="https://avatars.githubusercontent.com/u/7773955?s=64" width="64" alt="André"/><br/><sub><b>André</b></sub></a></td>
     <td align="center"><a href="https://github.com/bz-canva"><img src="https://avatars.githubusercontent.com/u/125319243?s=64" width="64" alt="Boris"/><br/><sub><b>Boris</b></sub></a></td>
+  </tr>
+  <tr>
     <td align="center"><a href="https://github.com/chenrui333"><img src="https://avatars.githubusercontent.com/u/1580956?s=64" width="64" alt="Rui Chen"/><br/><sub><b>Rui Chen</b></sub></a></td>
     <td align="center"><a href="https://github.com/sanju-naik"><img src="https://avatars.githubusercontent.com/u/66404008?s=64" width="64" alt="Sanju Naik"/><br/><sub><b>Sanju Naik</b></sub></a></td>
     <td align="center"><a href="https://github.com/lalten"><img src="https://avatars.githubusercontent.com/u/11611719?s=64" width="64" alt="Laurenz"/><br/><sub><b>Laurenz</b></sub></a></td>
     <td align="center"><a href="https://github.com/molar"><img src="https://avatars.githubusercontent.com/u/1433210?s=64" width="64" alt="mla"/><br/><sub><b>mla</b></sub></a></td>
-  </tr>
-  <tr>
     <td align="center"><a href="https://github.com/tinder-yukisawa"><img src="https://avatars.githubusercontent.com/u/54122444?s=64" width="64" alt="tinder-yukisawa"/><br/><sub><b>tinder-yukisawa</b></sub></a></td>
     <td align="center"><a href="https://github.com/KevinJiao"><img src="https://avatars.githubusercontent.com/u/9851473?s=64" width="64" alt="Kevin Jiao"/><br/><sub><b>Kevin Jiao</b></sub></a></td>
+  </tr>
+  <tr>
     <td align="center"><a href="https://github.com/vcase"><img src="https://avatars.githubusercontent.com/u/10698795?s=64" width="64" alt="Vincent Case"/><br/><sub><b>Vincent Case</b></sub></a></td>
     <td align="center"><a href="https://github.com/fh-wpanfil"><img src="https://avatars.githubusercontent.com/u/262680997?s=64" width="64" alt="Walt Panfil"/><br/><sub><b>Walt Panfil</b></sub></a></td>
     <td align="center"><a href="https://github.com/mehran-prs"><img src="https://avatars.githubusercontent.com/u/22454054?s=64" width="64" alt="Mehran Poursadeghi"/><br/><sub><b>Mehran Poursadeghi</b></sub></a></td>
@@ -1137,6 +1506,32 @@ one target per case (see [`tools/e2e/README.md`](tools/e2e/README.md)):
 ```terminal
 bazel test //tests:e2e_test
 ```
+
+## Proving a performance change
+
+A change that claims to make bazel-diff faster or leaner proves it with the perf-proof
+harness, and only with it: it is the one piece of evidence a performance PR carries. The
+harness builds a bazel-diff binary from each side of your changeset, runs both on Bazel
+workspaces of several sizes (interleaved, so drift lands on both sides), measures what the
+bazel-diff process itself cost in CPU time and peak memory, checks that both sides produced
+byte-identical hashes and the same impacted set, and renders a verdict with a significance
+test behind it:
+
+```terminal
+make perf-proof
+```
+
+That compares `HEAD` with its merge-base on `master`. Other changesets:
+
+```terminal
+python3 tools/perf/perf_proof.py --base v70.0.0 --candidate my-branch
+python3 tools/perf/perf_proof.py --base master --patch 0001-faster.patch
+python3 tools/perf/perf_proof.py --candidate WORKTREE   # the uncommitted working tree
+```
+
+Attach the resulting `perf-proof-summary.md` to the PR. See
+[`tools/perf/README.md`](tools/perf/README.md) for the stages, the metrics, how the verdict is
+decided, and the flags (workload sizes, iterations, a real repository, prebuilt binaries).
 
 ## Code coverage
 

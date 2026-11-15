@@ -1,0 +1,26 @@
+load("@dependent//:defs.bzl", "wrap")
+load("@ext//:defs.bzl", "crate")
+
+filegroup(
+    name = "uses_a",
+    srcs = ["@crates//:a"],
+)
+
+filegroup(
+    name = "uses_b",
+    srcs = ["@crates//:b"],
+)
+
+# Uses `ext`'s own rule and nothing from `@crates`, like a js_binary that does not
+# depend on the bumped npm package.
+crate(
+    name = "uses_ext",
+    srcs = ["input.txt"],
+)
+
+# Uses a rule of `dependent` and nothing from `@crates`, like a `jest_test` from
+# rules_jest.
+wrap(
+    name = "uses_dependent",
+    srcs = ["input.txt"],
+)

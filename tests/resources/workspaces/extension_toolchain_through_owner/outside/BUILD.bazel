@@ -1,0 +1,29 @@
+load("@ext//:defs.bzl", "tool")
+
+package(default_visibility = ["//visibility:public"])
+
+constraint_setting(name = "mode")
+
+constraint_value(name = "alternate", constraint_setting = ":mode")
+
+constraint_value(name = "other", constraint_setting = ":mode")
+
+platform(
+    name = "platform",
+    constraint_values = [":alternate"],
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "other_runtime",
+    define_values = {"runtime": "other"},
+)
+
+# The alternative SDK requires a separate installation.
+tool(
+    name = "impl",
+    runtime = select({
+        ":other_runtime": "@bazel_tools//tools/unavailable_test_sdk:installation",
+        "//conditions:default": ":version.txt",
+    }),
+)

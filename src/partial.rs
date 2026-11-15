@@ -28,6 +28,7 @@
 //! A fallback costs speed, never correctness.
 
 use crate::bazel::{attribute_main_repo_labels, target_label};
+use crate::components::{component_digest, member_digest, Completion, Components, Visit};
 use crate::hash::{hash_pool, is_main_repo, label_package, main_repo_path, HashOptions};
 use crate::model::{HashFileData, TargetHash};
 use crate::proto::blaze_query::Rule;
@@ -41,9 +42,10 @@ use std::path::{Component, Path, PathBuf};
 
 type DigestBytes = [u8; 32];
 
-/// Bumped when the recipe format or the evaluation formula changes, so an entry an older
-/// release wrote is regenerated rather than evaluated under a formula it was not recorded for.
-pub const RECIPE_VERSION: u32 = 1;
+/// Bumped when recorded inputs, the recipe format, or the evaluation formula changes, so an
+/// entry an older release wrote is regenerated rather than evaluated under a formula it was not
+/// recorded for.
+pub const RECIPE_VERSION: u32 = 19;
 
 // ---------------------------------------------------------------------------------------------
 // Git tree index
@@ -178,7 +180,8 @@ impl TreeIndex {
 /// label) with git's view standing in for the working tree: a file is its blob id and mode, a
 /// symlink its link blob, a submodule its commit, a directory the ordered digest of everything
 /// under it, and a label outside the main repository the digest of nothing, as in the default
-/// mode without fine-grained external repositories.
+/// mode without fine-grained external repositories. (A fine-grained external source's digest
+/// is read from disk once and kept in [`PartialRecipes::external_sources`].)
 pub fn source_digest(tree: &TreeIndex, label: &str, seed: &[u8]) -> DigestBytes {
     let Some(path) = main_repo_path(label) else {
         return Sha256::digest([]).into();
@@ -301,6 +304,13 @@ pub struct PartialRecipes {
     /// repository marker files list. A change under any of them forces a full generation.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub load_inputs: BTreeSet<String>,
+    /// Source file labels outside the main repository (those of
+    /// `--fineGrainedHashExternalRepos`) to the hex digest the full generation read from the
+    /// output base. The git tree does not hold them, so a derivation reuses these; anything
+    /// that can change an external repository's files (a module or lock file, a patch, a file
+    /// its repository rule read) forces a full generation instead.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub external_sources: BTreeMap<String, String>,
 }
 
 impl PartialRecipes {
@@ -345,6 +355,12 @@ impl RecipeRecorder {
 
     pub(crate) fn record_loading_inputs(&mut self, paths: impl IntoIterator<Item = String>) {
         self.recipes.load_inputs.extend(paths);
+    }
+
+    pub(crate) fn record_external_source(&mut self, label: &str, digest: DigestBytes) {
+        self.recipes
+            .external_sources
+            .insert(label.to_owned(), hex::encode(digest));
     }
 
     pub(crate) fn record_generated(&mut self, label: &str, generating_rule: &str) {
@@ -482,8 +498,7 @@ pub fn normalize_workspace_path(workspace: &Path, value: &str) -> Option<String>
 /// Computes every target's hash from the recipes and the revision's tree.
 ///
 /// `targets` lists every label with its kind (`Rule`, `GeneratedFile`, `SourceFile`); it is
-/// visited in label order, which fixes which member of a dependency cycle is entered first, as
-/// the default traversal does.
+/// visited in label order, as the default traversal does.
 pub fn evaluate(
     recipes: &PartialRecipes,
     targets: &BTreeMap<String, String>,
@@ -505,16 +520,19 @@ pub fn evaluate(
         source_labels
             .par_iter()
             .map(|label| {
+                if let Some(digest) = recipes.external_sources.get(*label) {
+                    return Ok(((*label).to_owned(), decode_digest(digest)?));
+                }
                 let mut seed = Sha256::new();
                 seed.update(label.as_bytes());
                 for subinclude in recipes.subincludes(label) {
                     seed.update(subinclude.as_bytes());
                 }
                 let seed: DigestBytes = seed.finalize().into();
-                ((*label).to_owned(), source_digest(tree, label, &seed))
+                Ok(((*label).to_owned(), source_digest(tree, label, &seed)))
             })
-            .collect::<HashMap<_, _>>()
-    });
+            .collect::<Result<HashMap<_, _>>>()
+    })?;
     let package_seeds = if recipes.package_seeds {
         package_seeds(recipes, &source_labels, tree)
     } else {
@@ -527,18 +545,18 @@ pub fn evaluate(
         source_digests,
         soft_digests: HashMap::new(),
         cache: HashMap::new(),
+        components: Components::default(),
     };
     let mut hashes = BTreeMap::new();
-    let mut path = Vec::new();
     for (label, kind) in targets {
         let (overall, direct) = match kind.as_str() {
-            "Rule" => evaluator.rule(label, &mut path)?,
+            "Rule" => evaluator.rule(label)?,
             "GeneratedFile" => {
                 let generating_rule = recipes
                     .generated
                     .get(label)
                     .ok_or_else(|| anyhow!("recipes do not name the rule generating {label}"))?;
-                evaluator.rule(generating_rule, &mut path)?
+                evaluator.rule(generating_rule)?
             }
             "SourceFile" => {
                 let mut hasher = Sha256::new();
@@ -610,13 +628,28 @@ struct Evaluator<'a> {
     tree: &'a TreeIndex,
     source_digests: HashMap<String, DigestBytes>,
     soft_digests: HashMap<String, Option<DigestBytes>>,
-    cache: HashMap<String, (DigestBytes, DigestBytes)>,
+    cache: HashMap<String, EvaluationState>,
+    components: Components<String, (DigestBytes, DigestBytes)>,
+}
+
+enum EvaluationState {
+    Pending(usize),
+    Complete((DigestBytes, DigestBytes)),
 }
 
 impl Evaluator<'_> {
-    fn rule(&mut self, key: &str, path: &mut Vec<String>) -> Result<(DigestBytes, DigestBytes)> {
-        if let Some(digest) = self.cache.get(key) {
-            return Ok(*digest);
+    fn rule(&mut self, key: &str) -> Result<(DigestBytes, DigestBytes)> {
+        match self.visit(key)? {
+            Visit::Complete(digest) => Ok(digest),
+            Visit::Pending(_) => unreachable!("a top-level rule completes its component"),
+        }
+    }
+
+    fn visit(&mut self, key: &str) -> Result<Visit<(DigestBytes, DigestBytes)>> {
+        match self.cache.get(key) {
+            Some(EvaluationState::Complete(digest)) => return Ok(Visit::Complete(*digest)),
+            Some(EvaluationState::Pending(position)) => return Ok(Visit::Pending(*position)),
+            None => {}
         }
         let recipe = self
             .recipes
@@ -624,16 +657,9 @@ impl Evaluator<'_> {
             .get(key)
             .ok_or_else(|| anyhow!("recipes hold no rule {key}"))?;
         let static_digest = recipe.static_digest()?;
-        if path.iter().any(|entry| entry == key) {
-            // A back edge: the rule stands in with a digest of its own definition, uncached,
-            // exactly as the default traversal does.
-            let mut hasher = Sha256::new();
-            hasher.update(b"cycle");
-            hasher.update(static_digest);
-            let placeholder: DigestBytes = hasher.finalize().into();
-            return Ok((placeholder, placeholder));
-        }
-        path.push(key.to_owned());
+        let position = self.components.enter(key.to_owned());
+        self.cache
+            .insert(key.to_owned(), EvaluationState::Pending(position));
         let mut direct = Sha256::new();
         direct.update(static_digest);
         for source in recipe.sources() {
@@ -656,14 +682,35 @@ impl Evaluator<'_> {
         let direct: DigestBytes = direct.finalize().into();
         let mut overall = Sha256::new();
         for dep in recipe.deps() {
-            let (dep_overall, _) = self.rule(dep, path)?;
-            overall.update(dep_overall);
+            match self.visit(dep)? {
+                Visit::Complete((dep_overall, _)) => overall.update(dep_overall),
+                Visit::Pending(dependency) => self.components.reaches(position, dependency),
+            }
         }
         overall.update(direct);
         let digest = (overall.finalize().into(), direct);
-        path.pop();
-        self.cache.insert(key.to_owned(), digest);
-        Ok(digest)
+        match self.components.finish(position, digest) {
+            Completion::Pending(lowlink) => Ok(Visit::Pending(lowlink)),
+            Completion::Single(name, digest) => {
+                self.cache.insert(name, EvaluationState::Complete(digest));
+                Ok(Visit::Complete(digest))
+            }
+            Completion::Cycle(members) => {
+                let component = component_digest(
+                    members
+                        .iter()
+                        .map(|(name, (overall, _))| (name.as_str(), *overall)),
+                );
+                for (name, (overall, direct)) in members {
+                    let digest = (member_digest(component, &name, overall), direct);
+                    self.cache.insert(name, EvaluationState::Complete(digest));
+                }
+                let Some(EvaluationState::Complete(digest)) = self.cache.get(key) else {
+                    unreachable!("the component root is complete");
+                };
+                Ok(Visit::Complete(*digest))
+            }
+        }
     }
 }
 
@@ -682,7 +729,10 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
         .collect();
     let hashes = evaluate(recipes, &targets, tree)?;
     Ok(HashFileData {
+        configured_roots: None,
         hashes,
+        // Fresh query observations can depend on external definitions outside these recipes.
+        observed_toolchains: None,
         module_graph_json: base.module_graph_json.clone(),
         dependency_fingerprint: base.dependency_fingerprint.clone(),
         dep_edges: base.dep_edges.clone(),
@@ -692,16 +742,13 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
 }
 
 /// Rejects hashing options partial-graph mode cannot honour. The derivation evaluates recipes
-/// keyed by bare label from the revision's git tree alone, so it has no configured instances
-/// (cquery), no files outside the tree (fine-grained external repositories) and no
+/// keyed by bare label from the revision's git tree and the recorded external source digests
+/// alone, so it has no configured instances (cquery), no isolated repository inputs and no
 /// per-invocation seeds (always-affected tags); each of those would make a derived entry differ
 /// from a full generation, which is the one property the mode rests on.
 pub fn validate_hash_options(options: &HashOptions) -> Result<()> {
     if options.bazel.use_cquery {
         bail!("--partialGraph does not support --useCquery");
-    }
-    if !options.bazel.fine_grained_external_repos.is_empty() {
-        bail!("--partialGraph does not support --fineGrainedHashExternalRepos");
     }
     if options.bazel.isolated_dependency_root.is_some() {
         bail!("--partialGraph does not support --isolatedDependencyRoot");
@@ -778,12 +825,19 @@ pub fn is_graph_defining_path(path: &str) -> bool {
             | ".bazeliskrc"
     ) || name.ends_with(".bzl")
         || name.ends_with(".scl")
+        || is_module_segment(name)
         || name.ends_with("bazelrc")
         || name.ends_with(".BUILD")
         || name.starts_with("BUILD.")
         || name.ends_with(".patch")
         || name.ends_with(".diff")
         || path == "tools/bazel"
+}
+
+/// Whether a file name is a segment `MODULE.bazel` can `include()`. Bazel rejects an include
+/// whose file name does not end in `.MODULE.bazel` (`ModuleFileFunction`).
+pub fn is_module_segment(name: &str) -> bool {
+    name.ends_with(".MODULE.bazel")
 }
 
 /// Files that `MODULE.bazel` and the `WORKSPACE` files may name by label. Their content is
@@ -1329,6 +1383,57 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_cycles_include_outgoing_source_changes() {
+        let mut recipes = recipes();
+        recipes.rules.insert(
+            "//cycle:x".into(),
+            RuleRecipe::new(
+                [3; 32],
+                vec![],
+                vec!["//cycle:y".into(), "//cycle:z".into()],
+            ),
+        );
+        recipes.rules.insert(
+            "//cycle:z".into(),
+            RuleRecipe::new(
+                [5; 32],
+                vec![],
+                vec!["//cycle:y".into(), "//pkg:lib".into()],
+            ),
+        );
+        recipes.rules.insert(
+            "//cycle:consumer".into(),
+            RuleRecipe::new([6; 32], vec![], vec!["//cycle:y".into()]),
+        );
+        let mut targets = targets();
+        targets.insert("//cycle:z".into(), "Rule".into());
+        targets.insert("//cycle:consumer".into(), "Rule".into());
+        let before = evaluate(&recipes, &targets, &fixture_tree()).unwrap();
+        let mut edited = fixture_tree();
+        edited.entries.get_mut("pkg/a.txt").unwrap().object = "a2".into();
+        let after = evaluate(&recipes, &targets, &edited).unwrap();
+        for label in ["//cycle:x", "//cycle:y", "//cycle:z", "//cycle:consumer"] {
+            assert_ne!(before[label].hash, after[label].hash, "{label}");
+            assert_eq!(
+                before[label].direct_hash, after[label].direct_hash,
+                "{label}"
+            );
+        }
+        assert_eq!(before["//other:c.txt"].hash, after["//other:c.txt"].hash);
+
+        // Derivation uses the recipes themselves, without requiring emitted dependency edges.
+        let base = HashFileData {
+            hashes: before,
+            partial: Some(recipes),
+            ..Default::default()
+        };
+        let derived = derive(&base, &edited).unwrap();
+        assert_eq!(derived.hashes, after);
+        assert_eq!(derived.partial, base.partial);
+        assert!(derived.dep_edges.is_empty());
+    }
+
+    #[test]
     fn evaluation_rejects_incomplete_recipes() {
         let recipes = recipes();
         let mut targets = targets();
@@ -1371,7 +1476,9 @@ mod tests {
         let recipes = recipes();
         let targets = targets();
         let mut base = HashFileData {
+            configured_roots: None,
             hashes: evaluate(&recipes, &targets, &fixture_tree()).unwrap(),
+            observed_toolchains: None,
             module_graph_json: Some("{}".into()),
             dependency_fingerprint: Some("fp".into()),
             dep_edges: BTreeMap::from([("//pkg:bin".to_owned(), vec!["//pkg:lib".to_owned()])]),
@@ -1458,6 +1565,7 @@ mod tests {
             "third_party/BUILD.foo.bazel",
             "third_party/fix.patch",
             "third_party/fix.diff",
+            "third_party/llvm/llvm.MODULE.bazel",
             "tools/bazel",
         ] {
             assert!(is_graph_defining_path(path), "{path}");

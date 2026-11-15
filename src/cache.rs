@@ -7,10 +7,16 @@
 //! it.
 
 use crate::hash::HashOptions;
+use crate::model::ConfiguredRoots;
 use crate::partial;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+
+pub const FINE_ALIAS_INPUTS_VERSION: u32 = 19;
+pub const LOCAL_ARCHIVE_BUILD_FILE_VERSION: u32 = 2;
+/// Rooted cquery hashes include inputs of each explicitly serialized aspect application.
+pub const CONFIGURED_ASPECT_INPUTS_VERSION: u32 = 1;
 
 /// Digests the hash-affecting configuration: the package version, every query and hashing
 /// option, whether dependency edges are recorded, and, only when on, partial-graph mode (its
@@ -81,6 +87,26 @@ pub fn configuration_fingerprint(
         hasher.update(value.as_bytes());
         hasher.update([0]);
     }
+    hasher.update(b"cycleComponents=1\0");
+    if let Some(expr) = &options.bazel.cquery_root_expression {
+        hasher.update(format!("configuredRoots={}\0", ConfiguredRoots::VERSION));
+        hasher.update(format!(
+            "configuredAspectInputs={CONFIGURED_ASPECT_INPUTS_VERSION}\0"
+        ));
+        hasher.update(expr.as_bytes());
+        hasher.update([0]);
+    }
+    if !options.bazel.use_cquery {
+        hasher.update(b"queryToolchainImplementations=1\0");
+    }
+    hasher.update(b"stackSourcePaths=1\0");
+    hasher.update(format!("localArchiveBuildFile={LOCAL_ARCHIVE_BUILD_FILE_VERSION}\0").as_bytes());
+    if !options.bazel.use_cquery
+        && !options.bazel.fine_grained_external_repos.is_empty()
+        && options.bazel.isolated_dependency_root.is_none()
+    {
+        hasher.update(format!("fineAliasInputs={FINE_ALIAS_INPUTS_VERSION}\0").as_bytes());
+    }
     if let Some(root) = &options.bazel.isolated_dependency_root {
         hasher.update(b"isolatedDependencyRoot=");
         hasher.update(root.as_bytes());
@@ -124,6 +150,7 @@ mod tests {
                 cquery_options: Vec::new(),
                 use_cquery: false,
                 cquery_expression: None,
+                cquery_root_expression: None,
                 keep_going: false,
                 fine_grained_external_repos: BTreeSet::new(),
                 label_only_module_extensions: BTreeSet::new(),
@@ -153,6 +180,12 @@ mod tests {
         let mut cquery = options();
         cquery.bazel.use_cquery = true;
         assert_ne!(configuration_fingerprint(&cquery, false, false), base);
+        let cquery_fingerprint = configuration_fingerprint(&cquery, false, false);
+        cquery.bazel.cquery_root_expression = Some("//app:lib".to_owned());
+        let rooted = configuration_fingerprint(&cquery, false, false);
+        assert_ne!(rooted, cquery_fingerprint);
+        cquery.bazel.cquery_root_expression = Some("//app:other".to_owned());
+        assert_ne!(configuration_fingerprint(&cquery, false, false), rooted);
         let mut seeded = options();
         seeded.seed_filepaths.insert(PathBuf::from("seed"));
         assert_ne!(configuration_fingerprint(&seeded, false, false), base);

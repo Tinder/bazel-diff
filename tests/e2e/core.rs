@@ -239,6 +239,72 @@ fn serve_end_to_end() {
     );
 }
 
+/// One server, two clones: each query is answered from the repository it names, with the
+/// repository's own revisions and hashes, and a query that names none is refused.
+#[test]
+fn serve_multiple_repositories() {
+    let app = copy_workspace("distance_metrics");
+    let app_from = init_git(app.path());
+    fs::write(app.path().join("lib.sh"), "echo app\n").unwrap();
+    let app_to = commit(app.path(), "change app");
+    let lib = copy_workspace("distance_metrics");
+    let lib_from = init_git(lib.path());
+    fs::write(lib.path().join("BUILD.bazel"), "").unwrap();
+    let lib_to = commit(lib.path(), "empty lib");
+    let cache = tempfile::tempdir().unwrap();
+    let server = ServerProcess::start_repositories(
+        &[("app", app.path()), ("lib", lib.path())],
+        cache.path(),
+        &["--trackDeps"],
+    );
+    let query = |path: &str| -> (u16, Value) {
+        let (status, body) = server.get(path).unwrap();
+        (status, serde_json::from_str(&body).unwrap())
+    };
+
+    let (status, body) = query(&format!("/impacted_targets?from={app_from}&to={app_to}"));
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing required parameter 'repo'"),
+        "{body}"
+    );
+    let (status, body) = query(&format!(
+        "/impacted_targets?repo=app&from={app_from}&to={app_to}"
+    ));
+    assert_eq!(status, 200, "{body}");
+    let impacted = body["impactedTargets"].as_array().unwrap();
+    assert!(impacted.iter().any(|label| label == "//:lib"), "{body}");
+    // The library clone emptied its BUILD file: its targets are gone rather than changed, so
+    // only the BUILD file itself is impacted, unlike the app clone's answer above.
+    let (status, body) = query(&format!(
+        "/impacted_targets?repo=lib&from={lib_from}&to={lib_to}"
+    ));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["impactedTargets"],
+        serde_json::json!(["//:BUILD.bazel"])
+    );
+    let (status, body) = query(&format!(
+        "/impacted_targets?repo=lib&from={app_from}&to={app_to}"
+    ));
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = query(&format!(
+        "/impacted_targets_with_distances?repo=app&from={app_from}&to={app_to}"
+    ));
+    assert_eq!(status, 200, "{body}");
+    let (status, metrics) = query("/metrics");
+    assert_eq!(status, 200);
+    assert_eq!(metrics["ready"], true);
+    assert_eq!(
+        metrics["repositories"]["app"]["workspace"],
+        app.path().to_string_lossy().as_ref()
+    );
+    assert_eq!(metrics["repositories"]["lib"]["ready"], true);
+}
+
 /// `--partialGraph`: a source edit is answered without a `bazel query`, with the same impacted
 /// set and distances as the default mode, and the derived cache entry is byte-identical to the
 /// one a full generation in the same mode writes; a `BUILD` edit falls back to a full generation.

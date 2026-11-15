@@ -201,8 +201,42 @@ fn transitive_external_repo_change_reaches_consumer() {
     let first = copy_workspace("bzlmod_transitive_external");
     let second = copy_workspace("bzlmod_transitive_external");
     fs::write(second.path().join("inner/data.txt"), "world\n").unwrap();
-    let impacted = diff_local(first.path(), second.path(), &[]);
-    assert!(impacted.contains("//:consume") || impacted.contains("@@//:consume"));
+    let output = tempfile::tempdir().unwrap();
+    let from = output.path().join("from.json");
+    let to = output.path().join("to.json");
+    let explicit = output.path().join("explicit.txt");
+    let current = output.path().join("current.txt");
+    assert!(generate(first.path(), &from, &[]).status.success());
+    assert!(generate(second.path(), &to, &[]).status.success());
+    for path in [&from, &to] {
+        let data: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(data["metadata"]["moduleGraphJson"]
+            .as_str()
+            .is_some_and(|graph| !graph.is_empty()));
+    }
+    assert!(impacted(second.path(), &from, &to, &explicit, &[])
+        .status
+        .success());
+    let result = std::process::Command::new(binary())
+        .current_dir(second.path())
+        .args(["get-impacted-targets", "-b"])
+        .arg(bazel())
+        .arg("-sh")
+        .arg(&from)
+        .arg("-fh")
+        .arg(&to)
+        .arg("-o")
+        .arg(&current)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read(&current).unwrap(), fs::read(&explicit).unwrap());
+    let changed = read_lines(&current);
+    assert!(changed.contains("//:consume") || changed.contains("@@//:consume"));
 }
 
 /// cquery prints canonical labels (`@@inner+//:data`) where query prints apparent ones
@@ -324,12 +358,120 @@ fn hub_named_by_canonical_name_is_fine_grained_under_its_apparent_name() {
     }
 }
 
-// Module `ext`'s extension generates the `@crates` hub and its spokes, whose targets use a rule
-// `ext` defines. In query mode `//external:ext` stands in for everything its extensions generate,
-// so a fine-grained spoke target reaching `ext` through it changes whenever any other spoke does.
-// With the extension listed in `--labelOnlyModuleExtensions`, bumping spoke `b` impacts only
-// `//:uses_b`, while a change to `ext` itself still impacts both consumers. Without it, the
-// conservative edge stays and the bump impacts both.
+#[test]
+fn fine_alias_to_a_source_tracks_its_contents_and_visibility() {
+    if !supports_mod_show_repo() || !cfg!(unix) {
+        return;
+    }
+    let workspace = copy_workspace("fine_grained_hub_by_canonical_name");
+    let root = workspace.path();
+    // Import the source repository so its synthetic node also reaches the unimported sibling.
+    edit(&root.join("MODULE.bazel"), |m| {
+        format!("{m}\nuse_repo(crates, \"crates__a\")\n")
+    });
+    fs::write(root.join("BUILD.bazel"), r#"
+genrule(name = "uses_source", srcs = ["@crates//:a_source"], outs = ["source.txt"], cmd = "cat $< > $@")
+genrule(name = "reads_build", srcs = ["@crates//:a_build"], outs = ["definition.txt"], cmd = "cat $< > $@")
+"#).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let base = out.path().join("base.json");
+    let result = out.path().join("impacted.txt");
+    let template = root.join("spoke.BUILD");
+    let definition = fs::read_to_string(&template).unwrap();
+    for (state, a, b) in [
+        ("base", "1", "1"),
+        ("payload", "2", "1"),
+        ("sibling", "1", "2"),
+        ("no_sibling", "1", "1"),
+        ("unused", "1", "1"),
+        ("private", "1", "1"),
+        ("repository", "1", "1"),
+    ] {
+        let build = match state {
+            "unused" => format!("{definition}\nfilegroup(name = \"unused\")\n"),
+            "private" => definition.replacen("//visibility:public", "//visibility:private", 1),
+            _ => definition.clone(),
+        };
+        fs::write(&template, &build).unwrap();
+        let note = if state == "repository" { "changed" } else { "" };
+        let versions = if state == "no_sibling" {
+            format!(r#"{{"a":"{a}","note":"{note}"}}"#)
+        } else {
+            format!(r#"{{"a":"{a}","b":"{b}","note":"{note}"}}"#)
+        };
+        fs::write(root.join("versions.json"), versions).unwrap();
+        let snapshot = out.path().join(format!("{state}.json"));
+        let edges = out.path().join("edges.json");
+        let output = generate(
+            root,
+            &snapshot,
+            &[
+                "--fineGrainedHashExternalRepos=@crates",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_product(root, "//:reads_build", "definition.txt", build.trim());
+        if state == "private" {
+            let build = std::process::Command::new(bazel())
+                .current_dir(root)
+                .args(["build", "//:uses_source"])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&build.stderr);
+            assert!(
+                !build.status.success() && stderr.contains("not visible"),
+                "{stderr}"
+            );
+        } else {
+            assert_product(root, "//:uses_source", "source.txt", a);
+        }
+        assert!(impacted(
+            root,
+            &base,
+            &snapshot,
+            &result,
+            &["-d", edges.to_str().unwrap()]
+        )
+        .status
+        .success());
+        let changes: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+        let row = |name: &str| {
+            changes.iter().find(|r| {
+                r["label"].as_str().is_some_and(|label| {
+                    label == name || name.starts_with("//") && label.trim_start_matches('@') == name
+                })
+            })
+        };
+        assert_eq!(
+            row("//:uses_source").is_some(),
+            matches!(state, "payload" | "private" | "repository"),
+            "{state}: {changes:?}"
+        );
+        if matches!(state, "private" | "unused") {
+            assert!(row("//:reads_build").is_some(), "{state}: {changes:?}");
+        }
+        if state == "no_sibling" {
+            assert!(row("@crates//:a_source").is_none(), "{changes:?}");
+        }
+        if state == "repository" {
+            for (name, distance) in [("@crates//:a_source", 1), ("//:uses_source", 2)] {
+                let entry = row(name).unwrap();
+                assert_eq!(entry["targetDistance"], distance, "{name}");
+                assert_eq!(entry["packageDistance"], distance, "{name}");
+            }
+        }
+    }
+}
+
+// The two generated repositories both use ext's rule, but only one provides the changed data.
+// The explicit label-only contract can rule out a toolchain dependency between siblings.
 #[test]
 fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
     if !supports_mod_show_repo() {
@@ -355,7 +497,9 @@ fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
     });
     let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained));
     assert_eq!(impacted, BTreeSet::from(["//:uses_b".to_owned()]));
+    let registered = has_module_registrations(first.path());
     let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained[..2]));
+    // A MODULE-only registration inventory cannot rule out a build or test option.
     assert_eq!(
         impacted,
         BTreeSet::from(["//:uses_a".to_owned(), "//:uses_b".to_owned()])
@@ -368,6 +512,877 @@ fn fine_grained_spoke_does_not_reach_its_siblings_through_the_owning_module() {
         impacted,
         BTreeSet::from(["//:uses_a".to_owned(), "//:uses_b".to_owned()])
     );
+
+    // The owner can also forward a real generated input without a toolchain or a fine alias.
+    for workspace in [&first, &bumped] {
+        edit(&workspace.path().join("MODULE.bazel"), |module| {
+            format!(
+                r#"{module}
+archive = use_repo_rule("@ext//:crates.bzl", "forward")
+archive(name = "selected_archive", src = "@bridge_archive//:lib")
+archive(name = "bridge_archive", src = "@@ext++crates+crates__b//:lib")
+archive(name = "independent_archive")
+"#
+            )
+        });
+        edit(&workspace.path().join("ext/BUILD.bazel"), |build| {
+            format!(
+                r#"load(":defs.bzl", "crate")
+{build}
+crate(name = "data", srcs = ["@@ext++crates+crates__b//:lib"], visibility = ["//visibility:public"])
+"#
+            )
+        });
+        edit(&workspace.path().join("BUILD.bazel"), |build| {
+            format!(
+                r#"{build}
+genrule(name = "copy", srcs = ["@ext//:data"], outs = ["copied.txt"], cmd = "cp $< $@")
+genrule(name = "via_hub", srcs = ["@crates//:relay"], outs = ["hub.txt"], cmd = "cp $< $@")
+genrule(name = "direct", srcs = ["@@ext++crates+crates__relay//:lib"], outs = ["direct.txt"], cmd = "cp $< $@")
+genrule(name = "through_chain", srcs = ["@@ext++crates+crates__chain//:hop_5"], outs = ["chain.txt"], cmd = "cp $< $@")
+genrule(name = "via_archives", srcs = ["@selected_archive//:lib"], outs = ["via_archives.txt"], cmd = "cp $< $@")
+genrule(name = "from_archive", srcs = ["@bridge_archive//:lib"], outs = ["from_archive.txt"], cmd = "cp $< $@")
+filegroup(name = "independent", srcs = ["@independent_archive//:lib"])
+filegroup(name = "unavailable", srcs = ["@crates//:a"], target_compatible_with = ["@platforms//:incompatible"])
+"#
+            )
+        });
+    }
+    assert_product(first.path(), "//:copy", "copied.txt", "1.0");
+    assert_product(bumped.path(), "//:copy", "copied.txt", "2.0");
+    for (target, file) in [
+        ("//:via_hub", "hub.txt"),
+        ("//:direct", "direct.txt"),
+        ("//:through_chain", "chain.txt"),
+        ("//:via_archives", "via_archives.txt"),
+        ("//:from_archive", "from_archive.txt"),
+    ] {
+        assert_product(first.path(), target, file, "1.0");
+        assert_product(bumped.path(), target, file, "2.0");
+    }
+    let repos = [
+        "--fineGrainedHashExternalRepos",
+        "@crates,@@ext++crates+crates__a,@selected_archive",
+    ];
+    let impacted = main(diff_local(first.path(), bumped.path(), &repos));
+    assert!(impacted.contains("//:via_hub"), "{impacted:?}");
+    assert!(impacted.contains("//:direct"), "{impacted:?}");
+    assert!(!impacted.contains("//:independent"), "{impacted:?}");
+    if registered {
+        assert!(impacted.contains("//:through_chain"), "{impacted:?}");
+        // A requested archive can forward through another directly imported repository.
+        assert!(impacted.contains("//:via_archives"), "{impacted:?}");
+        assert!(impacted.contains("//:from_archive"), "{impacted:?}");
+        let output = tempfile::tempdir().unwrap();
+        let report = generate(
+            first.path(),
+            &output.path().join("hashes.json"),
+            &[repos[0], repos[1], "-v"],
+        );
+        let log = String::from_utf8_lossy(&report.stderr);
+        assert!(report.status.success(), "{log}");
+        let chain_queries = log
+            .lines()
+            .filter(|line| line.contains("let d = ") && line.contains("+crates__chain//:hop_"))
+            .collect::<Vec<_>>();
+        assert!(chain_queries.len() <= 2, "{chain_queries:?}");
+        let hashes = fs::read_to_string(output.path().join("hashes.json")).unwrap();
+        assert!(hashes.contains("+crates__chain//:hop_0"));
+        assert!(hashes.contains("+crates__chain//:alternate"));
+        assert!(!hashes.contains("+crates__chain//:unused"));
+    }
+    assert!(impacted.contains("//:copy"), "{impacted:?}");
+    assert!(impacted.contains("//:uses_b"), "{impacted:?}");
+    assert!(impacted.contains("//:uses_a"), "{impacted:?}");
+    if registered {
+        assert!(impacted.contains("//:unavailable"), "{impacted:?}");
+    }
+}
+
+// Issue #603. Module `ext` owns the `@crates` extension, whose spokes are named after their
+// version the way rules_js's `npm` names `npm__user-agents__2.1.229`, so a bump replaces spoke `b`
+// rather than changing it. In query mode `//external:ext` depends on every repository its
+// extensions generate, so the bump reaches every target that uses `ext`'s own rule (`//:uses_ext`,
+// like a js_binary) and every target of a module with a `bazel_dep` path to `ext`
+// (`//:uses_dependent`, whose `dependent` reaches `ext` through `middle`, like rules_jest reaching
+// gazelle). Neither names anything in `@crates`. With the extension listed in
+// `--labelOnlyModuleExtensions`, `ext` no longer stands in for its repositories, so the bump
+// impacts only the hub's consumers, with or without fine-graining; a change to `ext` itself must
+// still reach both.
+#[test]
+fn label_only_extension_bump_does_not_reach_users_of_the_owner_or_its_dependents() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let label_only = ["--labelOnlyModuleExtensions", "@ext//:crates.bzl%crates"];
+    let fine_grained = [
+        label_only[0],
+        label_only[1],
+        "--fineGrainedHashExternalRepos",
+        "@crates",
+    ];
+    let main = |impacted: BTreeSet<String>| -> BTreeSet<String> {
+        impacted
+            .into_iter()
+            .map(|label| label.trim_start_matches("@@").to_owned())
+            .filter(|label| label.starts_with("//") && !label.starts_with("//external:"))
+            .collect()
+    };
+    let set = |labels: &[&str]| -> BTreeSet<String> {
+        labels.iter().copied().map(str::to_owned).collect()
+    };
+    let first = copy_workspace("extension_owner_dependent_module");
+    let bumped = copy_workspace("extension_owner_dependent_module");
+    edit(&bumped.path().join("versions.json"), |text| {
+        text.replace("\"b\": \"1.0\"", "\"b\": \"2.0\"")
+    });
+    // Without the opt-in the conservative owner edge stays and the bump reaches both, which is
+    // what the issue reports.
+    let impacted = main(diff_local(first.path(), bumped.path(), &[]));
+    assert!(
+        impacted.contains("//:uses_ext") && impacted.contains("//:uses_dependent"),
+        "{impacted:?}"
+    );
+
+    // Without fine-graining every consumer of the `@crates` hub sees the bump.
+    let impacted = main(diff_local(first.path(), bumped.path(), &label_only));
+    assert_eq!(impacted, set(&["//:uses_a", "//:uses_b"]), "label-only");
+    let impacted = main(diff_local(first.path(), bumped.path(), &fine_grained));
+    assert_eq!(impacted, set(&["//:uses_b"]), "label-only, fine-grained");
+
+    // `dependent` and `//:uses_ext` really depend on `ext`: a change to its own tree reaches them.
+    let changed_owner = copy_workspace("extension_owner_dependent_module");
+    fs::write(changed_owner.path().join("ext/tool.sh"), "exit 1\n").unwrap();
+    for flags in [&label_only[..], &fine_grained[..]] {
+        let impacted = main(diff_local(first.path(), changed_owner.path(), flags));
+        assert!(
+            impacted.contains("//:uses_ext") && impacted.contains("//:uses_dependent"),
+            "{flags:?}: {impacted:?}"
+        );
+    }
+}
+
+fn partial_hashes(
+    root: &std::path::Path,
+    out: &std::path::Path,
+    name: &str,
+    base: Option<&std::path::Path>,
+    options: &[&str],
+) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    let hashes = out.join(format!("{name}.json"));
+    let edges = out.join(format!("{name}-edges.json"));
+    let edge_arg = edges.display().to_string();
+    let base_arg = base.map(|path| path.display().to_string());
+    let mut args = options.to_vec();
+    args.extend(["--partialGraph", "-d", &edge_arg]);
+    if let Some(base) = &base_arg {
+        args.extend(["--baseHashes", base]);
+    }
+    let result = generate(root, &hashes, &args);
+    let log = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert!(result.status.success(), "{name}: {log}");
+    (hashes, edges, log)
+}
+
+#[test]
+fn fine_aliases_acquire_hidden_libraries_and_definition_sources() {
+    fn external_key<V>(map: &std::collections::BTreeMap<String, V>, suffix: &str) -> String {
+        let keys = map
+            .keys()
+            .filter(|key| key.starts_with('@') && key.ends_with(suffix))
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 1, "expected one {suffix}: {keys:?}");
+        keys[0].as_str().to_owned()
+    }
+    fn direct(hash: &str) -> &str {
+        hash.rsplit_once('~').unwrap().1
+    }
+    if !supports_mod_show_repo() {
+        return;
+    }
+
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    let out = tempfile::tempdir().unwrap();
+    let build_path = root.join("library/BUILD.bazel");
+    let build = fs::read_to_string(&build_path).unwrap();
+    let implementation_path = root.join("library/defs/library.bzl");
+    let implementation = fs::read_to_string(&implementation_path).unwrap();
+    let unrelated_path = root.join("unrelated/rules.bzl");
+    let unrelated = fs::read_to_string(&unrelated_path).unwrap();
+    let modes: [(&str, &[&str]); 2] = [
+        ("fine", &["--fineGrainedHashExternalRepos=@public"]),
+        (
+            "excluded",
+            &[
+                "--fineGrainedHashExternalRepos=@public",
+                "--excludeExternalTargets",
+            ],
+        ),
+    ];
+    let mut snapshots = std::collections::BTreeMap::new();
+    for (state, data, other, unrelated_edit, product) in [
+        ("base", "before\n", false, false, "before"),
+        ("source", "after\n", false, false, "after"),
+        ("definition", "before\n", true, false, "other"),
+        ("implementation", "before\n", false, false, "other"),
+        ("unrelated", "before\n", false, true, "before"),
+    ] {
+        fs::write(root.join("library/data.txt"), data).unwrap();
+        fs::write(
+            &build_path,
+            if other {
+                build.replace("selected = \"data.txt\"", "selected = \"other.txt\"")
+            } else {
+                build.clone()
+            },
+        )
+        .unwrap();
+        fs::write(
+            &implementation_path,
+            if state == "implementation" {
+                implementation.replace(
+                    "file.basename == ctx.attr.selected",
+                    "file.basename != ctx.attr.selected",
+                )
+            } else {
+                implementation.clone()
+            },
+        )
+        .unwrap();
+        fs::write(
+            &unrelated_path,
+            format!(
+                "{unrelated}{}",
+                if unrelated_edit {
+                    "\n# unrelated edit\n"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .unwrap();
+        assert_product(root, "//:consumer", "consumer.txt", product);
+        for (mode, flags) in modes {
+            let hashes = out.path().join(format!("{state}-{mode}.json"));
+            let edges = out.path().join(format!("{state}-{mode}-edges.json"));
+            let mut args = flags.to_vec();
+            args.extend(["--includeTargetType", "-d", edges.to_str().unwrap()]);
+            let generated = generate(root, &hashes, &args);
+            assert!(
+                generated.status.success(),
+                "{state} {mode}: {}",
+                String::from_utf8_lossy(&generated.stderr)
+            );
+            snapshots.insert((state, mode), (hashes, edges));
+        }
+    }
+    for (mode, _) in modes {
+        for (state, expected) in [
+            ("source", true),
+            ("definition", true),
+            ("implementation", true),
+            ("unrelated", false),
+        ] {
+            let result = out.path().join(format!("{state}-{mode}-impact.txt"));
+            let impact = impacted(
+                root,
+                &snapshots[&("base", mode)].0,
+                &snapshots[&(state, mode)].0,
+                &result,
+                &[],
+            );
+            assert!(
+                impact.status.success(),
+                "{state} {mode}: {}",
+                String::from_utf8_lossy(&impact.stderr)
+            );
+            let selected = read_lines(&result);
+            assert_eq!(
+                selected.contains("//:consumer"),
+                expected,
+                "{state} {mode}: {selected:?}"
+            );
+            if state == "unrelated" {
+                assert!(selected.contains("//unrelated:probe"));
+            }
+        }
+        let base = hashes(&snapshots[&("base", mode)].0);
+        let source = hashes(&snapshots[&("source", mode)].0);
+        let definition = hashes(&snapshots[&("definition", mode)].0);
+        let data = external_key(&base, "library//:data.txt");
+        let other = external_key(&base, "library//:other.txt");
+        let build = external_key(&base, "library//:BUILD.bazel");
+        let library_hash = external_key(&base, "library//:lib");
+        assert_ne!(direct(&base[&data]), direct(&source[&data]));
+        assert_ne!(direct(&base[&library_hash]), direct(&source[&library_hash]));
+        assert_eq!(direct(&base[&other]), direct(&source[&other]));
+        assert_eq!(direct(&base[&build]), direct(&source[&build]));
+        assert_ne!(direct(&base[&build]), direct(&definition[&build]));
+        assert_eq!(direct(&base[&data]), direct(&definition[&data]));
+
+        let implementation = hashes(&snapshots[&("implementation", mode)].0);
+        let bzl = external_key(&base, "library//defs:library.bzl");
+        assert_ne!(direct(&base[&bzl]), direct(&implementation[&bzl]));
+        for file in [&build, &data, &other] {
+            assert_eq!(direct(&base[file]), direct(&implementation[file]));
+        }
+
+        let edges = dep_edges(&snapshots[&("base", mode)].1);
+        let public = external_key(&edges, "public//:forward");
+        let hidden = external_key(&edges, "hidden//:forward");
+        let library = external_key(&edges, "library//:lib");
+        assert!(edges["//:consumer"].contains(&public));
+        assert!(edges[&public].contains(&hidden));
+        assert!(edges[&hidden].contains(&library));
+        external_key(&base, "hidden//:BUILD.bazel");
+    }
+}
+
+#[test]
+fn ordinary_alias_can_use_a_matcher_from_a_reached_external_package() {
+    fn direct(value: &str) -> &str {
+        value.rsplit_once('~').unwrap().1
+    }
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    fs::write(root.join("before.txt"), "before").unwrap();
+    fs::write(root.join("after.txt"), "after").unwrap();
+    fs::write(
+        root.join("BUILD.bazel"),
+        r#"exports_files(["before.txt", "after.txt"])
+constraint_setting(name = "system", default_constraint_value = ":regular")
+constraint_value(name = "regular", constraint_setting = ":system", visibility = ["//visibility:public"])
+constraint_value(name = "none", constraint_setting = ":system")
+constraint_setting(name = "other_system", default_constraint_value = ":generic")
+constraint_value(name = "generic", constraint_setting = ":other_system")
+constraint_value(name = "special", constraint_setting = ":other_system", visibility = ["//visibility:public"])
+alias(
+    name = "eligible",
+    actual = select({
+        "@library//:first": "@library//:first",
+        "@library//:second": "@library//:second",
+        "//conditions:default": "@library//:first",
+    }),
+)
+genrule(
+    name = "consumer",
+    srcs = select({":eligible": ["before.txt"], "//conditions:default": ["after.txt"]}),
+    outs = ["consumer.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+genrule(
+    name = "probe",
+    srcs = select({"@public//:probe": ["after.txt"], "//conditions:default": ["before.txt"]}),
+    outs = ["probe.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("public.BUILD"),
+        r#"alias(name = "probe", actual = "@library//:second", visibility = ["//visibility:public"])
+"#,
+    )
+    .unwrap();
+    edit(&root.join("library/BUILD.bazel"), |text| {
+        format!(
+            r#"{text}
+config_setting(name = "first", constraint_values = ["@@//:regular"])
+config_setting(name = "second", constraint_values = ["@@//:special"])
+"#
+        )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let snapshot = |name: &str, product: &str| {
+        assert_product(root, "//:consumer", "consumer.txt", product);
+        assert_product(root, "//:probe", "probe.txt", "before");
+        let file = out.path().join(format!("{name}.json"));
+        let edges = out.path().join(format!("{name}.edges.json"));
+        let run = generate(
+            root,
+            &file,
+            &[
+                "--fineGrainedHashExternalRepos=@public",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        (file, edges)
+    };
+    let before = snapshot("before", "before");
+    edit(&root.join("BUILD.bazel"), |text| {
+        text.replace(
+            r#"default_constraint_value = ":regular""#,
+            r#"default_constraint_value = ":none""#,
+        )
+    });
+    let after = snapshot("after", "after");
+    let before_hashes = hashes(&before.0);
+    let after_hashes = hashes(&after.0);
+    assert_ne!(
+        direct(&before_hashes["//:system"]),
+        direct(&after_hashes["//:system"])
+    );
+    assert_eq!(
+        direct(&before_hashes["//:consumer"]),
+        direct(&after_hashes["//:consumer"])
+    );
+    for (name, value) in before_hashes
+        .iter()
+        .filter(|(name, _)| name.starts_with("//external:"))
+    {
+        assert_eq!(direct(value), direct(&after_hashes[name]), "{name}");
+    }
+    let result = out.path().join("impacted.txt");
+    assert!(impacted(root, &before.0, &after.0, &result, &[])
+        .status
+        .success());
+    let labels = read_lines(&result);
+    assert!(labels.contains("//:consumer"), "{labels:?}");
+    assert!(!labels.contains("//:probe"), "{labels:?}");
+    for (_, edges) in [before, after] {
+        let graph = dep_edges(&edges);
+        let public = graph["//:probe"]
+            .iter()
+            .find(|name| name.starts_with('@') && name.ends_with("//:probe"))
+            .unwrap();
+        let second = graph[public]
+            .iter()
+            .find(|name| name.starts_with('@') && name.ends_with("//:second"))
+            .unwrap();
+        let first = format!("{}//:first", second.strip_suffix("//:second").unwrap());
+        assert!(graph["//:eligible"].contains(&first));
+        assert!(graph["//:eligible"].contains(second));
+        assert!(graph[&first].contains("//:regular"));
+    }
+}
+
+#[test]
+fn fine_alias_follows_already_returned_aliases_to_its_library() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    edit(&root.join("public.BUILD"), |text| {
+        text.replace("@hidden//:forward", "@@//:bridge")
+    });
+    edit(&root.join("BUILD.bazel"), |text| {
+        format!(
+            r#"{text}
+exports_files(["payload.txt"])
+alias(name = "bridge", actual = ":second_bridge", visibility = ["//visibility:public"])
+alias(name = "second_bridge", actual = "@library//:copy")
+"#
+        )
+    });
+    edit(&root.join("library/BUILD.bazel"), |text| {
+        format!(
+            r#"{text}
+genrule(name = "copy", srcs = ["@@//:payload.txt"], outs = ["copied.txt"], cmd = "cp $< $@")
+"#
+        )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let snapshot = |value: &str| {
+        fs::write(root.join("payload.txt"), value).unwrap();
+        assert_product(root, "//:consumer", "consumer.txt", value);
+        let file = out.path().join(format!("{value}.json"));
+        let run = generate(root, &file, &["--fineGrainedHashExternalRepos=@public"]);
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        file
+    };
+    let before = snapshot("before");
+    let after = snapshot("after");
+    let result = out.path().join("impacted.txt");
+    assert!(impacted(root, &before, &after, &result, &[])
+        .status
+        .success());
+    assert!(read_lines(&result).contains("//:consumer"));
+}
+
+#[test]
+fn main_alias_reaches_a_library_behind_an_external_alias() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    edit(&root.join("BUILD.bazel"), |text| {
+        format!(
+            r#"{text}
+exports_files(["deep_payload.txt"])
+alias(name = "main_alias", actual = "@library//:inner_alias")
+genrule(
+    name = "main_consumer",
+    srcs = [":main_alias"],
+    outs = ["main_consumer.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+"#
+        )
+    });
+    edit(&root.join("library/BUILD.bazel"), |text| {
+        format!(
+            r#"{text}
+alias(name = "inner_alias", actual = ":deep_library")
+library(name = "deep_library", srcs = ["deep_leaf.txt"], selected = "deep_leaf.txt")
+genrule(name = "copy_leaf", srcs = ["@@//:deep_payload.txt"], outs = ["deep_leaf.txt"], cmd = "cp $< $@")
+"#
+        )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let snapshot = |value: &str| {
+        fs::write(root.join("deep_payload.txt"), value).unwrap();
+        assert_product(root, "//:main_consumer", "main_consumer.txt", value);
+        assert_product(root, "//:consumer", "consumer.txt", "before");
+        let file = out.path().join(format!("{value}.json"));
+        let edges = out.path().join(format!("{value}-edges.json"));
+        let run = generate(
+            root,
+            &file,
+            &[
+                "--fineGrainedHashExternalRepos=@public",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        (file, edges)
+    };
+    let (before, _) = snapshot("before");
+    let (after, edges) = snapshot("after");
+    let result = out.path().join("impacted.txt");
+    assert!(impacted(root, &before, &after, &result, &[])
+        .status
+        .success());
+    let labels = read_lines(&result);
+    assert!(labels.contains("//:main_consumer"), "{labels:?}");
+    assert!(!labels.contains("//:consumer"), "{labels:?}");
+    let old = hashes(&before);
+    let new = hashes(&after);
+    for (label, value) in old
+        .iter()
+        .filter(|(label, _)| label.starts_with("//external:"))
+    {
+        assert_eq!(
+            value.rsplit_once('~').unwrap().1,
+            new[label].rsplit_once('~').unwrap().1,
+            "{label}"
+        );
+    }
+    let graph = dep_edges(&edges);
+    let package = graph["//:main_alias"]
+        .iter()
+        .find_map(|label| label.strip_suffix(":inner_alias"))
+        .unwrap();
+    for (from, to) in [
+        ("inner_alias", "deep_library"),
+        ("deep_library", "deep_leaf.txt"),
+        ("deep_leaf.txt", "copy_leaf"),
+    ] {
+        assert!(graph[&format!("{package}:{from}")].contains(&format!("{package}:{to}")));
+    }
+}
+
+#[test]
+fn fine_aliases_track_the_selected_destination_with_fixed_inputs() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    let output = tempfile::tempdir().unwrap();
+    edit(&root.join("library/BUILD.bazel"), |text| {
+        format!("{text}\nexports_files([\"other.txt\"])\n")
+    });
+    edit(&root.join("MODULE.bazel"), |text| {
+        text.replace(
+            r#"use_repo(aliases, "public")"#,
+            r#"use_repo(aliases, "public", "hidden")"#,
+        )
+    });
+    // The missing filegroup leads back into the already queried public package.
+    edit(&root.join("hidden.BUILD"), |text| {
+        format!(
+            "{text}\nfilegroup(name = \"round_trip\", srcs = [\"@public//:back\"], visibility = [\"//visibility:public\"])\n"
+        )
+    });
+    let mut snapshots = [Vec::new(), Vec::new()];
+    let first = "@hidden//:forward";
+    let other = "@library//:other.txt";
+    for (name, default, alternate, sibling, product) in [
+        ("base", first, other, first, "before"),
+        ("sibling", first, other, other, "before"),
+        ("swapped", other, first, other, "other"),
+    ] {
+        fs::write(
+            root.join("public.BUILD"),
+            format!(
+                r#"config_setting(name = "alt", values = {{"define": "choice=alt"}})
+alias(name = "forward", actual = "@hidden//:round_trip", visibility = ["//visibility:public"])
+alias(
+    name = "back",
+    actual = select({{":alt": "{alternate}", "//conditions:default": "{default}"}}),
+    visibility = ["//visibility:public"],
+)
+alias(name = "sibling", actual = "{sibling}")
+"#
+            ),
+        )
+        .unwrap();
+        assert_product(root, "//:consumer", "consumer.txt", product);
+        for (idx, fine) in ["@public", "@public,@hidden,@library"]
+            .into_iter()
+            .enumerate()
+        {
+            let out = output.path().join(format!("{name}-{idx}.json"));
+            let edges = output.path().join(format!("{name}-{idx}-edges.json"));
+            let generated = generate(
+                root,
+                &out,
+                &[
+                    &format!("--fineGrainedHashExternalRepos={fine}"),
+                    "--bazelCommandOptions=--proto:output_rule_attrs=tags",
+                    "-d",
+                    edges.to_str().unwrap(),
+                ],
+            );
+            assert!(
+                generated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&generated.stderr)
+            );
+            let graph = dep_edges(&edges);
+            let key = graph.keys().find(|k| k.ends_with("public//:back")).unwrap();
+            snapshots[idx].push((hashes(&out)[key].clone(), graph[key].clone(), out));
+        }
+    }
+    for (idx, profile) in snapshots.into_iter().enumerate() {
+        let [(before, inputs, first), (unchanged, sibling_inputs, _), (after, swapped_inputs, second)] =
+            profile.as_slice()
+        else {
+            unreachable!()
+        };
+        assert_eq!(inputs, sibling_inputs);
+        assert_eq!(inputs, swapped_inputs);
+        assert_eq!(before.rsplit('~').next(), unchanged.rsplit('~').next());
+        assert_ne!(
+            before.rsplit('~').next(),
+            after.rsplit('~').next(),
+            "fine profile {idx}"
+        );
+        let out = output.path().join("impact.txt");
+        assert!(impacted(root, first, second, &out, &[]).status.success());
+        assert!(read_lines(&out).contains("//:consumer"));
+    }
+}
+
+#[test]
+fn fine_aliases_preserve_partial_rebuilds() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    assert_product(root, "//:consumer", "consumer.txt", "before");
+    init_git(root);
+    let out = tempfile::tempdir().unwrap();
+    let partial = |name: &str, base: Option<&std::path::Path>| {
+        let hashes = out.path().join(format!("{name}.json"));
+        let edges = out.path().join(format!("{name}-edges.json"));
+        let edge_arg = edges.display().to_string();
+        let base_arg = base.map(|path| path.display().to_string());
+        let mut args = vec![
+            "--fineGrainedHashExternalRepos=@public",
+            "--excludeExternalTargets",
+            "--partialGraph",
+            "-d",
+            &edge_arg,
+        ];
+        if let Some(base) = &base_arg {
+            args.extend(["--baseHashes", base]);
+        }
+        let result = generate(root, &hashes, &args);
+        let log = String::from_utf8_lossy(&result.stderr).into_owned();
+        assert!(result.status.success(), "{name}: {log}");
+        (hashes, edges, log)
+    };
+    partial("warm", None);
+    if !git(root, &["status", "--porcelain"]).is_empty() {
+        commit(root, "settle repository metadata");
+    }
+    let lock_path = root.join("MODULE.bazel.lock");
+    let lock = fs::read(&lock_path).unwrap();
+    let (base, _, _) = partial("base", None);
+    assert_eq!(fs::read(&lock_path).unwrap(), lock);
+    fs::write(root.join("library/data.txt"), "after\n").unwrap();
+    assert_product(root, "//:consumer", "consumer.txt", "after");
+    assert_eq!(fs::read(&lock_path).unwrap(), lock);
+    assert_eq!(git(root, &["diff", "--name-only"]), "library/data.txt");
+    assert!(git(root, &["ls-files", "--others", "--exclude-standard"]).is_empty());
+    let (reused, reused_edges, log) = partial("reused", Some(&base));
+    assert!(
+        log.contains("full generation")
+            && log.contains("read while loading")
+            && log.contains("library"),
+        "{log}"
+    );
+    let (fresh, fresh_edges, _) = partial("fresh", None);
+    let saved_source = |path: &std::path::Path| {
+        let data: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let sources = data["metadata"]["partialGraph"]["externalSources"]
+            .as_object()
+            .expect("external source recipes");
+        let (label, digest) = sources
+            .iter()
+            .find(|(label, _)| label.ends_with("library//:data.txt"))
+            .expect("the library source behind the fine alias");
+        let hash = data["hashes"][label].as_str().expect("library source hash");
+        let direct = hash.rsplit_once('~').unwrap().1;
+        (digest.as_str().unwrap().to_owned(), direct.to_owned())
+    };
+    let (base_source, base_direct) = saved_source(&base);
+    let (fresh_source, fresh_direct) = saved_source(&fresh);
+    assert_ne!(base_source, fresh_source);
+    assert_ne!(base_direct, fresh_direct);
+    assert_eq!(fs::read(&reused).unwrap(), fs::read(&fresh).unwrap());
+    assert_eq!(dep_edges(&reused_edges), dep_edges(&fresh_edges));
+    assert!(dep_edges(&fresh_edges).iter().any(|(label, inputs)| {
+        label.ends_with("hidden//:forward")
+            && inputs.iter().any(|input| input.ends_with("library//:lib"))
+    }));
+    let selected = out.path().join("selected.txt");
+    let result = impacted(root, &base, &reused, &selected, &[]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(read_lines(&selected).contains("//:consumer"));
+}
+
+#[test]
+fn fine_aliases_honor_query_failure_mode() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    edit(&root.join("public.BUILD"), |text| {
+        format!("{text}\nalias(name = \"dangling\", actual = \"@hidden//:missing\")\n")
+    });
+    edit(&root.join("BUILD.bazel"), |text| {
+        format!("{text}\nfilegroup(name = \"uses_dangling\", srcs = [\"@public//:dangling\"])\n")
+    });
+    let out = tempfile::tempdir().unwrap();
+    let strict = out.path().join("strict.json");
+    let flags = [
+        "--fineGrainedHashExternalRepos=@public",
+        "--excludeExternalTargets",
+    ];
+    let result = generate(root, &strict, &flags);
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{error}");
+    assert!(
+        error.contains("failed to acquire ordinary alias inputs") && error.contains("//:missing"),
+        "{error}"
+    );
+    assert!(!strict.exists());
+
+    let kept = out.path().join("kept.json");
+    let edges = out.path().join("kept-edges.json");
+    let mut args = flags.to_vec();
+    args.extend(["--keep_going", "-d", edges.to_str().unwrap()]);
+    let result = generate(root, &kept, &args);
+    let warning = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{warning}");
+    assert!(
+        warning.contains("keeping ordinary repository fallbacks for incomplete alias discovery"),
+        "{warning}"
+    );
+    assert!(!dep_edges(&edges)
+        .keys()
+        .any(|label| label.ends_with("hidden//:forward")));
+}
+
+#[test]
+fn fine_aliases_acquire_a_library_with_many_dict_selects() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_alias_acquisition");
+    let root = workspace.path();
+    // Flattened, these 40 selects have 2^40 combinations.
+    edit(&root.join("library/defs/library.bzl"), |text| {
+        format!(
+            "{}{}",
+            text.replace(
+                "\"selected\": attr.string(mandatory = True),",
+                "\"selected\": attr.string(mandatory = True),\n        \"env\": attr.string_dict(),",
+            ),
+            r#"
+def many_selects(count):
+    result = None
+    for i in range(count):
+        branch = select({
+            ":c%d" % i: {"k%d" % i: "on"},
+            "//conditions:default": {"k%d" % i: "off"},
+        })
+        result = branch if result == None else result | branch
+    return result
+"#
+        )
+    });
+    edit(&root.join("library/BUILD.bazel"), |text| {
+        format!(
+            "{}\n[config_setting(name = \"c%d\" % i, define_values = {{\"c%d\" % i: \"1\"}}) for i in range(40)]\n",
+            text.replace(
+                "load(\"//defs:library.bzl\", \"library\")",
+                "load(\"//defs:library.bzl\", \"library\", \"many_selects\")",
+            )
+            .replace(
+                "selected = \"data.txt\",",
+                "selected = \"data.txt\",\n    env = many_selects(40),",
+            )
+        )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let hashes_path = out.path().join("hashes.json");
+    let result = generate(
+        root,
+        &hashes_path,
+        &[
+            "--fineGrainedHashExternalRepos=@public",
+            "--excludeExternalTargets",
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(hashes(&hashes_path)
+        .keys()
+        .any(|label| label.ends_with("library//:lib")));
 }
 
 const ISOLATED_ROOT: &[&str] = &["--isolatedDependencyRoot", "@hub"];
@@ -389,6 +1404,155 @@ fn assert_product(workspace: &std::path::Path, target: &str, file: &str, expecte
             .trim(),
         expected
     );
+}
+
+#[test]
+fn local_archive_build_file_reaches_only_its_own_repository_and_readers() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("local_archive_build_file");
+    let root = workspace.path();
+    let archive = fixture("integration-test-1.zip");
+    edit(&root.join("MODULE.bazel"), |text| {
+        text.replace("ARCHIVE_URL", &format!("file://{}", archive.display()))
+    });
+    let out = tempfile::tempdir().unwrap();
+    let template = fs::read_to_string(root.join("overlays/overlay.tpl")).unwrap();
+    let base = out.path().join("base.json");
+    for (arm, active, neighbor) in [
+        ("base", "A", "A"),
+        ("active", "B", "A"),
+        ("neighbor", "A", "B"),
+    ] {
+        for (file, value) in [("active.rules", active), ("neighbor.rules", neighbor)] {
+            fs::write(
+                root.join("overlays").join(file),
+                template.replace("VALUE", value),
+            )
+            .unwrap();
+        }
+        let hashes = out.path().join(format!("{arm}.json"));
+        let generated = generate(root, &hashes, &[]);
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        // The resolved tool and the direct reader use the same archive output.
+        assert_product(root, "//:products", "tool_user.txt", active);
+        assert_eq!(
+            fs::read_to_string(root.join("bazel-bin/plain.txt"))
+                .unwrap()
+                .trim(),
+            active
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("bazel-bin/other.txt"))
+                .unwrap()
+                .trim(),
+            neighbor
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("bazel-bin/stable.txt")).unwrap(),
+            "unchanged"
+        );
+        for product in ["copied", "local_copy"] {
+            assert_eq!(
+                fs::read_to_string(root.join(format!("bazel-bin/{product}.txt")))
+                    .unwrap()
+                    .trim(),
+                active
+            );
+        }
+        if arm == "base" {
+            continue;
+        }
+        let before: serde_json::Value = serde_json::from_slice(&fs::read(&base).unwrap()).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&hashes).unwrap()).unwrap();
+        for (repo, expected) in [
+            ("//external:sdk", arm == "active"),
+            ("//external:neighbor", arm == "neighbor"),
+        ] {
+            let before = before["hashes"][repo]
+                .as_str()
+                .unwrap()
+                .rsplit_once('~')
+                .unwrap()
+                .1;
+            let after = after["hashes"][repo]
+                .as_str()
+                .unwrap()
+                .rsplit_once('~')
+                .unwrap()
+                .1;
+            assert_eq!(before != after, expected, "{arm}: {repo}");
+        }
+        let affected = out.path().join(format!("{arm}.txt"));
+        let result = impacted(root, &base, &hashes, &affected, &[]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let rows = fs::read_to_string(affected).unwrap();
+        let changed: BTreeSet<_> = rows
+            .lines()
+            .map(|label| label.trim_start_matches('@'))
+            .collect();
+        for (label, expected) in [
+            ("//:registration", arm == "active"),
+            ("//:plain", arm == "active"),
+            ("//:copied", arm == "active"),
+            ("//:local_copy", arm == "active"),
+            ("//:other", arm == "neighbor"),
+            ("//:stable", false),
+        ] {
+            assert_eq!(changed.contains(label), expected, "{arm}: {label}");
+        }
+    }
+
+    init_git(root);
+    let partial = |name: &str, base: Option<&std::path::Path>| {
+        partial_hashes(root, out.path(), name, base, &[])
+    };
+    partial("warm", None);
+    if !git(root, &["status", "--porcelain"]).is_empty() {
+        commit(root, "settle repository metadata");
+    }
+    let lock_path = root.join("MODULE.bazel.lock");
+    let lock = fs::read(&lock_path).unwrap();
+    let (base, _, _) = partial("partial-base", None);
+    assert_eq!(fs::read(&lock_path).unwrap(), lock);
+    fs::write(
+        root.join("overlays/active.rules"),
+        template.replace("VALUE", "B"),
+    )
+    .unwrap();
+    assert_product(root, "//:plain", "plain.txt", "B");
+    assert_eq!(fs::read(&lock_path).unwrap(), lock);
+    assert_eq!(git(root, &["diff", "--name-only"]), "overlays/active.rules");
+    assert!(git(root, &["ls-files", "--others", "--exclude-standard"]).is_empty());
+    let (reused, reused_edges, log) = partial("reused", Some(&base));
+    assert!(
+        log.contains("full generation")
+            && log.contains("read while loading")
+            && log.contains("overlays"),
+        "{log}"
+    );
+    let (fresh, fresh_edges, _) = partial("fresh", None);
+    assert_eq!(fs::read(&reused).unwrap(), fs::read(&fresh).unwrap());
+    assert_eq!(dep_edges(&reused_edges), dep_edges(&fresh_edges));
+    let selected = out.path().join("partial-selected.txt");
+    let result = impacted(root, &base, &reused, &selected, &[]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let selected = read_lines(&selected);
+    assert!(selected.contains("//:plain"), "{selected:?}");
+    assert!(!selected.contains("//:other"), "{selected:?}");
 }
 
 #[test]
@@ -535,12 +1699,525 @@ fn isolated_dependency_root_keeps_hidden_spoke_changes() {
     assert!(!changed.contains("//outside:uses_owner"), "{changed:?}");
 }
 
-// Module `ext`'s extension generates `@app`, whose rule resolves a toolchain, and the repositories
-// that toolchain can come from. A query never shows a resolved toolchain as an input, so with
-// `@app` fine-grained the change has to reach `//:uses_app` through `ext`, however `ext` registers
-// the toolchain: from a repository it imports, through an alias whose toolchain lives in a
-// repository nobody imports, or by canonical label without importing anything. This is why
-// `--labelOnlyModuleExtensions` is opt-in: an extension like this one must not be listed.
+#[test]
+fn reports_observed_toolchain_type_references() {
+    let workspace = copy_workspace("extension_toolchain_through_owner");
+    let root = workspace.path();
+    edit(&root.join("MODULE.bazel"), |text| {
+        format!("{text}\nregister_toolchains(\"//declaration:registration\")\n")
+    });
+    edit(&root.join("declaration/BUILD.bazel"), |text| {
+        let text = text.replace(
+            r#"toolchain_type = "@ext//:toolchain_type""#,
+            r#"toolchain_type = ":public_type""#,
+        );
+        format!(
+            "{text}\nalias(name = \"public_type\", actual = \"@ext//:toolchain_type\")\nfilegroup(name = \"type_holder\", srcs = [\"@ext//:toolchain_type\"])\n"
+        )
+    });
+    // Stock query exposes ordinary attributes. The action still obtains its
+    // compiler version through the resolved ToolchainInfo.
+    edit(&root.join("ext/defs.bzl"), |text| {
+        text.replace(
+        r#"attrs = {"_wrapper":"#,
+        r#"attrs = {"_declared_type": attr.label(default = "@ext//:toolchain_type"), "_wrapper":"#,
+    )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let before = out.path().join("before.json");
+    let after = out.path().join("after.json");
+    let edges = out.path().join("edges.json");
+    let candidates = out.path().join("candidates.json");
+    let result = out.path().join("ordinary.txt");
+    let options = [
+        "--includeToolchainInputs",
+        "--fineGrainedHashExternalRepos=@ext",
+        "--bazelCommandOptions=--proto:output_rule_attrs=version",
+    ];
+    assert_product(
+        root,
+        "//declaration:consumer",
+        "declaration/consumer.txt",
+        "before",
+    );
+    assert!(generate(root, &before, &options).status.success());
+    edit(&root.join("declaration/BUILD.bazel"), |text| {
+        text.replace("\"before\"", "\"after\"")
+    });
+    assert_product(
+        root,
+        "//declaration:consumer",
+        "declaration/consumer.txt",
+        "after",
+    );
+    let mut tracked = options.to_vec();
+    tracked.extend(["-d", edges.to_str().unwrap()]);
+    assert!(generate(root, &after, &tracked).status.success());
+    assert!(impacted(
+        root,
+        &before,
+        &after,
+        &result,
+        &[
+            "-d",
+            edges.to_str().unwrap(),
+            "--toolchainCandidatesFile",
+            candidates.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+    let ordinary: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+    assert!(
+        ordinary
+            .iter()
+            .all(|row| row["label"] != "//declaration:consumer"),
+        "{ordinary:?}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(candidates).unwrap()).unwrap();
+    assert_eq!(report["complete"], false);
+    assert!(
+        report["possibleTypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "//declaration:public_type"),
+        "{report}"
+    );
+    let readers = report["possibleReaders"].as_array().unwrap();
+    assert!(
+        readers.iter().any(|v| v == "//declaration:consumer"),
+        "{report}"
+    );
+    assert!(
+        readers.iter().any(|v| v == "//declaration:type_holder"),
+        "{report}"
+    );
+    assert!(
+        readers.iter().all(|v| v != "//declaration:other"),
+        "{report}"
+    );
+}
+
+#[test]
+fn toolchain_declarations_follow_their_implementations() {
+    let workspace = copy_workspace("extension_toolchain_through_owner");
+    let root = workspace.path();
+    edit(&root.join("MODULE.bazel"), |module| {
+        format!("{module}\nregister_toolchains(\"//declaration:registration\")\n")
+    });
+    let out = tempfile::tempdir().unwrap();
+    let before = out.path().join("before.json");
+    let after = out.path().join("after.json");
+    let edges = out.path().join("edges.json");
+    let result = out.path().join("impacted.json");
+    let args = [
+        "--bazelCommandOptions=--noproto:flatten_selects",
+        "--includeTargetType",
+        "-d",
+        edges.to_str().unwrap(),
+    ];
+    for (hashes, value) in [(&before, "before"), (&after, "after")] {
+        if value == "after" {
+            edit(&root.join("declaration/BUILD.bazel"), |text| {
+                text.replace("\"before\"", "\"after\"")
+            });
+        }
+        assert_product(
+            root,
+            "//declaration:consumer",
+            "declaration/consumer.txt",
+            value,
+        );
+        assert!(generate(root, hashes, &args).status.success());
+    }
+    assert!(impacted(
+        root,
+        &before,
+        &after,
+        &result,
+        &["-d", edges.to_str().unwrap()]
+    )
+    .status
+    .success());
+    let changes: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+    let distance = |name: &str| {
+        changes
+            .iter()
+            .find(|row| row["label"] == name)
+            .and_then(|row| row["targetDistance"].as_u64())
+    };
+    assert_eq!(distance("//declaration:primary"), Some(0));
+    assert_eq!(distance("//declaration:registration"), Some(1));
+    assert_eq!(distance("//declaration:choice"), Some(1));
+    assert_eq!(distance("//declaration:other"), None);
+    assert!(dep_edges(&edges)["//declaration:choice"].contains("//declaration:other"));
+}
+
+#[test]
+fn parent_transition_reaches_a_toolchain_outside_the_extension() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("extension_toolchain_through_owner");
+    let changed = copy_workspace("extension_toolchain_through_owner");
+    for workspace in [&first, &changed] {
+        edit(&workspace.path().join("MODULE.bazel"), |module| {
+            format!(
+                r#"{module}
+bazel_dep(name = "outside")
+local_path_override(module_name = "outside", path = "outside")
+bazel_dep(name = "registrar")
+local_path_override(module_name = "registrar", path = "registrar")
+register_toolchains("@registrar//:registration", "@registrar//:all", "@registrar//other:registration")
+"#
+            )
+        });
+        edit(&workspace.path().join("BUILD.bazel"), |build| {
+            format!(
+                r#"load("//:generator.bzl", "forward")
+{build}
+forward(name = "switched", src = "@app//:lib")
+forward(name = "switched_main", src = "//declaration:consumer")
+genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "cat $< > $@")
+"#
+            )
+        });
+    }
+    let ordinary = std::process::Command::new(bazel())
+        .current_dir(first.path())
+        .args(["query", "deps(@outside//:impl)", "--nokeep_going"])
+        .output()
+        .unwrap();
+    assert!(!ordinary.status.success());
+    assert!(String::from_utf8_lossy(&ordinary.stderr).contains("unavailable_test_sdk"));
+    fs::write(changed.path().join("outside/version.txt"), "outside-2\n").unwrap();
+    for (workspace, content) in [(&first, "outside-1"), (&changed, "outside-2")] {
+        assert_product(workspace.path(), "//:normal", "normal.txt", "1.0");
+        assert_product(workspace.path(), "//:switched", "switched.txt", content);
+        assert_product(
+            workspace.path(),
+            "//:switched_main",
+            "switched_main.txt",
+            content,
+        );
+        assert_product(
+            workspace.path(),
+            "//declaration:consumer",
+            "declaration/consumer.txt",
+            "1.0",
+        );
+    }
+    let out = tempfile::tempdir().unwrap();
+    let edges = out.path().join("edges.json");
+    let changes = diff_local(
+        first.path(),
+        changed.path(),
+        &[
+            "--fineGrainedHashExternalRepos",
+            "@app",
+            "--depEdgesFile",
+            edges.to_str().unwrap(),
+        ],
+    );
+    if !has_module_registrations(first.path()) {
+        // Stock ordinary queries cannot name this hidden registration. The
+        // configured-root mode can observe it under the real incoming parent.
+        let selected = diff_local(
+            first.path(),
+            changed.path(),
+            &["--useCquery", "--cqueryRootExpression", "//:switched"],
+        );
+        assert!(
+            selected
+                .iter()
+                .any(|label| label.trim_start_matches('@') == "//:switched"),
+            "{selected:?}"
+        );
+        return;
+    }
+    assert!(
+        changes
+            .iter()
+            .any(|label| label.trim_start_matches("@@") == "//:switched"),
+        "{changes:?}"
+    );
+    assert!(changes.contains("//:switched_main"), "{changes:?}");
+    let graph = dep_edges(&edges);
+    for reader in ["@app//:lib", "//declaration:consumer"] {
+        let inputs = &graph[reader];
+        assert!(inputs.contains("@outside//:impl"), "{reader}: {inputs:?}");
+        assert!(
+            inputs.contains("@@ext++tools+tc//:impl"),
+            "{reader}: {inputs:?}"
+        );
+    }
+    // A declaration can choose a different compiler even when its label,
+    // order, implementation and the implementation's bytes stay fixed.
+    fs::copy(
+        first.path().join("outside/version.txt"),
+        changed.path().join("outside/version.txt"),
+    )
+    .unwrap();
+    let other = "registrar/other/BUILD.bazel";
+    let update = |path: &str| {
+        edit(&changed.path().join(path), |build| {
+            build.replace("@outside//:alternate", "@outside//:other")
+        });
+    };
+    update(other);
+    assert_product(changed.path(), "//:switched", "switched.txt", "outside-1");
+    let args = ["--fineGrainedHashExternalRepos", "@app"];
+    let changes = diff_local(first.path(), changed.path(), &args);
+    assert!(!changes.contains("//:switched"), "{changes:?}");
+    fs::copy(first.path().join(other), changed.path().join(other)).unwrap();
+    update("registrar/BUILD.bazel");
+    assert_product(changed.path(), "//:switched", "switched.txt", "1.0");
+    let changes = diff_local(first.path(), changed.path(), &args);
+    assert!(changes.contains("//:switched"), "{changes:?}");
+
+    // The two orders contain exactly the same declarations. Registering the
+    // alias first changes the tool selected under the parent's transition.
+    let registrar = "registrar/BUILD.bazel";
+    fs::copy(first.path().join(registrar), changed.path().join(registrar)).unwrap();
+    for (workspace, order) in [
+        (
+            &first,
+            r#""@registrar//:registration", "@registrar//:all", "@@ext++tools+tc_alias//:tc""#,
+        ),
+        (
+            &changed,
+            r#""@@ext++tools+tc_alias//:tc", "@registrar//:registration", "@registrar//:all""#,
+        ),
+    ] {
+        // An ambient filter for the unrelated type would hide both compilers.
+        fs::write(
+            workspace.path().join(".bazelrc"),
+            "mod --toolchain_type=@registrar//:other_type\n",
+        )
+        .unwrap();
+        edit(&workspace.path().join("MODULE.bazel"), |module| {
+            module.replace(r#""@registrar//:registration", "@registrar//:all""#, order)
+        });
+    }
+    assert_product(first.path(), "//:switched", "switched.txt", "outside-1");
+    assert_product(changed.path(), "//:switched", "switched.txt", "1.0");
+    let changes = diff_local(first.path(), changed.path(), &args);
+    assert!(changes.contains("//:switched"), "{changes:?}");
+}
+
+#[test]
+fn extra_toolchain_outside_the_ordinary_graph_reaches_its_reader() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("extension_toolchain_through_owner");
+    let changed = copy_workspace("extension_toolchain_through_owner");
+    for (workspace, version) in [(&first, "one"), (&changed, "two")] {
+        let root = workspace.path();
+        edit(&root.join("MODULE.bazel"), |module| {
+            format!(
+                r#"{module}
+bazel_dep(name = "outside")
+local_path_override(module_name = "outside", path = "outside")
+"#
+            )
+        });
+        fs::write(
+            root.join("outside/BUILD.bazel"),
+            r#"load("@ext//:defs.bzl", "tool")
+tool(name = "impl", runtime = "@@ext++tools+tc_impl//:version.txt", visibility = ["//visibility:public"])
+toolchain(name = "extra", toolchain = ":impl", toolchain_type = "@ext//:toolchain_type", visibility = ["//visibility:public"])
+"#,
+        )
+        .unwrap();
+        edit(&root.join("BUILD.bazel"), |build| {
+            format!(
+                r#"{build}
+genrule(name = "product", srcs = [":uses_app"], outs = ["product.txt"], cmd = "cat $< > $@")
+filegroup(name = "unrelated", srcs = ["@app//:copies"])
+alias(name = "runtime", actual = "@@ext++tools+tc_impl//:version.txt")
+alias(name = "forward", actual = ":runtime")
+genrule(name = "copy", srcs = [":forward"], outs = ["copy.txt"], cmd = "cat $< > $@")
+"#
+            )
+        });
+        fs::write(
+            root.join(".bazelrc"),
+            "build --config=compiler\nbuild:compiler --extra_toolchains=@outside//:extra\nbuild:unused --extra_toolchains=@absent//:extra\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("versions.json"),
+            format!(r#"{{"toolchain":"1.0","alternate":"{version}"}}"#),
+        )
+        .unwrap();
+        assert_product(root, "//:product", "product.txt", version);
+        assert_product(root, "//:copy", "copy.txt", version);
+    }
+    let out = tempfile::tempdir().unwrap();
+    let edges = out.path().join("edges.json");
+    let changes = diff_local(
+        first.path(),
+        changed.path(),
+        &[
+            "--fineGrainedHashExternalRepos",
+            "@app",
+            "--depEdgesFile",
+            edges.to_str().unwrap(),
+        ],
+    );
+    assert!(changes.contains("//:uses_app"), "{changes:?}");
+    assert!(changes.contains("//:product"), "{changes:?}");
+    assert!(!changes.contains("//:unrelated"), "{changes:?}");
+    if has_module_registrations(first.path()) {
+        // Keep positive MODULE compiler edges alongside the repository fallback.
+        assert!(dep_edges(&edges)["@app//:lib"].contains("@@ext++tools+tc//:impl"));
+    }
+
+    let compare_roots = || {
+        diff_local(
+            first.path(),
+            changed.path(),
+            &[
+                "--useCquery",
+                "--cqueryRootExpression=set(//:product //:copy //:unrelated)",
+            ],
+        )
+        .into_iter()
+        .map(|label| match label.strip_prefix("@@//") {
+            Some(target) => format!("//{target}"),
+            None => label,
+        })
+        .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        compare_roots(),
+        BTreeSet::from(["//:copy".into(), "//:product".into()])
+    );
+    for (workspace, version) in [(&first, "one"), (&changed, "two")] {
+        fs::remove_file(workspace.path().join(".bazelrc")).unwrap();
+        assert_product(workspace.path(), "//:product", "product.txt", "1.0");
+        assert_product(workspace.path(), "//:copy", "copy.txt", version);
+    }
+    assert_eq!(compare_roots(), BTreeSet::from(["//:copy".into()]));
+}
+
+#[test]
+fn separate_toolchain_type_keeps_its_own_consumers() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let first = copy_workspace("extension_toolchain_through_owner");
+    let changed = copy_workspace("extension_toolchain_through_owner");
+    for workspace in [&first, &changed] {
+        let root = workspace.path();
+        let bridge = root.join("bridge");
+        fs::create_dir(&bridge).unwrap();
+        fs::write(
+            bridge.join("MODULE.bazel"),
+            "module(name = \"bridge\")\nbazel_dep(name = \"ext\")\n",
+        )
+        .unwrap();
+        fs::write(
+            bridge.join("BUILD.bazel"),
+            r#"load(":rules.bzl", "bridge_lib")
+bridge_lib(name = "lib", visibility = ["//visibility:public"])
+"#,
+        )
+        .unwrap();
+        fs::write(
+            bridge.join("rules.bzl"),
+            r#"def _bridge(ctx):
+    out = ctx.actions.declare_file("bridge.txt")
+    ctx.actions.write(out, ctx.toolchains["@ext//:other_type"].version)
+    return [DefaultInfo(files = depset([out]))]
+
+bridge_lib = rule(implementation = _bridge, toolchains = ["@ext//:other_type"])
+"#,
+        )
+        .unwrap();
+        edit(&root.join("MODULE.bazel"), |module| {
+            format!(
+                "{module}\nbazel_dep(name = \"bridge\")\nlocal_path_override(module_name = \"bridge\", path = \"bridge\")\n"
+            )
+        });
+        edit(&root.join("ext/BUILD.bazel"), |build| {
+            format!(
+                "{build}\ntoolchain_type(name = \"other_type\", visibility = [\"//visibility:public\"])\n"
+            )
+        });
+        edit(&root.join("ext/defs.bzl"), |defs| {
+            format!(
+                r#"{defs}
+def _other(ctx):
+    out = ctx.actions.declare_file(ctx.label.name + ".txt")
+    ctx.actions.write(out, ctx.toolchains["@ext//:other_type"].version)
+    return [DefaultInfo(files = depset([out]))]
+
+other_lib = rule(
+    implementation = _other,
+    attrs = {{"_wrapper": attr.label(default = "@ext//:wrapper.sh", allow_single_file = True)}},
+    toolchains = ["@ext//:other_type"],
+)
+"#
+            )
+        });
+        edit(&root.join("ext/tools.bzl"), |extension| {
+            extension.replace(
+            "toolchain(name = \"tc\",",
+            "toolchain(name = \"other\", toolchain = \":impl\", toolchain_type = \"@ext//:other_type\", visibility = [\"//visibility:public\"])\ntoolchain(name = \"tc\",",
+        )
+        });
+        edit(&root.join("ext/MODULE.bazel"), |module| {
+            let module = module.replace("@tc//:all", "@tc//:tc");
+            format!(
+                "{module}\nuse_repo(tools, \"tc_impl\")\nregister_toolchains(\"@tc_impl//:other\")\n"
+            )
+        });
+        edit(&root.join("BUILD.bazel"), |build| {
+            format!(
+                r#"load("@ext//:defs.bzl", "other_lib")
+{build}
+other_lib(name = "other_reader")
+genrule(name = "bridge_reader", srcs = ["@bridge//:lib"], outs = ["bridge.txt"], cmd = "cat $< > $@")
+genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "cat $< > $@")
+"#
+            )
+        });
+    }
+    fs::write(
+        changed.path().join("versions.json"),
+        r#"{"toolchain":"1.0","alternate":"2.0"}"#,
+    )
+    .unwrap();
+    for (workspace, expected) in [(&first, "1.0"), (&changed, "2.0")] {
+        assert_product(
+            workspace.path(),
+            "//:other_reader",
+            "other_reader.txt",
+            expected,
+        );
+        assert_product(workspace.path(), "//:bridge_reader", "bridge.txt", expected);
+        assert_product(workspace.path(), "//:normal", "normal.txt", "1.0");
+    }
+    let selected = diff_local(
+        first.path(),
+        changed.path(),
+        &["--fineGrainedHashExternalRepos", "@app"],
+    );
+    assert!(selected.contains("//:other_reader"), "{selected:?}");
+    assert!(selected.contains("//:bridge_reader"), "{selected:?}");
+    // The MODULE registrations identify each reader's candidates, but another
+    // command-line registration can still use the shared extension.
+    assert!(selected.contains("//:normal"), "{selected:?}");
+}
+
+// The generated @app resolves a toolchain also produced by its extension. An
+// ordinary query omits the resolved implementation. Exercise direct, aliased
+// and canonical registrations, and a sibling read through an ordinary label.
 #[test]
 fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
     if !supports_mod_show_repo() {
@@ -576,13 +2253,184 @@ fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
                 .any(|label| label == "//:uses_app" || label == "@@//:uses_app"),
             "{registration}: {impacted:?}"
         );
+        assert_product(
+            first.path(),
+            "//declaration:consumer",
+            "declaration/consumer.txt",
+            "1.0",
+        );
+        assert_product(
+            bumped.path(),
+            "//declaration:consumer",
+            "declaration/consumer.txt",
+            "2.0",
+        );
+        assert!(
+            impacted.contains("//declaration:consumer"),
+            "{registration}: {impacted:?}"
+        );
+        if registration.starts_with(r#"use_repo(tools, "tc")"#) {
+            for workspace in [&first, &bumped] {
+                let generator = fs::read_to_string(workspace.path().join("generator.bzl")).unwrap();
+                fs::write(
+                    workspace.path().join("reader.bzl"),
+                    generator.replace("generate = rule(", "alias = rule("),
+                )
+                .unwrap();
+                edit(&workspace.path().join("ext/tools.bzl"), |tools| {
+                    tools.replace(
+                        r#"rctx.file("BUILD.bazel", 'alias(name = "tc", actual = "@tc_impl//:tc")')"#,
+                        r#"rctx.file("BUILD.bazel", """load("@@//:reader.bzl", reader = "alias")
+alias(name = "tc", actual = "@tc_impl//:tc")
+alias(name = "unavailable_alias", actual = "//absent:target")
+genrule(name = "relay", srcs = ["@hidden_reader//:late_reader"], outs = ["relay.txt"], cmd = "cat $(SRCS) > $@", visibility = ["//visibility:public"])
+reader(name = "late_reader", visibility = ["//visibility:public"])
+""")"#,
+                    ).replace(
+                        r#"tc_alias(name = "tc_alias")"#,
+                        "tc_alias(name = \"tc_alias\")\n    tc_alias(name = \"hidden_reader\")",
+                    )
+                });
+                let unrelated = workspace.path().join("unrelated");
+                fs::create_dir(&unrelated).unwrap();
+                fs::write(
+                    unrelated.join("MODULE.bazel"),
+                    "module(name = \"unrelated\")\n",
+                )
+                .unwrap();
+                fs::write(
+                    unrelated.join("BUILD.bazel"),
+                    "filegroup(name = \"partial\", srcs = [\"//absent:sdk\"], visibility = [\"//visibility:public\"])\n",
+                ).unwrap();
+                let partial = workspace.path().join("partial");
+                fs::create_dir(&partial).unwrap();
+                fs::write(partial.join("defs.bzl"), "def _partial(ctx):\n    return []\n\npartial = rule(implementation = _partial, attrs = {\"src\": attr.label()})\n").unwrap();
+                fs::write(partial.join("BUILD.bazel"), "load(\":defs.bzl\", \"partial\")\npartial(name = \"reader\", src = \"@unrelated//absent:sdk\")\n").unwrap();
+                edit(&workspace.path().join("MODULE.bazel"), |module| {
+                    format!(
+                        "{module}\nuse_repo(tools, \"tc_impl\")\nregister_toolchains(\"//:registration\")\nbazel_dep(name = \"unrelated\")\nlocal_path_override(module_name = \"unrelated\", path = \"unrelated\")\n"
+                    )
+                });
+                edit(&workspace.path().join("BUILD.bazel"), |build| {
+                    format!(
+                        r#"load("//:generator.bzl", "compiler", "generate")
+{build}
+genrule(name = "via_unavailable_alias", srcs = ["@@ext++tools+tc_alias//:unavailable_alias"], outs = ["unavailable.out"], cmd = "cat $(SRCS) > $@")
+genrule(name = "deep_reader", srcs = ["@@ext++tools+tc_alias//:relay"], outs = ["deep.txt"], cmd = "cat $(SRCS) > $@")
+toolchain_type(name = "generator_type")
+alias(name = "generator_alias", actual = ":generator_type")
+compiler(name = "compiler", src = "@tc_impl//:version.txt")
+toolchain(name = "registration", toolchain_type = ":generator_alias", toolchain = ":compiler")
+compiler(name = "unused_compiler", src = "@tc_impl//:version.txt")
+toolchain(name = "unused", toolchain_type = ":generator_alias", toolchain = ":unused_compiler")
+toolchain_type(name = "other_type")
+compiler(name = "other_compiler", src = "@tc_impl//:version.txt")
+toolchain(name = "other", toolchain_type = ":other_type", toolchain = ":other_compiler")
+generate(name = "independent")
+generate(name = "unbuildable", data = "@tc_impl//:version.txt", fail_analysis = True)
+generate(name = "also_unbuildable", fail_analysis = True, type_label = ":other_type")
+filegroup(name = "unrelated", srcs = ["@unrelated//:partial"])
+filegroup(name = "removed_api", srcs = ["@app//:removed"])
+genrule(
+    name = "read_versions",
+    srcs = [":uses_app", "@tc_impl//:version.txt"],
+    outs = ["versions.txt"],
+    cmd = "cat $(location :uses_app) $(location @tc_impl//:version.txt) > $@",
+)
+"#
+                    )
+                });
+            }
+            fs::write(
+                bumped.path().join("versions.json"),
+                r#"{"toolchain":"1.0","alternate":"2.0"}"#,
+            )
+            .unwrap();
+            assert_product(first.path(), "//:read_versions", "versions.txt", "1.01.0");
+            assert_product(bumped.path(), "//:read_versions", "versions.txt", "1.02.0");
+            assert_product(first.path(), "//:independent", "independent.txt", "1.0");
+            assert_product(bumped.path(), "//:independent", "independent.txt", "2.0");
+            assert_product(first.path(), "//:deep_reader", "deep.txt", "1.0");
+            assert_product(bumped.path(), "//:deep_reader", "deep.txt", "2.0");
+            let out = tempfile::tempdir().unwrap();
+            let edges = out.path().join("edges.json");
+            let changes = diff_local(
+                first.path(),
+                bumped.path(),
+                &[
+                    "--fineGrainedHashExternalRepos",
+                    "@app,@tc_impl",
+                    "--depEdgesFile",
+                    edges.to_str().unwrap(),
+                ],
+            );
+            let graph = dep_edges(&edges);
+            for (reader, expected) in [
+                ("//:independent", vec!["//:compiler", "//:unused_compiler"]),
+                ("//:unbuildable", vec!["//:compiler", "//:unused_compiler"]),
+                (
+                    "//:also_unbuildable",
+                    vec!["//:compiler", "//:other_compiler", "//:unused_compiler"],
+                ),
+            ] {
+                let compilers: Vec<_> = graph[reader]
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|child| child.ends_with("compiler"))
+                    .collect();
+                assert_eq!(compilers, expected, "{reader}");
+            }
+            let selected = |name| {
+                changes
+                    .iter()
+                    .any(|label| label.trim_start_matches("@@") == name)
+            };
+            assert!(selected("//:independent"), "{changes:?}");
+            assert!(selected("//:unbuildable"), "{changes:?}");
+            assert!(selected("//:read_versions"), "{changes:?}");
+            assert!(selected("//partial:reader"), "{changes:?}");
+            if has_module_registrations(first.path()) {
+                assert!(selected("//:removed_api"), "{changes:?}");
+            }
+            // Either visible declaration can be added by an incoming transition.
+            // The ordinary snapshot keeps both candidates for this toolchain type.
+            if has_module_registrations(first.path()) {
+                // The later, transitively reached Starlark reader and the native alias
+                // share a display name. Only the reader uses a compiler.
+                assert!(graph["@@ext++tools+hidden_reader//:late_reader"].contains("//:compiler"));
+                assert!(selected("//:deep_reader"), "{changes:?}");
+                let alias = &graph["@@ext++tools+tc_alias//:unavailable_alias"];
+                assert!(
+                    !alias
+                        .iter()
+                        .any(|input| input.ends_with(":impl") || input.ends_with("compiler")),
+                    "{alias:?}"
+                );
+                assert!(graph["@app//:lib"].contains("@tc_impl//:impl"));
+                assert!(graph["@app//:lib"].contains("@@ext++tools+tc//:impl"));
+            }
+            assert!(selected("//:uses_app"), "{changes:?}");
+            let precise = diff_local(
+                first.path(),
+                bumped.path(),
+                &["--useCquery", "--cqueryRootExpression", "//:uses_app"],
+            );
+            assert!(
+                !precise
+                    .iter()
+                    .any(|name| name.trim_start_matches('@') == "//:uses_app"),
+                "{precise:?}"
+            );
+        }
         if registration.starts_with("register_toolchains") {
             // The assertion is specifically about consumers of @app. The distinct @tc_impl
             // repository selected via a registered toolchain must still invalidate its user.
             // This other usage of the same extension is isolated and root-imported.
             for workspace in [&first, &bumped] {
                 edit(&workspace.path().join("MODULE.bazel"), |module| {
-                    format!("{module}\npeer = use_extension(\"@ext//:tools.bzl\", \"tools\", isolate = True)\nuse_repo(peer, peer_tc = \"tc\")\n")
+                    format!(
+                        "{module}\npeer = use_extension(\"@ext//:tools.bzl\", \"tools\", isolate = True)\nuse_repo(peer, peer_tc = \"tc\")\n"
+                    )
                 });
                 fs::write(
                     workspace.path().join(".bazelrc"),
@@ -627,6 +2475,86 @@ fn fine_grained_extension_target_sees_a_toolchain_from_its_extension() {
     }
 }
 
+#[test]
+fn registered_compiler_reads_fine_input_through_another_pinned_archive() {
+    use sha2::{Digest, Sha256};
+
+    let base = copy_workspace("extension_toolchain_through_owner");
+    let head = copy_workspace("extension_toolchain_through_owner");
+    let files = tempfile::tempdir().unwrap();
+    let overlay = files.path().join("bridge.BUILD");
+    let contents = r#"filegroup(name = "forward", srcs = ["@tc_impl//:version.txt"], visibility = ["//visibility:public"])"#;
+    fs::write(&overlay, contents).unwrap();
+    let overlay_hash = hex::encode(Sha256::digest(contents));
+    let zip = fixture("integration-test-1.zip");
+    for workspace in [&base, &head] {
+        let root = workspace.path();
+        edit(&root.join("MODULE.bazel"), |module| {
+            format!(
+                r#"{module}
+use_repo(tools, "tc_impl")
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+http_file(name = "overlay", urls = ["file://{}"], sha256 = "{overlay_hash}", downloaded_file_path = "bridge.BUILD")
+archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+archive(name = "bridge", urls = ["file://{zip}"], sha256 = "{zip_hash}", build_file = "@overlay//file:bridge.BUILD")
+archive(name = "sdk", urls = ["file://{zip}"], sha256 = "{zip_hash}", build_file_content = """load("@@//:generator.bzl", "compiler")
+compiler(name = "impl", src = "@bridge//:forward")
+toolchain(name = "registration", toolchain_type = "@@//:generator_type", toolchain = ":impl")
+""")
+register_toolchains("@sdk//:registration")
+"#,
+                overlay.display(),
+                zip = zip.display(),
+                zip_hash = "f9acf346049358076827b799e95de4b5acf0556fd75991e0dd5363814bc85683",
+            )
+        });
+        edit(&root.join("BUILD.bazel"), |build| {
+            format!(
+                r#"load(":generator.bzl", "generate")
+{build}
+toolchain_type(name = "generator_type", visibility = ["//visibility:public"])
+generate(name = "archive_reader")
+"#
+            )
+        });
+    }
+    fs::write(
+        head.path().join("versions.json"),
+        r#"{"toolchain":"1.0","alternate":"2.0"}"#,
+    )
+    .unwrap();
+    assert_product(
+        base.path(),
+        "//:archive_reader",
+        "archive_reader.txt",
+        "1.0",
+    );
+    assert_product(
+        head.path(),
+        "//:archive_reader",
+        "archive_reader.txt",
+        "2.0",
+    );
+    if has_module_registrations(base.path()) {
+        let affected = diff_local(
+            base.path(),
+            head.path(),
+            &["--fineGrainedHashExternalRepos", "@app,@tc_impl"],
+        );
+        assert!(affected.contains("//:archive_reader"), "{affected:?}");
+    }
+}
+
+fn has_module_registrations(workspace: &std::path::Path) -> bool {
+    std::process::Command::new(bazel())
+        .current_dir(workspace)
+        .args(["mod", "show_toolchains", "--output=json"])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
 fn diff_local(
     first: &std::path::Path,
     second: &std::path::Path,
@@ -640,6 +2568,38 @@ fn diff_local(
     assert!(generate(second, &to, args).status.success());
     assert!(impacted(second, &from, &to, &result, &[]).status.success());
     read_lines(&result)
+}
+
+#[test]
+fn external_macro_stack_uses_returned_source() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let base = copy_workspace("external_macro_stack");
+    let changed = copy_workspace("external_macro_stack");
+    edit(&changed.path().join("defs.bzl"), |text| {
+        text.replace(
+            "right, \"//conditions:default\": left",
+            "left, \"//conditions:default\": right",
+        )
+    });
+    assert_product(base.path(), "//:product", "product.txt", "left");
+    assert_product(changed.path(), "//:product", "product.txt", "right");
+    let impacted = diff_local(
+        base.path(),
+        changed.path(),
+        &[
+            "--fineGrainedHashExternalRepos=@bridge,@macros",
+            "--bazelStartupOptions=--ignore_all_rc_files",
+        ],
+    );
+    let contains = |name| {
+        impacted
+            .iter()
+            .any(|label| label.trim_start_matches('@') == name)
+    };
+    assert!(contains("//:uses_bridge"), "{impacted:?}");
+    assert!(!contains("//:unrelated"), "{impacted:?}");
 }
 
 #[test]
@@ -681,4 +2641,94 @@ fn returned_external_source_reaches_consumer() {
         "{targets:?}"
     );
     assert!(!targets.contains("@@//:unrelated") && !targets.contains("//:unrelated"));
+
+    if supports_mod_show_repo() {
+        ordinary_external_filegroup_consumers();
+    }
+}
+
+fn ordinary_external_filegroup_consumers() {
+    let workspace = copy_workspace("extension_toolchain_through_owner");
+    let root = workspace.path();
+    fs::copy(
+        root.join("filegroup_readers.BUILD"),
+        root.join("BUILD.bazel"),
+    )
+    .unwrap();
+    let output = tempfile::tempdir().unwrap();
+    for (state, source, compiler, unrelated) in [
+        ("base", "one", "1.0", "before"),
+        ("compiler", "one", "2.0", "before"),
+        ("copy", "two", "1.0", "before"),
+        ("unrelated", "one", "1.0", "after"),
+    ] {
+        fs::write(root.join("ext/wrapper.sh"), source).unwrap();
+        fs::write(
+            root.join("versions.json"),
+            format!(r#"{{"toolchain":"{compiler}"}}"#),
+        )
+        .unwrap();
+        fs::write(root.join("unrelated.txt"), unrelated).unwrap();
+        for (mode, query) in [
+            ("ordinary", "--bazelCommandOptions=--noproto:locations"),
+            (
+                "projected",
+                "--bazelCommandOptions=--noproto:locations --proto:output_rule_attrs=tags,testonly --proto:include_synthetic_attribute_hash",
+            ),
+            (
+                "filtered",
+                "--bazelCommandOptions=--noproto:locations --notool_deps --proto:output_rule_attrs=tags,testonly --proto:include_synthetic_attribute_hash",
+            ),
+        ] {
+            let hashes = output.path().join(format!("{state}-{mode}.json"));
+            assert!(
+                generate(
+                    root,
+                    &hashes,
+                    &[
+                        "--fineGrainedHashExternalRepos=@ext",
+                        "--excludeExternalTargets",
+                        query,
+                    ]
+                )
+                .status
+                .success()
+            );
+            if state != "base" {
+                let before = output.path().join(format!("base-{mode}.json"));
+                let result = output.path().join("impact.txt");
+                assert!(
+                    impacted(root, &before, &hashes, &result, &[])
+                        .status
+                        .success()
+                );
+                let changed = read_lines(&result);
+                if mode != "filtered" {
+                    assert_eq!(
+                        changed.contains("//:copy_reader"),
+                        state == "copy",
+                        "{state}: {changed:?}"
+                    );
+                    assert_eq!(
+                        changed.contains("//:unrelated"),
+                        state == "unrelated",
+                        "{state}: {changed:?}"
+                    );
+                }
+                if state == "compiler" || state == "copy" {
+                    assert!(
+                        changed.contains("//:tool_reader"),
+                        "{state}/{mode}: {changed:?}"
+                    );
+                }
+            }
+        }
+        assert_product(root, "//:copy_reader", "plain.txt", source);
+        assert_product(
+            root,
+            "//:tool_reader",
+            "mixed.txt",
+            &format!("{source}{compiler}"),
+        );
+    }
 }

@@ -246,7 +246,7 @@ mod tests {
         argv.extend(extra_args.iter().map(ToString::to_string));
         let env: BTreeMap<String, String> = env
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|&(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
         let mut log = Vec::new();
         let code = run(&argv, &env, &mut log);

@@ -1,0 +1,44 @@
+load(":tools.bzl", "use")
+
+toolchain_type(name = "type")
+
+toolchain(name = "registration", toolchain_type = ":type", toolchain = "@sdk//:implementation")
+
+use(name = "tool_user")
+
+genrule(
+    name = "plain",
+    srcs = ["@sdk//:payload"],
+    outs = ["plain.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+genrule(
+    name = "other",
+    srcs = ["@neighbor//:payload"],
+    outs = ["other.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+genrule(
+    name = "copied",
+    srcs = ["@copied//:payload"],
+    outs = ["copied.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+genrule(
+    name = "local_copy",
+    srcs = ["@local_copy//:payload"],
+    outs = ["local_copy.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+genrule(
+    name = "stable",
+    srcs = ["@forwarded//:stable.txt"],
+    outs = ["stable.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+filegroup(name = "products", srcs = [":tool_user", ":plain", ":other", ":copied", ":local_copy", ":stable"])

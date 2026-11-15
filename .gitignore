@@ -40,6 +40,10 @@ coverage-html/
 # Firecracker benchmark harness outputs
 .bench-results/
 
+# perf_proof.py (make perf-proof) report files
+perf-proof-summary.md
+perf-proof-metrics.json
+
 # Go orchestrator build output (go build . in tools/firecracker)
 /tools/firecracker/firecracker
 

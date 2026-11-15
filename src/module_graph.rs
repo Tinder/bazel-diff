@@ -48,6 +48,20 @@ fn parse_modules(json: &str) -> BTreeMap<String, Module> {
     modules
 }
 
+/// A complete successful producer answer must also be a usable snapshot for this module model.
+/// Ordinary comparisons keep their historical tolerance for missing or malformed metadata.
+pub(crate) fn usable_module_graph(json: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(json) else {
+        return false;
+    };
+    value.get("key").and_then(Value::as_str) == Some("<root>")
+        && value.get("root").and_then(Value::as_bool) == Some(true)
+        && ["dependencies", "indirectDependencies", "cycles"]
+            .iter()
+            .all(|field| value.get(*field).is_some_and(Value::is_array))
+        && parse_modules(json).contains_key("<root>")
+}
+
 fn changed_modules(from: &str, to: &str) -> BTreeSet<String> {
     let from = parse_modules(from);
     let to = parse_modules(to);
@@ -81,6 +95,26 @@ fn canonical_is_base_for_module(canonical: &str, module: &str) -> bool {
     !version.contains('+') && !version.contains('~')
 }
 
+/// Whether the end revision's workspace resolves its dependencies through Bzlmod, which decides
+/// the default of `--excludeExternalTargets` for impacted targets.
+///
+/// A hash file carries the module graph only when `bazel mod graph` answered while it was
+/// generated, which is exactly when [`BazelOptions::is_bzlmod_enabled`] would have answered yes
+/// for that revision. Reading it there spares the probe's Bazel invocation, which on a cold
+/// server (a CI job that downloads hashes generated elsewhere) means starting Bazel and
+/// resolving the module graph just to learn a boolean. Without a module graph the hash file
+/// cannot tell Bzlmod off from a graph that was never recorded, so Bazel is asked as before.
+pub fn bzlmod_enabled_for(to: &HashFileData, bazel: &BazelOptions) -> bool {
+    records_bzlmod(to) || bazel.is_bzlmod_enabled()
+}
+
+fn records_bzlmod(hashes: &HashFileData) -> bool {
+    hashes
+        .module_graph_json
+        .as_deref()
+        .is_some_and(|graph| !graph.trim().is_empty())
+}
+
 pub fn impacted_with_module_changes(
     from: &HashFileData,
     to: &HashFileData,
@@ -91,35 +125,89 @@ pub fn impacted_with_module_changes(
     })
 }
 
+/// Compare one standalone hash pair and retain the native paths and MODULE obligations.
+pub fn impact_graph(
+    from: &HashFileData,
+    to: &HashFileData,
+    dep_edges: &BTreeMap<String, Vec<String>>,
+    bazel: Option<&BazelOptions>,
+    target_types: Option<&HashSet<String>>,
+    exclude_external: bool,
+) -> Result<crate::model::ImpactGraph> {
+    let mut forced = BTreeSet::new();
+    visit_module_overlay(
+        from,
+        to,
+        bazel.is_some(),
+        |expression| bazel.unwrap().query(expression, false),
+        |label| {
+            forced.insert(label);
+        },
+    );
+    crate::model::hash_file_impact_graph(
+        from,
+        to,
+        dep_edges,
+        &forced,
+        target_types,
+        exclude_external,
+    )
+}
+
+fn main_label(label: &str) -> Option<&str> {
+    let label = crate::bazel::main_repo_label_key(label);
+    label.starts_with("//").then_some(label)
+}
+
 fn impacted_with_module_query(
     from: &HashFileData,
     to: &HashFileData,
     can_query: bool,
-    mut query: impl FnMut(&str) -> Result<Vec<Target>>,
+    query: impl FnMut(&str) -> Result<Vec<Target>>,
 ) -> Result<BTreeSet<String>> {
     let mut impacted = impacted_targets(&from.hashes, &to.hashes, None, false)?
         .into_iter()
         .collect::<BTreeSet<_>>();
+    visit_module_overlay(from, to, can_query, query, |label| {
+        impacted.insert(label);
+    });
+    Ok(impacted)
+}
+
+fn visit_module_overlay(
+    from: &HashFileData,
+    to: &HashFileData,
+    can_query: bool,
+    mut query: impl FnMut(&str) -> Result<Vec<Target>>,
+    mut emit: impl FnMut(String),
+) {
+    fn repo_inventory(file: &HashFileData) -> &BTreeMap<String, crate::model::TargetHash> {
+        file.configured_roots
+            .as_ref()
+            .map_or(&file.hashes, |view| &view.hashes)
+    }
     if from.module_graph_json == to.module_graph_json {
-        return Ok(impacted);
+        return;
     }
     let (Some(from_graph), Some(to_graph)) = (
         from.module_graph_json.as_deref(),
         to.module_graph_json.as_deref(),
     ) else {
-        return Ok(impacted);
+        return;
     };
     let changed = changed_modules(from_graph, to_graph);
     if changed.is_empty() {
-        return Ok(impacted);
+        return;
     }
     if !can_query {
-        return Ok(to.hashes.keys().cloned().collect());
+        for label in to.hashes.keys() {
+            emit(label.clone());
+        }
+        return;
     }
-    let canonical_repos = from
-        .hashes
+    let canonical_repos = repo_inventory(from)
         .keys()
-        .chain(to.hashes.keys())
+        .chain(repo_inventory(to).keys())
         .filter_map(|label| {
             label
                 .strip_prefix("@@")
@@ -136,7 +224,7 @@ fn impacted_with_module_query(
         })
         .collect::<BTreeSet<_>>();
     if repos.is_empty() {
-        return Ok(impacted);
+        return;
     }
     let expression = format!(
         "rdeps(//..., {})",
@@ -147,14 +235,26 @@ fn impacted_with_module_query(
             .join(" + ")
     );
     match query(&expression) {
+        Ok(targets) if to.configured_roots.is_some() => {
+            let dependency_roots: HashSet<_> = targets
+                .iter()
+                .filter_map(target_name)
+                .filter_map(main_label)
+                .collect();
+            for label in to.hashes.keys().filter(|label| {
+                main_label(label).is_some_and(|label| dependency_roots.contains(label))
+            }) {
+                emit(label.clone());
+            }
+        }
         Ok(targets) => {
-            impacted.extend(
-                targets
-                    .iter()
-                    .filter_map(target_name)
-                    .filter(|label| !label.starts_with("@@"))
-                    .map(str::to_owned),
-            );
+            for label in targets
+                .iter()
+                .filter_map(target_name)
+                .filter(|label| !label.starts_with("@@"))
+            {
+                emit(label.to_owned());
+            }
         }
         Err(error) => {
             eprintln!(
@@ -163,17 +263,26 @@ fn impacted_with_module_query(
             let workspace_targets = to
                 .hashes
                 .keys()
-                .filter(|label| !label.starts_with("@@") && !label.starts_with("//external:"))
+                .filter(|label| {
+                    if to.configured_roots.is_some() {
+                        main_label(label).is_some_and(|label| !label.starts_with("//external:"))
+                    } else {
+                        !label.starts_with("@@") && !label.starts_with("//external:")
+                    }
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             if workspace_targets.is_empty() {
-                impacted.extend(to.hashes.keys().cloned());
+                for label in to.hashes.keys() {
+                    emit(label.clone());
+                }
             } else {
-                impacted.extend(workspace_targets);
+                for label in workspace_targets {
+                    emit(label);
+                }
             }
         }
     }
-    Ok(impacted)
 }
 
 #[cfg(test)]
@@ -279,6 +388,54 @@ mod tests {
         );
         assert!(changed_modules(&graph("0.50.1"), &graph("0.50.1")).is_empty());
         assert!(changed_modules("invalid", &graph("0.50.1")).is_empty());
+    }
+
+    #[test]
+    fn records_bzlmod_only_for_a_recorded_module_graph() {
+        let with_graph = |graph: Option<&str>| HashFileData {
+            module_graph_json: graph.map(str::to_owned),
+            ..Default::default()
+        };
+        assert!(records_bzlmod(&with_graph(Some(&graph("0.50.1")))));
+        // No graph, or an empty answer, leaves the question to Bazel.
+        assert!(!records_bzlmod(&with_graph(None)));
+        assert!(!records_bzlmod(&with_graph(Some(""))));
+        assert!(!records_bzlmod(&with_graph(Some(" \n"))));
+    }
+
+    #[test]
+    fn verified_module_snapshot_requires_usable_data() {
+        let mut graph = serde_json::json!({
+            "key": "<root>",
+            "name": "root",
+            "version": "",
+            "apparentName": "root",
+            "dependencies": [],
+            "indirectDependencies": [],
+            "cycles": [],
+            "root": true,
+        });
+        assert!(usable_module_graph(&graph.to_string()));
+        for invalid in ["", "{", r#"{"key":"<root>"}"#] {
+            assert!(!usable_module_graph(invalid));
+        }
+        graph["dependencies"] = serde_json::json!([
+            {
+                "key": "ext@_", "name": "ext", "version": "", "apparentName": "ext",
+                "dependencies": [], "indirectDependencies": [], "cycles": []
+            },
+            {
+                "key": "tool@_", "name": "tool", "version": "", "apparentName": "tool",
+                "dependencies": [{
+                    "key": "ext@_", "name": "ext", "version": "", "apparentName": "ext",
+                    "unexpanded": true
+                }],
+                "indirectDependencies": [], "cycles": []
+            }
+        ]);
+        assert!(usable_module_graph(&graph.to_string()));
+        graph["dependencies"] = Value::Null;
+        assert!(!usable_module_graph(&graph.to_string()));
     }
 
     #[test]

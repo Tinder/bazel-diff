@@ -52,6 +52,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "core::serve_multiple_repositories",
+                "timeout": "moderate",
+            },
+            {
                 "name": "core::serve_partial_graph_derives_source_edits",
                 "timeout": "moderate",
             },
@@ -89,6 +93,42 @@ RUST_E2E_SUITES = [
             },
             {
                 "name": "external::cquery_external_dependency_change_platforms",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::external_macro_stack_uses_returned_source",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::extra_toolchain_outside_the_ordinary_graph_reaches_its_reader",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_alias_follows_already_returned_aliases_to_its_library",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_alias_to_a_source_tracks_its_contents_and_visibility",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_aliases_acquire_a_library_with_many_dict_selects",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_aliases_acquire_hidden_libraries_and_definition_sources",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_aliases_honor_query_failure_mode",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_aliases_preserve_partial_rebuilds",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_aliases_track_the_selected_destination_with_fixed_inputs",
                 "timeout": "moderate",
             },
             {
@@ -132,11 +172,47 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::label_only_extension_bump_does_not_reach_users_of_the_owner_or_its_dependents",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::local_archive_build_file_reaches_only_its_own_repository_and_readers",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::main_alias_reaches_a_library_behind_an_external_alias",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::ordinary_alias_can_use_a_matcher_from_a_reached_external_package",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::parent_transition_reaches_a_toolchain_outside_the_extension",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::registered_compiler_reads_fine_input_through_another_pinned_archive",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::remote_proto_bump_impacts_consumer",
                 "timeout": "moderate",
             },
             {
+                "name": "external::reports_observed_toolchain_type_references",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::returned_external_source_reaches_consumer",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::separate_toolchain_type_keeps_its_own_consumers",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::toolchain_declarations_follow_their_implementations",
                 "timeout": "moderate",
             },
             {
@@ -152,7 +228,27 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::configured_roots_preserve_module_obligations",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::cquery_keeps_dependencies_of_every_configured_instance",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::cquery_rejects_indistinguishable_toolchain_instances",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::cquery_reports_only_requested_configured_roots",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::cquery_verifies_aspect_free_selected_toolchain",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::cquery_verifies_covered_configured_roots",
                 "timeout": "moderate",
             },
             {
@@ -220,7 +316,23 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::main_repo_alias_change_reaches_consumer_cquery",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::main_repo_alias_change_reaches_consumer_cquery_workspace_mode",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::main_repo_alias_change_reaches_consumer_query",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::module_comment_and_lock_reformat_are_noops",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::ordinary_query_cycles_propagate_outgoing_changes",
                 "timeout": "moderate",
             },
             {

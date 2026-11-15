@@ -1,0 +1,7 @@
+module(name = "external_macro_stack")
+
+macros = use_repo_rule("//:repos.bzl", "macros")
+bridge = use_repo_rule("//:repos.bzl", "bridge")
+
+macros(name = "macros")
+bridge(name = "bridge")

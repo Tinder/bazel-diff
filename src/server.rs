@@ -3,11 +3,10 @@ use crate::cache;
 use crate::cancel::{Cancellation, CANCELLED};
 use crate::git::{self, DerivationPolicy, Git};
 use crate::hash::{elapsed_millis, generate_hashes_timed, GenerationTimings, HashOptions};
-use crate::model::{
-    filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
-};
-use crate::module_graph::impacted_with_module_changes;
+use crate::model::{filter_and_sort_labels, hash_file_distances, HashFileData};
+use crate::module_graph::{bzlmod_enabled_for, impacted_with_module_changes};
 use crate::partial::{self, Classification, Glob, TreeIndex, TreeKind};
+use crate::web_identity::WebIdentitySessions;
 use anyhow::{anyhow, bail, Context, Result};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -19,8 +18,9 @@ use s3::request::ResponseData;
 use s3::{Bucket, Region};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet, VecDeque};
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -30,9 +30,58 @@ use std::time::{Duration, Instant, SystemTime};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use url::{form_urlencoded, Url};
 
+/// The name a server started with `--workspacePath` registers its one repository under.
+pub const DEFAULT_REPOSITORY: &str = "default";
+
+/// One git clone the server answers queries for. Every repository shares the hashing
+/// configuration, the cache tiers and the port; each has its own working tree, git, Bazel
+/// server, readiness and workspace lock, so queries against different repositories run
+/// concurrently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Repository {
+    pub name: String,
+    pub workspace: PathBuf,
+}
+
+impl Repository {
+    /// Parses the `NAME=PATH` form of `--repo`. The path is not normalised here; the CLI does
+    /// that with the same rule it applies to `--workspacePath`.
+    pub fn parse(value: &str) -> Result<Self> {
+        let Some((name, workspace)) = value.split_once('=') else {
+            bail!("expected NAME=PATH, got {value:?}");
+        };
+        validate_repository_name(name)?;
+        if workspace.is_empty() {
+            bail!("repository {name:?} has an empty path");
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            workspace: PathBuf::from(workspace),
+        })
+    }
+}
+
+/// A repository name is addressed in URLs and JSON and names a log line, so it is kept to
+/// letters, digits, `.`, `_` and `-`.
+pub fn validate_repository_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("repository name must not be empty");
+    }
+    if !name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'))
+    {
+        bail!("repository name {name:?} may only contain letters, digits, '.', '_' and '-'");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub hash_options: HashOptions,
+    /// The repositories served, in the order given. Empty means the one repository at
+    /// `hash_options.bazel.workspace`, named [`DEFAULT_REPOSITORY`].
+    pub repositories: Vec<Repository>,
     pub git_path: PathBuf,
     pub port: u16,
     pub request_timeout: Duration,
@@ -51,6 +100,8 @@ pub struct ServerConfig {
     /// query loaded it from an untracked or ignored file and the entry would be cached under a
     /// revision it does not describe. With the flag the mismatch is logged and cached anyway.
     pub allow_untracked_packages: bool,
+    /// Exact main-repository packages exempt from the untracked package check.
+    pub allowed_untracked_packages: BTreeSet<String>,
     pub no_initial_fetch: bool,
     pub warmup_revisions: Vec<String>,
     pub cache_max_age: Option<Duration>,
@@ -65,6 +116,9 @@ pub struct ServerConfig {
     pub s3_prefix: String,
     pub s3_region: Option<String>,
     pub s3_endpoint: Option<String>,
+    /// STS endpoint for `AssumeRoleWithWebIdentity`. When set, the S3 tier signs with sessions
+    /// exchanged there (see [`WebIdentitySessions`]) instead of the default provider chain.
+    pub s3_sts_endpoint: Option<String>,
     pub s3_force_path_style: bool,
     pub gcs_bucket: Option<String>,
     pub gcs_prefix: String,
@@ -73,6 +127,7 @@ pub struct ServerConfig {
     pub nexus_prefix: String,
     pub nexus_credentials: Option<NexusCredentials>,
     pub nexus_ca_cert: Option<PathBuf>,
+    pub compute_slot_demand_average_window: Option<Duration>,
 }
 
 /// How long a timed-out request waits for its cancelled query to stop before answering anyway.
@@ -83,7 +138,12 @@ const CANCEL_GRACE: Duration = Duration::from_secs(60);
 /// How often a query waiting for the workspace re-checks whether it has been cancelled.
 const WORKSPACE_WAIT_POLL: Duration = Duration::from_millis(50);
 
+/// One repository's share of the server (see [`Repository`]). `config` is the server's with
+/// `hash_options.bazel.workspace` set to this repository's clone; the cache tiers behind
+/// `remote` and `memory` are the [`Shared`] ones every repository uses, since a cache key is
+/// the git tree plus the hashing configuration and says nothing about which clone it came from.
 struct State {
+    name: String,
     config: ServerConfig,
     ready: AtomicBool,
     workspace: Workspace,
@@ -97,12 +157,142 @@ struct State {
     /// Queries accepted and not yet finished: waiting for the workspace, running, or abandoned by
     /// a timed-out client but still running. `/metrics` reports it as `activeQueries`.
     active_queries: AtomicUsize,
-    started: Instant,
     fingerprint: String,
-    remote: Option<RemoteCache>,
+    remote: Option<Arc<RemoteCache>>,
     /// Parsed entries, in front of the local-disk tier. Guarded by its own lock rather than the
     /// workspace's so `/metrics` can read its size while a query holds the workspace.
-    memory: Mutex<MemoryCache>,
+    memory: Arc<Mutex<MemoryCache>>,
+}
+
+/// The cache tiers every repository of one server shares: `--cacheDir` is the same path in
+/// each repository's config, and these are the handles to the other two.
+#[derive(Clone)]
+struct Shared {
+    remote: Option<Arc<RemoteCache>>,
+    memory: Arc<Mutex<MemoryCache>>,
+}
+
+impl Shared {
+    fn new(config: &ServerConfig, remote: Option<RemoteCache>) -> Self {
+        Self {
+            remote: remote.map(Arc::new),
+            memory: Arc::new(Mutex::new(MemoryCache::new(config.cache_memory_max))),
+        }
+    }
+}
+
+/// Per workspace. Update the count and its time history under one lock so
+/// concurrent arrivals and departures cannot record demand levels out of order.
+struct RuntimeMetrics {
+    compute_slot_demand: usize,
+    compute_slot_demand_average: ComputeSlotDemandAverage,
+}
+
+#[derive(Clone, Copy)]
+struct DemandLevel {
+    at: Instant,
+    value: usize,
+}
+
+struct ComputeSlotDemandAverage {
+    window: Duration,
+    started: Instant,
+    levels: VecDeque<DemandLevel>,
+}
+
+impl ComputeSlotDemandAverage {
+    fn new(window: Duration, started: Instant) -> Self {
+        let mut levels = VecDeque::new();
+        levels.push_back(DemandLevel {
+            at: started,
+            value: 0,
+        });
+        Self {
+            window,
+            started,
+            levels,
+        }
+    }
+
+    fn record(&mut self, value: usize, now: Instant) {
+        self.prune(now);
+        if self.levels.back().is_some_and(|level| level.value == value) {
+            return;
+        }
+        self.levels.push_back(DemandLevel { at: now, value });
+        self.prune(now);
+    }
+
+    // Slot demand counts are small integers, which f64 represents exactly.
+    #[allow(clippy::cast_precision_loss)]
+    fn current_average(&mut self, now: Instant) -> f64 {
+        self.prune(now);
+        let start = self.window_start(now);
+        let span = now.saturating_duration_since(start);
+        if span.is_zero() {
+            return self.levels.back().map_or(0.0, |level| level.value as f64);
+        }
+
+        let mut weighted_value_seconds = 0.0;
+        for index in 0..self.levels.len() {
+            let level = self.levels[index];
+            let segment_start = if level.at < start { start } else { level.at };
+            let segment_end = self.levels.get(index + 1).map_or(now, |next| next.at);
+            if segment_end > segment_start {
+                weighted_value_seconds +=
+                    level.value as f64 * segment_end.duration_since(segment_start).as_secs_f64();
+            }
+        }
+        weighted_value_seconds / span.as_secs_f64()
+    }
+
+    fn prune(&mut self, now: Instant) {
+        let cutoff = self.window_start(now);
+        while self.levels.len() > 1 && self.levels.get(1).is_some_and(|next| next.at <= cutoff) {
+            self.levels.pop_front();
+        }
+    }
+
+    fn window_start(&self, now: Instant) -> Instant {
+        let start = now.checked_sub(self.window).unwrap_or(self.started);
+        if start < self.started {
+            self.started
+        } else {
+            start
+        }
+    }
+}
+
+/// Starts before waiting for a workspace and ends on release, cancellation or error.
+struct ComputeSlotDemandGuard<'a>(&'a Mutex<RuntimeMetrics>);
+
+impl<'a> ComputeSlotDemandGuard<'a> {
+    fn start(metrics: &'a Mutex<RuntimeMetrics>) -> Self {
+        let mut state = metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.compute_slot_demand += 1;
+        let current = state.compute_slot_demand;
+        state
+            .compute_slot_demand_average
+            .record(current, Instant::now());
+        drop(state);
+        Self(metrics)
+    }
+}
+
+impl Drop for ComputeSlotDemandGuard<'_> {
+    fn drop(&mut self) {
+        let mut metrics = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.compute_slot_demand -= 1;
+        let current = metrics.compute_slot_demand;
+        metrics
+            .compute_slot_demand_average
+            .record(current, Instant::now());
+    }
 }
 
 /// The in-memory tier: entries already parsed, most recently used last.
@@ -145,12 +335,13 @@ impl MemoryCache {
     /// Remembers `data` for `key`, evicting least recently used entries to stay within budget. An
     /// entry larger than the whole budget is not kept.
     fn insert(&mut self, key: &str, bytes: u64, data: &Arc<HashFileData>) {
-        if bytes > self.budget {
-            return;
-        }
         if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
             let previous = self.entries.remove(index).expect("index from position");
             self.used -= previous.bytes;
+        }
+        // A refresh must discard the old value even if the new one cannot fit in memory.
+        if bytes > self.budget {
+            return;
         }
         while self.used + bytes > self.budget {
             let Some(evicted) = self.entries.pop_front() else {
@@ -181,21 +372,42 @@ fn memory_cache(state: &State) -> std::sync::MutexGuard<'_, MemoryCache> {
 }
 
 impl State {
+    /// A single-repository state named [`DEFAULT_REPOSITORY`] with cache tiers of its own.
+    #[cfg(test)]
     fn new(config: ServerConfig, remote: Option<RemoteCache>) -> Self {
+        let shared = Shared::new(&config, remote);
+        Self::with_shared(DEFAULT_REPOSITORY, config, &shared)
+    }
+
+    fn with_shared(name: &str, config: ServerConfig, shared: &Shared) -> Self {
         let fingerprint = configuration_fingerprint(&config);
+        let metrics = config.compute_slot_demand_average_window.map(|window| {
+            Mutex::new(RuntimeMetrics {
+                compute_slot_demand: 0,
+                compute_slot_demand_average: ComputeSlotDemandAverage::new(window, Instant::now()),
+            })
+        });
         Self {
-            memory: Mutex::new(MemoryCache::new(config.cache_memory_max)),
+            name: name.to_owned(),
+            memory: Arc::clone(&shared.memory),
+            remote: shared.remote.clone(),
             config,
             ready: AtomicBool::new(false),
             partial_derived: AtomicUsize::new(0),
             partial_rebuilds: AtomicUsize::new(0),
             untracked_package_rejections: AtomicUsize::new(0),
-            workspace: Workspace::default(),
+            workspace: Workspace {
+                holder: Mutex::new(None),
+                released: Condvar::new(),
+                metrics,
+            },
             active_queries: AtomicUsize::new(0),
-            started: Instant::now(),
             fingerprint,
-            remote,
         }
+    }
+
+    fn workspace(&self) -> &Path {
+        &self.config.hash_options.bazel.workspace
     }
 
     /// Git bound to the query currently holding the workspace, so the subprocesses it spawns die
@@ -221,14 +433,15 @@ impl State {
 /// remembers which operation holds it. That lets `/metrics` report `workspaceBusy`, lets the
 /// subprocesses the holder spawns be killed when its query is cancelled, and lets a query that is
 /// cancelled while queued give up instead of taking the workspace for nothing.
-#[derive(Default)]
 struct Workspace {
     holder: Mutex<Option<Arc<Cancellation>>>,
     released: Condvar,
+    metrics: Option<Mutex<RuntimeMetrics>>,
 }
 
 impl Workspace {
     fn acquire(&self, token: &Arc<Cancellation>) -> Result<WorkspaceGuard<'_>> {
+        let demand = self.metrics.as_ref().map(ComputeSlotDemandGuard::start);
         let mut holder = self.holder.lock().map_err(|_| poisoned())?;
         while holder.is_some() {
             if token.is_cancelled() {
@@ -241,7 +454,10 @@ impl Workspace {
                 .0;
         }
         *holder = Some(Arc::clone(token));
-        Ok(WorkspaceGuard { workspace: self })
+        Ok(WorkspaceGuard {
+            workspace: self,
+            _demand: demand,
+        })
     }
 
     fn holder(&self) -> Option<Arc<Cancellation>> {
@@ -268,6 +484,7 @@ fn poisoned() -> anyhow::Error {
 
 struct WorkspaceGuard<'a> {
     workspace: &'a Workspace,
+    _demand: Option<ComputeSlotDemandGuard<'a>>,
 }
 
 impl Drop for WorkspaceGuard<'_> {
@@ -283,9 +500,18 @@ impl Drop for WorkspaceGuard<'_> {
 struct ActiveQuery(Arc<State>);
 
 impl ActiveQuery {
-    fn start(state: &Arc<State>) -> Self {
-        state.active_queries.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(state))
+    fn start(state: &Arc<State>, reject_when_busy: bool) -> Option<Self> {
+        if reject_when_busy {
+            // Reserve admission atomically, before spawning, so two requests cannot both
+            // observe an idle repository and enqueue themselves.
+            state
+                .active_queries
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .ok()?;
+        } else {
+            state.active_queries.fetch_add(1, Ordering::SeqCst);
+        }
+        Some(Self(Arc::clone(state)))
     }
 }
 
@@ -295,11 +521,74 @@ impl Drop for ActiveQuery {
     }
 }
 
+/// The repositories one server answers for, by name, and how a request picks one.
+struct Service {
+    /// In the order the repositories were configured, which `/metrics` keeps.
+    repositories: Vec<Arc<State>>,
+    started: Instant,
+}
+
+/// Why a request's `repo` could not be resolved: the HTTP status and the message to answer with.
+struct UnknownRepository {
+    status: u16,
+    message: String,
+}
+
+impl Service {
+    fn new(repositories: Vec<Arc<State>>) -> Self {
+        Self {
+            repositories,
+            started: Instant::now(),
+        }
+    }
+
+    /// The repository a request addressed. A server with one repository answers for it whether
+    /// or not the request names it; with several, a request must name one.
+    fn select(&self, name: Option<&str>) -> Result<&Arc<State>, UnknownRepository> {
+        let names = || {
+            self.repositories
+                .iter()
+                .map(|state| state.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match name {
+            Some(name) => self
+                .repositories
+                .iter()
+                .find(|state| state.name == name)
+                .ok_or_else(|| UnknownRepository {
+                    status: 404,
+                    message: format!(
+                        "unknown repository {name:?}; this server serves: {}",
+                        names()
+                    ),
+                }),
+            None if self.repositories.len() == 1 => Ok(&self.repositories[0]),
+            None => Err(UnknownRepository {
+                status: 400,
+                message: format!(
+                    "missing required parameter 'repo'; this server serves: {}",
+                    names()
+                ),
+            }),
+        }
+    }
+
+    /// The instance is ready once every repository's startup fetch succeeded, so a load
+    /// balancer never routes to an instance that can answer for only some of them.
+    fn ready(&self) -> bool {
+        self.repositories
+            .iter()
+            .all(|state| state.ready.load(Ordering::Acquire))
+    }
+}
+
 /// The shared cache tier behind local disk. Every backend degrades the same way: a failed read is
 /// a miss (the revision is regenerated) and a failed write leaves the entry local-only, so an
 /// outage of the shared store costs throughput, never availability.
 enum RemoteCache {
-    S3(S3Cache),
+    S3(Box<S3Cache>),
     Gcs(Box<GcsCache>),
     Nexus(Box<NexusCache>),
 }
@@ -307,7 +596,7 @@ enum RemoteCache {
 impl RemoteCache {
     fn new(config: &ServerConfig) -> Result<Option<Self>> {
         if let Some(bucket_name) = &config.s3_bucket {
-            return Ok(Some(Self::S3(S3Cache::new(config, bucket_name)?)));
+            return Ok(Some(Self::S3(Box::new(S3Cache::new(config, bucket_name)?))));
         }
         if let Some(bucket_name) = &config.gcs_bucket {
             return Ok(Some(Self::Gcs(Box::new(GcsCache::new(
@@ -411,6 +700,9 @@ fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
 struct S3Cache {
     bucket: Box<Bucket>,
     prefix: String,
+    /// Set when credentials come from a configured STS endpoint; every request then signs with
+    /// the current session.
+    sessions: Option<WebIdentitySessions>,
 }
 
 impl S3Cache {
@@ -428,7 +720,19 @@ impl S3Cache {
             },
             None => region_name.parse().context("invalid S3 region")?,
         };
-        let credentials = Credentials::default().context("failed to resolve AWS credentials")?;
+        let sessions = config
+            .s3_sts_endpoint
+            .as_deref()
+            .map(WebIdentitySessions::from_env)
+            .transpose()?;
+        // A failed first exchange fails startup, as an unresolvable default chain does; later
+        // renewals degrade like any other S3 failure.
+        let credentials = match &sessions {
+            Some(sessions) => sessions
+                .credentials()
+                .context("failed to assume the S3 role at the STS endpoint")?,
+            None => Credentials::default().context("failed to resolve AWS credentials")?,
+        };
         let mut bucket =
             Bucket::new(bucket_name, region, credentials).context("failed to create S3 client")?;
         if config.s3_force_path_style {
@@ -437,7 +741,19 @@ impl S3Cache {
         Ok(Self {
             bucket,
             prefix: normalize_s3_prefix(&config.s3_prefix),
+            sessions,
         })
+    }
+
+    /// The bucket to send the next request with, signed by the current web-identity session when
+    /// one is configured.
+    fn signing_bucket(&self) -> Result<Cow<'_, Bucket>> {
+        let Some(sessions) = &self.sessions else {
+            return Ok(Cow::Borrowed(&self.bucket));
+        };
+        let mut bucket = (*self.bucket).clone();
+        bucket.set_credentials(sessions.credentials()?);
+        Ok(Cow::Owned(bucket))
     }
 
     fn object_key(&self, name: &str) -> String {
@@ -452,13 +768,16 @@ impl S3Cache {
     /// stack fails reading that absent body -- `attohttpc: Io Error: unexpected end of file`. A GET
     /// miss carries a real `NoSuchKey` body, so it reads back cleanly.
     fn get(&self, name: &str) -> Fetched {
-        let failure = match self.bucket.get_object(self.object_key(name)) {
+        let response = self
+            .signing_bucket()
+            .and_then(|bucket| bucket.get_object(self.object_key(name)).map_err(Into::into));
+        let failure = match response {
             Ok(response) if response.status_code() == 200 => {
                 return Fetched::Found(response.to_vec())
             }
             Ok(response) if response.status_code() == 404 => return Fetched::Missing,
             Ok(response) => http_failure(&response),
-            Err(error) => error.to_string(),
+            Err(error) => format!("{error:#}"),
         };
         eprintln!(
             "[Warn] S3 cache read of {} failed (treating as a miss): {failure}",
@@ -468,10 +787,15 @@ impl S3Cache {
     }
 
     fn put(&self, name: &str, data: &[u8]) {
-        let failure = match self.bucket.put_object(self.object_key(name), data) {
+        let response = self.signing_bucket().and_then(|bucket| {
+            bucket
+                .put_object(self.object_key(name), data)
+                .map_err(Into::into)
+        });
+        let failure = match response {
             Ok(response) if (200..300).contains(&response.status_code()) => return,
             Ok(response) => http_failure(&response),
-            Err(error) => error.to_string(),
+            Err(error) => format!("{error:#}"),
         };
         eprintln!(
             "[Warn] S3 cache write of {} failed (entry not shared): {failure}",
@@ -831,20 +1155,25 @@ fn read_pem_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueryBody {
+    repo: Option<String>,
     from: Option<String>,
     to: Option<String>,
     target_type: Option<Vec<String>>,
     modified_filepaths: Option<Vec<String>>,
     profile: Option<bool>,
+    reject_when_busy: Option<bool>,
 }
 
 #[derive(Debug)]
 struct QueryInputs {
+    /// The `repo` the request named, if any (see [`Service::select`]).
+    repository: Option<String>,
     from: String,
     to: String,
     target_types: Option<HashSet<String>>,
     modified_filepaths: BTreeSet<PathBuf>,
     profile: bool,
+    reject_when_busy: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -925,54 +1254,121 @@ pub fn validate_partial_graph(config: &ServerConfig) -> Result<()> {
     partial::validate_hash_options(&config.hash_options)
 }
 
-pub fn serve(config: ServerConfig) -> Result<()> {
+pub fn serve(config: &ServerConfig) -> Result<()> {
     if let Some(root) = &config.hash_options.bazel.isolated_dependency_root {
         bail!("serve does not support --isolatedDependencyRoot={root}");
     }
-    validate_partial_graph(&config)?;
+    validate_partial_graph(config)?;
+    let repositories = repositories(config)?;
     fs::create_dir_all(&config.cache_dir)?;
-    let remote = RemoteCache::new(&config)?;
-    let state = Arc::new(State::new(config, remote));
-    prune_cache(&state);
-    start_cache_pruner(&state)?;
-    perform_initial_fetch(&state);
-    let server = Server::http(("0.0.0.0", state.config.port))
+    let remote = RemoteCache::new(config)?;
+    let shared = Shared::new(config, remote);
+    let port = config.port;
+    let states = repositories
+        .iter()
+        .map(|repository| {
+            let mut config = config.clone();
+            config
+                .hash_options
+                .bazel
+                .workspace
+                .clone_from(&repository.workspace);
+            Arc::new(State::with_shared(&repository.name, config, &shared))
+        })
+        .collect::<Vec<_>>();
+    // Every repository prunes the same `--cacheDir`, so one pruner is enough.
+    prune_cache(&states[0]);
+    start_cache_pruner(&states[0])?;
+    perform_initial_fetches(&states);
+    let service = Arc::new(Service::new(states));
+    let server = Server::http(("0.0.0.0", port))
         .map_err(|error| anyhow!("failed to bind HTTP server: {error}"))?;
     eprintln!(
-        "[Info] bazel-diff query service listening on port {}",
-        state.config.port
+        "[Info] bazel-diff query service listening on port {port} for {}",
+        repositories
+            .iter()
+            .map(|repository| format!("{}={}", repository.name, repository.workspace.display()))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     for request in server.incoming_requests() {
-        let state = Arc::clone(&state);
-        std::thread::spawn(move || handle_request(request, &state));
+        let service = Arc::clone(&service);
+        std::thread::spawn(move || handle_request(request, &service));
     }
     Ok(())
 }
 
+/// The repositories `config` serves: `config.repositories`, or the one at
+/// `hash_options.bazel.workspace` named [`DEFAULT_REPOSITORY`]. Names must be valid and unique.
+pub fn repositories(config: &ServerConfig) -> Result<Vec<Repository>> {
+    if config.repositories.is_empty() {
+        return Ok(vec![Repository {
+            name: DEFAULT_REPOSITORY.to_owned(),
+            workspace: config.hash_options.bazel.workspace.clone(),
+        }]);
+    }
+    let mut seen = HashSet::new();
+    for repository in &config.repositories {
+        validate_repository_name(&repository.name)?;
+        if !seen.insert(repository.name.as_str()) {
+            bail!("repository {:?} is given more than once", repository.name);
+        }
+    }
+    Ok(config.repositories.clone())
+}
+
+/// Fetches and warms every repository at once: each has its own clone and Bazel server, so
+/// the startup cost of an instance is its slowest repository's, not their sum.
+fn perform_initial_fetches(states: &[Arc<State>]) {
+    std::thread::scope(|scope| {
+        for state in states {
+            scope.spawn(move || perform_initial_fetch(state));
+        }
+    });
+}
+
 /// Performs the startup git fetch (unless `--noInitialFetch`) and warmup, then flips `ready`
-/// once the clone is known good. On a fetch failure the server is left running but un-ready
-/// ("lame duck") so `/health` reports 503 and a load balancer removes the instance rather than
-/// us attempting a risky in-place repair; `/metrics` keeps answering with `ready: false`.
+/// once the clone is known good. A failed fetch is retried once after pruning origin, but only
+/// when Git recommends that command. Unrecovered failures leave the server running but un-ready
+/// ("lame duck"): `/health` reports 503 and `/metrics` keeps answering with `ready: false`.
 fn perform_initial_fetch(state: &Arc<State>) {
+    let name = &state.name;
     if !state.config.no_initial_fetch {
-        let fetch = [
-            String::from("fetch"),
-            String::from("--all"),
-            String::from("--tags"),
-        ];
-        if let Err(error) = git(state, &fetch) {
+        if let Err(error) = fetch_initial_revisions(state) {
             eprintln!(
-                "[Error] initial git fetch failed; server is lame-ducked (health will report NOT_READY): {error:#}"
+                "[Error] initial git fetch of repository {name} failed; server is lame-ducked (health will report NOT_READY): {error:#}"
             );
             return;
         }
     }
     for revision in &state.config.warmup_revisions {
         if let Err(error) = warm_revision(state, revision) {
-            eprintln!("[Warn] failed to warm revision {revision}: {error:#}");
+            eprintln!("[Warn] failed to warm revision {revision} of repository {name}: {error:#}");
         }
     }
     state.ready.store(true, Ordering::Release);
+}
+
+fn fetch_initial_revisions(state: &State) -> Result<()> {
+    let git = state.git();
+    let fetch = ["fetch", "--all", "--tags"];
+    let output = git.output(fetch)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.contains("git remote prune origin") && !stderr.contains("git remote prune origin") {
+        bail!("git fetch --all --tags failed: {stderr}{stdout}");
+    }
+    eprintln!(
+        "[Warn] initial git fetch of repository {} failed: {stderr}{stdout}; Git recommends git remote prune origin; pruning and retrying once",
+        state.name
+    );
+    git.run(["remote", "prune", "origin"])
+        .context("initial fetch recovery: git remote prune origin failed")?;
+    git.run(fetch)
+        .context("initial fetch recovery: fetch still failed after pruning origin")
 }
 
 fn start_cache_pruner(state: &Arc<State>) -> Result<()> {
@@ -997,18 +1393,18 @@ fn start_cache_pruner(state: &Arc<State>) -> Result<()> {
     Ok(())
 }
 
-fn handle_request(request: Request, state: &Arc<State>) {
-    if let Err(error) = route(request, state) {
+fn handle_request(request: Request, service: &Service) {
+    if let Err(error) = route(request, service) {
         eprintln!("[Error] failed to handle HTTP request: {error:#}");
     }
 }
 
-fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
+fn route(mut request: Request, service: &Service) -> Result<()> {
     let raw_url = request.url().to_owned();
     let (path, query) = raw_url.split_once('?').unwrap_or((&raw_url, ""));
     match path {
         "/health" => {
-            let ready = state.ready.load(Ordering::Acquire);
+            let ready = service.ready();
             respond_text(
                 request,
                 if ready { 200 } else { 503 },
@@ -1023,12 +1419,27 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
                     &json!({"error": "method not allowed, use GET"}),
                 );
             }
-            respond_json(request, 200, &metrics(state))
+            respond_json(request, 200, &metrics(service))
+        }
+        "/metrics/prometheus" => {
+            if service.repositories[0].workspace.metrics.is_none() {
+                return respond_json(request, 404, &json!({"error": "not found"}));
+            }
+            if request.method() != &Method::Get {
+                return respond_json(
+                    request,
+                    405,
+                    &json!({"error": "method not allowed, use GET"}),
+                );
+            }
+            let response = Response::from_string(metrics_prometheus(service)).with_header(
+                Header::from_bytes("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                    .unwrap(),
+            );
+            request.respond(response)?;
+            Ok(())
         }
         "/impacted_targets" | "/impacted_targets_with_distances" | "/dependency_edges" => {
-            if !state.ready.load(Ordering::Acquire) {
-                return respond_json(request, 503, &json!({"error": "service not ready"}));
-            }
             if request.method() != &Method::Get && request.method() != &Method::Post {
                 return respond_json(
                     request,
@@ -1042,6 +1453,19 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
                     return respond_json(request, 400, &json!({"error": error.to_string()}))
                 }
             };
+            let state = match service.select(inputs.repository.as_deref()) {
+                Ok(state) => state,
+                Err(unknown) => {
+                    return respond_json(
+                        request,
+                        unknown.status,
+                        &json!({"error": unknown.message}),
+                    )
+                }
+            };
+            if !state.ready.load(Ordering::Acquire) {
+                return respond_json(request, 503, &json!({"error": "service not ready"}));
+            }
             let kind = match path {
                 "/dependency_edges" => QueryKind::DepEdges,
                 "/impacted_targets_with_distances" => QueryKind::Distances,
@@ -1062,7 +1486,13 @@ fn route(mut request: Request, state: &Arc<State>) -> Result<()> {
             }
             let timeout = state.config.request_timeout;
             let token = Arc::new(Cancellation::new());
-            let active = ActiveQuery::start(state);
+            let Some(active) = ActiveQuery::start(state, inputs.reject_when_busy) else {
+                return respond_json(
+                    request,
+                    503,
+                    &json!({"error": "server busy: another query is already processing"}),
+                );
+            };
             let state_for_compute = Arc::clone(state);
             let worker_token = Arc::clone(&token);
             let (sender, receiver) = mpsc::sync_channel(1);
@@ -1138,6 +1568,15 @@ fn cancel_query(
 }
 
 fn parse_query_inputs(request: &mut Request, query: &str) -> Result<QueryInputs> {
+    let params = form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect::<std::collections::HashMap<_, _>>();
+    // `repo` is read from the query string for both methods, so a client can keep one URL per
+    // repository; a POST body's `repo` wins over it.
+    let repository = params
+        .get("repo")
+        .filter(|value| !value.is_empty())
+        .cloned();
     if request.method() == &Method::Post {
         let mut raw = String::new();
         request.as_reader().read_to_string(&mut raw)?;
@@ -1154,6 +1593,7 @@ fn parse_query_inputs(request: &mut Request, query: &str) -> Result<QueryInputs>
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("missing required fields 'from' and 'to'"))?;
         return Ok(QueryInputs {
+            repository: body.repo.filter(|value| !value.is_empty()).or(repository),
             from,
             to,
             target_types: normalized_types(body.target_type),
@@ -1166,11 +1606,9 @@ fn parse_query_inputs(request: &mut Request, query: &str) -> Result<QueryInputs>
                 .map(PathBuf::from)
                 .collect(),
             profile: body.profile.unwrap_or(false),
+            reject_when_busy: body.reject_when_busy.unwrap_or(false),
         });
     }
-    let params = form_urlencoded::parse(query.as_bytes())
-        .into_owned()
-        .collect::<std::collections::HashMap<_, _>>();
     let from = params
         .get("from")
         .filter(|value| !value.is_empty())
@@ -1182,6 +1620,7 @@ fn parse_query_inputs(request: &mut Request, query: &str) -> Result<QueryInputs>
         .cloned()
         .ok_or_else(|| anyhow!("missing required query parameters 'from' and 'to'"))?;
     Ok(QueryInputs {
+        repository,
         from,
         to,
         target_types: normalized_types(
@@ -1191,6 +1630,9 @@ fn parse_query_inputs(request: &mut Request, query: &str) -> Result<QueryInputs>
         ),
         modified_filepaths: BTreeSet::new(),
         profile: params.get("profile").is_some_and(|value| value == "true"),
+        reject_when_busy: params
+            .get("rejectWhenBusy")
+            .is_some_and(|value| value == "true"),
     })
 }
 
@@ -1242,20 +1684,15 @@ fn compute_query(
     let diff_started = Instant::now();
     checkout(state, &to_sha)?;
     let bazel = state.bazel_options();
-    let exclude_external = bazel.is_bzlmod_enabled();
+    let exclude_external = bzlmod_enabled_for(&to, &bazel);
+    from.ensure_same_root_mode(&to)?;
     let impacted = impacted_with_module_changes(&from, &to, Some(&bazel))?;
     let impacted_value = if matches!(kind, QueryKind::Distances) {
-        let hash_impacted = impacted_targets(&from.hashes, &to.hashes, None, false)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let mut distance_from = from.hashes.clone();
-        for label in impacted.difference(&hash_impacted) {
-            distance_from.remove(label);
-        }
-        serde_json::to_value(impacted_targets_with_distances(
-            &distance_from,
-            &to.hashes,
+        serde_json::to_value(hash_file_distances(
+            &from,
+            &to,
             &to.dep_edges,
+            Some(&impacted),
             inputs.target_types.as_ref(),
             exclude_external,
         )?)?
@@ -1305,7 +1742,8 @@ fn compute_query(
 fn warm_revision(state: &Arc<State>, revision: &str) -> Result<()> {
     let _guard = state.workspace.acquire(&Arc::new(Cancellation::new()))?;
     let sha = resolve_sha(state, revision)?;
-    get_hashes_locked(state, &sha, &BTreeSet::new(), None)?;
+    // Warm Bazel itself and refresh the server's entries, even if a cache tier has a hit.
+    retrieve_hashes_locked(state, &sha, &BTreeSet::new(), None, false)?;
     Ok(())
 }
 
@@ -1404,6 +1842,17 @@ fn get_hashes_locked(
     modified: &BTreeSet<PathBuf>,
     base: Option<(&str, &Arc<HashFileData>)>,
 ) -> Result<Retrieval> {
+    retrieve_hashes_locked(state, sha, modified, base, true)
+}
+
+/// With `read_cache` disabled, generate afresh but still write every configured cache tier.
+fn retrieve_hashes_locked(
+    state: &Arc<State>,
+    sha: &str,
+    modified: &BTreeSet<PathBuf>,
+    base: Option<(&str, &Arc<HashFileData>)>,
+    read_cache: bool,
+) -> Result<Retrieval> {
     // Keyed by the commit's tree, not the commit itself: a rebase, an amended message, or a merge
     // commit that changes no file all point at a tree that was already hashed.
     let tree = resolve_tree(state, sha)?;
@@ -1411,7 +1860,11 @@ fn get_hashes_locked(
     let path = state.config.cache_dir.join(format!("{key}.json"));
     let mut current_dependency_fingerprint = None;
     // Bound first so the tier's lock is released before the (possibly slow) servability check.
-    let remembered = memory_cache(state).get(&key);
+    let remembered = if read_cache {
+        memory_cache(state).get(&key)
+    } else {
+        None
+    };
     if let Some(data) = remembered {
         let read_started = Instant::now();
         if cache_entry_is_servable(
@@ -1428,7 +1881,7 @@ fn get_hashes_locked(
             return Ok(Retrieval::hit(data, read_started));
         }
     }
-    if path.is_file() {
+    if read_cache && path.is_file() {
         let read_started = Instant::now();
         let bytes = fs::read(&path)
             .with_context(|| format!("failed to read hash file {}", path.display()))?;
@@ -1446,7 +1899,7 @@ fn get_hashes_locked(
             return Ok(Retrieval::hit(data, read_started));
         }
     }
-    if let Some(remote) = &state.remote {
+    if let (true, Some(remote)) = (read_cache, &state.remote) {
         let read_started = Instant::now();
         if let Some(bytes) = remote.get(&key) {
             let data = Arc::new(HashFileData::from_slice(&bytes)?);
@@ -1864,7 +2317,10 @@ fn check_tracked_packages(
     data: &HashFileData,
     tree: &TreeIndex,
 ) -> Result<()> {
-    let untracked = untracked_packages(data.hashes.keys().map(String::as_str), tree);
+    let untracked = untracked_packages(data.hashes.keys().map(String::as_str), tree)
+        .into_iter()
+        .filter(|package| !state.config.allowed_untracked_packages.contains(package))
+        .collect::<Vec<_>>();
     if untracked.is_empty() {
         return Ok(());
     }
@@ -1931,7 +2387,11 @@ fn git_output(state: &State, args: &[String]) -> Result<std::process::Output> {
     state.git().output(args)
 }
 
-fn metrics(state: &State) -> Value {
+/// The instance snapshot. The top-level counters sum over every repository, and `workspaceBusy`
+/// is true while any repository's workspace is held, so a single-repository deployment reads
+/// exactly as it always has; `repositories` breaks the same figures down by repository.
+fn metrics(service: &Service) -> Value {
+    let state = &service.repositories[0];
     let entries = cache_entries(&state.config.cache_dir);
     let total = entries.iter().map(|entry| entry.size).sum::<u64>();
     let (used, max) = memory_usage();
@@ -1939,24 +2399,37 @@ fn metrics(state: &State) -> Value {
         let memory = memory_cache(state);
         (memory.len(), memory.used, memory.budget)
     };
+    let sum = |counter: fn(&State) -> &AtomicUsize| {
+        service
+            .repositories
+            .iter()
+            .map(|state| counter(state).load(Ordering::SeqCst))
+            .sum::<usize>()
+    };
+    let repositories = service
+        .repositories
+        .iter()
+        .map(|state| (state.name.clone(), repository_metrics(state)))
+        .collect::<serde_json::Map<_, _>>();
     json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "uptimeSeconds": state.started.elapsed().as_secs(),
-        "ready": state.ready.load(Ordering::Acquire),
-        "activeQueries": state.active_queries.load(Ordering::SeqCst),
-        "workspaceBusy": state.workspace.is_busy(),
+        "uptimeSeconds": service.started.elapsed().as_secs(),
+        "ready": service.ready(),
+        "activeQueries": sum(|state| &state.active_queries),
+        "workspaceBusy": service.repositories.iter().any(|state| state.workspace.is_busy()),
         "gitEngine": "subprocess",
         "trackDeps": state.config.track_deps,
         "dependencyFingerprint": state.config.dependency_fingerprint,
         "partialGraph": {
             "enabled": state.config.partial_graph,
-            "derived": state.partial_derived.load(Ordering::SeqCst),
-            "fullGenerations": state.partial_rebuilds.load(Ordering::SeqCst),
+            "derived": sum(|state| &state.partial_derived),
+            "fullGenerations": sum(|state| &state.partial_rebuilds),
         },
         "untrackedPackages": {
             "allowed": state.config.allow_untracked_packages,
-            "rejections": state.untracked_package_rejections.load(Ordering::SeqCst),
+            "rejections": sum(|state| &state.untracked_package_rejections),
         },
+        "repositories": repositories,
         "cache": {
             "directory": state.config.cache_dir.to_string_lossy(),
             "remote": state.config.remote_cache,
@@ -1970,6 +2443,52 @@ fn metrics(state: &State) -> Value {
             },
         },
         "jvm": {"usedBytes": used, "maxBytes": max}
+    })
+}
+
+fn metrics_prometheus(service: &Service) -> String {
+    let state = &service.repositories[0];
+    let mut body = String::new();
+    let _ = writeln!(
+        body,
+        "# HELP bazel_diff_compute_slot_demand_avg Rolling average number of requests either holding or waiting to acquire a workspace lock over the last {} seconds.",
+        state.config.compute_slot_demand_average_window.expect("metrics enabled").as_secs()
+    );
+    let _ = writeln!(body, "# TYPE bazel_diff_compute_slot_demand_avg gauge");
+    for state in &service.repositories {
+        let average = state
+            .workspace
+            .metrics
+            .as_ref()
+            .expect("metrics enabled")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .compute_slot_demand_average
+            .current_average(Instant::now());
+        // Repository names are validated as ASCII alphanumeric, '.', '_' or '-'.
+        let _ = writeln!(
+            body,
+            "bazel_diff_compute_slot_demand_avg{{repo=\"{}\"}} {average}",
+            state.name
+        );
+    }
+    body
+}
+
+/// One repository's share of `/metrics`: its clone, and the figures that are per workspace.
+fn repository_metrics(state: &State) -> Value {
+    json!({
+        "workspace": state.workspace().to_string_lossy(),
+        "ready": state.ready.load(Ordering::Acquire),
+        "activeQueries": state.active_queries.load(Ordering::SeqCst),
+        "workspaceBusy": state.workspace.is_busy(),
+        "partialGraph": {
+            "derived": state.partial_derived.load(Ordering::SeqCst),
+            "fullGenerations": state.partial_rebuilds.load(Ordering::SeqCst),
+        },
+        "untrackedPackages": {
+            "rejections": state.untracked_package_rejections.load(Ordering::SeqCst),
+        },
     })
 }
 
@@ -2092,7 +2611,7 @@ fn respond_text(request: Request, status: u16, body: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::bazel::BazelOptions;
-    use crate::model::TargetHash;
+    use crate::model::{impacted_targets, TargetHash};
     use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -2111,6 +2630,7 @@ mod tests {
                     cquery_options: Vec::new(),
                     use_cquery: false,
                     cquery_expression: None,
+                    cquery_root_expression: None,
                     keep_going: false,
                     fine_grained_external_repos: BTreeSet::new(),
                     label_only_module_extensions: BTreeSet::new(),
@@ -2129,6 +2649,7 @@ mod tests {
                 always_affected_tags: HashSet::new(),
                 partial_tree: None,
             },
+            repositories: Vec::new(),
             git_path: PathBuf::from("git"),
             port: 0,
             request_timeout: Duration::ZERO,
@@ -2138,6 +2659,7 @@ mod tests {
             partial_graph: false,
             partial_graph_rebuild_patterns: Vec::new(),
             allow_untracked_packages: false,
+            allowed_untracked_packages: BTreeSet::new(),
             no_initial_fetch: true,
             warmup_revisions: Vec::new(),
             cache_max_age: None,
@@ -2150,6 +2672,7 @@ mod tests {
             s3_prefix: String::new(),
             s3_region: None,
             s3_endpoint: None,
+            s3_sts_endpoint: None,
             s3_force_path_style: false,
             gcs_bucket: None,
             gcs_prefix: String::new(),
@@ -2158,6 +2681,7 @@ mod tests {
             nexus_prefix: String::new(),
             nexus_credentials: None,
             nexus_ca_cert: None,
+            compute_slot_demand_average_window: Some(Duration::from_secs(5)),
         }
     }
 
@@ -2225,6 +2749,11 @@ mod tests {
         Arc::new(state)
     }
 
+    /// A server answering for `state` alone, as `--workspacePath` starts one.
+    fn service_of(state: &Arc<State>) -> Service {
+        Service::new(vec![Arc::clone(state)])
+    }
+
     /// The full-content cache key `get_hashes_locked` uses for a commit: its tree, not its SHA.
     fn cache_key_for_commit(state: &State, sha: &str) -> String {
         cache_key(state, &resolve_tree(state, sha).unwrap(), &BTreeSet::new())
@@ -2287,6 +2816,10 @@ mod tests {
     }
 
     fn request(state: &Arc<State>, request: &str) -> String {
+        request_service(&service_of(state), request)
+    }
+
+    fn request_service(service: &Service, request: &str) -> String {
         let server = Server::http("127.0.0.1:0").unwrap();
         let address = server.server_addr().to_ip().unwrap();
         let request = request.to_owned();
@@ -2299,12 +2832,220 @@ mod tests {
             response
         });
         let incoming = server.recv().unwrap();
-        route(incoming, state).unwrap();
+        route(incoming, service).unwrap();
         client.join().unwrap()
+    }
+
+    /// `(status, body)` of a request routed to `service`.
+    fn query_service(service: &Service, request: &str) -> (u16, Value) {
+        let response = request_service(service, request);
+        let status = response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .unwrap();
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap();
+        (status, serde_json::from_str(body).unwrap())
+    }
+
+    /// A repository state whose cache tiers are `shared`, without the dependency-fingerprint
+    /// guard, so a pre-written entry is served without a checkout.
+    fn shared_state(name: &str, repo: &Path, cache: &Path, shared: &Shared) -> Arc<State> {
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.to_path_buf();
+        config.hash_options.bazel.bazel = PathBuf::from("/bin/false");
+        config.cache_dir = cache.to_path_buf();
+        let state = State::with_shared(name, config, shared);
+        state.ready.store(true, Ordering::Release);
+        Arc::new(state)
+    }
+
+    /// Writes cache entries for `from` and `to` in which `label` changed, so a query between
+    /// them answers `[label]` from the cache alone.
+    fn write_changed_entry(state: &State, from: &str, to: &str, label: &str) {
+        for (sha, value) in [(from, "before"), (to, "after")] {
+            let data = HashFileData {
+                hashes: std::collections::BTreeMap::from([(
+                    label.to_owned(),
+                    hash("Rule", value, value),
+                )]),
+                ..Default::default()
+            };
+            let key = cache_key_for_commit(state, sha);
+            write_hashes(
+                &state.config.cache_dir.join(format!("{key}.json")),
+                &data,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn repository_names_and_specs_are_validated() {
+        let parsed = Repository::parse("app=/clones/app").unwrap();
+        assert_eq!(parsed.name, "app");
+        assert_eq!(parsed.workspace, PathBuf::from("/clones/app"));
+        // The first `=` splits, so a path may contain one.
+        assert_eq!(
+            Repository::parse("a.b_c-1=/x=y").unwrap().workspace,
+            PathBuf::from("/x=y")
+        );
+        for invalid in ["app", "=/x", "app=", "a b=/x", "a/b=/x"] {
+            assert!(Repository::parse(invalid).is_err(), "{invalid}");
+        }
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = PathBuf::from("/single");
+        let only = repositories(&config).unwrap();
+        assert_eq!(
+            only,
+            vec![Repository {
+                name: DEFAULT_REPOSITORY.to_owned(),
+                workspace: PathBuf::from("/single")
+            }]
+        );
+        config.repositories = vec![
+            Repository::parse("app=/a").unwrap(),
+            Repository::parse("lib=/b").unwrap(),
+        ];
+        assert_eq!(repositories(&config).unwrap(), config.repositories);
+        config
+            .repositories
+            .push(Repository::parse("app=/c").unwrap());
+        assert_eq!(
+            repositories(&config).unwrap_err().to_string(),
+            "repository \"app\" is given more than once"
+        );
+    }
+
+    #[test]
+    fn queries_are_routed_to_the_named_repository() {
+        let (app_repo, app_from, app_to) = initialize_git_repo();
+        let (lib_repo, lib_first, _) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let shared = Shared::new(&test_config(), None);
+        let app = shared_state("app", app_repo.path(), cache.path(), &shared);
+        let lib = shared_state("lib", lib_repo.path(), cache.path(), &shared);
+        // The two clones start identical, and a cache entry is keyed by the tree alone, so
+        // they would share one: give `lib` trees of its own to answer for.
+        assert_eq!(
+            cache_key_for_commit(&app, &app_from),
+            cache_key_for_commit(&lib, &lib_first)
+        );
+        let lib_commit = |content: &str| {
+            fs::write(lib_repo.path().join("lib.txt"), content).unwrap();
+            git_command(lib_repo.path(), &["add", "lib.txt"]);
+            git_command(lib_repo.path(), &["commit", "-q", "-m", content]);
+            git_command(lib_repo.path(), &["rev-parse", "HEAD"])
+        };
+        let lib_from = lib_commit("lib one");
+        let lib_to = lib_commit("lib two");
+        write_changed_entry(&app, &app_from, &app_to, "//app:one");
+        write_changed_entry(&lib, &lib_from, &lib_to, "//lib:one");
+        let service = Service::new(vec![Arc::clone(&app), Arc::clone(&lib)]);
+        let get = |query: &str| {
+            query_service(
+                &service,
+                &format!("GET /impacted_targets?{query} HTTP/1.1\r\nHost: x\r\n\r\n"),
+            )
+        };
+
+        // With several repositories a request must name one, and only a configured one.
+        let (status, body) = get(&format!("from={app_from}&to={app_to}"));
+        assert_eq!(status, 400);
+        assert_eq!(
+            body["error"],
+            "missing required parameter 'repo'; this server serves: app, lib"
+        );
+        let (status, body) = get(&format!("repo=web&from={app_from}&to={app_to}"));
+        assert_eq!(status, 404);
+        assert_eq!(
+            body["error"],
+            "unknown repository \"web\"; this server serves: app, lib"
+        );
+        let (status, body) = get(&format!("repo=app&from={app_from}&to={app_to}"));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["impactedTargets"], json!(["//app:one"]));
+        assert_eq!(body["from"], app_from);
+        let (status, body) = get(&format!("repo=lib&from={lib_from}&to={lib_to}"));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["impactedTargets"], json!(["//lib:one"]));
+        // A revision of one repository is not resolvable in the other.
+        let (status, body) = get(&format!("repo=app&from={lib_from}&to={lib_to}"));
+        assert_eq!(status, 400);
+        assert!(
+            body["error"].as_str().unwrap().contains("missing"),
+            "{body}"
+        );
+
+        // POST: the body's `repo` wins over the query string's.
+        let body = json!({"repo": "lib", "from": lib_from, "to": lib_to}).to_string();
+        let (status, answer) = query_service(
+            &service,
+            &format!(
+                "POST /impacted_targets?repo=app HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(answer["impactedTargets"], json!(["//lib:one"]));
+
+        // Both repositories share the cache tiers, and `/metrics` breaks the figures down.
+        let (status, metrics) = query_service(&service, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(status, 200);
+        assert_eq!(metrics["ready"], true);
+        assert_eq!(metrics["cache"]["entries"], 4);
+        assert_eq!(metrics["cache"]["memory"]["entries"], 4);
+        assert_eq!(
+            metrics["repositories"]["app"]["workspace"],
+            app_repo.path().to_string_lossy().as_ref()
+        );
+        assert_eq!(metrics["repositories"]["lib"]["ready"], true);
+        assert_eq!(metrics["repositories"]["lib"]["activeQueries"], 0);
+
+        // Readiness is per repository for queries and all-or-nothing for the instance.
+        lib.ready.store(false, Ordering::Release);
+        assert!(
+            request_service(&service, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                .starts_with("HTTP/1.1 503")
+        );
+        let (status, _) = get(&format!("repo=lib&from={lib_from}&to={lib_to}"));
+        assert_eq!(status, 503);
+        let (status, _) = get(&format!("repo=app&from={app_from}&to={app_to}"));
+        assert_eq!(status, 200);
+        let (_, metrics) = query_service(&service, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(metrics["ready"], false);
+        assert_eq!(metrics["repositories"]["app"]["ready"], true);
+        assert_eq!(metrics["repositories"]["lib"]["ready"], false);
+
+        // A single-repository server answers whether or not the request names it.
+        let single = service_of(&app);
+        for query in [
+            format!("from={app_from}&to={app_to}"),
+            format!("repo=app&from={app_from}&to={app_to}"),
+        ] {
+            let (status, body) = query_service(
+                &single,
+                &format!("GET /impacted_targets?{query} HTTP/1.1\r\nHost: x\r\n\r\n"),
+            );
+            assert_eq!(status, 200, "{body}");
+        }
+        let (status, body) = query_service(
+            &single,
+            &format!("GET /impacted_targets?repo=lib&from={app_from}&to={app_to} HTTP/1.1\r\nHost: x\r\n\r\n"),
+        );
+        assert_eq!(status, 404);
+        assert_eq!(
+            body["error"],
+            "unknown repository \"lib\"; this server serves: app"
+        );
     }
 
     struct CapturedS3Request {
         url: String,
+        method: Method,
     }
 
     fn remote_cache_with_responses(
@@ -2324,6 +3065,7 @@ mod tests {
                 sender
                     .send(CapturedS3Request {
                         url: request.url().to_owned(),
+                        method: request.method().clone(),
                     })
                     .unwrap();
                 request
@@ -2343,13 +3085,76 @@ mod tests {
         .unwrap()
         .with_path_style();
         (
-            RemoteCache::S3(S3Cache {
+            RemoteCache::S3(Box::new(S3Cache {
                 bucket,
                 prefix: normalize_s3_prefix(prefix),
-            }),
+                sessions: None,
+            })),
             receiver,
             handle,
         )
+    }
+
+    #[test]
+    fn s3_cache_signs_with_the_web_identity_session() {
+        let sts = Server::http("127.0.0.1:0").unwrap();
+        let sts_endpoint = format!("http://{}/", sts.server_addr().to_ip().unwrap());
+        let sts_thread = thread::spawn(move || {
+            let answer = "<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult>\
+                <Credentials><AccessKeyId>session-key</AccessKeyId>\
+                <SecretAccessKey>session-secret</SecretAccessKey>\
+                <SessionToken>session-token</SessionToken>\
+                <Expiration>2999-01-01T00:00:00Z</Expiration></Credentials>\
+                </AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>";
+            let request = sts.recv().unwrap();
+            request.respond(Response::from_string(answer)).unwrap();
+        });
+        let s3 = Server::http("127.0.0.1:0").unwrap();
+        let s3_endpoint = format!("http://{}", s3.server_addr().to_ip().unwrap());
+        let s3_thread = thread::spawn(move || {
+            let request = s3.recv().unwrap();
+            let token = request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv("x-amz-security-token"))
+                .map(|header| header.value.to_string());
+            request
+                .respond(Response::from_data(Vec::new()).with_status_code(StatusCode(404)))
+                .unwrap();
+            token
+        });
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_file = token_dir.path().join("token");
+        fs::write(&token_file, "service-account-token").unwrap();
+        let sessions = WebIdentitySessions::new(
+            &sts_endpoint,
+            "arn:aws:iam::role/cache".to_owned(),
+            token_file,
+            "bazel-diff".to_owned(),
+        )
+        .unwrap();
+        let placeholder = Credentials::new(Some("key"), Some("secret"), None, None, None).unwrap();
+        let bucket = Bucket::new(
+            "bucket",
+            Region::Custom {
+                region: "us-east-1".to_owned(),
+                endpoint: s3_endpoint,
+            },
+            placeholder,
+        )
+        .unwrap()
+        .with_path_style();
+        let cache = S3Cache {
+            bucket,
+            prefix: String::new(),
+            sessions: Some(sessions),
+        };
+
+        let fetched = cache.get("entry.json.gz");
+
+        sts_thread.join().unwrap();
+        assert!(matches!(fetched, Fetched::Missing));
+        assert_eq!(s3_thread.join().unwrap().as_deref(), Some("session-token"));
     }
 
     #[test]
@@ -2429,7 +3234,7 @@ mod tests {
         config.hash_options.bazel.isolated_dependency_root = Some("@hub".into());
         assert!(validate_partial_graph(&config).is_ok());
         assert_eq!(
-            serve(config).unwrap_err().to_string(),
+            serve(&config).unwrap_err().to_string(),
             "serve does not support --isolatedDependencyRoot=@hub"
         );
         assert_eq!(fs::read(cache.path()).unwrap(), b"preserved");
@@ -2455,10 +3260,7 @@ mod tests {
             .bazel
             .fine_grained_external_repos
             .insert("@crates".into());
-        assert!(validate_partial_graph(&fine_grained)
-            .unwrap_err()
-            .to_string()
-            .contains("--fineGrainedHashExternalRepos"));
+        assert!(validate_partial_graph(&fine_grained).is_ok());
 
         let mut always_affected = config;
         always_affected
@@ -2626,7 +3428,22 @@ esac
             fs::read_dir(&cache).unwrap().next().is_none(),
             "a rejected generation must not be cached"
         );
-        assert_eq!(metrics(&strict)["untrackedPackages"]["rejections"], 1);
+        assert_eq!(
+            metrics(&service_of(&strict))["untrackedPackages"]["rejections"],
+            1
+        );
+
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.clone();
+        config.hash_options.bazel.bazel = bazel.clone();
+        config.hash_options.bazel.no_bazelrc = false;
+        config.cache_dir = cache.clone();
+        config.allowed_untracked_packages.insert("other".to_owned());
+        let selective = ready_state(config.clone(), None);
+        assert!(get_hashes_locked(&selective, &sha, &BTreeSet::new(), None).is_err());
+        config.allowed_untracked_packages.insert("pkg".to_owned());
+        let selective = ready_state(config, None);
+        assert!(get_hashes_locked(&selective, &sha, &BTreeSet::new(), None).is_ok());
 
         let lenient = state_with(true);
         let retrieval = get_hashes_locked(&lenient, &sha, &BTreeSet::new(), None).unwrap();
@@ -2635,7 +3452,10 @@ esac
             lenient.untracked_package_rejections.load(Ordering::SeqCst),
             0
         );
-        assert_eq!(metrics(&lenient)["untrackedPackages"]["allowed"], true);
+        assert_eq!(
+            metrics(&service_of(&lenient))["untrackedPackages"]["allowed"],
+            true
+        );
     }
 
     /// A repository with the fixed graph above and four commits: `base`; a source and a README
@@ -2685,6 +3505,64 @@ esac
         config.cache_dir = cache.to_path_buf();
         config.partial_graph = partial;
         ready_state(config, None)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_revision_bypasses_server_caches_and_refreshes_entries() {
+        let (root, bazel, [base, _, _, _]) = partial_graph_repo();
+        let repo = root.path().join("repo");
+        for (index, (partial, limited_memory)) in [(false, false), (true, false), (true, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let cache = root.path().join(format!("cache-{index}"));
+            fs::create_dir_all(&cache).unwrap();
+            let mut state = partial_graph_state(&repo, &cache, &bazel, partial);
+            let (remote, requests, handle) =
+                remote_cache_with_responses("warm", vec![(200, Vec::new())]);
+            Arc::get_mut(&mut state).unwrap().remote = Some(Arc::new(remote));
+            let key = cache_key_for_commit(&state, &base);
+            let path = cache.join(format!("{key}.json"));
+            let stale = HashFileData {
+                hashes: std::collections::BTreeMap::from([(
+                    "//stale:cached".to_owned(),
+                    hash("Rule", "old", "old"),
+                )]),
+                ..Default::default()
+            };
+            write_hashes(&path, &stale, true);
+            if limited_memory {
+                memory_cache(&state).budget = fs::metadata(&path).unwrap().len();
+            }
+            let cached = get_hashes_locked(&state, &base, &BTreeSet::new(), None).unwrap();
+            assert!(cached.cache_hit);
+            assert_eq!(memory_cache(&state).len(), 1);
+
+            warm_revision(&state, &base).unwrap();
+
+            // Warmup must query Bazel, not return the stale memory/disk entry or read S3.
+            let request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(request.method, Method::Put);
+            assert_eq!(request.url, format!("/bucket/warm/{key}.json.gz"));
+            handle.join().unwrap();
+            let refreshed = HashFileData::read(&path).unwrap();
+            assert!(!refreshed.hashes.contains_key("//stale:cached"));
+            assert!(refreshed.hashes.contains_key("//pkg:lib"));
+            assert_eq!(refreshed.partial.is_some(), partial);
+            assert_eq!(git_command(&repo, &["rev-parse", "HEAD"]), base);
+            assert_eq!(
+                state.partial_rebuilds.load(Ordering::SeqCst),
+                usize::from(partial)
+            );
+            if limited_memory {
+                assert_eq!(memory_cache(&state).len(), 0);
+            }
+            let next = get_hashes_locked(&state, &base, &BTreeSet::new(), None).unwrap();
+            assert!(next.cache_hit);
+            assert_eq!(next.data.hashes, refreshed.hashes);
+            assert!(!Arc::ptr_eq(&cached.data, &next.data));
+        }
     }
 
     #[cfg(unix)]
@@ -2835,11 +3713,14 @@ esac
             .unwrap()
             .contains("carries no partial-graph recipes"));
 
-        let snapshot = metrics(&state);
+        let snapshot = metrics(&service_of(&state));
         assert_eq!(snapshot["partialGraph"]["enabled"], true);
         assert_eq!(snapshot["partialGraph"]["derived"], 2);
         assert_eq!(snapshot["partialGraph"]["fullGenerations"], 2);
-        assert_eq!(metrics(&plain)["partialGraph"]["enabled"], false);
+        assert_eq!(
+            metrics(&service_of(&plain))["partialGraph"]["enabled"],
+            false
+        );
     }
 
     #[test]
@@ -3487,6 +4368,83 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         assert!(skipped.ready.load(Ordering::Acquire));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn initial_fetch_prunes_origin_only_when_recommended_and_checks_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (message, stream, fetch_status, prune_status, retry_status, expected_ready) in [
+            ("try running 'git remote prune origin'", 2, 1, 0, 0, true),
+            ("try running 'git remote prune origin'", 1, 1, 0, 0, true),
+            ("try running 'git remote prune origin'", 2, 1, 1, 0, false),
+            ("try running 'git remote prune origin'", 2, 1, 0, 1, false),
+            ("authentication failed", 2, 1, 0, 0, false),
+            ("git remote prune origin", 2, 0, 0, 0, true),
+        ] {
+            let repo = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let script = repo.path().join("fake-git");
+            fs::write(
+                &script,
+                format!(
+                    r#"#!/bin/sh
+printf '%s\n' "$*" >> commands
+case "$*" in
+  'fetch --all --tags')
+    if [ -f fetched ]; then exit {retry_status}; fi
+    : > fetched
+    printf '%s\n' "{message}" >&{stream}
+    exit {fetch_status}
+    ;;
+  'remote prune origin') exit {prune_status} ;;
+  *) exit 99 ;;
+esac
+"#
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut config = test_config();
+            config.no_initial_fetch = false;
+            config.hash_options.bazel.workspace = repo.path().to_path_buf();
+            config.git_path = script;
+            config.cache_dir = cache.path().to_path_buf();
+            let state = Arc::new(State::new(config, None));
+
+            perform_initial_fetch(&state);
+
+            assert_eq!(state.ready.load(Ordering::Acquire), expected_ready);
+            let mut expected_commands = vec!["fetch --all --tags"];
+            if fetch_status != 0 && message.contains("git remote prune origin") {
+                expected_commands.push("remote prune origin");
+                if prune_status == 0 {
+                    expected_commands.push("fetch --all --tags");
+                }
+            }
+            assert_eq!(
+                fs::read_to_string(repo.path().join("commands"))
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                expected_commands
+            );
+            let health = request(&state, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+            assert!(health.starts_with(if expected_ready {
+                "HTTP/1.1 200"
+            } else {
+                "HTTP/1.1 503"
+            }));
+            assert_eq!(metrics(&service_of(&state))["ready"], expected_ready);
+            if !expected_ready {
+                assert!(request(
+                    &state,
+                    "GET /impacted_targets?from=a&to=b HTTP/1.1\r\nHost: x\r\n\r\n"
+                )
+                .starts_with("HTTP/1.1 503"));
+            }
+        }
+    }
+
     #[test]
     fn git_resolution_checkout_and_errors_use_real_repository() {
         let (repo, first, second) = initialize_git_repo();
@@ -3682,11 +4640,14 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         let key = cache_key_for_commit(&state, &sha);
         let path = cache.path().join(format!("{key}.json"));
         write_hashes(&path, &data, false);
-        assert_eq!(metrics(&state)["cache"]["memory"]["entries"], 0);
+        assert_eq!(
+            metrics(&service_of(&state))["cache"]["memory"]["entries"],
+            0
+        );
 
         let first = get_hashes_locked(&state, &sha, &BTreeSet::new(), None).unwrap();
         assert!(first.cache_hit);
-        let memory = metrics(&state)["cache"]["memory"].clone();
+        let memory = metrics(&service_of(&state))["cache"]["memory"].clone();
         assert_eq!(memory["entries"], 1);
         assert_eq!(memory["sizeBytes"], fs::metadata(&path).unwrap().len());
         assert_eq!(memory["maxBytes"], state.config.cache_memory_max);
@@ -3777,11 +4738,13 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             );
         }
         let inputs = QueryInputs {
+            repository: None,
             from: first,
             to: second.clone(),
             target_types: None,
             modified_filepaths: BTreeSet::new(),
             profile: true,
+            reject_when_busy: false,
         };
         let result = compute_query(
             &state,
@@ -3978,12 +4941,171 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
     }
 
     #[test]
+    fn compute_slot_demand_average_tracks_per_repository_workspace_demand() {
+        fn demand_metrics(state: &State) -> &Mutex<RuntimeMetrics> {
+            state.workspace.metrics.as_ref().unwrap()
+        }
+        // Deterministic time-weighted average, including startup and window expiry.
+        let started = Instant::now();
+        let mut average = ComputeSlotDemandAverage::new(Duration::from_secs(20), started);
+        assert!(average.current_average(started).abs() < 1e-9);
+        average.record(1, started + Duration::from_secs(5));
+        assert!((average.current_average(started + Duration::from_secs(10)) - 0.5).abs() < 1e-9);
+        average.record(3, started + Duration::from_secs(10));
+        average.record(0, started + Duration::from_secs(15));
+        assert!((average.current_average(started + Duration::from_secs(20)) - 1.0).abs() < 1e-9);
+        assert!((average.current_average(started + Duration::from_secs(30)) - 0.75).abs() < 1e-9);
+        assert!(
+            average
+                .current_average(started + Duration::from_secs(35))
+                .abs()
+                < 1e-9
+        );
+
+        let config = test_config();
+        let shared = Shared::new(&config, None);
+        let first = Arc::new(State::with_shared("first", config.clone(), &shared));
+        let second = Arc::new(State::with_shared("second", config, &shared));
+        let service = Service::new(vec![Arc::clone(&first), Arc::clone(&second)]);
+        let token = Arc::new(Cancellation::new());
+        let first_guard = first.workspace.acquire(&token).unwrap();
+        assert_eq!(
+            demand_metrics(&first).lock().unwrap().compute_slot_demand,
+            1
+        );
+        assert_eq!(
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
+            0
+        );
+        let second_guard = second.workspace.acquire(&token).unwrap();
+        assert_eq!(
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
+            1
+        );
+
+        // A cancelled waiter must not leak demand while another operation holds the lock.
+        let cancelled = Arc::new(Cancellation::new());
+        cancelled.cancel();
+        assert!(first.workspace.acquire(&cancelled).is_err());
+        assert_eq!(
+            demand_metrics(&first).lock().unwrap().compute_slot_demand,
+            1
+        );
+        assert_eq!(
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
+            1
+        );
+        drop(first_guard);
+        assert_eq!(
+            demand_metrics(&first).lock().unwrap().compute_slot_demand,
+            0
+        );
+        assert_eq!(
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
+            1
+        );
+        drop(second_guard);
+        assert_eq!(
+            demand_metrics(&second).lock().unwrap().compute_slot_demand,
+            0
+        );
+
+        // Give each repository a deterministic, distinct history without sleeps.
+        let started = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+        for (state, demand) in [(&first, 2), (&second, 0)] {
+            let mut average = ComputeSlotDemandAverage::new(Duration::from_secs(5), started);
+            average.record(demand, started);
+            state
+                .workspace
+                .metrics
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .compute_slot_demand_average = average;
+        }
+
+        // The endpoint works even before readiness, independently of JSON /metrics.
+        let response = request_service(
+            &service,
+            "GET /metrics/prometheus HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("text/plain; version=0.0.4; charset=utf-8"));
+        assert!(response.contains("# TYPE bazel_diff_compute_slot_demand_avg gauge\n"));
+        assert!(response.contains("\nbazel_diff_compute_slot_demand_avg{repo=\"first\"} 2\n"));
+        assert!(response.contains("\nbazel_diff_compute_slot_demand_avg{repo=\"second\"} 0\n"));
+        assert!(!response.contains("\nbazel_diff_compute_slot_demand_avg "));
+        assert_eq!(
+            response
+                .matches("# HELP bazel_diff_compute_slot_demand_avg ")
+                .count(),
+            1
+        );
+        assert_eq!(
+            response
+                .matches("# TYPE bazel_diff_compute_slot_demand_avg ")
+                .count(),
+            1
+        );
+
+        let single = Arc::new(State::new(test_config(), None));
+        let response = request(
+            &single,
+            "GET /metrics/prometheus HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.contains("\nbazel_diff_compute_slot_demand_avg{repo=\"default\"} 0\n"));
+        let response = request_service(
+            &service,
+            "POST /metrics/prometheus HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 405"), "{response}");
+    }
+
+    #[test]
+    // The guard's demand slot is intentionally only dropped; this test asserts it stays empty.
+    #[allow(clippy::used_underscore_binding)]
+    fn disabled_prometheus_does_not_track_workspace_demand() {
+        let mut config = test_config();
+        config.compute_slot_demand_average_window = None;
+        let shared = Shared::new(&config, None);
+        let first = Arc::new(State::with_shared("first", config.clone(), &shared));
+        let second = Arc::new(State::with_shared("second", config, &shared));
+        let token = Arc::new(Cancellation::new());
+        for state in [&first, &second] {
+            assert!(state.workspace.metrics.is_none());
+            let guard = state.workspace.acquire(&token).unwrap();
+            assert!(guard._demand.is_none());
+            assert!(state.workspace.is_busy());
+            let cancelled = Arc::new(Cancellation::new());
+            cancelled.cancel();
+            assert!(state.workspace.acquire(&cancelled).is_err());
+            drop(guard);
+            assert!(!state.workspace.is_busy());
+        }
+        for service in [service_of(&first), Service::new(vec![first, second])] {
+            for method in ["GET", "POST"] {
+                let response = request_service(
+                    &service,
+                    &format!("{method} /metrics/prometheus HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                );
+                assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+            }
+            let response = request_service(
+                &service,
+                "GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+    }
+
+    #[test]
     fn metrics_and_human_sizes_report_cache_state() {
         let repo = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         fs::write(cache.path().join("one.json"), vec![0; 1536]).unwrap();
         let state = state_for_repo(repo.path(), cache.path(), true);
-        let value = metrics(&state);
+        let value = metrics(&service_of(&state));
         assert_eq!(value["ready"], true);
         assert_eq!(value["trackDeps"], true);
         assert_eq!(value["dependencyFingerprint"], true);
@@ -4186,7 +5308,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         let repo = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let state = state_for_repo(repo.path(), cache.path(), false);
-        let idle = metrics(&state);
+        let idle = metrics(&service_of(&state));
         assert_eq!(idle["activeQueries"], 0);
         assert_eq!(idle["workspaceBusy"], false);
         assert!(state.workspace.holder().is_none());
@@ -4195,7 +5317,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
 
         let token = Arc::new(Cancellation::new());
         let guard = state.workspace.acquire(&token).unwrap();
-        assert_eq!(metrics(&state)["workspaceBusy"], true);
+        assert_eq!(metrics(&service_of(&state))["workspaceBusy"], true);
         assert!(Arc::ptr_eq(&state.workspace.holder().unwrap(), &token));
         // Bazel options handed out while the query holds the workspace carry its token, so the
         // subprocesses they spawn are killed with it.
@@ -4209,13 +5331,110 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         );
         assert_eq!(bazel.check_cancelled().unwrap_err().to_string(), CANCELLED);
         drop(guard);
-        assert_eq!(metrics(&state)["workspaceBusy"], false);
+        assert_eq!(metrics(&service_of(&state))["workspaceBusy"], false);
         assert!(state.workspace.holder().is_none());
 
-        let counted = ActiveQuery::start(&state);
-        assert_eq!(metrics(&state)["activeQueries"], 1);
+        let counted = ActiveQuery::start(&state, false).unwrap();
+        assert_eq!(metrics(&service_of(&state))["activeQueries"], 1);
         drop(counted);
-        assert_eq!(metrics(&state)["activeQueries"], 0);
+        assert_eq!(metrics(&service_of(&state))["activeQueries"], 0);
+    }
+
+    #[test]
+    fn reject_when_busy_is_atomic_and_scoped_to_the_requested_repository() {
+        let (app_repo, from, to) = initialize_git_repo();
+        let (lib_repo, _, _) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let shared = Shared::new(&test_config(), None);
+        let app = shared_state("app", app_repo.path(), cache.path(), &shared);
+        let lib = shared_state("lib", lib_repo.path(), cache.path(), &shared);
+        // Both repositories have the same trees and can use these pre-written entries.
+        write_changed_entry(&app, &from, &to, "//app:one");
+        let service = Service::new(vec![Arc::clone(&app), Arc::clone(&lib)]);
+        let get = |repository: &str, extra: &str| {
+            query_service(
+                &service,
+                &format!(
+                    "GET /impacted_targets?repo={repository}&from=HEAD~1&to=HEAD{extra} HTTP/1.1\r\nHost: x\r\n\r\n"
+                ),
+            )
+        };
+        let post = |extra: &str| {
+            let body = format!(r#"{{"repo":"app","from":"HEAD~1","to":"HEAD"{extra}}}"#);
+            query_service(
+                &service,
+                &format!(
+                    "POST /impacted_targets HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+
+        // Reserve an accepted query without timing-dependent sleeps or running Bazel.
+        let active = ActiveQuery::start(&app, false).unwrap();
+        for (status, body) in [
+            get("app", "&rejectWhenBusy=true"),
+            post(r#", "rejectWhenBusy":true"#),
+        ] {
+            assert_eq!(status, 503, "{body}");
+            assert_eq!(
+                body["error"],
+                "server busy: another query is already processing"
+            );
+        }
+        assert_eq!(app.active_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            app.workspace
+                .metrics
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .compute_slot_demand,
+            0
+        );
+
+        // Busy is per repository. Missing/false flags still allow the usual queuing.
+        for (status, body) in [
+            get("lib", "&rejectWhenBusy=true"),
+            get("app", ""),
+            get("app", "&rejectWhenBusy=false"),
+            get("app", "&rejectWhenBusy=TRUE"),
+            post(""),
+            post(r#", "rejectWhenBusy":false"#),
+        ] {
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(body["impactedTargets"], json!(["//app:one"]));
+        }
+        assert_eq!(app.active_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(lib.active_queries.load(Ordering::SeqCst), 0);
+        drop(active);
+        let (status, body) = get("app", "&rejectWhenBusy=true");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(app.active_queries.load(Ordering::SeqCst), 0);
+
+        // Simultaneous opt-in admissions must have exactly one winner. Keep its guard
+        // alive until both contenders have attempted admission.
+        let barrier = std::sync::Barrier::new(2);
+        let admitted = thread::scope(|scope| {
+            let workers = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let active = ActiveQuery::start(&app, true);
+                        barrier.wait();
+                        active.is_some()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .filter(|admitted| *admitted)
+                .count()
+        });
+        assert_eq!(admitted, 1);
+        assert_eq!(app.active_queries.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -4323,7 +5542,12 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         assert!(response.starts_with("HTTP/1.1 400"));
         assert!(response.contains("\"error\":"));
 
-        for body in ["", "not-json", r#"{"from":"","to":"b"}"#] {
+        for body in [
+            "",
+            "not-json",
+            r#"{"from":"","to":"b"}"#,
+            r#"{"from":"a","to":"b","rejectWhenBusy":"true"}"#,
+        ] {
             let response = request(
                 &state,
                 &format!(

@@ -68,6 +68,149 @@ See https://github.com/aspect-extensions/impacted
 
 * We run `bazel-diff` on the starting and final JSON hash filepaths to get our impacted set of targets. This impacted set of targets is written to a file.
 
+## Possible toolchain readers
+
+For ordinary queries, pass `--includeToolchainInputs` to a fresh `generate-hashes` at both revisions and request `--depEdgesFile` at the final revision. The hash file records the native toolchain declarations the query returned. Shallow metadata reads recover their implementation and type attributes and follow literal type aliases already in the query result. Partial derivation cannot establish these supplemental observations and omits the index. The head file also preserves references to those types before external inputs are mapped to repository nodes.
+
+Pass the head edge file and `--toolchainCandidatesFile=possible.json` to `get-impacted-targets`. Its usual impact output retains its existing format. The additional file lists `possibleTypes`, `possibleReaders`, and unresolved observations. A type belongs in the result when its observed declaration bindings or the associated hashes differ or cannot be compared. A change to the recorded module graph also makes the observed types possible. A reader can reference a type as ordinary data, and its configured build may stay unchanged.
+
+These observations supplement an existing selection. The file reports `complete: false` even when `unresolved` is empty. Bazel versions differ in which implicit type dependencies they emit, and a registration priority change can switch the selected compiler while every observed target hash stays equal. Absence from this file cannot exclude a job.
+
+## Configured Root Hashing
+
+`--useCquery` normally combines every configured instance of a label into one
+hash. This can select a stable requested target when another root
+uses the same label with a different compiler or `select()` result.
+
+Use `--cqueryRootExpression` to report the instances Bazel selects for the
+requested roots:
+
+```bash
+bazel-diff generate-hashes -w /path/to/workspace -b bazel --useCquery \
+  --cqueryRootExpression='set(//app:test //lib:test)' \
+  --depEdgesFile deps.json final_hashes.json
+```
+
+Bazel resolves `config((expression), target)` separately at each revision;
+`bazel-diff` hashes their dependencies together. Root sets and fine repository
+lists may differ as targets and repositories appear or disappear. Keep different
+build or test profiles in separate comparisons, using their corresponding
+`--cqueryCommandOptions`. If Bazel returns distinct targets with the same label
+and configuration checksum, generation fails. This can happen when toolchain
+resolution forces the same implementation onto different execution platforms.
+
+For a large expression, use `--cqueryRootExpressionFile roots.query`. Its UTF-8
+contents feed the same query and cache identity as the inline form. The file
+form keeps the expression out of the process argument list; a literal
+`--universe_scope` still uses that list, so omit it only when Bazel's inferred
+universe describes the intended profile. Both root options require
+`--useCquery` and conflict with `--cqueryExpression` and each other.
+
+The hash JSON contains only resolved bare root labels in `hashes`.
+`metadata.configuredRoots` version 2 stores the mapping from roots to instances
+and configured hashes; the usual flat edge file retains configured dependencies.
+Native impact results remain bare root labels, while distance and `explain`
+walks retain configured causes. Direct JSON consumers need the configured
+metadata and edge file to calculate distances. The edge file keeps its existing
+trusted companion contract. Native commands reject comparisons between legacy
+and configured root hashes.
+
+A verified empty selection produces an empty root artifact. Unresolved root
+identities and ambiguous bare keys fail generation. `bazel-diff` controls the
+cquery serialization needed for this model; other query filters still apply.
+Partial graph mode remains incompatible with cquery.
+
+### Verified Configured Roots
+
+Add `--verifyConfiguredRoots` to both rooted generations when a caller needs to
+distinguish a verified stable configured input graph from an unknown result:
+
+```bash
+bazel-diff generate-hashes -w /path/to/base -b bazel --useCquery \
+  --cqueryRootExpressionFile roots.query --verifyConfiguredRoots \
+  --includeTargetType base_hashes.json
+bazel-diff generate-hashes -w /path/to/head -b bazel --useCquery \
+  --cqueryRootExpressionFile roots.query --verifyConfiguredRoots \
+  --includeTargetType --depEdgesFile deps.json final_hashes.json
+```
+
+This opt-in mode keeps the normal configured hashes and dependency edges. It
+also runs a fresh cquery with the same workspace, startup options and cquery
+options. The verification view enables `implicit_deps`, `tool_deps`,
+`nodep_deps`, and `include_aspects` so a filtered dependency cannot be mistaken
+for an absent one. It requests the full attributes and typed explicit aspect
+serialization needed to check coverage. These extra edges establish coverage;
+they do not become positive impact paths.
+
+Verification requires a Bazel producer with typed explicit aspect output, such
+as [Bazel #32496](https://github.com/bazelbuild/bazel/pull/32496). Its completion
+marker can establish that the requested view contains no aspects; streamed output
+must end with the separate marker frame. Older output still requires an actual
+typed aspect record, which may be independent of a supported root. Verification
+also requires a successful query: partial or failed output leaves the normal
+hashes available without negative authority, even when it contains a marker.
+
+The initial supported roots are in the main repository and reach no aspect
+application. Each prerequisite in the full view must match the exact input used by
+the normal hash. A source qualifies only when that hash read a real regular file
+in the main workspace at the location Bazel returned. Missing files, directories,
+internal symlinks and external source views remain unknown. Package features and
+SourceFile rows for BUILD files with loads also remain unknown. The verifier
+separately binds the rule class and BUILD filename. A BUILD rename cannot be
+certified stable when the normal hash stays equal.
+
+`metadata.configuredRoots.verifiedRoots` maps covered endpoint roots to opaque
+context digests. The comparator uses these with the normal hashes, full configured
+root identities, and successful usable module snapshots. Historical files have no
+such authority. This mode requires fresh physical hashes and rejects partial/base
+reuse, overrides for content or modified files, ignored attributes, and target
+exclusions. It is available only on `generate-hashes`.
+
+Use the same worker for both captures and each revision's actual workspace and
+build configuration, including consistent repository options for
+supplementary commands. This verification covers the reported configured inputs;
+caller policy must still account for inputs outside that graph, such as
+workspace status action artifacts. A context difference withholds a stable verdict
+and does not claim a measured direct edit.
+
+## Impact Graph Output
+
+Use `--reportImpactGraph` when a caller applies its own policy to dependency
+paths. Supply the same head dependency file used for native distance output:
+
+```bash
+bazel-diff get-impacted-targets -w /path/to/workspace -b bazel \
+  -sh base_hashes.json -fh final_hashes.json --depEdgesFile deps.json \
+  --reportImpactGraph -o impact_graph.json
+```
+
+The version 1 JSON contains `targets`, the eligible labels and their target and
+package distances, and `paths`, the native changed graph for those outputs.
+Each path contains `kind`, `changed`, `direct`, and `roots`. The changed and
+direct values are keys in the supplied head dependency file; `roots` maps each
+public output label to its graph key. Intermediate nodes remain available when
+`--targetType` filters the outputs. Apply a path policy to this adjacency so a
+longer allowed path remains available.
+
+`unaffectedRoots` contains only roots whose covered inputs and context are equal
+in both verified captures for this configuration, with no positive or MODULE
+obligation. An absent label is unknown. A caller may remove an ordinary or
+independent candidate only when that label appears here for the job's own
+configuration; candidates in other profiles remain eligible.
+
+`ordinary` and `configured` paths use the corresponding hash graph. `shared`
+paths use direct changes on configured instances present in both files;
+they can select a root first requested at the head without treating enrollment as
+a change. An omitted head-only root remains unknown, so callers must retain any
+ordinary or independent nomination for it. Keep each build profile's comparison
+and dependency file together.
+
+`forced` paths are independent MODULE obligations. Each contains one root at
+distance zero and must be handled independently of the supplied adjacency. A
+root can also have an ordinary or configured path. For those path kinds, `direct`
+records the origins used by native distance calculation, including its existing
+distance-zero fallback for an incomplete dependency file.
+
 ## Partial Graph Updates
 
 A full `generate-hashes` pays for a `bazel query` over the whole graph even when the change
@@ -89,9 +232,10 @@ skips that query when it can:
   the content of regular files -- no `bazel query`, no Bazel at all. Anything else falls back to a
   full generation: an added, deleted, renamed or type-changed path; a symlink or submodule on
   either side; a change to a file Bazel reads while loading (`BUILD`, `BUILD.bazel`, `*.bzl`,
-  `*.scl`, `MODULE.bazel`, `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`, `VENDOR.bazel`,
-  `*bazelrc`, `.bazelversion`, `.bazelignore`, `.bazeliskrc`, `tools/bazel`, `*.BUILD`,
-  `BUILD.*`, `*.patch`, `*.diff`); a file `MODULE.bazel` or a `WORKSPACE` file names by label;
+  `*.scl`, `MODULE.bazel`, the `*.MODULE.bazel` segments it can include, `MODULE.bazel.lock`,
+  `WORKSPACE*`, `REPO.bazel`, `VENDOR.bazel`, `*bazelrc`, `.bazelversion`, `.bazelignore`,
+  `.bazeliskrc`, `tools/bazel`, `*.BUILD`, `BUILD.*`, `*.patch`, `*.diff`); a file one of
+  those module files or a `WORKSPACE` file names by label;
   anything a repository rule read from the workspace while the graph was generated; a
   `--seed-filepaths` file; a path matching `--partialGraphRebuildPattern` (a glob: `*` within a
   path segment, `**` across, a pattern without `/` matches the file name; repeatable); or a base
@@ -105,11 +249,13 @@ skips that query when it can:
   cannot feed `--depEdgesFile` and forces a full generation.
 * Hashes under the flag follow a slightly different formula from the default mode's, so
   `get-impacted-targets` and `explain` refuse a pair of files of which only one carries recipes.
-  Not supported together with `--useCquery`, `--fineGrainedHashExternalRepos`,
-  `--alwaysAffectedTags`, `--contentHashPath`, `--modified-filepaths` or `--targetType` (a file
-  missing targets cannot be derived from; filter in `get-impacted-targets` instead): a derivation
-  reads only the git tree and keys recipes by bare label. The workspace must be the repository
-  root, and `--gitPath` names the git binary (default `git`).
+  Not supported together with `--useCquery`, `--alwaysAffectedTags`, `--contentHashPath`,
+  `--modified-filepaths` or `--targetType` (a file missing targets cannot be derived from;
+  filter in `get-impacted-targets` instead): a derivation reads only the git tree and keys
+  recipes by bare label. With `--fineGrainedHashExternalRepos`, the digests of those
+  repositories' source files are recorded with the recipes and reused by a derivation, since
+  any change that could alter them forces a full generation. The workspace must be the
+  repository root, and `--gitPath` names the git binary (default `git`).
 
 A typical CI job hashes the merge base once on the main branch and keeps the file; a pull
 request run then needs no Bazel for the common case of a source-only change:
@@ -279,7 +425,9 @@ Endpoints:
   balancer should use this to route only to ready instances. If a fatal git error occurs at startup
   the instance "lame-ducks" itself by continuing to report `503` so the load balancer removes it.
 * `GET /impacted_targets?from=<rev>&to=<rev>` — returns the impacted targets as JSON. The optional
-  `targetType` parameter (e.g. `&targetType=Rule,SourceFile`) filters by target type.
+  `targetType` parameter (e.g. `&targetType=Rule,SourceFile`) filters by target type. On a server
+  that serves several repositories, `repo=<name>` names the one to query (see [Serving several
+  repositories](#serving-several-repositories)).
 
 ```bash
 curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
@@ -359,7 +507,9 @@ curl 'http://localhost:8080/dependency_edges?from=main&to=my-feature-branch'
   the queries accepted and not yet finished (queued, running, or abandoned by a client that stopped
   waiting), and `workspaceBusy` is `true` while any operation holds `--workspacePath` (a query's
   checkout and `bazel query`, or a startup warmup). A tool that shares the checkout with the server
-  should wait for `workspaceBusy` to be `false` before touching it.
+  should wait for `workspaceBusy` to be `false` before touching it. `repositories` breaks the
+  per-workspace figures down by repository (see [Serving several
+  repositories](#serving-several-repositories)).
 
 ```bash
 curl 'http://localhost:8080/metrics'
@@ -374,10 +524,48 @@ curl 'http://localhost:8080/metrics'
   "workspaceBusy": true,
   "gitEngine": "subprocess",
   "trackDeps": false,
+  "repositories": {"default": {"workspace": "/path/to/workspace-clone", "ready": true, "activeQueries": 1, "workspaceBusy": true, "partialGraph": {"derived": 0, "fullGenerations": 0}, "untrackedPackages": {"rejections": 0}}},
   "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB", "memory": {"entries": 2, "sizeBytes": 75374, "maxBytes": 536870912}},
   "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
 }
 ```
+
+### Serving several repositories
+
+One instance can answer for several git clones. `bazel-diff serve-multi` takes every `serve`
+flag except `--workspacePath`, which `--repo NAME=PATH` (repeatable) replaces, and a request
+addresses one repository with `repo=NAME`: a query-string parameter on `GET` and `POST`, or a
+`repo` field in the `POST` body, which wins over the query string.
+
+```bash
+bazel-diff serve-multi \
+  --repo app=/clones/app \
+  --repo lib=/clones/lib \
+  --cacheDir /var/cache/bazel-diff \
+  --port 8080
+
+curl 'http://localhost:8080/impacted_targets?repo=lib&from=main&to=my-feature-branch'
+```
+
+* Every repository shares the hashing flags (`--bazelPath`, `--bazelStartupOptions`,
+  `--trackDeps`, `--partialGraph`, ...), the cache (local disk, memory and the shared tier) and
+  the port. A cache entry is keyed by the git tree and the hashing configuration, never by the
+  clone it came from, so two clones that hold the same tree share one entry, and the cache a
+  single-repository instance built stays valid.
+* Each repository has its own working tree, git, Bazel server, workspace lock and readiness, so
+  queries against different repositories run concurrently, while queries against the same
+  repository are serialised as before. Size the instance for that many Bazel servers at once.
+* A request that names no `repo` is answered when the server serves exactly one repository and
+  refused with `400` otherwise; an unknown name is `404`. Either error lists the repositories
+  served. `serve` serves its one `--workspacePath` repository under the name `default`.
+* `--warmupRevision` warms every repository; a revision one clone lacks logs a warning for that
+  repository and does not stop the others.
+* `/health` reports `200` only once every repository's initial fetch succeeded, so a load
+  balancer never routes to an instance that can answer for some of its repositories but not
+  all. `/metrics` reports each repository under `repositories` with its own `ready`,
+  `activeQueries`, `workspaceBusy` and partial-graph counts, while the top-level fields
+  aggregate over all of them (`activeQueries` summed, `workspaceBusy` when any workspace is
+  held).
 
 ### Shared S3 cache for multi-instance deployments
 
@@ -404,6 +592,13 @@ through the standard AWS default provider chains (environment variables, profile
 identity on EKS, IMDS), or pin the region with `--s3Region`. `--s3Endpoint` plus
 `--s3ForcePathStyle` point the client at an S3-compatible store (MinIO, LocalStack) for local
 testing.
+
+S3-compatible stores that serve STS themselves (MinIO, SeaweedFS) can take a web identity token
+too, such as a Kubernetes ServiceAccount token. Set `--s3StsEndpoint` (or `AWS_ENDPOINT_URL_STS`)
+along with `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`, and `serve` sends
+`AssumeRoleWithWebIdentity` to that endpoint instead of `sts.amazonaws.com`. It renews the session
+five minutes before it expires, re-reading the token file each time, since kubelet rotates
+projected tokens. `AWS_ROLE_SESSION_NAME` names the session (default `bazel-diff`).
 
 S3 errors never fail a request: a failed read is treated as a cache miss (the revision is
 regenerated — slower, but correct) and a failed write leaves the entry local-only, so an S3 outage
@@ -506,7 +701,9 @@ Notes and operational guidance:
   the revision's git tree (packages below a tracked symlink or a submodule are not checked);
   otherwise the request fails, the error names the packages, and nothing is cached.
   `--allowUntrackedPackages` turns that into a warning for workspaces that generate `BUILD` files
-  outside git. `/metrics` counts rejections under `untrackedPackages`.
+  outside git. Use `--allowUntrackedPackages=//generated,//other` to allow only those exact
+  packages; other untracked packages still cause a rejection. `/metrics` counts rejections under
+  `untrackedPackages`.
 
 * Dependency fingerprinting (`--dependencyFingerprint`) is opt-in. When enabled, every generated
   cache entry records a fingerprint of the workspace's external-dependency state (the bzlmod module
@@ -529,10 +726,11 @@ Notes and operational guidance:
   -- when `git diff` between the two only modifies the content of regular files. Anything else
   falls back to a full generation: an added, deleted, renamed or type-changed path; a symlink or
   submodule on either side; a change to a file Bazel reads while loading (`BUILD`, `BUILD.bazel`,
-  `*.bzl`, `*.scl`, `MODULE.bazel`, `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`,
-  `VENDOR.bazel`, `*bazelrc`, `.bazelversion`, `.bazelignore`, `.bazeliskrc`, `tools/bazel`,
-  `*.BUILD`, `BUILD.*`, `*.patch`, `*.diff`); a file `MODULE.bazel` or a `WORKSPACE` file names
-  by label (a requirements or lock file a module extension reads); anything a repository rule
+  `*.bzl`, `*.scl`, `MODULE.bazel`, the `*.MODULE.bazel` segments it can include,
+  `MODULE.bazel.lock`, `WORKSPACE*`, `REPO.bazel`, `VENDOR.bazel`, `*bazelrc`, `.bazelversion`,
+  `.bazelignore`, `.bazeliskrc`, `tools/bazel`, `*.BUILD`, `BUILD.*`, `*.patch`, `*.diff`); a
+  file one of those module files or a `WORKSPACE` file names by label (a requirements or lock
+  file a module extension reads); anything a repository rule
   read from the workspace while the graph was generated (the root of a `local_repository` or
   `local_path_override`, the files its attributes name, and the files Bazel's repository marker
   files record as read), which every entry records; a `--seed-filepaths` file; or
@@ -547,8 +745,8 @@ Notes and operational guidance:
   produced (`generation.mode` is `derived` or `full`, with `partialFallbackReason`, `changedSources`,
   `unmatchedPaths`, `classifyMillis` and `deriveMillis`), `/metrics` counts both under
   `partialGraph`, and the server log says which path each generation took. Not supported together
-  with `--useCquery`, `--fineGrainedHashExternalRepos` or `--alwaysAffectedTags` (the server
-  refuses to start): a derivation reads only the git tree and keys recipes by bare label. The
+  with `--useCquery` or `--alwaysAffectedTags` (the server refuses to start): a derivation reads
+  only the git tree and the recorded external source digests, and keys recipes by bare label. The
   nightly [`partial-graph-bench`](.github/workflows/partial-graph-bench.yml) workflow checks the
   mode's speed and its exact agreement with the default mode (see `tools/perf/README.md`). The
   one-shot `generate-hashes --partialGraph` writes the same entries (see [Partial Graph
@@ -616,6 +814,28 @@ A few inputs are normalized or extended on the way in:
 
 * A source label that names a **directory** hashes the whole tree (entry names, kinds, file
   contents and executable bits, symlink targets), so an edit inside it impacts its consumers.
+* Outside `--isolatedDependencyRoot`, ordinary query checks native aliases in repositories named
+  by `--fineGrainedHashExternalRepos` or `--fineGrainedHashExternalReposFile` when returned inputs
+  reach them. On Bazel 8 and later, a metadata query identifies missing `actual` targets and a
+  dependency query adds their dependencies and build files. A literal binding on a reached fine
+  alias is followed through literal ordinary aliases already returned by the primary query until
+  the first missing destination.
+  A configurable ordinary alias already in the primary query contributes missing branches only
+  through the package inventory below. Each reached native alias hashes its evaluated `actual`
+  binding, including the destination for each `select()` condition. Acquired library rules also
+  hash the BUILD and Starlark files that define them.
+  When that dependency query returns rules from external packages, the same input walk also checks
+  reached ordinary aliases for missing `actual` targets in those packages. One query inventories
+  the matching packages; only the named targets and their dependencies returned by that inventory
+  enter the graph. Newly acquired aliases use the same binding hash, and inputs absent from the
+  inventory retain the existing repository fallback.
+  Earlier Bazel versions skip this alias acquisition. Full source hashing with these repository
+  options reads every returned regular external source file from Bazel's output base, including
+  files in the primary query. The same read applies when no alias query runs. Partial generation
+  records these digests for offline reuse. Source overrides use repository inputs for files
+  outside the named repositories.
+  A supplemental query failure stops strict generation. With `--keep_going`, generation reports
+  the failure and uses the primary target graph.
 * A **repository rule** (`//external:*`) that pins its download with `sha256` or `integrity` is
   hashed without its `url`/`urls`, since a mirror or registry move cannot change what it fetches.
   The main-repository files its attributes name -- patches, build files, lock files -- are hashed
@@ -624,13 +844,16 @@ A few inputs are normalized or extended on the way in:
   in the workspace, a `file://%workspace%` registry URL) is hashed relative to the workspace, so
   identical checkouts at different paths hash the same.
   In query mode the module that owns a module extension stands in for every repository the
-  extension generates, because a toolchain resolved from one of them is not a query input. A
-  fine-grained target inside one of those repositories that uses a rule from the owning module
-  therefore changes whenever any repository of the extension does. Listing the extension in
-  `--labelOnlyModuleExtensions` (for example `@rules_rs//rs:extensions.bzl%crate`) asserts that
-  its repositories use each other only through labels, so such a target reaches the owning module
-  without them. Do not list an extension whose targets resolve a toolchain the same extension
-  generates: that change would be missed. An extension whose name another `.bzl` file of the same
+  extension generates, because a toolchain resolved from one of them is not a query input. Every
+  target that uses a rule of the owning module, every target of a module with a `bazel_dep` path
+  to it, and every fine-grained target inside one of those repositories therefore changes whenever
+  any repository of the extension does: a `go.mod` bump through gazelle's `go_deps` or a
+  `pnpm-lock.yaml` bump through rules_js's `npm` impacts most of the workspace. Listing the
+  extension in `--labelOnlyModuleExtensions` (for example
+  `@gazelle//:extensions.bzl%go_deps` or `@rules_rs//rs:extensions.bzl%crate`) asserts that its
+  repositories are used only through labels, which the query reports, so the owning module no
+  longer stands in for them. Do not list an extension that generates a toolchain, such as
+  `rules_go`'s `go_sdk`: a change to it would be missed. An extension whose name another `.bzl` file of the same
   module also exports is reported and ignored, since Bazel tells their repositories apart only by
   a numeric suffix.
   `--isolatedDependencyRoot=@crates` asserts that every outside consumer of this
@@ -657,6 +880,11 @@ A few inputs are normalized or extended on the way in:
   a `--bazelPath` naming a batch file, or Bazelisk running a workspace's `tools/bazel.bat`
   wrapper -- so on Windows each invocation is given at most 6 KiB of names. Set
   `BAZEL_DIFF_MOD_ARGUMENT_BYTE_BUDGET` to a byte count to change that on any platform.
+* A rule's **Starlark instantiation stack** hashes the `.bzl` and `.scl` files that instantiated it.
+  Absolute workspace paths are normalized to workspace-relative names. During full physical source
+  hashing, a returned and resolved external Starlark source is matched by its path and hashed under
+  its repository label. This preserves macro changes when a `select()` keeps the same input labels
+  but changes their branches. Unknown paths outside the workspace remain ignored.
 * A **dependency cycle** in the query graph (which a build never sees, but which rules_go's
   `go_context_data` and nogo analyzers form through non-dependency attributes) no longer fails
   hashing. The back edge is hashed from the entered target's own definition, with a one-line
@@ -774,6 +1002,32 @@ one target per case (see [`tools/e2e/README.md`](tools/e2e/README.md)):
 ```terminal
 bazel test //tests:e2e_test
 ```
+
+## Proving a performance change
+
+A change that claims to make bazel-diff faster or leaner proves it with the perf-proof
+harness, and only with it: it is the one piece of evidence a performance PR carries. The
+harness builds a bazel-diff binary from each side of your changeset, runs both on Bazel
+workspaces of several sizes (interleaved, so drift lands on both sides), measures what the
+bazel-diff process itself cost in CPU time and peak memory, checks that both sides produced
+byte-identical hashes and the same impacted set, and renders a verdict with a significance
+test behind it:
+
+```terminal
+make perf-proof
+```
+
+That compares `HEAD` with its merge-base on `master`. Other changesets:
+
+```terminal
+python3 tools/perf/perf_proof.py --base v70.0.0 --candidate my-branch
+python3 tools/perf/perf_proof.py --base master --patch 0001-faster.patch
+python3 tools/perf/perf_proof.py --candidate WORKTREE   # the uncommitted working tree
+```
+
+Attach the resulting `perf-proof-summary.md` to the PR. See
+[`tools/perf/README.md`](tools/perf/README.md) for the stages, the metrics, how the verdict is
+decided, and the flags (workload sizes, iterations, a real repository, prebuilt binaries).
 
 ## Code coverage
 

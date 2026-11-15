@@ -18,3 +18,25 @@ filegroup(
     name = "control",
     srcs = ["control.txt"],
 )
+
+genrule(
+    name = "module_product",
+    srcs = [":consumer"],
+    outs = ["module_product.out"],
+    cmd = 'cat "$(SRCS)" > "$@"',
+)
+
+genrule(
+    name = "module_overlap",
+    srcs = [
+        ":consumer",
+        "control.txt",
+    ],
+    outs = ["module_overlap.out"],
+    cmd = 'cat "$(location :consumer)" "$(location control.txt)" > "$@"',
+)
+
+alias(
+    name = "module_wrapper",
+    actual = ":module_product",
+)

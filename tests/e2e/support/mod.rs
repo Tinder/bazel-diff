@@ -430,11 +430,42 @@ pub struct ServerProcess {
 
 impl ServerProcess {
     pub fn start(workspace: &Path, cache: &Path, extra: &[&str]) -> Self {
+        Self::start_with(
+            "serve",
+            vec!["-w".to_owned(), workspace.display().to_string()],
+            cache,
+            extra,
+        )
+    }
+
+    /// `serve-multi` for several named repositories (`--repo NAME=PATH` each).
+    pub fn start_repositories(
+        repositories: &[(&str, &Path)],
+        cache: &Path,
+        extra: &[&str],
+    ) -> Self {
+        let args = repositories
+            .iter()
+            .flat_map(|(name, workspace)| {
+                [
+                    "--repo".to_owned(),
+                    format!("{name}={}", workspace.display()),
+                ]
+            })
+            .collect();
+        Self::start_with("serve-multi", args, cache, extra)
+    }
+
+    fn start_with(
+        command: &str,
+        workspace_args: Vec<String>,
+        cache: &Path,
+        extra: &[&str],
+    ) -> Self {
         let port = free_port();
-        let mut args = vec![
-            "serve".to_owned(),
-            "-w".to_owned(),
-            workspace.display().to_string(),
+        let mut args = vec![command.to_owned()];
+        args.extend(workspace_args);
+        args.extend([
             "-b".to_owned(),
             bazel().display().to_string(),
             "--cacheDir".to_owned(),
@@ -442,7 +473,7 @@ impl ServerProcess {
             "--port".to_owned(),
             port.to_string(),
             "--no-initial-fetch".to_owned(),
-        ];
+        ]);
         args.extend(extra.iter().map(|value| (*value).to_owned()));
         let mut command = Command::new(binary());
         command.args(args);

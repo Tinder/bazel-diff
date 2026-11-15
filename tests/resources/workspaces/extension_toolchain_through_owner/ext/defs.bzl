@@ -1,11 +1,21 @@
 def _tool_impl(ctx):
-    return [platform_common.ToolchainInfo(version = ctx.attr.version)]
+    return [platform_common.ToolchainInfo(version = ctx.attr.version, runtime = ctx.file.runtime)]
 
-tool = rule(implementation = _tool_impl, attrs = {"version": attr.string()})
+tool = rule(
+    implementation = _tool_impl,
+    attrs = {
+        "runtime": attr.label(allow_single_file = True),
+        "version": attr.string(),
+    },
+)
 
 def _app_lib_impl(ctx):
     out = ctx.actions.declare_file(ctx.label.name + ".txt")
-    ctx.actions.write(out, ctx.toolchains["@ext//:toolchain_type"].version)
+    toolchain = ctx.toolchains["@ext//:toolchain_type"]
+    if toolchain.runtime:
+        ctx.actions.symlink(output = out, target_file = toolchain.runtime)
+    else:
+        ctx.actions.write(out, toolchain.version)
     return [DefaultInfo(files = depset([out]))]
 
 app_lib = rule(

@@ -1,0 +1,4 @@
+module(name = "registrar")
+
+bazel_dep(name = "ext")
+bazel_dep(name = "outside")

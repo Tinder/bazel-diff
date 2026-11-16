@@ -1091,7 +1091,7 @@ Options:
       --s3ForcePathStyle
           
       --s3StsEndpoint <S3_STS_ENDPOINT>
-          STS endpoint where AWS_WEB_IDENTITY_TOKEN_FILE is exchanged for AWS_ROLE_ARN's credentials (MinIO, SeaweedFS) [env: AWS_ENDPOINT_URL_STS=]
+          STS endpoint where `AWS_WEB_IDENTITY_TOKEN_FILE` is exchanged for `AWS_ROLE_ARN`'s credentials (`MinIO`, `SeaweedFS`) [env: AWS_ENDPOINT_URL_STS=]
       --gcsBucket <GCS_BUCKET>
           Google Cloud Storage bucket used as the shared cache tier (Application Default Credentials)
       --gcsPrefix <GCS_PREFIX>
@@ -1103,7 +1103,7 @@ Options:
       --nexusPrefix <NEXUS_PREFIX>
           [default: ""]
       --nexusUsername <NEXUS_USERNAME>
-          Basic-auth user; the password is read from the BAZEL_DIFF_NEXUS_PASSWORD environment variable [env: BAZEL_DIFF_NEXUS_USERNAME=]
+          Basic-auth user; the password is read from the `BAZEL_DIFF_NEXUS_PASSWORD` environment variable [env: BAZEL_DIFF_NEXUS_USERNAME=]
       --nexusCaCert <NEXUS_CA_CERT>
           PEM bundle of extra CA certificates to trust for --nexusUrl
   -h, --help
@@ -1205,7 +1205,7 @@ Options:
       --s3ForcePathStyle
           
       --s3StsEndpoint <S3_STS_ENDPOINT>
-          STS endpoint where AWS_WEB_IDENTITY_TOKEN_FILE is exchanged for AWS_ROLE_ARN's credentials (MinIO, SeaweedFS) [env: AWS_ENDPOINT_URL_STS=]
+          STS endpoint where `AWS_WEB_IDENTITY_TOKEN_FILE` is exchanged for `AWS_ROLE_ARN`'s credentials (`MinIO`, `SeaweedFS`) [env: AWS_ENDPOINT_URL_STS=]
       --gcsBucket <GCS_BUCKET>
           Google Cloud Storage bucket used as the shared cache tier (Application Default Credentials)
       --gcsPrefix <GCS_PREFIX>
@@ -1217,7 +1217,7 @@ Options:
       --nexusPrefix <NEXUS_PREFIX>
           [default: ""]
       --nexusUsername <NEXUS_USERNAME>
-          Basic-auth user; the password is read from the BAZEL_DIFF_NEXUS_PASSWORD environment variable [env: BAZEL_DIFF_NEXUS_USERNAME=]
+          Basic-auth user; the password is read from the `BAZEL_DIFF_NEXUS_PASSWORD` environment variable [env: BAZEL_DIFF_NEXUS_USERNAME=]
       --nexusCaCert <NEXUS_CA_CERT>
           PEM bundle of extra CA certificates to trust for --nexusUrl
   -h, --help
@@ -1345,7 +1345,7 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "78.0.0")
+bazel_dep(name = "bazel-diff", version = "79.0.0")
 ```
 
 You can now run the tool with:

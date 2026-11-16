@@ -122,21 +122,29 @@ impl BazelOptions {
     /// (#531). `mod graph` stays as the fallback for a Bazel without `dump_repo_mapping`,
     /// taking the partial answer it gives over such an extension.
     pub fn is_bzlmod_enabled(&self) -> bool {
-        let (enabled, _root_mapping) = self.probe_bzlmod();
+        let (enabled, _root_mapping) = self.probe_bzlmod(None);
         enabled
     }
 
-    fn probe_bzlmod(&self) -> (bool, Option<Vec<u8>>) {
+    /// `graph` is a `bazel mod graph --output=json` answer already in hand. It stands in for the
+    /// fallback `bazel mod graph`, which differs from it only in how the graph is printed.
+    fn probe_bzlmod(&self, graph: Option<&Output>) -> (bool, Option<Vec<u8>>) {
         if let Ok(output) = self.run_capture(&["mod", "dump_repo_mapping", ""]) {
             if output.status.success() {
                 return (true, Some(output.stdout));
             }
         }
-        let enabled = self.run_capture(&["mod", "graph"]).is_ok_and(|output| {
+        let answered = |output: &Output| {
             output.status.success()
                 || extension_failure(&String::from_utf8_lossy(&output.stderr))
                     .is_some_and(|failure| failure.answered)
-        });
+        };
+        let enabled = match graph {
+            Some(output) => answered(output),
+            None => self
+                .run_capture(&["mod", "graph"])
+                .is_ok_and(|output| answered(&output)),
+        };
         (enabled, None)
     }
 
@@ -161,7 +169,7 @@ impl BazelOptions {
                 return (true, Some(root));
             }
         }
-        self.probe_bzlmod()
+        self.probe_bzlmod(survey.graph.as_ref())
     }
 
     fn prefetch_module_mappings(
@@ -825,6 +833,9 @@ impl BazelOptions {
             configured_roots,
             module_graph_json,
             module_graph_complete,
+            // A workspace without Bzlmod has no module graph, and the probe already had
+            // `bazel mod graph` fail to say so.
+            module_graph_absent: !bzlmod_enabled,
             root_mapping,
             output_base: server_info.output_base,
             scoped_sources: ScopedSources {
@@ -3861,6 +3872,9 @@ pub(crate) struct QueriedTargets {
     pub(crate) configured_roots: Option<BTreeMap<String, String>>,
     pub(crate) module_graph_json: Option<String>,
     pub(crate) module_graph_complete: bool,
+    /// Discovery established that there is no module graph to ask Bazel for (Bzlmod is
+    /// disabled), so hashing does not run `bazel mod graph` again only to see it fail.
+    pub(crate) module_graph_absent: bool,
     pub(crate) root_mapping: Option<Vec<u8>>,
     pub(crate) scoped_sources: ScopedSources,
     /// The output base `bazel info` reported before the query, when it was asked.

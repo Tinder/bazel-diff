@@ -406,6 +406,7 @@ pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashF
             configured_roots: None,
             module_graph_json: None,
             module_graph_complete: false,
+            module_graph_absent: false,
             root_mapping: None,
             scoped_sources: ScopedSources::default(),
             output_base: None,
@@ -428,6 +429,7 @@ fn hash_targets_with_digests(
         configured_roots,
         module_graph_json,
         module_graph_complete,
+        module_graph_absent,
         root_mapping,
         scoped_sources,
         output_base,
@@ -437,7 +439,11 @@ fn hash_targets_with_digests(
         ExternalRepoResolver::new(&options.bazel, root_mapping, output_base)?;
     external_resolver.scoped_sources = scoped_sources;
     let module_graph_started = Instant::now();
-    let module_graph_json = module_graph_json.or_else(|| options.bazel.module_graph_json());
+    let module_graph_json = match module_graph_json {
+        Some(json) => Some(json),
+        None if module_graph_absent => None,
+        None => options.bazel.module_graph_json(),
+    };
     let verification = verification.filter(|_| {
         module_graph_complete
             && module_graph_json
@@ -4426,6 +4432,73 @@ esac
             assert_ne!(
                 direct.hashes[&label].direct_hash,
                 changed.hashes[&label].direct_hash
+            );
+        }
+    }
+
+    /// Without Bzlmod there is no module graph. Discovery already has Bazel say so once, so
+    /// generation asks `bazel mod graph` exactly once, whether or not a MODULE.bazel file makes
+    /// discovery ask for the JSON graph first.
+    #[test]
+    #[cfg(unix)]
+    fn generation_asks_once_for_a_module_graph_bzlmod_disables() {
+        for module_file in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            if module_file {
+                fs::write(workspace.path().join("MODULE.bazel"), "").unwrap();
+            }
+            fs::create_dir_all(workspace.path().join("app")).unwrap();
+            fs::write(workspace.path().join("app/input"), "input").unwrap();
+            let target = source_target("//app:input", &[]);
+            let mut encoded = Vec::new();
+            target.encode_length_delimited(&mut encoded);
+            fs::write(workspace.path().join("targets.pb"), encoded).unwrap();
+            let script = workspace.path().join("fake-bazel.sh");
+            fs::write(
+                &script,
+                r#"#!/bin/sh
+case "$1 $2" in
+  "mod dump_repo_mapping")
+    printf '%s\n' mapping >> "$PWD/mod-calls"
+    echo 'ERROR: Bzlmod has to be enabled for mod command to work.' >&2
+    exit 2
+    ;;
+  "mod graph")
+    printf '%s\n' "$*" >> "$PWD/mod-calls"
+    echo 'ERROR: Bzlmod has to be enabled for mod command to work.' >&2
+    exit 2
+    ;;
+  "version ") printf '%s\n' 'Build label: 8.7.0' ;;
+  "info output_base") printf '%s\n' "$PWD" ;;
+  "query "*)
+    while [ "$1" != --output_file ]; do shift; done
+    cp "$PWD/targets.pb" "$2"
+    ;;
+  *) exit 80 ;;
+esac
+"#,
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut options = hash_options(workspace.path());
+            options.bazel.bazel = script;
+            options.bazel.no_bazelrc = false;
+
+            let generated = generate_hashes(&options).unwrap();
+            assert_eq!(generated.hashes.len(), 1);
+            assert_eq!(generated.module_graph_json, None);
+            let calls = fs::read_to_string(workspace.path().join("mod-calls")).unwrap();
+            let graph_calls = calls.lines().filter(|call| call.contains("graph")).count();
+            assert_eq!(graph_calls, 1, "module_file={module_file}: {calls}");
+            assert_eq!(calls.lines().filter(|call| *call == "mapping").count(), 1);
+
+            // Hashing targets handed in directly still asks for the graph itself.
+            let direct = hash_targets(&options, vec![target.clone()]).unwrap();
+            assert_eq!(direct.hashes, generated.hashes);
+            let calls = fs::read_to_string(workspace.path().join("mod-calls")).unwrap();
+            assert_eq!(
+                calls.lines().filter(|call| call.contains("graph")).count(),
+                2
             );
         }
     }

@@ -1,28 +1,3 @@
-#![warn(clippy::pedantic)]
-// Pedantic lints this crate does not adopt:
-// - The doc lints: this is a CLI crate whose module API is not a stability
-//   commitment (see lib.rs), so `# Errors`/`# Panics` sections and `#[must_use]`
-//   on every accessor would be noise rather than a contract.
-// - too_many_lines: the long functions are linear CLI and pipeline glue;
-//   splitting them to satisfy a line count would not make them clearer.
-// - similar_names / struct_excessive_bools: the names mirror Bazel's own
-//   vocabulary and the bool-heavy structs are clap argument groups.
-// - case_sensitive_file_extension_comparisons: Bazel labels and workspace
-//   paths are case-sensitive, so the case-insensitive comparison the lint
-//   proposes would change which files a rule is seen to own.
-// - implicit_hasher: the target-type filters are only ever std `HashSet`s;
-//   a `BuildHasher` parameter would be generality nobody uses.
-#![allow(
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::must_use_candidate,
-    clippy::too_many_lines,
-    clippy::similar_names,
-    clippy::struct_excessive_bools,
-    clippy::case_sensitive_file_extension_comparisons,
-    clippy::implicit_hasher
-)]
-
 use anyhow::{bail, Context, Result};
 use bazel_diff::bazel::BazelOptions;
 use bazel_diff::explain::{self, ExplainFormat, ExplainLimits};

@@ -50,6 +50,9 @@ test_suite(
 # `transitive` walks deps/crate from each root; external crates are skipped by
 # the aspects themselves.
 #
+# Lint levels (clippy::pedantic, warnings denied) come from the clippy_flag
+# settings in .bazelrc and apply to every crate the aspects visit.
+#
 # Adding a first-party Rust crate? Add its root here.
 _RUST_LINT_ROOTS = [
     "//src:bazel-diff",

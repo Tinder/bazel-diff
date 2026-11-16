@@ -1,3 +1,5 @@
+//! End-to-end suite: drives the real `bazel-diff` binary against fixture workspaces.
+
 #[path = "e2e/core.rs"]
 mod core;
 #[path = "e2e/example.rs"]

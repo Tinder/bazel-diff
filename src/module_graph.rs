@@ -181,6 +181,11 @@ fn visit_module_overlay(
     mut query: impl FnMut(&str) -> Result<Vec<Target>>,
     mut emit: impl FnMut(String),
 ) {
+    fn repo_inventory(file: &HashFileData) -> &BTreeMap<String, crate::model::TargetHash> {
+        file.configured_roots
+            .as_ref()
+            .map_or(&file.hashes, |view| &view.hashes)
+    }
     if from.module_graph_json == to.module_graph_json {
         return;
     }
@@ -199,12 +204,6 @@ fn visit_module_overlay(
             emit(label.clone());
         }
         return;
-    }
-    fn repo_inventory(file: &HashFileData) -> &BTreeMap<String, crate::model::TargetHash> {
-        file.configured_roots
-            .as_ref()
-            .map(|view| &view.hashes)
-            .unwrap_or(&file.hashes)
     }
     let canonical_repos = repo_inventory(from)
         .keys()
@@ -678,7 +677,7 @@ mod tests {
         };
         let reformatted = graph("0.50.1")
             .replace("noise before JSON", "INFO: Invocation ID: 1234")
-            .replace("\n", "")
+            .replace('\n', "")
             .replace("  ", " ");
         assert_ne!(reformatted, graph("0.50.1"));
         let to = HashFileData {

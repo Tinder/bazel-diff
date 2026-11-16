@@ -3,7 +3,7 @@
 //! Bazel's `collect_coverage.sh` invokes the LCOV merger with a fixed set of
 //! filter patterns (`/usr/bin/.+`, `/usr/lib/.+`, `/usr/include.+`,
 //! `/Applications/.+`), and users may add their own via custom rules. The
-//! built-in CoverageOutputGenerator treats these as full-match Java regexes.
+//! built-in `CoverageOutputGenerator` treats these as full-match Java regexes.
 //! This module implements the small subset those patterns actually need —
 //! literals, `.`, character classes, `*`/`+`/`?` quantifiers, and `\`
 //! escapes — with full-string anchoring, avoiding a third-party regex crate.

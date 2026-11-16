@@ -544,7 +544,7 @@ struct ServeArgs {
     #[arg(long = "s3ForcePathStyle")]
     s3_force_path_style: bool,
 
-    /// STS endpoint where AWS_WEB_IDENTITY_TOKEN_FILE is exchanged for AWS_ROLE_ARN's credentials (MinIO, SeaweedFS)
+    /// STS endpoint where `AWS_WEB_IDENTITY_TOKEN_FILE` is exchanged for `AWS_ROLE_ARN`'s credentials (`MinIO`, `SeaweedFS`)
     #[arg(long = "s3StsEndpoint", env = "AWS_ENDPOINT_URL_STS")]
     s3_sts_endpoint: Option<String>,
 
@@ -571,7 +571,7 @@ struct ServeArgs {
     #[arg(long = "nexusPrefix", default_value = "")]
     nexus_prefix: String,
 
-    /// Basic-auth user; the password is read from the BAZEL_DIFF_NEXUS_PASSWORD environment variable
+    /// Basic-auth user; the password is read from the `BAZEL_DIFF_NEXUS_PASSWORD` environment variable
     #[arg(long = "nexusUsername", env = "BAZEL_DIFF_NEXUS_USERNAME")]
     nexus_username: Option<String>,
 
@@ -595,7 +595,7 @@ fn flatten_options(values: &[String]) -> Vec<String> {
 /// Folds `.` and `..` away lexically. Only meaningful on an absolute path:
 /// applied to a relative one, `.` and a leading `..` have nothing to resolve
 /// against and simply vanish, so callers go through [`parse_normalized_path`].
-fn normalize_path(path: PathBuf) -> PathBuf {
+fn normalize_path(path: &Path) -> PathBuf {
     path.components()
         .fold(PathBuf::new(), |mut normalized, component| {
             match component {
@@ -623,7 +623,7 @@ fn normalize_path(path: PathBuf) -> PathBuf {
 fn parse_normalized_path(value: &str) -> Result<PathBuf, String> {
     let absolute = std::path::absolute(value)
         .map_err(|error| format!("failed to resolve path {value:?}: {error}"))?;
-    Ok(normalize_path(absolute))
+    Ok(normalize_path(&absolute))
 }
 
 /// `--repo NAME=PATH`, with the path anchored and normalized like `--workspacePath`.
@@ -1145,8 +1145,11 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
             exclude_external,
         )?
         .into_iter()
-        .map(|label| format!("{label}\n"))
-        .collect()
+        .fold(String::new(), |mut acc, label| {
+            acc.push_str(&label);
+            acc.push('\n');
+            acc
+        })
     };
     match &args.output {
         Some(path) => fs::write(path, output)?,
@@ -1352,7 +1355,7 @@ impl ServeArgs {
         if let Some(first) = repositories.first() {
             // `serve` replaces the workspace per repository; the first stands in for the
             // validation below, which only reads the shared flags.
-            hash_options.bazel.workspace = first.workspace.clone();
+            hash_options.bazel.workspace.clone_from(&first.workspace);
         }
         let config = bazel_diff::server::ServerConfig {
             hash_options,
@@ -1467,11 +1470,12 @@ fn run() -> Result<()> {
         Commands::Fingerprint(args) => run_fingerprint(args)?,
         Commands::Warmup(args) => run_warmup(args, cli.verbose)?,
         Commands::Serve(args) => {
-            bazel_diff::server::serve(args.to_config(cli.verbose)?)?;
+            bazel_diff::server::serve(&args.to_config(cli.verbose)?)?;
         }
         Commands::ServeMulti(args) => {
             bazel_diff::server::serve(
-                args.serve
+                &args
+                    .serve
                     .to_config_with_repositories(cli.verbose, args.repositories.clone())?,
             )?;
         }
@@ -1587,7 +1591,7 @@ mod tests {
             ["a", "b", "c", "d"]
         );
         assert_eq!(
-            normalize_path(PathBuf::from("/home/../some-dir")),
+            normalize_path(Path::new("/home/../some-dir")),
             PathBuf::from("/some-dir")
         );
     }
@@ -2260,7 +2264,7 @@ mod tests {
             config
                 .partial_graph_rebuild_patterns
                 .iter()
-                .map(|glob| glob.pattern())
+                .map(bazel_diff::partial::Glob::pattern)
                 .collect::<Vec<_>>(),
             ["*.lock", "tools/**", "requirements.txt"]
         );

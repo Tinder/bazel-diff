@@ -243,7 +243,7 @@ fn transitive_external_repo_change_reaches_consumer() {
 /// (`@inner//:data`). The synthetic `//external:inner` node is named by the apparent name, so
 /// until the canonical name was translated the edge from `@@outer+//:lib` to the node was dropped
 /// and a change inside `inner` never reached `//:consume` under `--useCquery`. hashbench
-/// (2026-10-18) hit the same gap on a rules_multitool lockfile bump.
+/// (2026-10-18) hit the same gap on a `rules_multitool` lockfile bump.
 #[test]
 fn transitive_external_repo_change_reaches_consumer_cquery() {
     if !supports_mod_show_repo() {
@@ -629,7 +629,7 @@ fn label_only_extension_bump_does_not_reach_users_of_the_owner_or_its_dependents
             .collect()
     };
     let set = |labels: &[&str]| -> BTreeSet<String> {
-        labels.iter().map(|label| label.to_string()).collect()
+        labels.iter().copied().map(str::to_owned).collect()
     };
     let first = copy_workspace("extension_owner_dependent_module");
     let bumped = copy_workspace("extension_owner_dependent_module");
@@ -686,9 +686,6 @@ fn partial_hashes(
 
 #[test]
 fn fine_aliases_acquire_hidden_libraries_and_definition_sources() {
-    if !supports_mod_show_repo() {
-        return;
-    }
     fn external_key<V>(map: &std::collections::BTreeMap<String, V>, suffix: &str) -> String {
         let keys = map
             .keys()
@@ -699,6 +696,9 @@ fn fine_aliases_acquire_hidden_libraries_and_definition_sources() {
     }
     fn direct(hash: &str) -> &str {
         hash.rsplit_once('~').unwrap().1
+    }
+    if !supports_mod_show_repo() {
+        return;
     }
 
     let workspace = copy_workspace("fine_alias_acquisition");
@@ -841,6 +841,9 @@ fn fine_aliases_acquire_hidden_libraries_and_definition_sources() {
 
 #[test]
 fn ordinary_alias_can_use_a_matcher_from_a_reached_external_package() {
+    fn direct(value: &str) -> &str {
+        value.rsplit_once('~').unwrap().1
+    }
     if !supports_mod_show_repo() {
         return;
     }
@@ -926,9 +929,6 @@ config_setting(name = "second", constraint_values = ["@@//:special"])
     let after = snapshot("after", "after");
     let before_hashes = hashes(&before.0);
     let after_hashes = hashes(&after.0);
-    fn direct(value: &str) -> &str {
-        value.rsplit_once('~').unwrap().1
-    }
     assert_ne!(
         direct(&before_hashes["//:system"]),
         direct(&after_hashes["//:system"])
@@ -1965,7 +1965,7 @@ genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "ca
     let update = |path: &str| {
         edit(&changed.path().join(path), |build| {
             build.replace("@outside//:alternate", "@outside//:other")
-        })
+        });
     };
     update(other);
     assert_product(changed.path(), "//:switched", "switched.txt", "outside-1");

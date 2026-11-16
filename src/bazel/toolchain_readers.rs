@@ -529,7 +529,7 @@ impl BazelOptions {
         drop(graph);
         recovered.extend(suppliers);
         recovered.extend(opaque);
-        result.sources = super::deduplicate_targets(recovered)?;
+        result.sources = super::deduplicate_targets(recovered);
         Ok(result)
     }
 
@@ -1320,7 +1320,7 @@ impl BazelOptions {
                 super::CqueryCapture::AvailableOrdinaryInputs,
                 |_| true,
             )?;
-            super::deduplicate_targets(graph.targets)
+            Ok(super::deduplicate_targets(graph.targets))
         };
         if let Some(packages) = alias_packages.filter(|packages| !packages.is_empty()) {
             let inventory = super::package_targets(packages)?;

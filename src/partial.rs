@@ -95,7 +95,7 @@ impl TreeIndex {
                 let object_type = fields.next()?;
                 let object = fields.next()?.to_owned();
                 let kind = match (mode, object_type) {
-                    ("100644", "blob") | ("100664", "blob") => TreeKind::File { executable: false },
+                    ("100644" | "100664", "blob") => TreeKind::File { executable: false },
                     ("100755", "blob") => TreeKind::File { executable: true },
                     ("120000", "blob") => TreeKind::Symlink,
                     ("160000", "commit") => TreeKind::Submodule,
@@ -109,6 +109,7 @@ impl TreeIndex {
     }
 
     /// Tags the index with the id of the tree it was listed from.
+    #[must_use]
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
         self
@@ -187,24 +188,23 @@ pub fn source_digest(tree: &TreeIndex, label: &str, seed: &[u8]) -> DigestBytes 
     };
     let path = path.to_string_lossy().into_owned();
     let mut hasher = Sha256::new();
-    match tree.get(&path) {
-        Some(entry) => update_entry(&mut hasher, entry),
-        None => {
-            let mut directory = Sha256::new();
-            let mut populated = false;
-            for (relative, entry) in tree.under(&path) {
-                populated = true;
-                directory.update(relative.as_bytes());
-                directory.update([0]);
-                update_entry(&mut directory, entry);
-                directory.update([0]);
-            }
-            if populated {
-                hasher.update(directory.finalize());
-                hasher.update([2]);
-            } else {
-                hasher.update([0]);
-            }
+    if let Some(entry) = tree.get(&path) {
+        update_entry(&mut hasher, entry);
+    } else {
+        let mut directory = Sha256::new();
+        let mut populated = false;
+        for (relative, entry) in tree.under(&path) {
+            populated = true;
+            directory.update(relative.as_bytes());
+            directory.update([0]);
+            update_entry(&mut directory, entry);
+            directory.update([0]);
+        }
+        if populated {
+            hasher.update(directory.finalize());
+            hasher.update([2]);
+        } else {
+            hasher.update([0]);
         }
     }
     hasher.update(seed);
@@ -468,12 +468,11 @@ pub fn normalize_workspace_path(workspace: &Path, value: &str) -> Option<String>
         .unwrap_or(value);
     let path = Path::new(value);
     let relative = if path.is_absolute() {
-        match path.strip_prefix(workspace) {
-            Ok(stripped) => stripped.to_path_buf(),
-            Err(_) => {
-                let canonical = fs::canonicalize(workspace).ok()?;
-                path.strip_prefix(&canonical).ok()?.to_path_buf()
-            }
+        if let Ok(stripped) = path.strip_prefix(workspace) {
+            stripped.to_path_buf()
+        } else {
+            let canonical = fs::canonicalize(workspace).ok()?;
+            path.strip_prefix(&canonical).ok()?.to_path_buf()
         }
     } else {
         path.to_path_buf()
@@ -664,19 +663,18 @@ impl Evaluator<'_> {
         let mut direct = Sha256::new();
         direct.update(static_digest);
         for source in recipe.sources() {
-            let digest = match self.source_digests.get(source) {
-                Some(digest) => *digest,
-                None => {
-                    let soft = *self
-                        .soft_digests
-                        .entry(source.clone())
-                        .or_insert_with(|| soft_digest(self.tree, source));
-                    match soft {
-                        Some(digest) => digest,
-                        None => bail!(
-                            "source input {source} of {key} is neither a target nor a tracked file"
-                        ),
-                    }
+            let digest = if let Some(digest) = self.source_digests.get(source) {
+                *digest
+            } else {
+                let soft = *self
+                    .soft_digests
+                    .entry(source.clone())
+                    .or_insert_with(|| soft_digest(self.tree, source));
+                match soft {
+                    Some(digest) => digest,
+                    None => bail!(
+                        "source input {source} of {key} is neither a target nor a tracked file"
+                    ),
                 }
             };
             direct.update(digest);
@@ -1760,7 +1758,7 @@ mod tests {
             diff, tree, base,
         ) {
             Classification::Rebuild { reason } => reason,
-            other => panic!("expected a rebuild, got {other:?}"),
+            other @ Classification::Derivable { .. } => panic!("expected a rebuild, got {other:?}"),
         };
         assert!(reason(
             &[entry("pkg/new.txt", 'A', "000000", "100644")],

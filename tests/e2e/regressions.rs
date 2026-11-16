@@ -250,7 +250,7 @@ fn wrapped_external_repo_change_reaches_main_consumer() {
     );
 }
 
-/// Regression for https://github.com/Tinder/bazel-diff/issues/510: like the
+/// Regression for <https://github.com/Tinder/bazel-diff/issues/510>: like the
 /// #197 case above, but the wrapper module (`middle`) is only declared by
 /// `facade`, under a private apparent name, so it is not visible from the root.
 #[test]
@@ -350,7 +350,7 @@ fn hidden_wrapper_external_repo_change_propagates_with_explicit_chain() {
     assert!(!impacted.contains("//:control"), "{impacted:?}");
 }
 
-/// Regression for https://github.com/Tinder/bazel-diff/issues/522: a module patched through
+/// Regression for <https://github.com/Tinder/bazel-diff/issues/522>: a module patched through
 /// `single_version_override(patches = [...])`, where the patch rewrites a plain data file and no
 /// `.bzl`. The patch is hashed into the module's `//external:dep` node
 /// (`_bazel_diff_local_inputs_hash`), and `//:consumer` reaches that node through its input
@@ -403,9 +403,6 @@ fn single_version_override_patch_change_reaches_consumer_cquery() {
 /// the head, even when its configured hash was already present and unchanged at the base.
 #[test]
 fn configured_roots_preserve_module_obligations() {
-    if !supports_mod_show_repo() {
-        return;
-    }
     struct Snapshot {
         workspace: TestWorkspace,
         hashes: PathBuf,
@@ -415,6 +412,9 @@ fn configured_roots_preserve_module_obligations() {
         data: Value,
         product: Vec<u8>,
         overlap_product: Vec<u8>,
+    }
+    if !supports_mod_show_repo() {
+        return;
     }
     let output = tempfile::tempdir().unwrap();
     let capture = |name: &str, version: &str, change_source: bool, head: bool| {
@@ -759,7 +759,7 @@ fn repository_outside_the_workspace_keeps_its_path() {
     );
 }
 
-/// Regression for https://github.com/Tinder/bazel-diff/issues/544: the local registry lives inside
+/// Regression for <https://github.com/Tinder/bazel-diff/issues/544>: the local registry lives inside
 /// the workspace (`write_local_registry` registers it by its absolute path, which is what
 /// `%workspace%` expands to), so the `file://` URLs of `dep`'s registry patch and `MODULE.bazel`
 /// name each checkout's absolute path. Two identical checkouts at different paths must impact
@@ -1996,7 +1996,7 @@ fn cquery_verifies_covered_configured_roots() {
     assert_eq!(malformed["targets"], report["targets"]);
 }
 
-/// Regression for https://github.com/Tinder/bazel-diff/issues/522 and hashbench's
+/// Regression for <https://github.com/Tinder/bazel-diff/issues/522> and hashbench's
 /// `toolchain_patch_edit` scenario: a repository created by a module extension that no
 /// module imports (`go_sdk.download(patches = ...)`) is reached by toolchain resolution
 /// only. Editing its patch changes what every user of the toolchain builds, so the users
@@ -2112,7 +2112,7 @@ fn extension_repo_nodes_are_stable_without_a_change() {
     assert!(impacted.is_empty(), "{impacted:?}");
 }
 
-/// Reproducer for https://github.com/Tinder/bazel-diff/issues/531: a transitive module's
+/// Reproducer for <https://github.com/Tinder/bazel-diff/issues/531>: a transitive module's
 /// `use_extension` is broken (it imports a repository the extension no longer generates),
 /// but nothing in `//...` reaches that extension, so Bazel's lazy evaluation keeps
 /// `bazel build //...` green. `bazel mod graph` and `bazel mod show_repo` evaluate every
@@ -2302,7 +2302,7 @@ fn same_symbol_extension_failure_keeps_healthy_repo_hashed() {
     }
 }
 
-/// Reproducer for https://github.com/Tinder/bazel-diff/issues/535: the root maps the apparent
+/// Reproducer for <https://github.com/Tinder/bazel-diff/issues/535>: the root maps the apparent
 /// name `dep` to a repository rule (`+_repo_rules+dep`) and, under the apparent name
 /// `module_dep`, also depends on a *module* named `dep`, whose directory is `external/dep+`.
 /// `//:consumer` reads `@dep` only. Fine-grained hashing guessed the repository's directory

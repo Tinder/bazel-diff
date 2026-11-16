@@ -10,7 +10,7 @@
 use crate::model::{impacted_types, ImpactType, TargetHash};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 /// Why a root cause's own hash moved, independent of anything upstream of it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -273,7 +273,7 @@ fn walk_upstream(
 
     while let Some(current) = queue.pop_front() {
         let depth = distances[&current];
-        let deps = dep_edges.get(&current).map(Vec::as_slice).unwrap_or(&[]);
+        let deps = dep_edges.get(&current).map_or(&[][..], Vec::as_slice);
         if max_depth.is_some_and(|max| depth >= max) {
             if deps
                 .iter()
@@ -355,8 +355,7 @@ fn build_subgraph(
         .flat_map(|consumer| {
             dep_edges
                 .get(consumer)
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
+                .map_or(&[][..], Vec::as_slice)
                 .iter()
                 .filter(|dep| included.contains(*dep))
                 .map(|dep| ExplainEdge {
@@ -457,7 +456,7 @@ fn type_suffix(target_type: &str) -> String {
 
 fn render_text(e: &ImpactExplanation) -> String {
     let mut out = String::new();
-    out.push_str(&format!("{}{}\n", e.target, type_suffix(&e.target_type)));
+    let _ = writeln!(out, "{}{}", e.target, type_suffix(&e.target_type));
     if !e.impacted {
         out.push_str(if e.removed {
             "NOT IMPACTED -- this target exists in the starting revision but not the final \
@@ -488,13 +487,14 @@ fn render_text(e: &ImpactExplanation) -> String {
     }
 
     if e.truncated {
-        out.push_str(&format!(
-            "Root causes: {} (showing the {} nearest)\n",
+        let _ = writeln!(
+            out,
+            "Root causes: {} (showing the {} nearest)",
             e.total_root_causes,
             e.root_causes.len()
-        ));
+        );
     } else {
-        out.push_str(&format!("Root causes: {}\n", e.total_root_causes));
+        let _ = writeln!(out, "Root causes: {}", e.total_root_causes);
     }
     out.push('\n');
 
@@ -504,18 +504,20 @@ fn render_text(e: &ImpactExplanation) -> String {
             RootCauseKind::NewTarget => "new target in the final revision",
             RootCauseKind::SelfChanged => self_changed_reason(&cause.target_type),
         };
-        out.push_str(&format!(
-            "  {}. {}{}\n",
+        let _ = writeln!(
+            out,
+            "  {}. {}{}",
             index + 1,
             cause.label,
             type_suffix(&cause.target_type)
-        ));
-        out.push_str(&format!("     {reason}\n"));
-        out.push_str(&format!(
-            "     {}\n",
+        );
+        let _ = writeln!(out, "     {reason}");
+        let _ = writeln!(
+            out,
+            "     {}",
             hops(cause.target_distance, cause.package_hops)
-        ));
-        out.push_str(&format!("     {}\n", cause.path.join(" -> ")));
+        );
+        let _ = writeln!(out, "     {}", cause.path.join(" -> "));
         if index != last {
             out.push('\n');
         }
@@ -523,10 +525,11 @@ fn render_text(e: &ImpactExplanation) -> String {
 
     if e.truncated {
         out.push('\n');
-        out.push_str(&format!(
-            "  ... and {} more. Pass --maxRootCauses=0 to list every root cause.\n",
+        let _ = writeln!(
+            out,
+            "  ... and {} more. Pass --maxRootCauses=0 to list every root cause.",
             e.total_root_causes - e.root_causes.len()
-        ));
+        );
     }
     out
 }
@@ -563,39 +566,44 @@ fn node_ids(e: &ImpactExplanation) -> HashMap<&str, String> {
 
 fn render_dot(e: &ImpactExplanation) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "// bazel-diff explain -- why {} was impacted\n",
+    let _ = writeln!(
+        out,
+        "// bazel-diff explain -- why {} was impacted",
         dot_escape(&e.target)
-    ));
+    );
     out.push_str(
         "// Edges point in impact-propagation direction: root cause -> ... -> queried target.\n",
     );
     out.push_str("digraph bazel_diff_impact {\n");
     out.push_str("  rankdir=TB;\n");
-    out.push_str(&format!("  bgcolor=\"{SURFACE}\";\n"));
-    out.push_str(&format!(
+    let _ = writeln!(out, "  bgcolor=\"{SURFACE}\";");
+    let _ = writeln!(
+        out,
         "  node [shape=box, style=\"rounded,filled\", fillcolor=\"{SURFACE}\", \
          fontname=\"Helvetica\", fontsize=10, fontcolor=\"{INK}\", \
-         color=\"{HUE_INTERMEDIATE}\", penwidth=1];\n"
-    ));
-    out.push_str(&format!(
-        "  edge [color=\"{INK_MUTED}\", penwidth=1, arrowsize=0.7];\n"
-    ));
+         color=\"{HUE_INTERMEDIATE}\", penwidth=1];"
+    );
+    let _ = writeln!(
+        out,
+        "  edge [color=\"{INK_MUTED}\", penwidth=1, arrowsize=0.7];"
+    );
     out.push('\n');
 
     let ids = node_ids(e);
     for node in &e.nodes {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "  {} [label=\"{}\"",
             ids[node.label.as_str()],
             dot_escape(&node_label(node))
-        ));
+        );
         if node.is_queried_target {
-            out.push_str(&format!(", color=\"{HUE_QUERIED}\", penwidth=2"));
+            let _ = write!(out, ", color=\"{HUE_QUERIED}\", penwidth=2");
         } else if node.is_root_cause {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 ", color=\"{HUE_ROOT_CAUSE}\", penwidth=2, peripheries=2"
-            ));
+            );
         }
         out.push_str("];\n");
     }
@@ -605,25 +613,24 @@ fn render_dot(e: &ImpactExplanation) -> String {
     }
     for edge in &e.edges {
         if let (Some(from), Some(to)) = (ids.get(edge.from.as_str()), ids.get(edge.to.as_str())) {
-            out.push_str(&format!("  {from} -> {to};\n"));
+            let _ = writeln!(out, "  {from} -> {to};");
         }
     }
 
     out.push('\n');
     out.push_str("  subgraph cluster_legend {\n");
-    out.push_str(&format!(
-        "    label=\"Legend\"; fontname=\"Helvetica\"; fontsize=9; fontcolor=\"{INK_MUTED}\";\n"
-    ));
-    out.push_str(&format!(
-        "    color=\"{INK_MUTED}\"; penwidth=1; style=dashed;\n"
-    ));
-    out.push_str(&format!(
-        "    lg_root [label=\"root cause\", color=\"{HUE_ROOT_CAUSE}\", penwidth=2, peripheries=2];\n"
-    ));
+    let _ = writeln!(
+        out,
+        "    label=\"Legend\"; fontname=\"Helvetica\"; fontsize=9; fontcolor=\"{INK_MUTED}\";"
+    );
+    let _ = writeln!(out, "    color=\"{INK_MUTED}\"; penwidth=1; style=dashed;");
+    let _ = writeln!(out, "    lg_root [label=\"root cause\", color=\"{HUE_ROOT_CAUSE}\", penwidth=2, peripheries=2];"
+    );
     out.push_str("    lg_mid [label=\"carries the change\"];\n");
-    out.push_str(&format!(
-        "    lg_target [label=\"queried target\", color=\"{HUE_QUERIED}\", penwidth=2];\n"
-    ));
+    let _ = writeln!(
+        out,
+        "    lg_target [label=\"queried target\", color=\"{HUE_QUERIED}\", penwidth=2];"
+    );
     out.push_str("    lg_root -> lg_mid -> lg_target [style=invis];\n");
     out.push_str("  }\n");
     out.push_str("}\n");
@@ -632,10 +639,11 @@ fn render_dot(e: &ImpactExplanation) -> String {
 
 fn render_mermaid(e: &ImpactExplanation) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "%% bazel-diff explain -- why {} was impacted\n",
+    let _ = writeln!(
+        out,
+        "%% bazel-diff explain -- why {} was impacted",
         e.target
-    ));
+    );
     out.push_str(
         "%% Edges point in impact-propagation direction: root cause -> ... -> queried target.\n",
     );
@@ -653,24 +661,25 @@ fn render_mermaid(e: &ImpactExplanation) -> String {
         } else {
             format!("{id}[\"{text}\"]")
         };
-        out.push_str(&format!("  {shaped}\n"));
+        let _ = writeln!(out, "  {shaped}");
     }
 
     for edge in &e.edges {
         if let (Some(from), Some(to)) = (ids.get(edge.from.as_str()), ids.get(edge.to.as_str())) {
-            out.push_str(&format!("  {from} --> {to}\n"));
+            let _ = writeln!(out, "  {from} --> {to}");
         }
     }
 
-    out.push_str(&format!(
-        "  classDef rootCause fill:{SURFACE},stroke:{HUE_ROOT_CAUSE},stroke-width:2px,color:{INK}\n"
-    ));
-    out.push_str(&format!(
-        "  classDef intermediate fill:{SURFACE},stroke:{HUE_INTERMEDIATE},stroke-width:1px,color:{INK}\n"
-    ));
-    out.push_str(&format!(
-        "  classDef queried fill:{SURFACE},stroke:{HUE_QUERIED},stroke-width:2px,color:{INK}\n"
-    ));
+    let _ = writeln!(
+        out,
+        "  classDef rootCause fill:{SURFACE},stroke:{HUE_ROOT_CAUSE},stroke-width:2px,color:{INK}"
+    );
+    let _ = writeln!(out, "  classDef intermediate fill:{SURFACE},stroke:{HUE_INTERMEDIATE},stroke-width:1px,color:{INK}"
+    );
+    let _ = writeln!(
+        out,
+        "  classDef queried fill:{SURFACE},stroke:{HUE_QUERIED},stroke-width:2px,color:{INK}"
+    );
 
     let mut assign = |class_name: &str, predicate: fn(&ExplainNode) -> bool| {
         let matching = e
@@ -680,7 +689,7 @@ fn render_mermaid(e: &ImpactExplanation) -> String {
             .map(|node| ids[node.label.as_str()].as_str())
             .collect::<Vec<_>>();
         if !matching.is_empty() {
-            out.push_str(&format!("  class {} {class_name}\n", matching.join(",")));
+            let _ = writeln!(out, "  class {} {class_name}", matching.join(","));
         }
     };
     assign("queried", |node| node.is_queried_target);

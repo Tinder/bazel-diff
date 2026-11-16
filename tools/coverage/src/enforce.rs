@@ -99,7 +99,7 @@ pub fn check(report: &Report, config: &Config) -> Outcome {
         let hit = cov.lines_hit();
         total_found += found;
         total_hit += hit;
-        rows.push((hit as f64 / found as f64 * 100.0, hit, found, path));
+        rows.push((percent(hit, found), hit, found, path));
     }
 
     let mut text = String::new();
@@ -127,7 +127,7 @@ pub fn check(report: &Report, config: &Config) -> Outcome {
         };
     }
 
-    let overall = total_hit as f64 / total_found as f64 * 100.0;
+    let overall = percent(total_hit, total_found);
     let _ = writeln!(
         text,
         "\nTarget line coverage: {overall:.2}% ({total_hit} / {total_found} lines)"
@@ -158,6 +158,13 @@ pub fn check(report: &Report, config: &Config) -> Outcome {
     }
 }
 
+/// `hit` as a percentage of `found`. Line counts never approach 2^53, so the
+/// `u64 -> f64` conversion is exact for every report this tool will see.
+#[allow(clippy::cast_precision_loss)]
+fn percent(hit: u64, found: u64) -> f64 {
+    hit as f64 / found as f64 * 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,7 +173,7 @@ mod tests {
     fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|&(k, v)| (k.to_owned(), v.to_owned()))
             .collect()
     }
 
@@ -189,7 +196,7 @@ mod tests {
         ]))
         .unwrap()
         .unwrap();
-        assert_eq!(cfg.min_line_coverage, 87.5);
+        assert!((cfg.min_line_coverage - 87.5).abs() < f64::EPSILON);
         assert_eq!(cfg.include, vec!["src/", "lib/"]);
         assert_eq!(cfg.exclude, vec!["src/generated/"]);
     }
@@ -214,8 +221,8 @@ mod tests {
     fn cfg(min: f64, include: &[&str], exclude: &[&str]) -> Config {
         Config {
             min_line_coverage: min,
-            include: include.iter().map(|s| s.to_string()).collect(),
-            exclude: exclude.iter().map(|s| s.to_string()).collect(),
+            include: include.iter().map(ToString::to_string).collect(),
+            exclude: exclude.iter().map(ToString::to_string).collect(),
         }
     }
 

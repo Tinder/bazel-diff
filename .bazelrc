@@ -30,6 +30,35 @@ common --test_env=PATH
 # //:rust_clippy_check and //:rust_format_check.
 build --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
 build --output_groups=+clippy_checks
+
+# Lint policy for every first-party Rust crate (the aspect skips external
+# crates): clippy::pedantic, with warnings as errors. Cargo.toml [lints.clippy]
+# mirrors this list for `cargo clippy`; keep the two in step. Setting any flag
+# here replaces rules_rust's implicit -Dwarnings, so it comes first.
+#
+# Pedantic lints not adopted:
+# - The doc lints: this is a CLI crate whose module API is not a stability
+#   commitment (see src/lib.rs), so `# Errors`/`# Panics` sections and
+#   `#[must_use]` on every accessor would be noise rather than a contract.
+# - too_many_lines: the long functions are linear CLI and pipeline glue;
+#   splitting them to satisfy a line count would not make them clearer.
+# - similar_names / struct_excessive_bools: the names mirror Bazel's own
+#   vocabulary and the bool-heavy structs are clap argument groups.
+# - case_sensitive_file_extension_comparisons: Bazel labels and workspace
+#   paths are case-sensitive, so the case-insensitive comparison the lint
+#   proposes would change which files a rule is seen to own.
+# - implicit_hasher: the target-type filters are only ever std `HashSet`s;
+#   a `BuildHasher` parameter would be generality nobody uses.
+build --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+build --@rules_rust//rust/settings:clippy_flag=-Wclippy::pedantic
+build --@rules_rust//rust/settings:clippy_flag=-Aclippy::missing_errors_doc
+build --@rules_rust//rust/settings:clippy_flag=-Aclippy::missing_panics_doc
+build --@rules_rust//rust/settings:clippy_flag=-Aclippy::must_use_candidate
+build --@rules_rust//rust/settings:clippy_flag=-Aclippy::too_many_lines
+build --@rules_rust//rust/settings:clippy_flag=-Aclippy::similar_names
+build --@rules_rust//rust/settings:clippy_flag=-Aclippy::struct_excessive_bools
+build --@rules_rust//rust/settings:clippy_flag=-Aclippy::case_sensitive_file_extension_comparisons
+build --@rules_rust//rust/settings:clippy_flag=-Aclippy::implicit_hasher
 build --aspects=@rules_rust//rust:defs.bzl%rustfmt_aspect
 build --output_groups=+rustfmt_checks
 

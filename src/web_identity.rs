@@ -1,7 +1,7 @@
 //! Temporary S3 credentials from `AssumeRoleWithWebIdentity` at a configurable STS endpoint.
 //!
 //! `aws-creds` sends web-identity exchanges only to `https://sts.amazonaws.com/`. S3-compatible
-//! stores (MinIO, SeaweedFS) serve STS themselves, so with an STS endpoint configured the S3 tier
+//! stores (`MinIO`, `SeaweedFS`) serve STS themselves, so with an STS endpoint configured the S3 tier
 //! makes the exchange here and renews the session before it expires.
 
 use anyhow::{bail, Context, Result};
@@ -21,7 +21,7 @@ const DEFAULT_SESSION_NAME: &str = "bazel-diff";
 const STS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const STS_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Exchanges a web identity token (a Kubernetes ServiceAccount token, say) for S3 credentials and
+/// Exchanges a web identity token (a Kubernetes `ServiceAccount` token, say) for S3 credentials and
 /// reuses them until [`RENEWAL_MARGIN`] before they expire.
 pub struct WebIdentitySessions {
     endpoint: Url,
@@ -95,7 +95,7 @@ impl WebIdentitySessions {
     }
 
     /// One `AssumeRoleWithWebIdentity` call. The token file is read every time because kubelet
-    /// rotates a projected ServiceAccount token before it expires.
+    /// rotates a projected `ServiceAccount` token before it expires.
     fn assume_role(&self) -> Result<Session> {
         let token = fs::read_to_string(&self.token_file).with_context(|| {
             format!(
@@ -279,8 +279,7 @@ mod tests {
             .form
             .iter()
             .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
-            .unwrap_or_else(|| panic!("form has no {name}"))
+            .map_or_else(|| panic!("form has no {name}"), |(_, value)| value.as_str())
     }
 
     #[test]

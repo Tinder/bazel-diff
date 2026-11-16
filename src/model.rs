@@ -37,14 +37,14 @@ fn decode_lowercase_hex(value: &str) -> Option<[u8; 32]> {
     const INVALID: u8 = 0xff;
     const TABLE: [u8; 256] = {
         let mut table = [INVALID; 256];
-        let mut digit = 0;
+        let mut digit: u8 = 0;
         while digit < 10 {
-            table[b'0' as usize + digit] = digit as u8;
+            table[b'0' as usize + digit as usize] = digit;
             digit += 1;
         }
-        let mut letter = 0;
+        let mut letter: u8 = 0;
         while letter < 6 {
-            table[b'a' as usize + letter] = 10 + letter as u8;
+            table[b'a' as usize + letter as usize] = 10 + letter;
             letter += 1;
         }
         table
@@ -580,8 +580,7 @@ impl<'de> Deserialize<'de> for HashFileData {
 impl HashFileData {
     pub fn ensure_same_root_mode(&self, other: &Self) -> Result<()> {
         match (&self.configured_roots, &other.configured_roots) {
-            (None, None) => Ok(()),
-            (Some(_), Some(_)) => Ok(()),
+            (None, None) | (Some(_), Some(_)) => Ok(()),
             _ => bail!("incompatible configured-root hash files; generate both in the same mode"),
         }
     }
@@ -853,10 +852,10 @@ pub fn impacted_types(
             None => Some((label.clone(), ImpactType::Direct)),
             Some(starting_hash) if !starting_hash.same_as(final_hash) => Some((
                 label.clone(),
-                if starting_hash.direct_hash != final_hash.direct_hash {
-                    ImpactType::Direct
-                } else {
+                if starting_hash.direct_hash == final_hash.direct_hash {
                     ImpactType::Indirect
+                } else {
+                    ImpactType::Direct
                 },
             )),
             _ => None,
@@ -929,7 +928,7 @@ pub fn impacted_targets_with_distances(
         dep_edges,
         target_types,
         exclude_external,
-        impact_types,
+        &impact_types,
         DistanceOptions::default(),
     )?;
     Ok(result.targets)
@@ -1248,14 +1247,14 @@ struct DistanceTrace {
     shared_direct: BTreeSet<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct DistanceOptions<'a> {
     root_direct: Option<&'a HashSet<String>>,
     shared: Option<&'a HashSet<String>>,
     capture: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct DistanceRequest<'a> {
     shared: Option<&'a HashSet<String>>,
     capture: bool,
@@ -1307,7 +1306,7 @@ fn hash_file_distance_results(
         dep_edges,
         target_types,
         exclude_external,
-        changes,
+        &changes,
         DistanceOptions {
             root_direct: to.configured_roots.as_ref().map(|_| &forced_direct),
             shared: request.shared,
@@ -1322,7 +1321,7 @@ fn distances_for_types(
     dep_edges: &BTreeMap<String, Vec<String>>,
     target_types: Option<&HashSet<String>>,
     exclude_external: bool,
-    impact_types: HashMap<String, ImpactType>,
+    impact_types: &HashMap<String, ImpactType>,
     options: DistanceOptions<'_>,
 ) -> Result<DistanceResults> {
     let DistanceOptions {
@@ -1332,7 +1331,7 @@ fn distances_for_types(
     } = options;
     let mut dependents = HashMap::<&str, Vec<&str>>::new();
     let mut roots = Vec::new();
-    for (label, impact) in &impact_types {
+    for (label, impact) in impact_types {
         if *impact == ImpactType::Direct {
             roots.push(label.as_str());
             if shared.is_none() {

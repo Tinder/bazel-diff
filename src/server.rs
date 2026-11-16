@@ -2,7 +2,7 @@ use crate::bazel::BazelOptions;
 use crate::cache;
 use crate::cancel::{Cancellation, CANCELLED};
 use crate::git::{self, DerivationPolicy, Git};
-use crate::hash::{generate_hashes_timed, HashOptions};
+use crate::hash::{elapsed_millis, generate_hashes_timed, GenerationTimings, HashOptions};
 use crate::model::{filter_and_sort_labels, hash_file_distances, HashFileData};
 use crate::module_graph::{bzlmod_enabled_for, impacted_with_module_changes};
 use crate::partial::{self, Classification, Glob, TreeIndex, TreeKind};
@@ -223,6 +223,8 @@ impl ComputeSlotDemandAverage {
         self.prune(now);
     }
 
+    // Slot demand counts are small integers, which f64 represents exactly.
+    #[allow(clippy::cast_precision_loss)]
     fn current_average(&mut self, now: Instant) -> f64 {
         self.prune(now);
         let start = self.window_start(now);
@@ -235,11 +237,7 @@ impl ComputeSlotDemandAverage {
         for index in 0..self.levels.len() {
             let level = self.levels[index];
             let segment_start = if level.at < start { start } else { level.at };
-            let segment_end = self
-                .levels
-                .get(index + 1)
-                .map(|next| next.at)
-                .unwrap_or(now);
+            let segment_end = self.levels.get(index + 1).map_or(now, |next| next.at);
             if segment_end > segment_start {
                 weighted_value_seconds +=
                     level.value as f64 * segment_end.duration_since(segment_start).as_secs_f64();
@@ -272,7 +270,7 @@ impl<'a> ComputeSlotDemandGuard<'a> {
     fn start(metrics: &'a Mutex<RuntimeMetrics>) -> Self {
         let mut state = metrics
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.compute_slot_demand += 1;
         let current = state.compute_slot_demand;
         state
@@ -288,7 +286,7 @@ impl Drop for ComputeSlotDemandGuard<'_> {
         let mut metrics = self
             .0
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         metrics.compute_slot_demand -= 1;
         let current = metrics.compute_slot_demand;
         metrics
@@ -370,7 +368,7 @@ fn memory_cache(state: &State) -> std::sync::MutexGuard<'_, MemoryCache> {
     state
         .memory
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl State {
@@ -467,10 +465,7 @@ impl Workspace {
     }
 
     fn is_busy(&self) -> bool {
-        self.holder
-            .lock()
-            .map(|holder| holder.is_some())
-            .unwrap_or(true)
+        self.holder.lock().map_or(true, |holder| holder.is_some())
     }
 
     /// Fails once the operation holding the workspace has been cancelled: the caller is about to
@@ -1259,26 +1254,30 @@ pub fn validate_partial_graph(config: &ServerConfig) -> Result<()> {
     partial::validate_hash_options(&config.hash_options)
 }
 
-pub fn serve(config: ServerConfig) -> Result<()> {
+pub fn serve(config: &ServerConfig) -> Result<()> {
     if let Some(root) = &config.hash_options.bazel.isolated_dependency_root {
         bail!("serve does not support --isolatedDependencyRoot={root}");
     }
-    validate_partial_graph(&config)?;
-    let repositories = repositories(&config)?;
+    validate_partial_graph(config)?;
+    let repositories = repositories(config)?;
     fs::create_dir_all(&config.cache_dir)?;
-    let remote = RemoteCache::new(&config)?;
-    let shared = Shared::new(&config, remote);
+    let remote = RemoteCache::new(config)?;
+    let shared = Shared::new(config, remote);
     let port = config.port;
     let states = repositories
         .iter()
         .map(|repository| {
             let mut config = config.clone();
-            config.hash_options.bazel.workspace = repository.workspace.clone();
+            config
+                .hash_options
+                .bazel
+                .workspace
+                .clone_from(&repository.workspace);
             Arc::new(State::with_shared(&repository.name, config, &shared))
         })
         .collect::<Vec<_>>();
     // Every repository prunes the same `--cacheDir`, so one pruner is enough.
-    prune_cache(&states[0])?;
+    prune_cache(&states[0]);
     start_cache_pruner(&states[0])?;
     perform_initial_fetches(&states);
     let service = Arc::new(Service::new(states));
@@ -1294,7 +1293,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
     );
     for request in server.incoming_requests() {
         let service = Arc::clone(&service);
-        std::thread::spawn(move || handle_request(request, service));
+        std::thread::spawn(move || handle_request(request, &service));
     }
     Ok(())
 }
@@ -1388,16 +1387,14 @@ fn start_cache_pruner(state: &Arc<State>) -> Result<()> {
         .name("bazel-diff-cache-pruner".to_owned())
         .spawn(move || loop {
             std::thread::sleep(interval);
-            if let Err(error) = prune_cache(&state) {
-                eprintln!("[Warn] cache prune pass failed; retrying next interval: {error:#}");
-            }
+            prune_cache(&state);
         })
         .context("failed to start cache pruner")?;
     Ok(())
 }
 
-fn handle_request(request: Request, service: Arc<Service>) {
-    if let Err(error) = route(request, &service) {
+fn handle_request(request: Request, service: &Service) {
+    if let Err(error) = route(request, service) {
         eprintln!("[Error] failed to handle HTTP request: {error:#}");
     }
 }
@@ -1500,7 +1497,7 @@ fn route(mut request: Request, service: &Service) -> Result<()> {
             let worker_token = Arc::clone(&token);
             let (sender, receiver) = mpsc::sync_channel(1);
             std::thread::spawn(move || {
-                let result = compute_query(&state_for_compute, inputs, kind, &worker_token);
+                let result = compute_query(&state_for_compute, &inputs, kind, &worker_token);
                 // Decrement before answering so a client that polls /metrics right after its
                 // response never sees its own finished query still counted.
                 drop(active);
@@ -1653,7 +1650,7 @@ fn normalized_types(types: Option<Vec<String>>) -> Option<HashSet<String>> {
 
 fn compute_query(
     state: &Arc<State>,
-    inputs: QueryInputs,
+    inputs: &QueryInputs,
     kind: QueryKind,
     token: &Arc<Cancellation>,
 ) -> Result<Value> {
@@ -1661,13 +1658,13 @@ fn compute_query(
     let _guard = state.workspace.acquire(token)?;
     let resolve_started = Instant::now();
     let (from_sha, to_sha) = resolve_both(state, &inputs.from, &inputs.to)?;
-    let resolve_millis = resolve_started.elapsed().as_millis() as u64;
+    let resolve_millis = elapsed_millis(resolve_started);
     if matches!(kind, QueryKind::DepEdges) {
         // Same graph generate-hashes writes to --depEdgesFile: the end revision's
         // full (unscoped) dependency map. modifiedFilepaths must not shrink it —
         // PRI/CRI BFS-walk this file from the app target and need every edge.
         let to = get_hashes_locked(state, &to_sha, &BTreeSet::new(), None)?.data;
-        prune_cache(state)?;
+        prune_cache(state);
         return Ok(serde_json::to_value(&to.dep_edges)?);
     }
     let from_started = Instant::now();
@@ -1708,7 +1705,7 @@ fn compute_query(
             exclude_external,
         )?)?
     };
-    let diff_millis = diff_started.elapsed().as_millis() as u64;
+    let diff_millis = elapsed_millis(diff_started);
     let mut result = serde_json::Map::from_iter([
         ("from".to_owned(), Value::String(from_sha.clone())),
         ("to".to_owned(), Value::String(to_sha.clone())),
@@ -1718,7 +1715,7 @@ fn compute_query(
         result.insert(
             "profile".to_owned(),
             json!({
-                "totalDurationMillis": started.elapsed().as_millis() as u64,
+                "totalDurationMillis": elapsed_millis(started),
                 "resolveRevisionsDurationMillis": resolve_millis,
                 "hashRetrievals": [from_profile, to_profile],
                 "diffDurationMillis": diff_millis,
@@ -1738,7 +1735,7 @@ fn compute_query(
             }),
         );
     }
-    prune_cache(state)?;
+    prune_cache(state);
     Ok(Value::Object(result))
 }
 
@@ -1753,7 +1750,7 @@ fn warm_revision(state: &Arc<State>, revision: &str) -> Result<()> {
 /// Wall-clock breakdown of one cache-miss hash generation, in pipeline order: the `git
 /// checkout`, then the phases of [`generate_hashes_timed`], then serialising the result and
 /// writing it to the cache tiers. `targetCount` sizes the graph the phases operated on. Field
-/// names match the profile the Kotlin service emitted, which tools/serve_harness.py asserts on.
+/// names match the profile the Kotlin service emitted, which `tools/serve_harness.py` asserts on.
 ///
 /// In partial-graph mode the `partial` fields say how the entry was produced: `mode` is
 /// `derived` (no checkout, no query: the base's recipes were re-evaluated) or `full`, with
@@ -1810,10 +1807,6 @@ impl Retrieval {
             generation: None,
         }
     }
-}
-
-fn elapsed_millis(started: Instant) -> u64 {
-    started.elapsed().as_millis() as u64
 }
 
 /// One `profile.hashRetrievals[]` entry. Optional phases are omitted rather than nulled so a hit
@@ -1929,7 +1922,7 @@ fn retrieve_hashes_locked(
     }
     let mut options = state.config.hash_options.clone();
     options.bazel.cancellation = state.workspace.holder();
-    options.modified_filepaths = modified.clone();
+    options.modified_filepaths.clone_from(modified);
     options.track_deps = state.config.track_deps;
     let mut tree = None;
     if modified.is_empty() && options.content_hashes.is_none() {
@@ -2023,22 +2016,21 @@ fn retrieve_hashes_locked(
             state.partial_derived.fetch_add(1, Ordering::SeqCst);
         }
     }
-    let (mut data, timings, checkout_millis) = match derived {
-        Some(data) => (data, Default::default(), 0),
-        None => {
-            let checkout_started = Instant::now();
-            checkout(state, sha)?;
-            let checkout_millis = elapsed_millis(checkout_started);
-            if state.config.partial_graph {
-                options.partial_tree = tree.clone();
-            }
-            let (data, timings) = generate_hashes_timed(&options)?;
-            // The scoped `modifiedFilepaths` path has no tree index and keeps its disk semantics.
-            if let Some(tree) = &tree {
-                check_tracked_packages(state, sha, &data, tree)?;
-            }
-            (data, timings, checkout_millis)
+    let (mut data, timings, checkout_millis) = if let Some(data) = derived {
+        (data, GenerationTimings::default(), 0)
+    } else {
+        let checkout_started = Instant::now();
+        checkout(state, sha)?;
+        let checkout_millis = elapsed_millis(checkout_started);
+        if state.config.partial_graph {
+            options.partial_tree.clone_from(&tree);
         }
+        let (data, timings) = generate_hashes_timed(&options)?;
+        // The scoped `modifiedFilepaths` path has no tree index and keeps its disk semantics.
+        if let Some(tree) = &tree {
+            check_tracked_packages(state, sha, &data, tree)?;
+        }
+        (data, timings, checkout_millis)
     };
     // A generation the client stopped waiting for is not cached: the subprocess kill above may
     // have left the working tree mid-checkout, and the caller may already be reusing it.
@@ -2159,24 +2151,20 @@ fn cache_entry_matches_dependency_fingerprint(
             }
         };
     }
-    Ok(match current_dependency_fingerprint.as_deref() {
-        Some(current) => {
-            let matched = current == cached_fingerprint;
-            eprintln!(
-                "[BD-DBG][cache-guard-check] scope={scope} sha={sha} cachedFp={} currentFp={} matched={matched}",
-                short_fingerprint(cached_fingerprint),
-                short_fingerprint(current)
-            );
-            matched
-        }
-        None => {
-            eprintln!(
-                "[BD-DBG][cache-guard-check] scope={scope} sha={sha} cachedFp={} currentFp=NONE matched=false",
-                short_fingerprint(cached_fingerprint)
-            );
-            false
-        }
-    })
+    let Some(current) = current_dependency_fingerprint.as_deref() else {
+        eprintln!(
+            "[BD-DBG][cache-guard-check] scope={scope} sha={sha} cachedFp={} currentFp=NONE matched=false",
+            short_fingerprint(cached_fingerprint)
+        );
+        return Ok(false);
+    };
+    let matched = current == cached_fingerprint;
+    eprintln!(
+        "[BD-DBG][cache-guard-check] scope={scope} sha={sha} cachedFp={} currentFp={} matched={matched}",
+        short_fingerprint(cached_fingerprint),
+        short_fingerprint(current)
+    );
+    Ok(matched)
 }
 
 fn short_fingerprint(value: &str) -> &str {
@@ -2474,7 +2462,7 @@ fn metrics_prometheus(service: &Service) -> String {
             .as_ref()
             .expect("metrics enabled")
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .compute_slot_demand_average
             .current_average(Instant::now());
         // Repository names are validated as ASCII alphanumeric, '.', '_' or '-'.
@@ -2531,7 +2519,7 @@ fn cache_entries(directory: &Path) -> Vec<CacheEntry> {
         .collect()
 }
 
-fn prune_cache(state: &State) -> Result<()> {
+fn prune_cache(state: &State) {
     let mut entries = cache_entries(&state.config.cache_dir);
     entries.sort_by_key(|entry| entry.modified);
     let now = SystemTime::now();
@@ -2558,7 +2546,6 @@ fn prune_cache(state: &State) -> Result<()> {
             let _ = fs::remove_file(entry.path);
         }
     }
-    Ok(())
 }
 
 fn touch(path: &Path) {
@@ -2574,6 +2561,8 @@ fn human_bytes(bytes: u64) -> String {
         return format!("{bytes} B");
     }
     let units = ["KB", "MB", "GB", "TB"];
+    // Rounded to one decimal below, so the f64 mantissa is more than enough.
+    #[allow(clippy::cast_precision_loss)]
     let mut value = bytes as f64 / 1024.0;
     let mut unit = 0;
     while value >= 1024.0 && unit < units.len() - 1 {
@@ -3245,7 +3234,7 @@ mod tests {
         config.hash_options.bazel.isolated_dependency_root = Some("@hub".into());
         assert!(validate_partial_graph(&config).is_ok());
         assert_eq!(
-            serve(config).unwrap_err().to_string(),
+            serve(&config).unwrap_err().to_string(),
             "serve does not support --isolatedDependencyRoot=@hub"
         );
         assert_eq!(fs::read(cache.path()).unwrap(), b"preserved");
@@ -3636,11 +3625,13 @@ esac
                 .into_iter()
                 .collect()
         );
-        assert!(
-            to.data.hashes["//pkg:lib"].direct_hash != from.data.hashes["//pkg:lib"].direct_hash
+        assert_ne!(
+            to.data.hashes["//pkg:lib"].direct_hash,
+            from.data.hashes["//pkg:lib"].direct_hash
         );
-        assert!(
-            to.data.hashes["//pkg:bin"].direct_hash == from.data.hashes["//pkg:bin"].direct_hash
+        assert_eq!(
+            to.data.hashes["//pkg:bin"].direct_hash,
+            from.data.hashes["//pkg:bin"].direct_hash
         );
 
         // A full generation of the same revision, in a fresh cache, writes the identical entry.
@@ -4302,7 +4293,7 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
         assert_eq!(
             normalized_types(Some(vec![
                 " Rule ".into(),
-                "".into(),
+                String::new(),
                 "SourceFile".into(),
                 "Rule".into(),
             ])),
@@ -4757,7 +4748,7 @@ esac
         };
         let result = compute_query(
             &state,
-            inputs,
+            &inputs,
             QueryKind::Distances,
             &Arc::new(Cancellation::new()),
         )
@@ -4788,11 +4779,11 @@ esac
 
         let mut state = state_for_repo(repo.path(), cache.path(), false);
         Arc::get_mut(&mut state).unwrap().config.cache_max_entries = Some(2);
-        prune_cache(&state).unwrap();
+        prune_cache(&state);
         assert_eq!(cache_entries(cache.path()).len(), 2);
 
         Arc::get_mut(&mut state).unwrap().config.cache_max_size = Some(7);
-        prune_cache(&state).unwrap();
+        prune_cache(&state);
         assert!(
             cache_entries(cache.path())
                 .iter()
@@ -4803,7 +4794,7 @@ esac
 
         Arc::get_mut(&mut state).unwrap().config.cache_max_age = Some(Duration::ZERO);
         thread::sleep(Duration::from_millis(2));
-        prune_cache(&state).unwrap();
+        prune_cache(&state);
         assert!(cache_entries(cache.path()).is_empty());
         assert!(cache.path().join("ignored.tmp").exists());
     }
@@ -4957,16 +4948,18 @@ esac
         // Deterministic time-weighted average, including startup and window expiry.
         let started = Instant::now();
         let mut average = ComputeSlotDemandAverage::new(Duration::from_secs(20), started);
-        assert_eq!(average.current_average(started), 0.0);
+        assert!(average.current_average(started).abs() < 1e-9);
         average.record(1, started + Duration::from_secs(5));
         assert!((average.current_average(started + Duration::from_secs(10)) - 0.5).abs() < 1e-9);
         average.record(3, started + Duration::from_secs(10));
         average.record(0, started + Duration::from_secs(15));
         assert!((average.current_average(started + Duration::from_secs(20)) - 1.0).abs() < 1e-9);
         assert!((average.current_average(started + Duration::from_secs(30)) - 0.75).abs() < 1e-9);
-        assert_eq!(
-            average.current_average(started + Duration::from_secs(35)),
-            0.0
+        assert!(
+            average
+                .current_average(started + Duration::from_secs(35))
+                .abs()
+                < 1e-9
         );
 
         let config = test_config();
@@ -5018,7 +5011,7 @@ esac
         );
 
         // Give each repository a deterministic, distinct history without sleeps.
-        let started = Instant::now() - Duration::from_secs(5);
+        let started = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
         for (state, demand) in [(&first, 2), (&second, 0)] {
             let mut average = ComputeSlotDemandAverage::new(Duration::from_secs(5), started);
             average.record(demand, started);
@@ -5070,6 +5063,8 @@ esac
     }
 
     #[test]
+    // The guard's demand slot is intentionally only dropped; this test asserts it stays empty.
+    #[allow(clippy::used_underscore_binding)]
     fn disabled_prometheus_does_not_track_workspace_demand() {
         let mut config = test_config();
         config.compute_slot_demand_average_window = None;

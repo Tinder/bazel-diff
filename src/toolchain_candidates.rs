@@ -90,12 +90,11 @@ pub fn compare(from: &HashFileData, to: &HashFileData) -> CandidateReport {
         }
         for operand in operands {
             possible |= result.unresolved.contains(operand);
-            match hash_pair(operand) {
-                (Some(a), Some(b)) => possible |= !a.same_as(b),
-                _ => {
-                    possible = true;
-                    result.unresolved.insert(operand.clone());
-                }
+            if let (Some(a), Some(b)) = hash_pair(operand) {
+                possible |= !a.same_as(b);
+            } else {
+                possible = true;
+                result.unresolved.insert(operand.clone());
             }
         }
         let types = old

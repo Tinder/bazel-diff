@@ -41,8 +41,7 @@ pub(crate) fn hash_pool() -> &'static rayon::ThreadPool {
             .filter(|threads| *threads > 0)
             .unwrap_or_else(|| {
                 std::thread::available_parallelism()
-                    .map(usize::from)
-                    .unwrap_or(1)
+                    .map_or(1, usize::from)
                     .min(DEFAULT_HASH_THREADS)
             });
         rayon::ThreadPoolBuilder::new()
@@ -205,9 +204,9 @@ enum HashTarget {
 impl HashTarget {
     fn label(&self) -> &str {
         match self {
-            HashTarget::Rule(label) => label,
-            HashTarget::RepositoryDefinition(label) => label,
-            HashTarget::Source(label) => label,
+            HashTarget::Rule(label)
+            | HashTarget::RepositoryDefinition(label)
+            | HashTarget::Source(label) => label,
             HashTarget::Generated {
                 name,
                 generating_rule: _,
@@ -231,8 +230,10 @@ pub struct GenerationTimings {
     pub target_hash_millis: u64,
 }
 
-fn elapsed_millis(started: Instant) -> u64 {
-    started.elapsed().as_millis() as u64
+/// Milliseconds since `started`, saturating rather than truncating past `u64::MAX` (about 584
+/// million years).
+pub(crate) fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
@@ -562,20 +563,17 @@ fn hash_targets_with_environment(
                     hash_targets.push(HashTarget::Rule(rule.name.clone()));
                     // Generated targets are prehashed and deduplicated; raw callers provide no
                     // digests and retain the ordered fallback below, including duplicate names.
-                    match rules
+                    if let Some((id, prepared)) = rules
                         .ids
                         .get(&rule.name)
                         .and_then(|&id| prepared.get_mut(id)?.take().map(|value| (id, value)))
                     {
-                        Some((id, prepared)) => {
-                            rules.slots[id].rule = Some(Rc::new(RuleNode::new(rule, prepared)));
+                        rules.slots[id].rule = Some(Rc::new(RuleNode::new(rule, prepared)));
+                    } else {
+                        if let Some(id) = rules.ids.get(&rule.name) {
+                            rules.ordinary_inputs.remove(id);
                         }
-                        None => {
-                            if let Some(id) = rules.ids.get(&rule.name) {
-                                rules.ordinary_inputs.remove(id);
-                            }
-                            decoded_rules.push((rule.name.clone(), rule));
-                        }
+                        decoded_rules.push((rule.name.clone(), rule));
                     }
                 }
             }
@@ -703,13 +701,13 @@ fn hash_targets_with_environment(
                 .iter()
                 .take(8)
                 .map(|(key, node)| {
-                    if !node.covered {
-                        format!("{key}: input or context was not verified")
-                    } else {
+                    if node.covered {
                         format!(
                             "{key}: source location {:?} was not observed",
                             coverage.source_locations.get(*key)
                         )
+                    } else {
+                        format!("{key}: input or context was not verified")
                     }
                 })
                 .collect::<Vec<_>>();
@@ -1604,7 +1602,7 @@ impl Labels {
     }
 
     /// A native filegroup needs a strict native declaration, a matching ordinary definition,
-    /// and an observed InputFile or complete filegroup for every input. The definition matches
+    /// and an observed `InputFile` or complete filegroup for every input. The definition matches
     /// either the full declaration or a fresh caller-projected row with synthetic hash evidence.
     /// Cycles and other rule kinds remain unresolved. Native genrule parents additionally require
     /// complete direct children and an explicitly returned empty toolchains attribute.
@@ -1825,24 +1823,25 @@ impl Labels {
                     definition_digest: _,
                     inputs,
                 } => pending.extend(inputs.iter().cloned()),
-                RepositoryDefinitionState::Visiting => unreachable!("closed repository graph"),
-                RepositoryDefinitionState::Unavailable => unreachable!("closed repository graph"),
+                RepositoryDefinitionState::Visiting | RepositoryDefinitionState::Unavailable => {
+                    unreachable!("closed repository graph")
+                }
             }
         }
         let mut definitions = HashMap::new();
         for repository in needed {
-            let (definition, definition_digest, inputs) = match states
-                .get(&repository)
-                .expect("planned repository")
-            {
-                RepositoryDefinitionState::Complete {
-                    label,
-                    definition_digest,
-                    inputs,
-                } => (label, *definition_digest, inputs),
-                RepositoryDefinitionState::Visiting => unreachable!("closed repository graph"),
-                RepositoryDefinitionState::Unavailable => unreachable!("closed repository graph"),
-            };
+            let (definition, definition_digest, inputs) =
+                match states.get(&repository).expect("planned repository") {
+                    RepositoryDefinitionState::Complete {
+                        label,
+                        definition_digest,
+                        inputs,
+                    } => (label, *definition_digest, inputs),
+                    RepositoryDefinitionState::Visiting
+                    | RepositoryDefinitionState::Unavailable => {
+                        unreachable!("closed repository graph")
+                    }
+                };
             let inputs = inputs
                 .iter()
                 .map(
@@ -1852,10 +1851,8 @@ impl Labels {
                             definition_digest: _,
                             inputs: _,
                         } => label.clone(),
-                        RepositoryDefinitionState::Visiting => {
-                            unreachable!("closed repository graph")
-                        }
-                        RepositoryDefinitionState::Unavailable => {
+                        RepositoryDefinitionState::Visiting
+                        | RepositoryDefinitionState::Unavailable => {
                             unreachable!("closed repository graph")
                         }
                     },
@@ -1903,8 +1900,8 @@ impl Labels {
             }
             BTreeEntry::Occupied(entry) => {
                 return match entry.get() {
-                    RepositoryDefinitionState::Visiting => false,
-                    RepositoryDefinitionState::Unavailable => false,
+                    RepositoryDefinitionState::Visiting
+                    | RepositoryDefinitionState::Unavailable => false,
                     RepositoryDefinitionState::Complete {
                         label: _,
                         definition_digest: _,
@@ -1928,8 +1925,9 @@ impl Labels {
                 inputs.clone()
             } else {
                 match node.prepared.repository_inputs.as_ref()? {
-                    RepositoryInputs::DefinitionOnly => Vec::new(),
-                    RepositoryInputs::WithSiblings(_) => Vec::new(),
+                    RepositoryInputs::DefinitionOnly | RepositoryInputs::WithSiblings(_) => {
+                        Vec::new()
+                    }
                 }
             };
             Some((node.prepared.definition_digest, inputs))
@@ -2656,6 +2654,8 @@ pub(crate) fn hash_directory_into(hasher: &mut Sha256, root: &Path) -> Result<()
     hash_directory_tree(hasher, root, false)
 }
 
+// Only the non-Unix branch can fail; the Unix one hashes the raw bytes.
+#[allow(clippy::unnecessary_wraps)]
 fn hash_directory_entry_path(hasher: &mut Sha256, path: &Path, strict: bool) -> Result<()> {
     for (index, component) in path.components().enumerate() {
         if index != 0 {
@@ -3827,21 +3827,20 @@ impl ExternalRepoResolver {
         root_mapping: Option<Vec<u8>>,
         output_base: Option<PathBuf>,
     ) -> Result<Self> {
-        let output_base = match output_base {
-            Some(output_base) => output_base,
-            None => {
-                let mut command = options.command_for_hashing();
-                command.arg("info").arg("output_base").stdin(Stdio::null());
-                let output = cancel::output(options.cancellation.as_deref(), &mut command)
-                    .context("failed to determine Bazel output_base")?;
-                if !output.status.success() {
-                    bail!(
-                        "bazel info output_base failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+        let output_base = if let Some(output_base) = output_base {
+            output_base
+        } else {
+            let mut command = options.command_for_hashing();
+            command.arg("info").arg("output_base").stdin(Stdio::null());
+            let output = cancel::output(options.cancellation.as_deref(), &mut command)
+                .context("failed to determine Bazel output_base")?;
+            if !output.status.success() {
+                bail!(
+                    "bazel info output_base failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
         };
         Ok(Self {
             workspace: options.workspace.clone(),
@@ -3934,7 +3933,7 @@ impl ExternalRepoResolver {
                 }
             }
         }
-        Ok(external.join(canonical.map(String::as_str).unwrap_or(repo)))
+        Ok(external.join(canonical.map_or(repo, String::as_str)))
     }
 
     /// Returns the main repository's apparent -> canonical repository mapping,
@@ -5287,7 +5286,7 @@ esac
     fn file_hashing_reuses_its_buffer_across_files_of_any_size() {
         let directory = tempfile::tempdir().unwrap();
         let large: Vec<u8> = (0..FILE_HASH_BUFFER_SIZE * 2 + 7)
-            .map(|index| (index % 251) as u8)
+            .map(|index| u8::try_from(index % 251).unwrap())
             .collect();
         let cases: [&[u8]; 4] = [&large, b"short", b"", &large[..FILE_HASH_BUFFER_SIZE]];
         for (index, content) in cases.into_iter().enumerate() {

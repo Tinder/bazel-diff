@@ -30,7 +30,11 @@ flate2 = "1.1"
 gcp_auth = { version = "=0.12.3", default-features = false, features = ["webpki-roots"] }
 hex = "0.4"
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring"] }
-mimalloc = { version = "0.1", optional = true }
+# no_thp: build mimalloc without its MADV_HUGEPAGE hint. With the hint, the first touch of each
+# mimalloc page faults in and zeroes a whole 2 MiB huge page, much of which generate-hashes never
+# uses: peak RSS was 14-35% higher on the perf-proof workloads, for no CPU gain. Systems that turn
+# huge pages on for every process (THP "always") are unaffected.
+mimalloc = { version = "0.1", optional = true, features = ["no_thp"] }
 # Already resolved for aws-creds; parses STS answers in web_identity.rs.
 quick-xml = { version = "0.32", features = ["serialize"] }
 rayon = "1.10"

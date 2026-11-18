@@ -54,14 +54,15 @@ fn decode_lowercase_hex(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut bytes = [0; 32];
+    // Valid digits are below 16, so one check of the high nibbles of every looked-up value,
+    // after the loop, finds any invalid digit; the loop itself has no branch to mispredict.
+    let mut seen = 0;
     for (byte, pair) in bytes.iter_mut().zip(hex.chunks_exact(2)) {
         let (high, low) = (TABLE[pair[0] as usize], TABLE[pair[1] as usize]);
-        if high == INVALID || low == INVALID {
-            return None;
-        }
+        seen |= high | low;
         *byte = (high << 4) | low;
     }
-    Some(bytes)
+    (seen & 0xf0 == 0).then_some(bytes)
 }
 
 impl From<[u8; 32]> for Digest {
@@ -125,6 +126,13 @@ pub(crate) const REPOSITORY_DEFINITION_KIND: &str = "RepositoryDefinition";
 
 impl TargetHash {
     pub fn parse(value: &str) -> Result<Self> {
+        match Self::parse_generated(value) {
+            Some(parsed) => Ok(parsed),
+            None => Self::parse_separated(value),
+        }
+    }
+
+    fn parse_separated(value: &str) -> Result<Self> {
         let (kind, hashes) = value
             .split_once('#')
             .map_or(("", value), |(kind, hashes)| (kind, hashes));
@@ -138,6 +146,33 @@ impl TargetHash {
             kind: kind.to_owned(),
             hash: Digest::parse(hash),
             direct_hash: Digest::parse(direct_hash),
+        })
+    }
+
+    /// The shape `generate-hashes` writes, `[kind#]<64 hex>~<64 hex>`, read at fixed offsets
+    /// instead of searched for separators. `None` for anything else, which [`Self::parse`] then
+    /// reads the general way; on every value this accepts, that would give the same result.
+    fn parse_generated(value: &str) -> Option<Self> {
+        const DIGEST: usize = 64;
+        let bytes = value.as_bytes();
+        let kind_end = bytes.len().checked_sub(2 * DIGEST + 1)?;
+        if bytes[kind_end + DIGEST] != b'~' {
+            return None;
+        }
+        let kind = match kind_end.checked_sub(1) {
+            None => "",
+            // The general parse splits at the first `#`: this one must be it.
+            Some(separator) if bytes[separator] == b'#' && !bytes[..separator].contains(&b'#') => {
+                &value[..separator]
+            }
+            Some(_) => return None,
+        };
+        let hash = decode_lowercase_hex(&value[kind_end..kind_end + DIGEST])?;
+        let direct_hash = decode_lowercase_hex(&value[kind_end + DIGEST + 1..])?;
+        Some(Self {
+            kind: kind.to_owned(),
+            hash: Digest::Sha256(hash),
+            direct_hash: Digest::Sha256(direct_hash),
         })
     }
 
@@ -1602,6 +1637,37 @@ mod tests {
         }
         assert_eq!(target("Rule", "a", "b").json_value(true), "Rule#a~b");
         assert_eq!(target("Rule", "a", "b").json_value(false), "a~b");
+    }
+
+    #[test]
+    fn generated_hash_shape_parses_like_the_general_reader() {
+        let a = "0123456789abcdef".repeat(4);
+        let b = "fedcba9876543210".repeat(4);
+        let upper = a.to_uppercase();
+        let values = [
+            format!("{a}~{b}"),
+            format!("Rule#{a}~{b}"),
+            format!("#{a}~{b}"),
+            format!("Rule{a}~{b}"),
+            format!("Ru#le#{a}~{b}"),
+            format!("Rülé#{a}~{b}"),
+            format!("{upper}~{b}"),
+            format!("Rule#{a}~{upper}"),
+            format!("Rule#{a}#{b}"),
+            format!("Rule#{a}~{b}~"),
+            format!("Rule#x{a}~{b}"),
+            format!("{a}~{}", &b[1..]),
+            format!("{a}~~{}", &b[1..]),
+        ];
+        for value in &values {
+            let general = TargetHash::parse_separated(value);
+            if let Some(fast) = TargetHash::parse_generated(value) {
+                assert_eq!(Some(&fast), general.as_ref().ok(), "{value}");
+            }
+            assert_eq!(TargetHash::parse(value).ok(), general.ok(), "{value}");
+        }
+        assert!(TargetHash::parse_generated(&format!("{a}~{b}")).is_some());
+        assert!(TargetHash::parse_generated(&format!("Rule#{a}~{b}")).is_some());
     }
 
     #[test]

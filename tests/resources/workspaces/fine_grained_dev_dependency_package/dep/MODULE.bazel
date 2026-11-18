@@ -1,0 +1,12 @@
+module(
+    name = "dep",
+    version = "1.0",
+)
+
+# Visible only when `dep` is the root module; ignored (with the override) when `dep` is
+# consumed as a dependency, as it is by the reproducer workspace.
+bazel_dep(name = "devtool", version = "1.0", dev_dependency = True)
+local_path_override(
+    module_name = "devtool",
+    path = "../devtool",
+)

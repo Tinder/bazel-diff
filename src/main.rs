@@ -1155,6 +1155,8 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
         Some(path) => fs::write(path, output)?,
         None => print!("{output}"),
     }
+    // The process exits next: freeing two hash files entry by entry would only cost CPU.
+    std::mem::forget((from, to));
     Ok(())
 }
 
@@ -1462,7 +1464,8 @@ fn run() -> Result<()> {
                     bazel_diff::hash::generate_hashes_with_toolchain_inputs,
                 )?;
             } else {
-                run_generate(args, cli.verbose)?;
+                // Written already, and the process exits next: skip freeing it entry by entry.
+                std::mem::forget(run_generate(args, cli.verbose)?);
             }
         }
         Commands::GetImpactedTargets(args) => run_get_impacted(args, cli.verbose)?,

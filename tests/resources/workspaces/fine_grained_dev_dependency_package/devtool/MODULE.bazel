@@ -1,0 +1,4 @@
+module(
+    name = "devtool",
+    version = "1.0",
+)

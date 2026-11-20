@@ -605,7 +605,7 @@ impl BazelOptions {
             self.collect_all_targets(
                 initial_repositories,
                 server_info.external_package,
-                |expression, use_cquery| {
+                |expression, use_cquery, tolerate_partial| {
                     let normal_view = if use_cquery
                         && self.cquery_root_expression.is_some()
                         && self.exclude_targets_query.is_none()
@@ -658,7 +658,13 @@ impl BazelOptions {
                         }
                         Ok(targets)
                     } else {
-                        Ok(ordinary
+                        let tolerant = tolerate_partial.then(|| Self {
+                            keep_going: true,
+                            ..ordinary.clone()
+                        });
+                        Ok(tolerant
+                            .as_ref()
+                            .unwrap_or(&ordinary)
                             .query_with_capture(
                                 expression,
                                 use_cquery,
@@ -1665,12 +1671,13 @@ impl BazelOptions {
     }
 
     /// `external_package` is whether `//external` exists, when known; `Some(false)` leaves it out
-    /// of the query instead of trying it and retrying without it.
+    /// of the query instead of trying it and retrying without it. `query` takes the expression,
+    /// whether it is a cquery, and whether a partial (`--keep_going`) answer is acceptable.
     fn collect_all_targets(
         &self,
         bzlmod_repos: Vec<Target>,
         external_package: Option<bool>,
-        mut query: impl FnMut(&str, bool) -> Result<Vec<Target>>,
+        mut query: impl FnMut(&str, bool, bool) -> Result<Vec<Target>>,
     ) -> Result<Vec<Target>> {
         let include_external = !self.exclude_external_targets && external_package != Some(false);
         let mut queries = Vec::new();
@@ -1684,9 +1691,9 @@ impl BazelOptions {
                 .map(|expression| format!("deps({})", Self::configured_root_query(expression)))
                 .or_else(|| self.cquery_expression.clone())
                 .unwrap_or_else(|| "deps(//...:all-targets)".to_owned());
-            let mut targets = query(&self.with_exclude_filter(expression), true)?;
+            let mut targets = query(&self.with_exclude_filter(expression), true, false)?;
             if include_external {
-                match query("'//external:all-targets'", false) {
+                match query("'//external:all-targets'", false, false) {
                     Ok(external) => targets.extend(external),
                     Err(error) if is_external_package_error(&error.to_string()) => {
                         eprintln!(
@@ -1699,36 +1706,134 @@ impl BazelOptions {
             targets.extend(bzlmod_repos);
             Ok(deduplicate_targets(targets))
         } else {
-            queries.push("'//...:all-targets'".to_owned());
-            queries.extend(
-                self.fine_grained_external_repos
-                    .iter()
-                    .map(|repo| format!("'{repo}//...:all-targets'")),
-            );
-            let full = self.with_exclude_filter(queries.join(" + "));
-            match query(&full, false) {
-                Ok(mut targets) => {
-                    targets.extend(bzlmod_repos);
-                    Ok(deduplicate_targets(targets))
-                }
-                Err(error) if include_external && is_external_package_error(&error.to_string()) => {
-                    let without_external = self.with_exclude_filter(
-                        std::iter::once("'//...:all-targets'".to_owned())
-                            .chain(
-                                self.fine_grained_external_repos
-                                    .iter()
-                                    .map(|repo| format!("'{repo}//...:all-targets'")),
-                            )
-                            .collect::<Vec<_>>()
-                            .join(" + "),
-                    );
-                    let mut targets = query(&without_external, false)?;
-                    targets.extend(bzlmod_repos);
-                    Ok(deduplicate_targets(targets))
-                }
-                Err(error) => Err(error),
+            let fine_grained = self
+                .fine_grained_external_repos
+                .iter()
+                .map(|repo| format!("'{repo}//...:all-targets'"));
+            let workspace = |external: bool| {
+                external
+                    .then(|| "'//external:all-targets'".to_owned())
+                    .into_iter()
+                    .chain(std::iter::once("'//...:all-targets'".to_owned()))
+            };
+            let full = |external: bool| {
+                self.with_exclude_filter(
+                    workspace(external)
+                        .chain(fine_grained.clone())
+                        .collect::<Vec<_>>()
+                        .join(" + "),
+                )
+            };
+            let mut external = include_external;
+            let mut result = query(&full(external), false, false);
+            if result
+                .as_ref()
+                .is_err_and(|error| external && is_external_package_error(&error.to_string()))
+            {
+                external = false;
+                result = query(&full(external), false, false);
             }
+            let mut targets = match result {
+                Ok(targets) => targets,
+                Err(error) if self.keep_going || self.fine_grained_external_repos.is_empty() => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    let base = |external: bool| {
+                        self.with_exclude_filter(
+                            workspace(external).collect::<Vec<_>>().join(" + "),
+                        )
+                    };
+                    self.collect_reachable_fine_grained(external, base, error, &mut query)?
+                }
+            };
+            targets.extend(bzlmod_repos);
+            Ok(deduplicate_targets(targets))
         }
+    }
+
+    /// Recovers from a failed strict query of `//...` plus the fine-grained repositories when
+    /// the only packages that cannot be loaded are ones nothing uses (#663).
+    ///
+    /// `@repo//...:all-targets` loads every package of a fine-grained repository, including
+    /// documentation and test packages whose BUILD files load a `dev_dependency` module. Bazel
+    /// drops dev dependencies of non-root modules, so those packages can never be loaded from
+    /// the consuming workspace. The main workspace is queried strictly again on its own; each
+    /// fine-grained repository is queried strictly and, failing that, with `--keep_going`. The
+    /// partial answer is accepted only if no returned rule names an input in a package of that
+    /// repository that was not loaded -- such an input could not be hashed, which is the error
+    /// `--keep_going=false` promises.
+    fn collect_reachable_fine_grained(
+        &self,
+        include_external: bool,
+        base: impl Fn(bool) -> String,
+        original: anyhow::Error,
+        query: &mut impl FnMut(&str, bool, bool) -> Result<Vec<Target>>,
+    ) -> Result<Vec<Target>> {
+        let mut targets = match query(&base(include_external), false, false) {
+            Err(error) if include_external && is_external_package_error(&error.to_string()) => {
+                query(&base(false), false, false)
+            }
+            result => result,
+        }?;
+        // Repository spelling (`@dep`, `@@dep+`) as Bazel printed it -> packages it loaded.
+        let mut partial: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut skipped = Vec::new();
+        for repo in &self.fine_grained_external_repos {
+            let pattern = self.with_exclude_filter(format!("'{repo}//...:all-targets'"));
+            let members = match query(&pattern, false, false) {
+                Ok(members) => members,
+                Err(error) => {
+                    let Ok(members) = query(&pattern, false, true) else {
+                        return Err(original);
+                    };
+                    let before = partial.len();
+                    for (repository, package) in members
+                        .iter()
+                        .filter_map(target_name)
+                        .filter_map(label_repository_and_package)
+                    {
+                        partial
+                            .entry(repository.to_owned())
+                            .or_default()
+                            .insert(package.to_owned());
+                    }
+                    if partial.len() == before {
+                        // Nothing loaded: there is no way to tell which labels name this
+                        // repository, so references into it cannot be checked.
+                        return Err(original);
+                    }
+                    skipped.push((repo, error));
+                    members
+                }
+            };
+            targets.extend(members);
+        }
+        let unhashed: BTreeSet<&str> = targets
+            .iter()
+            .filter_map(|target| target.rule.as_option())
+            .flat_map(|rule| rule.rule_input.iter())
+            .filter(|input| {
+                label_repository_and_package(input).is_some_and(|(repository, package)| {
+                    partial
+                        .get(repository)
+                        .is_some_and(|loaded| !loaded.contains(package))
+                })
+            })
+            .map(String::as_str)
+            .collect();
+        if !unhashed.is_empty() {
+            return Err(original.context(format!(
+                "fine-grained external repository inputs are in packages that failed to load: {}",
+                unhashed.into_iter().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        for (repo, error) in skipped {
+            eprintln!(
+                "[Warn] skipping packages of fine-grained repository {repo} that failed to load and that no hashed target uses: {error:#}"
+            );
+        }
+        Ok(targets)
     }
     fn query_bzlmod_repos(
         &self,
@@ -5747,6 +5852,18 @@ pub(crate) fn main_repo_label_key(label: &str) -> &str {
         .unwrap_or(label)
 }
 
+/// Splits `@repo//pkg:name` into `("@repo", "pkg")`; `None` for a main-repository label.
+fn label_repository_and_package(label: &str) -> Option<(&str, &str)> {
+    let (repository, rest) = label.split_once("//")?;
+    if repository.trim_start_matches('@').is_empty() {
+        return None;
+    }
+    Some((
+        repository,
+        rest.split_once(':').map_or(rest, |(package, _)| package),
+    ))
+}
+
 pub fn target_name(target: &Target) -> Option<&str> {
     match target.r#type {
         target::Discriminator::Rule => target.rule.as_option().map(|rule| rule.name.as_str()),
@@ -7034,7 +7151,7 @@ mod tests {
         let options = test_options(PathBuf::new(), PathBuf::new());
         let mut queries = Vec::new();
         options
-            .collect_all_targets(Vec::new(), Some(false), |expression, _| {
+            .collect_all_targets(Vec::new(), Some(false), |expression, _, _| {
                 queries.push(expression.to_owned());
                 Ok(vec![rule_target("//app:lib")])
             })
@@ -7920,7 +8037,7 @@ mod tests {
             .collect_all_targets(
                 vec![rule_target("//external:bzlmod")],
                 None,
-                |expression, cquery| {
+                |expression, cquery, _| {
                     queries.push((expression.to_owned(), cquery));
                     if queries.len() == 1 {
                         Err(anyhow!("no such package 'external'"))
@@ -7939,6 +8056,96 @@ mod tests {
             targets.iter().filter_map(target_name).collect::<Vec<_>>(),
             ["//app:lib", "//external:bzlmod"]
         );
+    }
+
+    /// #663: a fine-grained repository with a package that cannot be loaded is hashed without
+    /// that package, unless a returned rule reads from it.
+    #[test]
+    fn query_collection_skips_unused_unloadable_fine_grained_packages() {
+        let options = BazelOptions {
+            workspace: PathBuf::new(),
+            bazel: PathBuf::new(),
+            startup_options: Vec::new(),
+            command_options: Vec::new(),
+            cquery_options: Vec::new(),
+            use_cquery: false,
+            cquery_expression: None,
+            cquery_root_expression: None,
+            keep_going: false,
+            fine_grained_external_repos: BTreeSet::from(["@repo".to_owned()]),
+            label_only_module_extensions: BTreeSet::new(),
+            isolated_dependency_root: None,
+            exclude_external_targets: true,
+            exclude_targets_query: None,
+            no_bazelrc: false,
+            verbose: false,
+            cancellation: None,
+        };
+        let consumer = |input: &str| {
+            let mut target = rule_target("//app:lib");
+            target.rule.as_option_mut().unwrap().rule_input = vec![input.to_owned()];
+            target
+        };
+        let collect = |options: &BazelOptions, input: &str, loaded: Vec<Target>| {
+            let mut queries = Vec::new();
+            let result =
+                options.collect_all_targets(Vec::new(), None, |expression, _, tolerate_partial| {
+                    queries.push((expression.to_owned(), tolerate_partial));
+                    match (expression, tolerate_partial) {
+                        ("'//...:all-targets'", false) => Ok(vec![consumer(input)]),
+                        ("'@repo//...:all-targets'", true) => Ok(loaded.clone()),
+                        _ => Err(anyhow!("error loading package '@@repo+//docs'")),
+                    }
+                });
+            (result, queries)
+        };
+
+        let (targets, queries) = collect(
+            &options,
+            "@repo//lib:data",
+            vec![rule_target("@repo//lib:data")],
+        );
+        assert_eq!(
+            queries,
+            [
+                (
+                    "'//...:all-targets' + '@repo//...:all-targets'".to_owned(),
+                    false
+                ),
+                ("'//...:all-targets'".to_owned(), false),
+                ("'@repo//...:all-targets'".to_owned(), false),
+                ("'@repo//...:all-targets'".to_owned(), true),
+            ]
+        );
+        assert_eq!(
+            targets
+                .unwrap()
+                .iter()
+                .filter_map(target_name)
+                .collect::<Vec<_>>(),
+            ["//app:lib", "@repo//lib:data"]
+        );
+
+        // An input in the package that failed to load cannot be hashed: still an error.
+        let (result, _) = collect(
+            &options,
+            "@repo//docs:docs",
+            vec![rule_target("@repo//lib:data")],
+        );
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("@repo//docs:docs"), "{error}");
+        assert!(error.contains("error loading package"), "{error}");
+
+        // Nothing loaded at all: references into the repository cannot be checked.
+        let (result, _) = collect(&options, "@repo//lib:data", Vec::new());
+        assert!(result.is_err());
+
+        // --keep_going already tolerates the partial answer in the one combined query.
+        let mut lenient = options.clone();
+        lenient.keep_going = true;
+        let (result, queries) = collect(&lenient, "@repo//lib:data", Vec::new());
+        assert!(result.is_err());
+        assert_eq!(queries.len(), 1);
     }
 
     #[test]
@@ -7964,7 +8171,7 @@ mod tests {
         };
         let mut queries = Vec::new();
         let targets = options
-            .collect_all_targets(Vec::new(), None, |expression, cquery| {
+            .collect_all_targets(Vec::new(), None, |expression, cquery, _| {
                 queries.push((expression.to_owned(), cquery));
                 if cquery {
                     Ok(vec![rule_target("//app:lib")])

@@ -2822,3 +2822,63 @@ fn main_repo_alias_change_reaches_consumer_cquery_workspace_mode() {
         );
     }
 }
+
+/// Reproducer for <https://github.com/Tinder/bazel-diff/issues/663>: fine-grained hashing
+/// queries `@dep//...:all-targets`, which loads every package of the repository, including
+/// `@dep//docs`, whose BUILD file loads a `dev_dependency` module. Bazel drops dev
+/// dependencies of non-root modules, so that package cannot be loaded from this workspace
+/// and the default (`--keep_going=false`) query exits 7, failing hash generation, although
+/// `//:consumer` reads `@dep//:data` only and nothing reaches `@dep//docs`. The reporter hit
+/// this with `--fineGrainedHashExternalRepos=@rules_go`, whose `docs` packages load Stardoc.
+#[test]
+fn fine_grained_repo_with_dev_dependency_only_package_is_hashed() {
+    let first = copy_workspace("fine_grained_dev_dependency_package");
+    let edited = copy_workspace("fine_grained_dev_dependency_package");
+    fs::write(edited.path().join("dep/value.txt"), "two\n").unwrap();
+
+    // The same workspace hashes fine while @dep is treated as one opaque repository.
+    let coarse = first.path().join("coarse.json");
+    assert!(generate(first.path(), &coarse, &[]).status.success());
+
+    let fine_grained = ["--fineGrainedHashExternalRepos", "@dep"];
+    let output = first.path().join("fine.json");
+    let generated = generate(first.path(), &output, &fine_grained);
+    assert!(
+        generated.status.success(),
+        "an unused package needing a dev dependency must not fail fine-grained hashing:\n{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let hashes = hashes(&output);
+    assert!(
+        hashes.keys().any(|label| label.ends_with("//:data")),
+        "@dep//:data must be hashed target by target: {:?}",
+        hashes.keys().collect::<Vec<_>>()
+    );
+
+    let impacted = diff_workspaces(first.path(), edited.path(), &fine_grained);
+    assert!(
+        impacted.contains("//:consumer"),
+        "//:consumer reads the edited @dep//:data, got {impacted:?}"
+    );
+}
+
+/// The other half of <https://github.com/Tinder/bazel-diff/issues/663>: skipping a package
+/// that cannot be loaded is only sound while nothing reads it. Once `//:consumer` names
+/// `@dep//docs:docs`, that input cannot be hashed, so `--keep_going=false` still fails.
+#[test]
+fn fine_grained_repo_input_in_unloadable_package_still_fails() {
+    let workspace = copy_workspace("fine_grained_dev_dependency_package");
+    edit(&workspace.path().join("BUILD"), |build| {
+        build.replace("\"@dep//:data\"", "\"@dep//:data\", \"@dep//docs:docs\"")
+    });
+    let output = workspace.path().join("hashes.json");
+    let generated = generate(
+        workspace.path(),
+        &output,
+        &["--fineGrainedHashExternalRepos", "@dep"],
+    );
+    assert!(!generated.status.success());
+    let stderr = String::from_utf8_lossy(&generated.stderr);
+    assert!(stderr.contains("@dep//docs:docs"), "{stderr}");
+    assert!(stderr.contains("error loading package"), "{stderr}");
+}

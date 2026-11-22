@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-pub const FINE_ALIAS_INPUTS_VERSION: u32 = 19;
+pub const FINE_ALIAS_INPUTS_VERSION: u32 = 20;
 pub const LOCAL_ARCHIVE_BUILD_FILE_VERSION: u32 = 2;
 /// Rooted cquery hashes include inputs of each explicitly serialized aspect application.
 pub const CONFIGURED_ASPECT_INPUTS_VERSION: u32 = 1;

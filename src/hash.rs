@@ -673,6 +673,24 @@ fn hash_targets_with_environment(
             }
         }
     }
+    // Alias acquisition returns external sources outside the fine-grained repositories, which
+    // are not read with a content map. Each hashes to the same constant, so its entry carries no
+    // change information. Rule digests still read it from its slot, and partial evaluation needs
+    // every source as a target.
+    let unresolved_external_sources = if options.bazel.use_cquery
+        || options.bazel.fine_grained_external_repos.is_empty()
+        || options.bazel.isolated_dependency_root.is_some()
+        || options.partial_tree.is_some()
+    {
+        HashSet::new()
+    } else {
+        let unresolved: DigestBytes = Sha256::digest([]).into();
+        physical
+            .iter()
+            .filter(|(label, digest, _)| !is_main_repo(label) && *digest == unresolved)
+            .map(|(label, _, _)| label.clone())
+            .collect()
+    };
     let mut source_digests = Vec::with_capacity(physical.len());
     let mut observed_sources = HashSet::new();
     for (label, digest, observed) in physical {
@@ -983,6 +1001,9 @@ fn hash_targets_with_environment(
             }
         };
         digests.push((key, kind, digest));
+    }
+    if !unresolved_external_sources.is_empty() {
+        retain_resolved_sources(&mut digests, &unresolved_external_sources);
     }
     let recorder = context.recorder.take();
     let verified_contexts = context.verification.take().map(|state| {
@@ -1386,6 +1407,31 @@ fn configured_root_hashes(
 /// digest as is, so hash files do not change where nothing was collapsed. A label with
 /// several configured instances hashes all of them, in key order, so a change reaching any
 /// instance changes the label, and its dependency edges are the union of its instances'.
+/// Drops the entries of unresolved external sources, except one for any canonical repository
+/// that would otherwise have no entry: module changes find the repositories to query in the
+/// hash file's labels.
+fn retain_resolved_sources(
+    digests: &mut Vec<(String, &'static str, TargetDigest)>,
+    unresolved: &HashSet<String>,
+) {
+    fn canonical_repo(label: &str) -> Option<&str> {
+        label
+            .strip_prefix("@@")
+            .and_then(|label| label.split_once("//"))
+            .map(|(repo, _)| repo)
+            .filter(|repo| !repo.is_empty())
+    }
+    let mut represented = digests
+        .iter()
+        .filter(|(key, _, _)| !unresolved.contains(key))
+        .filter_map(|(key, _, _)| canonical_repo(key).map(str::to_owned))
+        .collect::<HashSet<_>>();
+    digests.retain(|(key, _, _)| {
+        !unresolved.contains(key)
+            || canonical_repo(key).is_some_and(|repo| represented.insert(repo.to_owned()))
+    });
+}
+
 fn aggregate_by_label(
     digests: Vec<(String, &'static str, TargetDigest)>,
     track_deps: bool,
@@ -7060,6 +7106,106 @@ printf '%s\n' "$stdout"
                 .unwrap(),
             <DigestBytes>::from(Sha256::digest([]))
         );
+    }
+
+    #[test]
+    fn unread_external_sources_leave_no_entry() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        for file in [
+            "ext/read.txt",
+            "unread+/a.txt",
+            "unread+/b.txt",
+            "sole+/first.txt",
+            "sole+/second.txt",
+        ] {
+            let path = output_base.join("external").join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, file).unwrap();
+        }
+        fs::create_dir_all(workspace.path().join("pkg")).unwrap();
+        fs::write(workspace.path().join("pkg/main.txt"), "main").unwrap();
+        let mut options = hash_options(workspace.path());
+        options.bazel.fine_grained_external_repos = BTreeSet::from(["ext".to_owned()]);
+        let sources = [
+            "//pkg:main.txt",
+            "@ext//:read.txt",
+            "@@unread+//:a.txt",
+            "@@unread+//:b.txt",
+            "@@sole+//:first.txt",
+            "@@sole+//:second.txt",
+        ];
+        let targets = || {
+            let mut targets = vec![
+                rule_target(Rule {
+                    name: "//pkg:consumer".into(),
+                    rule_class: "filegroup".into(),
+                    rule_input: sources.iter().map(|&label| label.into()).collect(),
+                    ..Default::default()
+                }),
+                rule_target(Rule {
+                    name: "@@unread+//:lib".into(),
+                    rule_class: "filegroup".into(),
+                    rule_input: vec!["@@unread+//:a.txt".into()],
+                    ..Default::default()
+                }),
+            ];
+            targets.extend(sources.iter().map(|label| source_target(label, &[])));
+            targets
+        };
+        let hash = |options: &HashOptions| {
+            hash_targets_with_environment(
+                options,
+                targets(),
+                PreparedRules::default(),
+                ExternalRepoResolver {
+                    workspace: options.bazel.workspace.clone(),
+                    bazel: options.bazel.bazel.clone(),
+                    output_base: output_base.clone(),
+                    repo_mapping: Arc::new(OnceLock::from(HashMap::new())),
+                    ..Default::default()
+                },
+                Some(r#"{"name":"root"}"#.to_owned()),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let all_sources = |hashed: &HashFileData| {
+            sources
+                .iter()
+                .all(|label| hashed.hashes.contains_key(*label))
+        };
+
+        // Full source hashing reads every returned external source, so each keeps its entry.
+        assert!(all_sources(&hash(&options)));
+
+        // With a content map, as `serve` seeds from `git ls-tree`, sources outside the main
+        // repository and the fine-grained ones are not read. Their entries are dropped, except the
+        // first of a repository with no other entry, which keeps it visible to module changes.
+        let content_hashes = BTreeMap::from([("pkg/main.txt".to_owned(), "main".to_owned())]);
+        options.content_hashes = Some(content_hashes);
+        let hashed = hash(&options);
+        assert_eq!(
+            hashed.hashes.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "//pkg:consumer",
+                "//pkg:main.txt",
+                "@@sole+//:first.txt",
+                "@@unread+//:lib",
+                "@ext//:read.txt",
+            ]
+        );
+        // Source digests fold into their consumers, so no dependency edge names a dropped entry.
+        assert!(hashed
+            .dep_edges
+            .values()
+            .flatten()
+            .all(|label| hashed.hashes.contains_key(label)));
+
+        // cquery output keeps every source.
+        options.bazel.use_cquery = true;
+        assert!(all_sources(&hash(&options)));
     }
 
     #[test]

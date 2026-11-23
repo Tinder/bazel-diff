@@ -284,7 +284,15 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::fine_grained_repo_input_in_unloadable_package_still_fails",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::fine_grained_repo_rule_is_not_shadowed_by_a_same_named_module",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::fine_grained_repo_with_dev_dependency_only_package_is_hashed",
                 "timeout": "moderate",
             },
             {

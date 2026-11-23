@@ -1,0 +1,19 @@
+module(
+    name = "fine_grained_dev_dependency_package_test",
+    version = "0.0.0",
+)
+
+# Reproducer workspace for https://github.com/Tinder/bazel-diff/issues/663.
+#
+# @dep stands in for rules_go: its `docs` package loads a .bzl file from a module that
+# @dep declares with `dev_dependency = True` (Stardoc, for rules_go). Bazel drops dev
+# dependencies of non-root modules, so from this workspace `@dep//docs` cannot be loaded:
+#
+#   error loading package '@@dep+//docs': ... No repository visible as '@devtool'
+#
+# //:consumer reads @dep//:data only; nothing here reaches @dep//docs.
+bazel_dep(name = "dep", version = "1.0")
+local_path_override(
+    module_name = "dep",
+    path = "dep",
+)

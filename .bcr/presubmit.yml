@@ -3,16 +3,16 @@ matrix:
   - 8.x
   - 9.x
 tasks:
-  verify_targets_debian10:
-    name: Verify build targets (Debian 10)
-    platform: debian10
+  verify_targets_debian13:
+    name: Verify build targets (Debian 13)
+    platform: debian13
     bazel: ${{ bazel }}
     build_targets:
     - '@bazel-diff//:bazel-diff'
     - '@bazel-diff//:bazel-diff-rust'
-  verify_targets_ubuntu2004:
-    name: Verify build targets (Ubuntu 20.04)
-    platform: ubuntu2004
+  verify_targets_ubuntu2404:
+    name: Verify build targets (Ubuntu 24.04)
+    platform: ubuntu2404
     bazel: ${{ bazel }}
     build_targets:
     - '@bazel-diff//:bazel-diff'
@@ -60,7 +60,7 @@ bcr_test_module:
   module_path: ""
   matrix:
     platform:
-    - ubuntu2004
+    - ubuntu2404
     - macos_arm64
     bazel:
     - 8.x

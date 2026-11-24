@@ -1,0 +1,4 @@
+module(name = "rules_x")
+
+sdk = use_extension("//:sdk.bzl", "sdk")
+use_repo(sdk, "x_checker")

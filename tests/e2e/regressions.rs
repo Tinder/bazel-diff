@@ -250,6 +250,63 @@ fn wrapped_external_repo_change_reaches_main_consumer() {
     );
 }
 
+fn contains_main(impacted: &BTreeSet<String>, target: &str) -> bool {
+    impacted.contains(target) || impacted.contains(&format!("@@{target}"))
+}
+
+/// A module extension can hand a main-repository label to a repository it generates, as
+/// `rules_go`'s `go_sdk.nogo(nogo = "//...")` does for `@io_bazel_rules_nogo`, whose alias every
+/// Go rule depends on through `_nogo`. The repository is hashed by its definition, so its node
+/// has to depend on the target its attribute names, and every repository whose mapping can reach
+/// it (`@tool` through `@rules_x`) has to depend on that node, without loading any external
+/// package. A label-only extension leaves its owner without stand-in edges to its repositories,
+/// so there only the mapping of `@rules_x` connects `@tool` to `@x_checker`.
+#[test]
+fn repository_attribute_naming_main_target_propagates() {
+    let first = copy_workspace("main_repo_back_edge_through_rules");
+    let second = copy_workspace("main_repo_back_edge_through_rules");
+    fs::write(second.path().join("checker/checker.txt"), "after\n").unwrap();
+    for args in [
+        &[][..],
+        &["--excludeExternalTargets"][..],
+        &["--labelOnlyModuleExtensions", "@rules_x//:sdk.bzl%sdk"][..],
+    ] {
+        let impacted = diff_workspaces(first.path(), second.path(), args);
+        for target in ["//checker:checker", "//:direct", "//:via_tool"] {
+            assert!(
+                contains_main(&impacted, target),
+                "{target} {args:?}: {impacted:?}"
+            );
+        }
+        assert!(
+            !contains_main(&impacted, "//:control"),
+            "{args:?}: {impacted:?}"
+        );
+    }
+}
+
+/// The edges toward the main-repository target replace none of the existing coupling: a change
+/// to the `tool` module still reaches its user, and an unrelated target stays unaffected.
+#[test]
+fn repository_main_target_edges_keep_module_coupling() {
+    let first = copy_workspace("main_repo_back_edge_through_rules");
+    let second = copy_workspace("main_repo_back_edge_through_rules");
+    fs::write(second.path().join("tool/bin.txt"), "changed\n").unwrap();
+    for args in [&[][..], &["--excludeExternalTargets"][..]] {
+        let impacted = diff_workspaces(first.path(), second.path(), args);
+        assert!(
+            contains_main(&impacted, "//:via_tool"),
+            "{args:?}: {impacted:?}"
+        );
+        for target in ["//:control", "//:direct", "//checker:checker"] {
+            assert!(
+                !contains_main(&impacted, target),
+                "{target} {args:?}: {impacted:?}"
+            );
+        }
+    }
+}
+
 /// Regression for <https://github.com/Tinder/bazel-diff/issues/510>: like the
 /// #197 case above, but the wrapper module (`middle`) is only declared by
 /// `facade`, under a private apparent name, so it is not visible from the root.

@@ -577,11 +577,13 @@ impl BazelOptions {
         if observe {
             ordinary.command_options.push("--proto:rule_classes".into());
         }
-        let initial_repositories = if observe {
+        // Repository nodes are lowered after the query, which supplies the main-repository targets
+        // their definitions can name. The isolated scope reads them while it completes the query.
+        let initial_repositories = if self.isolated_dependency_root.is_none() {
             Vec::new()
         } else {
             definitions.take().map_or_else(Vec::new, |mut defs| {
-                defs.lower(self, &canonical_to_apparent, |row| {
+                defs.lower(self, &canonical_to_apparent, None, |row| {
                     row.finish(&BTreeSet::new(), &mut |target, inputs, ordinary| {
                         transform(std::slice::from_mut(target), &[], inputs, ordinary);
                     })
@@ -599,7 +601,8 @@ impl BazelOptions {
         });
         let mut loads = BTreeMap::new();
         let mut verification = None;
-        let mut targets = if configured_roots.as_ref().is_some_and(BTreeMap::is_empty) {
+        let no_roots = configured_roots.as_ref().is_some_and(BTreeMap::is_empty);
+        let mut targets = if no_roots {
             Vec::new()
         } else {
             self.collect_all_targets(
@@ -776,9 +779,21 @@ impl BazelOptions {
         let mut registration_hashes = BTreeMap::new();
         let mut supplier_hashes = BTreeMap::new();
         let mut toolchain_declarations = BTreeMap::new();
-        if let Some(mut defs) = definitions {
-            let repos = defs.lower(self, &canonical_to_apparent, std::convert::identity);
-            if let Some(mapping) = root_mapping.as_deref() {
+        if let Some(mut defs) = definitions.filter(|_| !no_roots) {
+            let main_nodes = targets
+                .iter()
+                .filter_map(target_name)
+                .map(|name| main_repo_label_key(target_label(name)))
+                .filter(|name| name.starts_with("//") && !name.starts_with("//external:"))
+                .map(str::to_owned)
+                .collect::<HashSet<_>>();
+            let repos = defs.lower(
+                self,
+                &canonical_to_apparent,
+                Some(&main_nodes),
+                std::convert::identity,
+            );
+            if let Some(mapping) = root_mapping.as_deref().filter(|_| observe) {
                 let survey = (module_graph_complete
                     && defs.extensions.complete_mappings
                     && !failed_extensions.observed)
@@ -819,6 +834,17 @@ impl BazelOptions {
             }
             // MODULE registrations are positive compiler inputs. A build or test rc
             // can register another toolchain that this ordinary query never loads.
+            // A legacy `//external` rule of the query keeps its name, as deduplication would;
+            // the synthetic row must not replace the definition prepared for it.
+            let present = targets
+                .iter()
+                .filter_map(target_name)
+                .collect::<HashSet<_>>();
+            let repos = repos
+                .into_iter()
+                .filter(|row| target_name(&row.target).is_none_or(|name| !present.contains(name)))
+                .collect::<Vec<_>>();
+            drop(present);
             targets.extend(repos.into_iter().map(|row| {
                 row.finish(&BTreeSet::new(), &mut |target, group, ordinary| {
                     transform(std::slice::from_mut(target), &[], group, ordinary);
@@ -2228,15 +2254,18 @@ impl BazelOptions {
         let mut module_repos = visible_module_repos.clone();
         module_repos.extend(hidden_module_repos.iter().cloned());
         let mut module_mappings = BTreeMap::new();
+        let mut answered_mappings = BTreeMap::new();
         let mut complete_mappings = complete_inputs && failed.is_empty();
         if !module_repos.is_empty() {
             // The hidden modules' repository names are derived, not reported, so a derivation
             // Bazel disagrees with falls back to the root-visible modules alone.
+            let mut aligned = true;
+            let mut requested = &module_repos;
             let mappings = match self.module_mappings(
                 &module_repos,
                 prefetched,
                 failed,
-                &mut complete_mappings,
+                &mut aligned,
             ) {
                 Ok(mappings) => mappings,
                 Err(error) if !hidden_module_repos.is_empty() => {
@@ -2244,10 +2273,16 @@ impl BazelOptions {
                         "[Warn] {error:#}; enumerating extension repositories from the root-visible modules only"
                     );
                     complete_mappings = false;
-                    self.dump_repo_mappings(&visible_module_repos, failed, &mut complete_mappings)?
+                    aligned = true;
+                    requested = &visible_module_repos;
+                    self.dump_repo_mappings(&visible_module_repos, failed, &mut aligned)?
                 }
                 Err(error) => return Err(error),
             };
+            complete_mappings &= aligned;
+            if aligned && mappings.len() == requested.len() {
+                answered_mappings.extend(requested.iter().cloned().zip(mappings.iter().cloned()));
+            }
             imported.extend(
                 mappings
                     .iter()
@@ -2276,6 +2311,9 @@ impl BazelOptions {
             let mappings = if let Ok(mappings) =
                 self.dump_repo_mappings(&names, failed, &mut complete_spoke_mappings)
             {
+                if complete_spoke_mappings && mappings.len() == names.len() {
+                    answered_mappings.extend(names.iter().cloned().zip(mappings.iter().cloned()));
+                }
                 mappings
             } else {
                 complete_spoke_mappings = false;
@@ -2283,13 +2321,20 @@ impl BazelOptions {
                 // one at a time and report the ones Bazel cannot describe.
                 let mut mappings = Vec::new();
                 for name in &names {
-                    match self.dump_repo_mappings(
-                        std::slice::from_ref(name),
-                        failed,
-                        &mut complete_mappings,
-                    ) {
-                        Ok(mapping) => mappings.extend(mapping),
+                    let mut answered = true;
+                    match self.dump_repo_mappings(std::slice::from_ref(name), failed, &mut answered)
+                    {
+                        Ok(mapping) => {
+                            complete_mappings &= answered;
+                            if let [single] = mapping.as_slice() {
+                                if answered {
+                                    answered_mappings.insert(name.clone(), single.clone());
+                                }
+                            }
+                            mappings.extend(mapping);
+                        }
                         Err(error) if self.keep_going => {
+                            complete_mappings &= answered;
                             eprintln!(
                                 "[Warn] skipping the module extension behind {name}: {error:#}"
                             );
@@ -2320,6 +2365,7 @@ impl BazelOptions {
             generated,
             complete_mappings: complete_mappings && complete_spoke_mappings,
             module_mappings,
+            answered_mappings,
         })
     }
 
@@ -3299,6 +3345,10 @@ struct ExtensionRepositories {
     complete_mappings: bool,
     /// Complete module mappings from the ordinary module read, keyed by their requested canonical names.
     module_mappings: BTreeMap<String, RepoMapping>,
+    /// Every mapping Bazel answered unambiguously, even when others failed: module repositories
+    /// by canonical name, and each extension's shared mapping by its representative's canonical
+    /// name. Only main-target edges read these, so an incomplete set adds fewer edges.
+    answered_mappings: BTreeMap<String, RepoMapping>,
 }
 
 #[derive(Default)]
@@ -4115,10 +4165,13 @@ struct RepositoryDefinitions {
 }
 
 impl RepositoryDefinitions {
+    /// `main_nodes` are the main-repository targets of the query, when it has run; without
+    /// them, an edge is kept for every attribute value that names a single target.
     fn lower<T>(
         &mut self,
         bazel: &BazelOptions,
         canonical_to_apparent: &BTreeMap<String, Vec<String>>,
+        main_nodes: Option<&HashSet<String>>,
         process: impl FnMut(RepositoryRow) -> T,
     ) -> Vec<T> {
         repository_rows(
@@ -4127,6 +4180,10 @@ impl RepositoryDefinitions {
             ModuleDependencies {
                 edges: &self.module_edges,
                 mappings: &self.extensions.module_mappings,
+                main_targets: MainTargetEdges {
+                    mappings: Some(&self.extensions.answered_mappings),
+                    nodes: main_nodes,
+                },
             },
             (!bazel.use_cquery).then_some(&self.extensions.imported),
             &self.label_only,
@@ -4292,10 +4349,21 @@ fn materialize_repository_inputs(
     }
 }
 
+/// Inputs for the edges from `//external:` nodes to the main-repository targets their
+/// repositories' definitions name (see `main_target_edges`).
+#[derive(Clone, Copy, Default)]
+struct MainTargetEdges<'a> {
+    /// Repository mappings by canonical name; an extension's under its representative.
+    mappings: Option<&'a BTreeMap<String, RepoMapping>>,
+    /// Main-repository targets of the query, as `//package:name`.
+    nodes: Option<&'a HashSet<String>>,
+}
+
 #[derive(Clone, Copy)]
 struct ModuleDependencies<'a> {
     edges: &'a BTreeMap<String, BTreeSet<String>>,
     mappings: &'a BTreeMap<String, RepoMapping>,
+    main_targets: MainTargetEdges<'a>,
 }
 
 /// The base rule contains only real module inputs. Extension memberships
@@ -4352,6 +4420,116 @@ impl RepositoryRow {
     }
 }
 
+/// A main-repository attribute value as the `//package:name` key of the target it names, or
+/// `None` for a package pattern (`__subpackages__`, `__pkg__`, `...`, `all`), which names none.
+fn main_target_key(value: &str) -> Option<String> {
+    let label = main_repo_label_key(value);
+    let body = label.strip_prefix("//")?;
+    let (package, name) = match body.split_once(':') {
+        Some((package, name)) => (package, name),
+        None => (body, body.rsplit('/').next().unwrap_or(body)),
+    };
+    let pattern = matches!(
+        name,
+        "" | "__subpackages__" | "__pkg__" | "all" | "all-targets" | "*"
+    ) || package == "..."
+        || package.ends_with("/...");
+    (!pattern).then(|| format!("//{package}:{name}"))
+}
+
+/// Edges that let a change to a main-repository target reach the repositories whose definitions
+/// name it, and every repository that can name one of those.
+///
+/// A repository rule can write a label it was given into a BUILD file of its own: `rules_go`'s
+/// `go_sdk.nogo(nogo = "//...")` becomes `@io_bazel_rules_nogo//:nogo`, an alias of that
+/// target, and every Go rule depends on the alias through `_nogo`. The repository is hashed by
+/// its definition, which does not change when the target does, so its node depends on each
+/// main-repository target its attributes name (first map). A repository reaches another only
+/// through a label its repository mapping resolves, so a repository whose mapping holds such a
+/// node, directly or through other such repositories, depends on it too (second map, canonical
+/// names). Other mapping entries add no edge: everything else stays coupled as before.
+fn main_target_edges(
+    repositories: &[Repository],
+    main: MainTargetEdges<'_>,
+) -> (
+    BTreeMap<String, BTreeSet<String>>,
+    BTreeMap<String, BTreeSet<String>>,
+) {
+    let mut targets = BTreeMap::<String, BTreeSet<String>>::new();
+    for repository in repositories {
+        let Some(canonical) = repository.canonical_name.as_deref() else {
+            continue;
+        };
+        let labels = attribute_main_repo_labels(&repository.attribute)
+            .filter_map(main_target_key)
+            .filter(|label| main.nodes.is_none_or(|nodes| nodes.contains(label)))
+            .collect::<BTreeSet<_>>();
+        if !labels.is_empty() {
+            targets
+                .entry(canonical.to_owned())
+                .or_default()
+                .extend(labels);
+        }
+    }
+    let Some(mappings) = main.mappings.filter(|_| !targets.is_empty()) else {
+        return (targets, BTreeMap::new());
+    };
+    // Every repository of one extension shares the mapping of the representative Bazel was
+    // asked about.
+    let extension_mappings: HashMap<&str, &RepoMapping> = mappings
+        .iter()
+        .filter_map(|(canonical, mapping)| Some((extension_usage_prefix(canonical)?, mapping)))
+        .collect();
+    let known: BTreeSet<&str> = repositories
+        .iter()
+        .filter_map(|repository| repository.canonical_name.as_deref())
+        .collect();
+    let mut users = HashMap::<&str, Vec<&str>>::new();
+    for &canonical in &known {
+        let mapping = mappings.get(canonical).or_else(|| {
+            extension_usage_prefix(canonical)
+                .and_then(|prefix| extension_mappings.get(prefix).copied())
+        });
+        for dependency in mapping
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .map(String::as_str)
+            .filter(|dependency| *dependency != canonical && known.contains(dependency))
+        {
+            users.entry(dependency).or_default().push(canonical);
+        }
+    }
+    // For each repository naming a target, a repository depends on the entries of its mapping
+    // one step closer to it. Every repository that can reach it keeps a path there, and the
+    // edges toward one target never close a cycle: an extension's repositories map their owner,
+    // which maps them back, and a hub's spokes map each other.
+    let mut repositories = BTreeMap::<String, BTreeSet<String>>::new();
+    for seed in targets.keys().map(String::as_str) {
+        let mut distance = HashMap::from([(seed, 0_usize)]);
+        let mut layer = vec![seed];
+        while !layer.is_empty() {
+            let mut next = Vec::new();
+            for dependency in layer {
+                let step = distance[dependency] + 1;
+                for &user in users.get(dependency).into_iter().flatten() {
+                    let known = *distance.entry(user).or_insert_with(|| {
+                        next.push(user);
+                        step
+                    });
+                    if known == step {
+                        repositories
+                            .entry(user.to_owned())
+                            .or_default()
+                            .insert(dependency.to_owned());
+                    }
+                }
+            }
+            layer = next;
+        }
+    }
+    (targets, repositories)
+}
+
 fn repository_rows<T>(
     mut repositories: Vec<Repository>,
     canonical_to_apparent: &BTreeMap<String, Vec<String>>,
@@ -4364,6 +4542,7 @@ fn repository_rows<T>(
     let ModuleDependencies {
         edges: module_edges,
         mappings: module_mappings,
+        main_targets,
     } = modules;
     let workspace = RepositoryWorkspace::from_repositories(workspace, &repositories);
     // A module the root cannot see has no apparent name there; its node is named by canonical
@@ -4461,6 +4640,7 @@ fn repository_rows<T>(
         }
     }
     let referenced: BTreeSet<_> = setup_inputs.values().flatten().collect();
+    let (main_targets, main_target_repositories) = main_target_edges(&repositories, main_targets);
     let mut prepared_files = HashMap::new();
     let mut module_definitions = BTreeMap::new();
     let mut input_definitions = BTreeMap::<String, BTreeSet<String>>::new();
@@ -4595,8 +4775,17 @@ fn repository_rows<T>(
             .into_iter()
             .flat_map(|module| module_edges.get(module).into_iter().flatten())
             .filter_map(|dependency| module_to_canonical.get(dependency))
+            .chain(
+                main_target_repositories
+                    .get(canonical)
+                    .into_iter()
+                    .flatten(),
+            )
             .flat_map(|canonical| node_names(canonical))
             .collect::<BTreeSet<_>>();
+        let main_labels = main_targets
+            .get(canonical)
+            .filter(|labels| !labels.is_empty());
         let mut memberships = owned.get(canonical).cloned().unwrap_or_default();
         if let Some(group) = extension
             .filter(|_| extension_edges.is_some_and(|imported| imported.contains(canonical)))
@@ -4644,8 +4833,15 @@ fn repository_rows<T>(
         // All apparent names have the same definition. Move it into the final output.
         let mut rules = std::iter::repeat_n(rule, names.len());
         for apparent in names {
+            let mut target =
+                repository_target(rules.next().unwrap(), &apparent, &ordinary_dependencies);
+            if let Some(labels) = &main_labels {
+                let rule = target.rule.as_option_mut().expect("repository");
+                rule.rule_input.extend(labels.iter().cloned());
+                rule.rule_input.sort_unstable();
+            }
             targets.push(process(RepositoryRow {
-                target: repository_target(rules.next().unwrap(), &apparent, &ordinary_dependencies),
+                target,
                 memberships: memberships.clone(),
                 generated,
                 setup_hash,
@@ -6792,6 +6988,124 @@ mod tests {
         )
     }
     #[test]
+    fn main_target_key_names_single_targets_only() {
+        assert_eq!(
+            main_target_key("@@//go/nogo:nogo").as_deref(),
+            Some("//go/nogo:nogo")
+        );
+        assert_eq!(
+            main_target_key("//checker").as_deref(),
+            Some("//checker:checker")
+        );
+        assert_eq!(main_target_key("@//:lib").as_deref(), Some("//:lib"));
+        for pattern in [
+            "@@//go:__subpackages__",
+            "//go:__pkg__",
+            "//go/...",
+            "//...",
+            "//go:all",
+            "//go:*",
+            "@@rules_go+//go:def.bzl",
+        ] {
+            assert_eq!(main_target_key(pattern), None, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn main_target_edges_follow_mappings_toward_repositories_naming_main_targets() {
+        let repository = |canonical: &str, values: &[&str]| Repository {
+            canonical_name: Some(canonical.to_owned()),
+            attribute: values
+                .iter()
+                .map(|value| Attribute {
+                    name: "nogo".into(),
+                    r#type: attribute::Discriminator::String,
+                    string_value: Some((*value).to_owned()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let nogo = "rules_go++go_sdk+io_bazel_rules_nogo";
+        let repositories = [
+            repository(
+                nogo,
+                &["@@//go/nogo:nogo", "@@//go:__subpackages__", "@@//gone:x"],
+            ),
+            repository("rules_go++go_sdk+go_sdk", &[]),
+            repository("rules_go+", &[]),
+            repository("gazelle+", &[]),
+            repository("gazelle++go_deps+org_golang_x_tools", &[]),
+            repository("unrelated+", &[]),
+        ];
+        let mapping = |entries: &[(&str, &str)]| {
+            entries
+                .iter()
+                .map(|(apparent, canonical)| ((*apparent).to_owned(), (*canonical).to_owned()))
+                .collect::<RepoMapping>()
+        };
+        let mappings = BTreeMap::from([
+            (
+                "rules_go+".to_owned(),
+                mapping(&[("rules_go", "rules_go+"), ("io_bazel_rules_nogo", nogo)]),
+            ),
+            (
+                "gazelle+".to_owned(),
+                mapping(&[("io_bazel_rules_go", "rules_go+"), ("other", "unrelated+")]),
+            ),
+            // The extension's shared mapping, asked about through one representative.
+            (
+                "rules_go++go_sdk+go_sdk".to_owned(),
+                mapping(&[("rules_go", "rules_go+"), ("io_bazel_rules_nogo", nogo)]),
+            ),
+            (
+                "gazelle++go_deps+org_golang_x_tools".to_owned(),
+                mapping(&[("io_bazel_rules_go", "rules_go+")]),
+            ),
+            ("unrelated+".to_owned(), mapping(&[("gazelle", "gazelle+")])),
+        ]);
+        let nodes = HashSet::from(["//go/nogo:nogo".to_owned()]);
+        let (targets, repositories) = main_target_edges(
+            &repositories,
+            MainTargetEdges {
+                mappings: Some(&mappings),
+                nodes: Some(&nodes),
+            },
+        );
+        assert_eq!(
+            targets,
+            BTreeMap::from([(
+                nogo.to_owned(),
+                BTreeSet::from(["//go/nogo:nogo".to_owned()])
+            )])
+        );
+        let edges = |pairs: &[(&str, &str)]| {
+            let mut edges = BTreeMap::<String, BTreeSet<String>>::new();
+            for (from, to) in pairs {
+                edges
+                    .entry((*from).to_owned())
+                    .or_default()
+                    .insert((*to).to_owned());
+            }
+            edges
+        };
+        // `go_sdk` reaches the nogo repository through the extension's mapping. Mapping entries
+        // that are no closer to it add no edge: the nogo repository's and `go_sdk`'s own way to
+        // their owner `rules_go+`, and `gazelle+`'s entry for `unrelated+`, which reaches it only
+        // through `gazelle+`.
+        assert_eq!(
+            repositories,
+            edges(&[
+                ("rules_go+", nogo),
+                ("rules_go++go_sdk+go_sdk", nogo),
+                ("gazelle+", "rules_go+"),
+                ("gazelle++go_deps+org_golang_x_tools", "rules_go+"),
+                ("unrelated+", "gazelle+"),
+            ])
+        );
+    }
+
+    #[test]
     fn observing_a_membership_preserves_an_overlapping_module_dependency() {
         let row = RepositoryRow {
             target: repository_target(Rule::default(), "owner", &BTreeSet::from(["both".into()])),
@@ -7740,6 +8054,7 @@ mod tests {
                 ModuleDependencies {
                     edges: &BTreeMap::new(),
                     mappings: &BTreeMap::new(),
+                    main_targets: MainTargetEdges::default(),
                 },
                 None,
                 &LabelOnlyRepositories::default(),
@@ -8221,6 +8536,7 @@ mod tests {
             ModuleDependencies {
                 edges: &edges,
                 mappings: &BTreeMap::new(),
+                main_targets: MainTargetEdges::default(),
             },
             None,
             &LabelOnlyRepositories::default(),
@@ -8279,6 +8595,7 @@ mod tests {
             ModuleDependencies {
                 edges: &BTreeMap::new(),
                 mappings: &BTreeMap::new(),
+                main_targets: MainTargetEdges::default(),
             },
             Some(&BTreeSet::new()),
             &LabelOnlyRepositories::default(),
@@ -8362,6 +8679,7 @@ mod tests {
                 ModuleDependencies {
                     edges: &BTreeMap::new(),
                     mappings: &BTreeMap::new(),
+                    main_targets: MainTargetEdges::default(),
                 },
                 None,
                 &LabelOnlyRepositories::default(),
@@ -8420,6 +8738,7 @@ mod tests {
             ModuleDependencies {
                 edges: &parse_module_dependency_edges(graph),
                 mappings: &BTreeMap::new(),
+                main_targets: MainTargetEdges::default(),
             },
             None,
             &LabelOnlyRepositories::default(),
@@ -9072,6 +9391,7 @@ exit 1
             ModuleDependencies {
                 edges: &edges,
                 mappings: &BTreeMap::new(),
+                main_targets: MainTargetEdges::default(),
             },
             Some(&imported),
             &LabelOnlyRepositories::default(),
@@ -9123,6 +9443,7 @@ exit 1
             ModuleDependencies {
                 edges: &edges,
                 mappings: &BTreeMap::new(),
+                main_targets: MainTargetEdges::default(),
             },
             Some(&imported),
             &LabelOnlyRepositories {
@@ -9159,6 +9480,7 @@ exit 1
             ModuleDependencies {
                 edges: &edges,
                 mappings: &BTreeMap::new(),
+                main_targets: MainTargetEdges::default(),
             },
             None,
             &LabelOnlyRepositories::default(),
@@ -9561,6 +9883,7 @@ exit 1
                 ModuleDependencies {
                     edges: &BTreeMap::new(),
                     mappings: &BTreeMap::new(),
+                    main_targets: MainTargetEdges::default(),
                 },
                 None,
                 &LabelOnlyRepositories::default(),

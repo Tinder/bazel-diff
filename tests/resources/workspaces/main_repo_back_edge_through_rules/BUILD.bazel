@@ -1,0 +1,23 @@
+load("@rules_x//:defs.bzl", "x_library")
+
+# Reaches //checker only through x_library's implicit `_checker` attribute.
+x_library(
+    name = "direct",
+    srcs = ["direct.txt"],
+)
+
+# Reaches //checker only through another module's x_library, like a target that runs
+# gazelle's Go binary.
+genrule(
+    name = "via_tool",
+    srcs = ["@tool//:bin"],
+    outs = ["via_tool.out"],
+    cmd = "cp $< $@",
+)
+
+genrule(
+    name = "control",
+    srcs = ["control.txt"],
+    outs = ["control.out"],
+    cmd = "cp $< $@",
+)

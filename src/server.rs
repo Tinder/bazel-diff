@@ -3277,9 +3277,8 @@ mod tests {
     /// workspace, so the graph a revision reports is whatever that revision committed.
     #[cfg(unix)]
     fn fake_bazel(directory: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let script = directory.join("fake-bazel.sh");
-        fs::write(
+        crate::test_support::write_executable(
             &script,
             r#"#!/bin/sh
 case "$1 $2" in
@@ -3294,9 +3293,7 @@ case "$1 $2" in
   *) exit 80 ;;
 esac
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         script
     }
 
@@ -4371,8 +4368,6 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
     #[cfg(unix)]
     #[test]
     fn initial_fetch_prunes_origin_only_when_recommended_and_checks_recovery() {
-        use std::os::unix::fs::PermissionsExt;
-
         for (message, stream, fetch_status, prune_status, retry_status, expected_ready) in [
             ("try running 'git remote prune origin'", 2, 1, 0, 0, true),
             ("try running 'git remote prune origin'", 1, 1, 0, 0, true),
@@ -4384,9 +4379,9 @@ nQBeQ4AIl47nDOrFeVnvse8R9IHJ
             let repo = tempfile::tempdir().unwrap();
             let cache = tempfile::tempdir().unwrap();
             let script = repo.path().join("fake-git");
-            fs::write(
+            crate::test_support::write_executable(
                 &script,
-                format!(
+                &format!(
                     r#"#!/bin/sh
 printf '%s\n' "$*" >> commands
 case "$*" in
@@ -4401,9 +4396,7 @@ case "$*" in
 esac
 "#
                 ),
-            )
-            .unwrap();
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            );
             let mut config = test_config();
             config.no_initial_fetch = false;
             config.hash_options.bazel.workspace = repo.path().to_path_buf();
@@ -5482,16 +5475,13 @@ esac
     #[cfg(unix)]
     #[test]
     fn timed_out_query_kills_its_subprocess_and_releases_the_workspace() {
-        use std::os::unix::fs::PermissionsExt;
-
         let (repo, first, second) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
         let tools = tempfile::tempdir().unwrap();
         // A git that never returns on its own: the query's first subprocess hangs in it, so only
         // the kill can end the request in time.
         let slow_git = tools.path().join("slow-git");
-        fs::write(&slow_git, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        fs::set_permissions(&slow_git, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&slow_git, "#!/bin/sh\nexec sleep 30\n");
         let mut state = state_for_repo(repo.path(), cache.path(), false);
         {
             let config = &mut Arc::get_mut(&mut state).unwrap().config;

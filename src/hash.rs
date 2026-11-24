@@ -4422,9 +4422,9 @@ mod tests {
             } else {
                 "exit 0"
             };
-            fs::write(
+            crate::test_support::write_executable(
                 &script,
-                format!(
+                &format!(
                     r#"#!/bin/sh
 case "$1 $2" in
   "mod dump_repo_mapping")
@@ -4446,9 +4446,7 @@ case "$1 $2" in
 esac
 "#,
                 ),
-            )
-            .unwrap();
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            );
             let mut options = hash_options(workspace.path());
             options.bazel.bazel = script;
             options.bazel.no_bazelrc = false;
@@ -4513,7 +4511,7 @@ esac
             target.encode_length_delimited(&mut encoded);
             fs::write(workspace.path().join("targets.pb"), encoded).unwrap();
             let script = workspace.path().join("fake-bazel.sh");
-            fs::write(
+            crate::test_support::write_executable(
                 &script,
                 r#"#!/bin/sh
 case "$1 $2" in
@@ -4536,9 +4534,7 @@ case "$1 $2" in
   *) exit 80 ;;
 esac
 "#,
-            )
-            .unwrap();
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            );
             let mut options = hash_options(workspace.path());
             options.bazel.bazel = script;
             options.bazel.no_bazelrc = false;

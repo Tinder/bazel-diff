@@ -1657,13 +1657,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn relative_workspace_path_spawns_bazel_in_the_working_directory() {
-        use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
         let directory = tempfile::tempdir().unwrap();
         let stub_bazel = directory.path().join("bazel");
-        fs::write(&stub_bazel, "#!/bin/sh\npwd -P\n").unwrap();
-        fs::set_permissions(&stub_bazel, fs::Permissions::from_mode(0o755)).unwrap();
+        // Written by a separate shell, so this process never holds the stub open for writing
+        // while another test forks: Linux refuses to execute it then ("Text file busy").
+        let written = Command::new("/bin/sh")
+            .args(["-c", r#"printf '%s' "$2" > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(&stub_bazel)
+            .arg("#!/bin/sh\npwd -P\n")
+            .status()
+            .unwrap();
+        assert!(written.success());
 
         let cli = parse(&[
             "bazel-diff",

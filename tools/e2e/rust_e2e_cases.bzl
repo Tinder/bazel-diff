@@ -360,6 +360,14 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::repository_attribute_naming_main_target_propagates",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::repository_main_target_edges_keep_module_coupling",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::repository_named_by_workspace_path_does_not_depend_on_its_path",
                 "timeout": "moderate",
             },

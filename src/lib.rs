@@ -23,4 +23,6 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/proto.rs"));
 }
 pub mod server;
+#[cfg(all(test, unix))]
+mod test_support;
 pub mod web_identity;

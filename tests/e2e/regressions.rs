@@ -307,6 +307,62 @@ fn repository_main_target_edges_keep_module_coupling() {
     }
 }
 
+/// A source edit behind a repository's main-target edge is derived under `--partialGraph`
+/// without a query: the repository node's recipe keeps the edge, so the derived file equals a
+/// full generation and still impacts the targets that reach it through `@x_checker` and `@tool`.
+#[test]
+fn repository_main_target_edges_survive_partial_graph_derivation() {
+    for flags in [&[][..], &["--excludeExternalTargets"][..]] {
+        let workspace = copy_workspace("main_repo_back_edge_through_rules");
+        let root = workspace.path();
+        init_git(root);
+        let out = tempfile::tempdir().unwrap();
+        let hashes = |name: &str, base: Option<&Path>| -> (PathBuf, String) {
+            let path = out.path().join(format!("{name}.json"));
+            let base_arg = base.map(|base| base.display().to_string());
+            let mut args = flags.to_vec();
+            args.push("--partialGraph");
+            if let Some(base) = &base_arg {
+                args.extend(["--baseHashes", base]);
+            }
+            let result = generate(root, &path, &args);
+            let log = String::from_utf8_lossy(&result.stderr).into_owned();
+            assert!(result.status.success(), "{name} {flags:?}: {log}");
+            (path, log)
+        };
+        // Generation can settle the lockfile; derive from a base of the committed tree.
+        hashes("warm", None);
+        if !git(root, &["status", "--porcelain"]).is_empty() {
+            commit(root, "settle repository metadata");
+        }
+        let (base, _) = hashes("base", None);
+        fs::write(root.join("checker/checker.txt"), "after\n").unwrap();
+        let (derived, log) = hashes("derived", Some(&base));
+        assert!(log.contains("partial graph: derived"), "{flags:?}: {log}");
+        let (full, _) = hashes("full", None);
+        assert_eq!(
+            fs::read(&derived).unwrap(),
+            fs::read(&full).unwrap(),
+            "{flags:?}: derived and fully generated files differ"
+        );
+        let result_path = out.path().join("impacted.txt");
+        assert!(impacted(root, &base, &derived, &result_path, &[])
+            .status
+            .success());
+        let impacted = read_lines(&result_path);
+        for target in ["//checker:checker", "//:direct", "//:via_tool"] {
+            assert!(
+                contains_main(&impacted, target),
+                "{target} {flags:?}: {impacted:?}"
+            );
+        }
+        assert!(
+            !contains_main(&impacted, "//:control"),
+            "{flags:?}: {impacted:?}"
+        );
+    }
+}
+
 /// Regression for <https://github.com/Tinder/bazel-diff/issues/510>: like the
 /// #197 case above, but the wrapper module (`middle`) is only declared by
 /// `facade`, under a private apparent name, so it is not visible from the root.

@@ -1268,6 +1268,15 @@ A few inputs are normalized or extended on the way in:
   hashed without its `url`/`urls`, since a mirror or registry move cannot change what it fetches.
   The main-repository files its attributes name -- patches, build files, lock files -- are hashed
   by content, so a changed patch is a changed repository.
+  A main-repository *target* its attributes name is a dependency of the repository's node: a
+  repository rule can write that label into a BUILD file of its own, as `rules_go`'s
+  `go_sdk.nogo(nogo = "//...")` does for `@io_bazel_rules_nogo`, whose alias every Go rule
+  depends on through `_nogo`. A repository whose repository mapping holds such a node, directly
+  or through other such repositories, depends on it too, so a change to the target reaches the
+  Go rules of every module that maps `rules_go`. Only labels that are main-graph nodes count
+  (package patterns such as `//pkg:__subpackages__` do not), and other mapping entries add no
+  edge. A label a repository rule writes without receiving it as a whole attribute value is not
+  seen.
   An attribute that names a workspace path absolutely (a crate or Go module built from a directory
   in the workspace, a `file://%workspace%` registry URL) is hashed relative to the workspace, so
   identical checkouts at different paths hash the same.

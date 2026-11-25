@@ -1094,11 +1094,13 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
         .unwrap_or_else(|| bzlmod_enabled_for(&to, &bazel));
     let target_types = (!args.target_type.is_empty())
         .then(|| args.target_type.iter().cloned().collect::<HashSet<_>>());
+    // The dependency edges, when read, are kept to the end and leaked with the hash files.
+    let mut dep_edges = None;
     let output = if let Some(dep_edges_file) = &args.dep_edges_file {
-        let dep_edges = dep_edges_from_slice(&fs::read(dep_edges_file)?)?;
+        let dep_edges = &*dep_edges.insert(dep_edges_from_slice(&fs::read(dep_edges_file)?)?);
         if let Some(path) = &args.toolchain_candidates_file {
             let mut report = bazel_diff::toolchain_candidates::compare(&from, &to);
-            bazel_diff::toolchain_candidates::add_returned_readers(&mut report, &to, &dep_edges);
+            bazel_diff::toolchain_candidates::add_returned_readers(&mut report, &to, dep_edges);
             let readers = std::mem::take(&mut report.possible_readers);
             report.possible_readers = filter_and_sort_labels(
                 readers,
@@ -1115,7 +1117,7 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
             let report = impact_graph(
                 &from,
                 &to,
-                &dep_edges,
+                dep_edges,
                 Some(&bazel),
                 target_types.as_ref(),
                 exclude_external,
@@ -1128,7 +1130,7 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
             let targets = hash_file_distances(
                 &from,
                 &to,
-                &dep_edges,
+                dep_edges,
                 module_impacted.as_ref(),
                 target_types.as_ref(),
                 exclude_external,
@@ -1155,8 +1157,9 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
         Some(path) => fs::write(path, output)?,
         None => print!("{output}"),
     }
-    // The process exits next: freeing two hash files entry by entry would only cost CPU.
-    std::mem::forget((from, to));
+    // The process exits next: freeing two hash files and the dependency edges entry by entry would
+    // only cost CPU.
+    std::mem::forget((from, to, dep_edges));
     Ok(())
 }
 

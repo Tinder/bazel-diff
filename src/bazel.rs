@@ -26,10 +26,15 @@ struct BazelVersion(u32, u32, u32);
 /// The flag that decides whether the `//external` package exists.
 const WORKSPACE_FLAG: &str = "enable_workspace";
 
+/// The flag that decides whether the workspace resolves its dependencies through Bzlmod.
+/// Matches `--experimental_enable_bzlmod` too.
+const BZLMOD_FLAG: &str = "enable_bzlmod";
+
 /// What one `bazel info release output_base starlark-semantics` reports. Generation asks for
 /// these together before querying so that the same call replaces `bazel version`, the later
 /// `bazel info output_base` of the hashing pass, and -- when WORKSPACE is known to be disabled --
-/// the `//external:all-targets` query that would only fail and be retried without it.
+/// the `//external:all-targets` query that would only fail and be retried without it. When it
+/// shows Bzlmod is off, it also replaces the `bazel mod` probes that would only fail to say so.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ServerInfo {
     version: Option<BazelVersion>,
@@ -37,6 +42,9 @@ pub(crate) struct ServerInfo {
     /// Whether `//external` exists. `None` when it cannot be told from `bazel info` alone, which
     /// keeps the query probing for it.
     external_package: Option<bool>,
+    /// Whether Bzlmod is enabled. `None` when `bazel info` and `bazel mod` might not agree on
+    /// it, which keeps the `bazel mod` probes deciding.
+    bzlmod: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -315,12 +323,34 @@ impl BazelOptions {
         {
             info.external_package = None;
         }
+        // The `bazel mod` probes run without `--bazelCommandOptions`, like `bazel info`, and
+        // both read a bazelrc's `common` lines; only the `build` and `info` lines (`bazel info`)
+        // and the `mod` lines (`bazel mod`) are read by one and not the other.
+        if info.bzlmod.is_some() && self.bazelrc_mentions_outside_common(BZLMOD_FLAG) {
+            info.bzlmod = None;
+        }
         Some(info)
     }
 
     /// Whether any bazelrc Bazel reads for this workspace, or one they import, names `flag`.
     /// Deliberately coarse: a comment or an unrelated config naming it also counts.
     fn bazelrc_mentions(&self, flag: &str) -> bool {
+        self.bazelrc_lines_mentioning(flag, |_| true)
+    }
+
+    /// Whether a bazelrc names `flag` on a line other than a comment or a plain `common` or
+    /// `always` line, which every command reads alike. A `common:config` line counts: the
+    /// config may be selected for some commands only.
+    fn bazelrc_mentions_outside_common(&self, flag: &str) -> bool {
+        self.bazelrc_lines_mentioning(flag, |line| {
+            !line.starts_with('#')
+                && !matches!(line.split_whitespace().next(), Some("common" | "always"))
+        })
+    }
+
+    /// Whether a bazelrc Bazel reads for this workspace, or one they import, has a line naming
+    /// `flag` that `counts` (given the trimmed line).
+    fn bazelrc_lines_mentioning(&self, flag: &str, counts: impl Fn(&str) -> bool) -> bool {
         if self.no_bazelrc {
             return false;
         }
@@ -345,11 +375,11 @@ impl BazelOptions {
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
             };
-            if text.contains(flag) {
-                return true;
-            }
             for line in text.lines() {
                 let line = line.trim();
+                if line.contains(flag) && counts(line) {
+                    return true;
+                }
                 let Some(import) = line
                     .strip_prefix("try-import")
                     .or_else(|| line.strip_prefix("import"))
@@ -507,8 +537,12 @@ impl BazelOptions {
             .as_ref()
             .is_ok_and(|found| *found >= BazelVersion(8, 6, 0) && *found != BazelVersion(9, 0, 0));
         let mut survey = ModuleSurvey::default();
-        let (bzlmod_enabled, root_mapping) =
-            self.probe_query_repositories(supports_bzlmod, &mut survey);
+        // `bazel mod` would only fail when `bazel info` already shows Bzlmod is off.
+        let (bzlmod_enabled, root_mapping) = if server_info.bzlmod == Some(false) {
+            (false, None)
+        } else {
+            self.probe_query_repositories(supports_bzlmod, &mut survey)
+        };
         let version = match checked_version {
             Ok(found) => Some(found),
             Err(error) => {
@@ -4711,10 +4745,19 @@ fn parse_server_info(text: &str) -> Option<ServerInfo> {
     } else {
         version.map(|version| version < BazelVersion(8, 0, 0))
     };
+    // Bzlmod is off by default before Bazel 7 and on from 7 on.
+    let bzlmod = if semantics.contains("enable_bzlmod=true") {
+        Some(true)
+    } else if semantics.contains("enable_bzlmod=false") {
+        Some(false)
+    } else {
+        version.map(|version| version >= BazelVersion(7, 0, 0))
+    };
     Some(ServerInfo {
         version,
         output_base: Some(output_base),
         external_package,
+        bzlmod,
     })
 }
 
@@ -7109,6 +7152,18 @@ mod tests {
         let development = info("development version", default);
         assert_eq!(development.version, None);
         assert_eq!(development.external_package, None);
+        assert_eq!(development.bzlmod, None);
+        assert_eq!(bazel8.bzlmod, Some(true));
+        assert_eq!(info("release 7.0.0", default).bzlmod, Some(true));
+        assert_eq!(info("release 6.5.0", default).bzlmod, Some(false));
+        assert_eq!(
+            info("release 8.8.2", "StarlarkSemantics{enable_bzlmod=false}").bzlmod,
+            Some(false)
+        );
+        assert_eq!(
+            info("release 6.5.0", "StarlarkSemantics{enable_bzlmod=true}").bzlmod,
+            Some(true)
+        );
         assert_eq!(parse_server_info("release: release 8.8.2\n"), None);
     }
 
@@ -7139,6 +7194,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options.server_info().unwrap().external_package, None);
+    }
+
+    /// `bazel info` stands in for the `bazel mod` probes only when no bazelrc line one of them
+    /// reads and the other does not names the flag. Neither gets `--bazelCommandOptions`.
+    #[test]
+    fn server_info_leaves_bzlmod_open_when_bazel_mod_may_disagree() {
+        let workspace = tempfile::tempdir().unwrap();
+        let script = workspace.path().join("bazel");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'release: release 8.8.2\\noutput_base: /ob\\nstarlark-semantics: StarlarkSemantics{enable_bzlmod=false}\\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut options = test_options(workspace.path().to_path_buf(), script);
+        options.no_bazelrc = true;
+        assert_eq!(options.server_info().unwrap().bzlmod, Some(false));
+        options.command_options = vec!["--enable_bzlmod".into()];
+        assert_eq!(options.server_info().unwrap().bzlmod, Some(false));
+        options.command_options.clear();
+        options.no_bazelrc = false;
+        fs::write(
+            workspace.path().join(".bazelrc"),
+            "common --noenable_bzlmod\n  # mod --enable_bzlmod\ntry-import %workspace%/user.bazelrc\n",
+        )
+        .unwrap();
+        assert_eq!(options.server_info().unwrap().bzlmod, Some(false));
+        for line in [
+            "build --noenable_bzlmod\n",
+            "info --noenable_bzlmod\n",
+            "mod --enable_bzlmod\n",
+            "common:ci --noenable_bzlmod\n",
+            "build --experimental_enable_bzlmod\n",
+        ] {
+            fs::write(workspace.path().join("user.bazelrc"), line).unwrap();
+            assert_eq!(options.server_info().unwrap().bzlmod, None, "{line}");
+        }
     }
 
     #[test]

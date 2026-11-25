@@ -4545,6 +4545,66 @@ esac
         }
     }
 
+    /// When `bazel info` shows Bzlmod is off, generation asks `bazel mod` nothing: discovery
+    /// skips its probes and the hashing pass knows there is no module graph. A bazelrc line only
+    /// `bazel info` reads (`build`) may disagree with `bazel mod`, so the probes are back.
+    #[test]
+    #[cfg(unix)]
+    fn generation_skips_bazel_mod_when_bazel_info_shows_bzlmod_off() {
+        for (bazelrc, mod_calls) in [
+            (None, 0),
+            (
+                Some("common --noenable_bzlmod\n# build --enable_bzlmod\n"),
+                0,
+            ),
+            (Some("build --noenable_bzlmod\n"), 2),
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            fs::write(workspace.path().join("MODULE.bazel"), "").unwrap();
+            if let Some(bazelrc) = bazelrc {
+                fs::write(workspace.path().join(".bazelrc"), bazelrc).unwrap();
+            }
+            fs::create_dir_all(workspace.path().join("app")).unwrap();
+            fs::write(workspace.path().join("app/input"), "input").unwrap();
+            let target = source_target("//app:input", &[]);
+            let mut encoded = Vec::new();
+            target.encode_length_delimited(&mut encoded);
+            fs::write(workspace.path().join("targets.pb"), encoded).unwrap();
+            let script = workspace.path().join("fake-bazel.sh");
+            fs::write(
+                &script,
+                r#"#!/bin/sh
+case "$1" in
+  mod)
+    printf '%s\n' "$*" >> "$PWD/mod-calls"
+    echo 'ERROR: Bzlmod has to be enabled for mod command to work.' >&2
+    exit 2
+    ;;
+  info)
+    printf 'release: release 8.8.2\noutput_base: %s\nstarlark-semantics: StarlarkSemantics{enable_bzlmod=false, enable_workspace=true}\n' "$PWD"
+    ;;
+  query)
+    while [ "$1" != --output_file ]; do shift; done
+    cp "$PWD/targets.pb" "$2"
+    ;;
+  *) exit 80 ;;
+esac
+"#,
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut options = hash_options(workspace.path());
+            options.bazel.bazel = script;
+            options.bazel.no_bazelrc = false;
+
+            let generated = generate_hashes(&options).unwrap();
+            assert_eq!(generated.hashes.len(), 1);
+            assert_eq!(generated.module_graph_json, None);
+            let calls = fs::read_to_string(workspace.path().join("mod-calls")).unwrap_or_default();
+            assert_eq!(calls.lines().count(), mod_calls, "{bazelrc:?}: {calls}");
+        }
+    }
+
     #[test]
     fn canonical_rule_inputs_are_sorted_and_configuration_sensitive() {
         let rule = Rule {

@@ -307,13 +307,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn bazel_version_is_read_from_bazel_and_unknown_when_it_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let workspace = tempfile::tempdir().unwrap();
         let script = |name: &str, body: &str| {
             let path = workspace.path().join(name);
-            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
             path
         };
 

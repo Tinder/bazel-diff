@@ -7515,16 +7515,11 @@ mod tests {
     fn server_info_leaves_external_package_open_when_the_query_may_set_it() {
         let workspace = tempfile::tempdir().unwrap();
         let script = workspace.path().join("bazel");
-        fs::write(
-            &script,
-            "#!/bin/sh\nprintf 'release: release 8.8.2\\noutput_base: /ob\\nstarlark-semantics: StarlarkSemantics{}\\n'\n",
-        )
-        .unwrap();
+        let body = "#!/bin/sh\nprintf 'release: release 8.8.2\\noutput_base: /ob\\nstarlark-semantics: StarlarkSemantics{}\\n'\n";
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_support::write_executable(&script, body);
+        #[cfg(not(unix))]
+        fs::write(&script, body).unwrap();
         let mut options = test_options(workspace.path().to_path_buf(), script);
         options.no_bazelrc = true;
         assert_eq!(options.server_info().unwrap().external_package, Some(false));

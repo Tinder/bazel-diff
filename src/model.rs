@@ -24,16 +24,56 @@ pub enum Digest {
 
 impl Digest {
     pub fn parse(value: &str) -> Self {
-        match decode_lowercase_hex(value) {
+        match decode_lowercase_hex(value.as_bytes()) {
             Some(bytes) => Self::Sha256(bytes),
             None => Self::Text(value.into()),
         }
     }
 }
 
-/// Decodes exactly 64 lowercase hex digits in one table-driven pass; anything else is `None`.
-/// This runs twice per entry of every hash file read, so it is the parse's hot loop.
-fn decode_lowercase_hex(value: &str) -> Option<[u8; 32]> {
+/// Decodes exactly 64 lowercase hex digits; anything else is `None`. This runs twice per entry of
+/// every hash file read, so it is the parse's hot loop: it checks and converts eight digits per
+/// step ([`decode_hex_word`]) instead of looking each one up in a table.
+fn decode_lowercase_hex(hex: &[u8]) -> Option<[u8; 32]> {
+    let hex: &[u8; 64] = hex.try_into().ok()?;
+    let mut bytes = [0; 32];
+    for (out, digits) in bytes.chunks_exact_mut(4).zip(hex.chunks_exact(8)) {
+        let word = u64::from_le_bytes(digits.try_into().expect("eight digits"));
+        out.copy_from_slice(&decode_hex_word(word)?);
+    }
+    Some(bytes)
+}
+
+/// Decodes eight lowercase hex digits, read as a little-endian word, into four bytes, or `None`
+/// when any byte is not one. Every step works on all eight bytes at once: once each byte is known
+/// to be below 0x80, adding a constant of at most 0x80 to every byte cannot carry into the next
+/// one, and the sum's high bit says whether the byte reached the bound the constant encodes.
+fn decode_hex_word(word: u64) -> Option<[u8; 4]> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = ONES * 0x80;
+    const LOW_BYTES: u64 = 0x00ff_00ff_00ff_00ff;
+    if word & HIGH != 0 {
+        return None;
+    }
+    // The high bit of each byte of `at_least(bound)` is set iff that byte is >= bound.
+    let at_least = |bound: u8| word + ONES * u64::from(0x80 - bound);
+    let digit = at_least(b'0') & !at_least(b'9' + 1) & HIGH;
+    let letter = at_least(b'a') & !at_least(b'f' + 1) & HIGH;
+    if digit | letter != HIGH {
+        return None;
+    }
+    // '0'..='9' end in the nibbles 0..=9 and 'a'..='f' in 1..=6: letters add 9.
+    let nibbles = (word & (ONES * 0x0f)) + (letter >> 7) * 9;
+    // Each 16-bit lane holds a digit pair, the first digit in its low byte: make that the high
+    // nibble of the lane's low byte.
+    let lanes = ((nibbles & LOW_BYTES) << 4) | ((nibbles >> 8) & LOW_BYTES);
+    let lanes = lanes.to_le_bytes();
+    Some([lanes[0], lanes[2], lanes[4], lanes[6]])
+}
+
+/// The one-digit-at-a-time decode [`decode_lowercase_hex`] replaced, kept as its test oracle.
+#[cfg(test)]
+fn decode_lowercase_hex_by_table(value: &str) -> Option<[u8; 32]> {
     const INVALID: u8 = 0xff;
     const TABLE: [u8; 256] = {
         let mut table = [INVALID; 256];
@@ -126,9 +166,18 @@ pub(crate) const REPOSITORY_DEFINITION_KIND: &str = "RepositoryDefinition";
 
 impl TargetHash {
     pub fn parse(value: &str) -> Result<Self> {
+        Self::parse_bytes(value.as_bytes())
+    }
+
+    /// [`Self::parse`] on a hash value's raw JSON bytes. The shape `generate-hashes` writes is
+    /// checked digit by digit on the way, which also proves it is ASCII, so only other values
+    /// (and a kind, which is short) are validated as UTF-8.
+    fn parse_bytes(value: &[u8]) -> Result<Self> {
         match Self::parse_generated(value) {
             Some(parsed) => Ok(parsed),
-            None => Self::parse_separated(value),
+            None => Self::parse_separated(
+                std::str::from_utf8(value).context("hash value is not valid UTF-8")?,
+            ),
         }
     }
 
@@ -152,9 +201,8 @@ impl TargetHash {
     /// The shape `generate-hashes` writes, `[kind#]<64 hex>~<64 hex>`, read at fixed offsets
     /// instead of searched for separators. `None` for anything else, which [`Self::parse`] then
     /// reads the general way; on every value this accepts, that would give the same result.
-    fn parse_generated(value: &str) -> Option<Self> {
+    fn parse_generated(bytes: &[u8]) -> Option<Self> {
         const DIGEST: usize = 64;
-        let bytes = value.as_bytes();
         let kind_end = bytes.len().checked_sub(2 * DIGEST + 1)?;
         if bytes[kind_end + DIGEST] != b'~' {
             return None;
@@ -163,12 +211,12 @@ impl TargetHash {
             None => "",
             // The general parse splits at the first `#`: this one must be it.
             Some(separator) if bytes[separator] == b'#' && !bytes[..separator].contains(&b'#') => {
-                &value[..separator]
+                std::str::from_utf8(&bytes[..separator]).ok()?
             }
             Some(_) => return None,
         };
-        let hash = decode_lowercase_hex(&value[kind_end..kind_end + DIGEST])?;
-        let direct_hash = decode_lowercase_hex(&value[kind_end + DIGEST + 1..])?;
+        let hash = decode_lowercase_hex(&bytes[kind_end..kind_end + DIGEST])?;
+        let direct_hash = decode_lowercase_hex(&bytes[kind_end + DIGEST + 1..])?;
         Some(Self {
             kind: kind.to_owned(),
             hash: Digest::Sha256(hash),
@@ -463,6 +511,56 @@ impl<'de> Deserialize<'de> for JsonStr<'de> {
     }
 }
 
+/// A JSON string's bytes, escapes resolved, borrowed from the input when it has no escapes. Unlike
+/// [`JsonStr`] the bytes are not checked to be UTF-8: hash values go to
+/// [`TargetHash::parse_bytes`], whose digit checks already prove the usual value is ASCII, so a
+/// second full pass over the value would only repeat that work.
+struct JsonBytes<'de>(Cow<'de, [u8]>);
+
+impl<'de> Deserialize<'de> for JsonBytes<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct JsonBytesVisitor;
+
+        impl<'de> Visitor<'de> for JsonBytesVisitor {
+            type Value = JsonBytes<'de>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_borrowed_bytes<E: de::Error>(
+                self,
+                value: &'de [u8],
+            ) -> Result<Self::Value, E> {
+                Ok(JsonBytes(Cow::Borrowed(value)))
+            }
+
+            fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                Ok(JsonBytes(Cow::Owned(value.to_owned())))
+            }
+
+            fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(JsonBytes(Cow::Owned(value)))
+            }
+
+            fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+                Ok(JsonBytes(Cow::Borrowed(value.as_bytes())))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(JsonBytes(Cow::Owned(value.as_bytes().to_owned())))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(JsonBytes(Cow::Owned(value.into_bytes())))
+            }
+        }
+
+        // serde_json reads a string requested as bytes without validating it as UTF-8.
+        deserializer.deserialize_bytes(JsonBytesVisitor)
+    }
+}
+
 /// Parses a `--depEdgesFile` (`{label: [dependency labels]}`). `generate-hashes` writes it from a
 /// sorted map, so the entries are collected and the map built in one bulk pass, as for [`Hashes`],
 /// instead of searching the tree for every label; a repeated label keeps its last value, as
@@ -517,8 +615,8 @@ impl<'de> Deserialize<'de> for Hashes {
                 // comparison per level) for every insert. `BTreeMap::from_iter` sorts stably and
                 // keeps the last value for a repeated label, exactly as repeated inserts would.
                 let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
-                while let Some((label, value)) = map.next_entry::<String, JsonStr<'de>>()? {
-                    let hash = TargetHash::parse(&value.0).map_err(de::Error::custom)?;
+                while let Some((label, value)) = map.next_entry::<String, JsonBytes<'de>>()? {
+                    let hash = TargetHash::parse_bytes(&value.0).map_err(de::Error::custom)?;
                     entries.push((label, hash));
                 }
                 Ok(Hashes(entries.into_iter().collect()))
@@ -580,8 +678,9 @@ impl<'de> Deserialize<'de> for HashFileData {
                             data.tree = metadata.tree;
                         }
                         label => {
-                            let value = map.next_value::<JsonStr<'de>>()?;
-                            let hash = TargetHash::parse(&value.0).map_err(de::Error::custom)?;
+                            let value = map.next_value::<JsonBytes<'de>>()?;
+                            let hash =
+                                TargetHash::parse_bytes(&value.0).map_err(de::Error::custom)?;
                             bare.push((label.to_owned(), hash));
                         }
                     }
@@ -821,20 +920,72 @@ fn accepts(
     Ok(target_types.contains(&hash.kind))
 }
 
+/// Pairs every entry of `to` with the entry `from` has for the same label, in label order.
+///
+/// Both maps iterate in label order, so one merged walk pairs them with a single label comparison
+/// per step. Looking each label up in `from` instead costs a tree search per label, a string
+/// comparison per level, and labels share long `//package/path:` prefixes, so each comparison
+/// scans most of both strings. When `to` is much smaller than `from` the walk would visit mostly
+/// labels nobody asked about, so it looks those few labels up instead.
+struct PairedEntries<'a> {
+    to: std::collections::btree_map::Iter<'a, String, TargetHash>,
+    from: &'a BTreeMap<String, TargetHash>,
+    walk: Option<std::iter::Peekable<std::collections::btree_map::Iter<'a, String, TargetHash>>>,
+}
+
+/// `to` entries at most this many times fewer than `from`'s still take the merged walk.
+const PAIRED_WALK_RATIO: usize = 16;
+
+fn paired_entries<'a>(
+    from: &'a BTreeMap<String, TargetHash>,
+    to: &'a BTreeMap<String, TargetHash>,
+) -> PairedEntries<'a> {
+    let walk =
+        (to.len().saturating_mul(PAIRED_WALK_RATIO) >= from.len()).then(|| from.iter().peekable());
+    PairedEntries {
+        to: to.iter(),
+        from,
+        walk,
+    }
+}
+
+impl<'a> Iterator for PairedEntries<'a> {
+    type Item = (&'a String, &'a TargetHash, Option<&'a TargetHash>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (label, hash) = self.to.next()?;
+        let Some(walk) = &mut self.walk else {
+            return Some((label, hash, self.from.get(label)));
+        };
+        let previous = loop {
+            let Some((candidate, _)) = walk.peek() else {
+                break None;
+            };
+            match candidate.as_str().cmp(label.as_str()) {
+                std::cmp::Ordering::Less => {
+                    walk.next();
+                }
+                std::cmp::Ordering::Equal => break walk.next().map(|(_, previous)| previous),
+                std::cmp::Ordering::Greater => break None,
+            }
+        };
+        Some((label, hash, previous))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.to.size_hint()
+    }
+}
+
 pub fn impacted_targets(
     from: &BTreeMap<String, TargetHash>,
     to: &BTreeMap<String, TargetHash>,
     target_types: Option<&HashSet<String>>,
     exclude_external: bool,
 ) -> Result<Vec<String>> {
-    let impacted = to
-        .iter()
-        .filter(|(label, hash)| {
-            !from
-                .get(*label)
-                .is_some_and(|previous| previous.same_as(hash))
-        })
-        .map(|(label, _)| label.clone())
+    let impacted = paired_entries(from, to)
+        .filter(|(_, hash, previous)| !previous.is_some_and(|previous| previous.same_as(hash)))
+        .map(|(label, _, _)| label.clone())
         .filter(|label| !exclude_external || !label.starts_with("//external:"))
         .filter_map(|label| match accepts(&label, from, to, target_types) {
             Ok(true) => Some(Ok(label)),
@@ -882,8 +1033,8 @@ pub fn impacted_types(
     from: &BTreeMap<String, TargetHash>,
     to: &BTreeMap<String, TargetHash>,
 ) -> HashMap<String, ImpactType> {
-    to.iter()
-        .filter_map(|(label, final_hash)| match from.get(label) {
+    paired_entries(from, to)
+        .filter_map(|(label, final_hash, starting_hash)| match starting_hash {
             None => Some((label.clone(), ImpactType::Direct)),
             Some(starting_hash) if !starting_hash.same_as(final_hash) => Some((
                 label.clone(),
@@ -1661,13 +1812,107 @@ mod tests {
         ];
         for value in &values {
             let general = TargetHash::parse_separated(value);
-            if let Some(fast) = TargetHash::parse_generated(value) {
+            if let Some(fast) = TargetHash::parse_generated(value.as_bytes()) {
                 assert_eq!(Some(&fast), general.as_ref().ok(), "{value}");
             }
             assert_eq!(TargetHash::parse(value).ok(), general.ok(), "{value}");
         }
-        assert!(TargetHash::parse_generated(&format!("{a}~{b}")).is_some());
-        assert!(TargetHash::parse_generated(&format!("Rule#{a}~{b}")).is_some());
+        assert!(TargetHash::parse_generated(format!("{a}~{b}").as_bytes()).is_some());
+        assert!(TargetHash::parse_generated(format!("Rule#{a}~{b}").as_bytes()).is_some());
+    }
+
+    #[test]
+    fn paired_walk_matches_per_label_lookups() {
+        // Deterministic pseudo-random label sets: shared, added, removed and changed labels, in
+        // every size ratio, including the ones that switch to lookups.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..200 {
+            let mut map = || {
+                let len = usize::try_from(next() % [3, 40, 400][round % 3]).unwrap();
+                (0..len)
+                    .map(|_| {
+                        let value = next();
+                        (
+                            format!("//p{}:t{}", value % 7, (value >> 8) % 50),
+                            target("", ["a", "b"][usize::from(value & 1 == 1)], "c"),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            };
+            let (from, to) = (map(), map());
+            for (from, to) in [(&from, &to), (&to, &from), (&from, &from)] {
+                let walked = paired_entries(from, to).collect::<Vec<_>>();
+                let looked_up = to
+                    .iter()
+                    .map(|(label, hash)| (label, hash, from.get(label)))
+                    .collect::<Vec<_>>();
+                assert_eq!(walked, looked_up, "round {round}");
+            }
+        }
+    }
+
+    #[test]
+    fn word_hex_decode_matches_the_table_decode_for_every_byte_in_every_position() {
+        let valid = "0123456789abcdeffedcba9876543210".repeat(2);
+        assert_eq!(
+            decode_lowercase_hex(valid.as_bytes()),
+            decode_lowercase_hex_by_table(&valid)
+        );
+        assert!(decode_lowercase_hex(valid.as_bytes()).is_some());
+        for position in 0..64 {
+            for byte in 0..=u8::MAX {
+                let mut bytes = valid.clone().into_bytes();
+                bytes[position] = byte;
+                let expected = std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(decode_lowercase_hex_by_table);
+                assert_eq!(
+                    decode_lowercase_hex(&bytes),
+                    expected,
+                    "byte {byte:#04x} at {position}"
+                );
+            }
+        }
+        for len in [0, 63, 65] {
+            assert_eq!(decode_lowercase_hex(&vec![b'a'; len]), None);
+        }
+    }
+
+    #[test]
+    fn hash_values_read_as_bytes_parse_like_strings() {
+        let (a, b) = ("ab".repeat(32), "cd".repeat(32));
+        let escaped = format!("{{\"//x:a\":\"R\\u00fcle#{a}~{b}\",\"//x:b\":\"{a}~{b}\",\"//x:c\":\"fixture\\u007eother\"}}");
+        let parsed = HashFileData::from_slice(escaped.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.hashes["//x:a"],
+            TargetHash::parse(&format!("Rüle#{a}~{b}")).unwrap()
+        );
+        assert_eq!(
+            parsed.hashes["//x:b"],
+            TargetHash::parse(&format!("{a}~{b}")).unwrap()
+        );
+        assert_eq!(
+            parsed.hashes["//x:c"],
+            TargetHash::parse("fixture~other").unwrap()
+        );
+        // A value that is not UTF-8 is still refused, now by the hash parse.
+        let invalid = [
+            &b"{\"//x:a\":\"k\xff#"[..],
+            a.as_bytes(),
+            b"~",
+            b.as_bytes(),
+            b"\"}",
+        ]
+        .concat();
+        assert!(HashFileData::from_slice(&invalid).is_err());
+        let lone = format!("{{\"//x:a\":\"\\ud800~{b}\"}}");
+        assert!(HashFileData::from_slice(lone.as_bytes()).is_err());
     }
 
     #[test]

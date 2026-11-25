@@ -1357,7 +1357,7 @@ Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
 With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "80.0.0")
+bazel_dep(name = "bazel-diff", version = "81.0.0")
 ```
 
 You can now run the tool with:
@@ -1411,10 +1411,10 @@ bazel run :bazel-diff --config=verbose -- --help
     <td align="center"><a href="https://github.com/honnix"><img src="https://avatars.githubusercontent.com/u/158892?s=64" width="64" alt="Honnix"/><br/><sub><b>Honnix</b></sub></a></td>
     <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="eric wang"/><br/><sub><b>eric wang</b></sub></a></td>
     <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="Eric Wang"/><br/><sub><b>Eric Wang</b></sub></a></td>
-    <td align="center"><a href="https://github.com/tgeng"><img src="https://avatars.githubusercontent.com/u/29584386?s=64" width="64" alt="Tianyu Geng"/><br/><sub><b>Tianyu Geng</b></sub></a></td>
+    <td align="center"><a href="https://github.com/Spikhalskiy"><img src="https://avatars.githubusercontent.com/u/532108?s=64" width="64" alt="Dmitry Spikhalsky"/><br/><sub><b>Dmitry Spikhalsky</b></sub></a></td>
   </tr>
   <tr>
-    <td align="center"><a href="https://github.com/Spikhalskiy"><img src="https://avatars.githubusercontent.com/u/532108?s=64" width="64" alt="Dmitry Spikhalsky"/><br/><sub><b>Dmitry Spikhalsky</b></sub></a></td>
+    <td align="center"><a href="https://github.com/tgeng"><img src="https://avatars.githubusercontent.com/u/29584386?s=64" width="64" alt="Tianyu Geng"/><br/><sub><b>Tianyu Geng</b></sub></a></td>
     <td align="center"><a href="https://github.com/BalestraPatrick"><img src="https://avatars.githubusercontent.com/u/3658887?s=64" width="64" alt="Patrick Balestra"/><br/><sub><b>Patrick Balestra</b></sub></a></td>
     <td align="center"><a href="https://github.com/purkhusid"><img src="https://avatars.githubusercontent.com/u/5622403?s=64" width="64" alt="Daniel P. Purkhus"/><br/><sub><b>Daniel P. Purkhus</b></sub></a></td>
     <td align="center"><a href="https://github.com/alexeagle"><img src="https://avatars.githubusercontent.com/u/47395?s=64" width="64" alt="Alex Eagle"/><br/><sub><b>Alex Eagle</b></sub></a></td>

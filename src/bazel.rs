@@ -4484,43 +4484,78 @@ fn main_target_edges(
         .iter()
         .filter_map(|repository| repository.canonical_name.as_deref())
         .collect();
-    let mut users = HashMap::<&str, Vec<&str>>::new();
+    // Repositories that share a mapping (every repository of one extension) form one group, so
+    // the reverse edges grow with the mappings rather than with the square of an extension's
+    // size: a hub with thousands of spokes would otherwise list every spoke as a user of every
+    // other one.
+    let mut group_of = HashMap::<*const RepoMapping, usize>::new();
+    let mut groups = Vec::<(Vec<&str>, Vec<&str>)>::new();
     for &canonical in &known {
-        let mapping = mappings.get(canonical).or_else(|| {
+        let Some(mapping) = mappings.get(canonical).or_else(|| {
             extension_usage_prefix(canonical)
                 .and_then(|prefix| extension_mappings.get(prefix).copied())
-        });
-        for dependency in mapping
-            .into_iter()
-            .flat_map(BTreeMap::values)
-            .map(String::as_str)
-            .filter(|dependency| *dependency != canonical && known.contains(dependency))
-        {
-            users.entry(dependency).or_default().push(canonical);
+        }) else {
+            continue;
+        };
+        let group = *group_of
+            .entry(std::ptr::from_ref(mapping))
+            .or_insert_with(|| {
+                let dependencies = mapping
+                    .values()
+                    .map(String::as_str)
+                    .filter(|dependency| known.contains(dependency))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                groups.push((Vec::new(), dependencies));
+                groups.len() - 1
+            });
+        groups[group].0.push(canonical);
+    }
+    let mut user_groups = HashMap::<&str, Vec<usize>>::new();
+    for (group, (_, dependencies)) in groups.iter().enumerate() {
+        for &dependency in dependencies {
+            user_groups.entry(dependency).or_default().push(group);
         }
     }
     // For each repository naming a target, a repository depends on the entries of its mapping
-    // one step closer to it. Every repository that can reach it keeps a path there, and the
-    // edges toward one target never close a cycle: an extension's repositories map their owner,
-    // which maps them back, and a hub's spokes map each other.
+    // one step closer to it, itself excluded. Every repository that can reach it keeps a path
+    // there, and the edges toward one target never close a cycle: an extension's repositories
+    // map their owner, which maps them back, and a hub's spokes map each other.
     let mut repositories = BTreeMap::<String, BTreeSet<String>>::new();
     for seed in targets.keys().map(String::as_str) {
         let mut distance = HashMap::from([(seed, 0_usize)]);
+        let mut reached = vec![false; groups.len()];
         let mut layer = vec![seed];
         while !layer.is_empty() {
             let mut next = Vec::new();
             for dependency in layer {
                 let step = distance[dependency] + 1;
-                for &user in users.get(dependency).into_iter().flatten() {
-                    let known = *distance.entry(user).or_insert_with(|| {
-                        next.push(user);
-                        step
-                    });
-                    if known == step {
-                        repositories
-                            .entry(user.to_owned())
-                            .or_default()
-                            .insert(dependency.to_owned());
+                for &group in user_groups.get(dependency).into_iter().flatten() {
+                    // A group is first reached from a dependency at the smallest distance, and
+                    // the whole previous layer is known by then.
+                    if std::mem::replace(&mut reached[group], true) {
+                        continue;
+                    }
+                    let (members, dependencies) = &groups[group];
+                    let closer = dependencies
+                        .iter()
+                        .copied()
+                        .filter(|candidate| distance.get(candidate) == Some(&(step - 1)))
+                        .collect::<Vec<_>>();
+                    for &member in members {
+                        if distance.contains_key(member) {
+                            continue;
+                        }
+                        distance.insert(member, step);
+                        next.push(member);
+                        let edges = repositories.entry(member.to_owned()).or_default();
+                        edges.extend(
+                            closer
+                                .iter()
+                                .filter(|&&candidate| candidate != member)
+                                .map(|&candidate| candidate.to_owned()),
+                        );
                     }
                 }
             }
@@ -7103,6 +7138,56 @@ mod tests {
                 ("unrelated+", "gazelle+"),
             ])
         );
+    }
+
+    /// A hub's spokes share one mapping that names every spoke. When a spoke names a main
+    /// target, the other spokes and the hub depend on it, the spoke itself does not, and a
+    /// module that maps only the hub depends on the hub.
+    #[test]
+    fn main_target_edges_handle_a_seed_inside_a_shared_extension_mapping() {
+        let repository = |canonical: &str, value: Option<&str>| Repository {
+            canonical_name: Some(canonical.to_owned()),
+            attribute: value
+                .into_iter()
+                .map(|value| Attribute {
+                    name: "target".into(),
+                    r#type: attribute::Discriminator::String,
+                    string_value: Some(value.to_owned()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let (hub, a, b) = ("rules_x++hub+hub", "rules_x++hub+a", "rules_x++hub+b");
+        let repositories = [
+            repository(hub, None),
+            repository(a, Some("@@//:t")),
+            repository(b, None),
+            repository("tool+", None),
+        ];
+        let mapping = |entries: &[(&str, &str)]| {
+            entries
+                .iter()
+                .map(|(apparent, canonical)| ((*apparent).to_owned(), (*canonical).to_owned()))
+                .collect::<RepoMapping>()
+        };
+        let mappings = BTreeMap::from([
+            (hub.to_owned(), mapping(&[("hub", hub), ("a", a), ("b", b)])),
+            ("tool+".to_owned(), mapping(&[("hub", hub)])),
+        ]);
+        let nodes = HashSet::from(["//:t".to_owned()]);
+        let (_, repositories) = main_target_edges(
+            &repositories,
+            MainTargetEdges {
+                mappings: Some(&mappings),
+                nodes: Some(&nodes),
+            },
+        );
+        let expected = [(hub, a), (b, a), ("tool+", hub)]
+            .into_iter()
+            .map(|(from, to)| (from.to_owned(), BTreeSet::from([to.to_owned()])))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(repositories, expected);
     }
 
     #[test]

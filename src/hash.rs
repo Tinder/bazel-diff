@@ -1576,6 +1576,12 @@ struct Labels {
     ordinary_inputs: HashMap<usize, Vec<String>>,
 }
 
+/// Whether an ordinary repository input names another repository's node rather than a
+/// main-repository target the repository's definition names.
+fn is_repository_node(input: &str) -> bool {
+    input.starts_with("//external:")
+}
+
 const REPOSITORY_DEFINITION_PREFIX: &str = "//external:__bazel_diff_repository_definition__/";
 
 fn repository_definition_label(repository: &str) -> String {
@@ -1868,7 +1874,12 @@ impl Labels {
                     label: _,
                     definition_digest: _,
                     inputs,
-                } => pending.extend(inputs.iter().cloned()),
+                } => pending.extend(
+                    inputs
+                        .iter()
+                        .filter(|input| is_repository_node(input))
+                        .cloned(),
+                ),
                 RepositoryDefinitionState::Visiting | RepositoryDefinitionState::Unavailable => {
                     unreachable!("closed repository graph")
                 }
@@ -1890,8 +1901,10 @@ impl Labels {
                 };
             let inputs = inputs
                 .iter()
-                .map(
-                    |input| match states.get(input).expect("planned module child") {
+                .map(|input| match states.get(input) {
+                    // A main-repository target the definition names keeps its own node.
+                    None if !is_repository_node(input) => input.clone(),
+                    state => match state.expect("planned module child") {
                         RepositoryDefinitionState::Complete {
                             label,
                             definition_digest: _,
@@ -1902,7 +1915,7 @@ impl Labels {
                             unreachable!("closed repository graph")
                         }
                     },
-                )
+                })
                 .collect();
             let rule = Rule {
                 name: definition.clone(),
@@ -1982,7 +1995,7 @@ impl Labels {
             return fail(states);
         };
         let (definition_digest, inputs) = candidate;
-        for input in &inputs {
+        for input in inputs.iter().filter(|input| is_repository_node(input)) {
             if !self.plan_repository_definition(input, occupied, states) {
                 return fail(states);
             }

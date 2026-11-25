@@ -1,0 +1,8 @@
+genrule(
+    name = "checker",
+    srcs = ["checker.txt"],
+    outs = ["checker.sh"],
+    cmd = "cp $< $@",
+    executable = True,
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,7 @@
+load("@rules_x//:defs.bzl", "x_library")
+
+x_library(
+    name = "bin",
+    srcs = ["bin.txt"],
+    visibility = ["//visibility:public"],
+)

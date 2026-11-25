@@ -1,0 +1,3 @@
+module(name = "tool")
+
+bazel_dep(name = "rules_x")

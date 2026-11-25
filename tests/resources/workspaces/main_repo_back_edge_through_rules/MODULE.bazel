@@ -1,0 +1,13 @@
+module(name = "main_repo_back_edge_through_rules")
+
+bazel_dep(name = "rules_x")
+local_path_override(module_name = "rules_x", path = "rules_x")
+
+bazel_dep(name = "tool")
+local_path_override(module_name = "tool", path = "tool")
+
+# Like rules_go's `go_sdk.nogo(nogo = "//...")`: the root hands a main-repository label to an
+# extension of `rules_x`, which generates `@x_checker` aliasing it. Every `x_library`, in any
+# module, depends on that alias through an implicit attribute, like every Go rule through `_nogo`.
+sdk = use_extension("@rules_x//:sdk.bzl", "sdk")
+sdk.checker(checker = "//checker")

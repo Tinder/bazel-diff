@@ -692,9 +692,20 @@ Notes and operational guidance:
   reuses a previously cached entry of the other kind. This mirrors the `generate-hashes --depEdgesFile`
   / `get-impacted-targets --depEdgesFile` flow used by the CLI.
 
-* Working-tree integrity is checked on every full generation. `serve` switches revisions with
-  `git checkout --force`, which removes the files a revision no longer tracks but leaves untracked
-  and ignored files where they are, so a generated `BUILD` file left behind by an earlier run would
+* Workspace cleanup is opt-in for `serve` and `serve-multi`. With `--cleanWorkspace`, the server
+  runs `git clean -fdx` before every checkout, even when HEAD already matches the revision.
+  This deletes untracked and ignored files, so use a dedicated workspace and keep caches outside
+  it. The configured `--seed-filepaths` list and the seed files it names are preserved automatically.
+  Preserve other files with `--cleanWorkspaceExclude MODULE.bazel.lock,local.bazelrc`.
+  The comma-separated entries are exact workspace-relative file paths, not glob patterns;
+  absolute paths, parent traversal and empty entries are rejected. The option requires
+  `--cleanWorkspace` and applies to each workspace in multi-repository mode.
+  Exclusions protect files from cleanup, not from changes made by checkout.
+  Nested Git repositories are not forcibly removed. Without `--cleanWorkspace`, and for
+  one-shot CLI commands, cleanup is not performed.
+
+* Working-tree integrity is checked on every full generation. Without cleanup, an untracked
+  `BUILD` file left behind by an earlier run can
   be loaded by `bazel query` at every revision and its targets cached under revisions that do not
   contain them -- and reported as impacted to consumers whose checkout has no such package. After
   the query, every main-repository package it returned must have its `BUILD` or `BUILD.bazel` in

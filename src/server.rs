@@ -83,6 +83,11 @@ pub struct ServerConfig {
     /// `hash_options.bazel.workspace`, named [`DEFAULT_REPOSITORY`].
     pub repositories: Vec<Repository>,
     pub git_path: PathBuf,
+    pub clean_workspace: bool,
+    /// Exact workspace-relative file paths, not Git ignore patterns.
+    pub clean_workspace_exclude: BTreeSet<PathBuf>,
+    /// The seed list itself, retained alongside its inputs when cleaning the workspace.
+    pub seed_filepaths_file: Option<PathBuf>,
     pub port: u16,
     pub request_timeout: Duration,
     pub cache_dir: PathBuf,
@@ -1259,6 +1264,7 @@ pub fn serve(config: &ServerConfig) -> Result<()> {
         bail!("serve does not support --isolatedDependencyRoot={root}");
     }
     validate_partial_graph(config)?;
+    validate_workspace_clean(config)?;
     let repositories = repositories(config)?;
     fs::create_dir_all(&config.cache_dir)?;
     let remote = RemoteCache::new(config)?;
@@ -2376,7 +2382,36 @@ fn classify_revisions(
 }
 
 fn checkout(state: &State, sha: &str) -> Result<()> {
-    state.git().checkout(sha)
+    if !state.config.clean_workspace {
+        return state.git().checkout(sha);
+    }
+    validate_workspace_clean(&state.config)?;
+    let mut preserved = state.config.hash_options.seed_filepaths.clone();
+    preserved.extend(state.config.seed_filepaths_file.iter().cloned());
+    preserved.extend(state.config.clean_workspace_exclude.iter().cloned());
+    state.git().checkout_clean(sha, &preserved)
+}
+
+pub fn validate_workspace_clean(config: &ServerConfig) -> Result<()> {
+    if !config.clean_workspace && !config.clean_workspace_exclude.is_empty() {
+        bail!("--cleanWorkspaceExclude requires --cleanWorkspace");
+    }
+    for path in &config.clean_workspace_exclude {
+        if path.as_os_str().is_empty()
+            || path
+                .to_str()
+                .is_none_or(|value| value.ends_with('/') || value.contains(['\n', '\r']))
+            || !path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            bail!(
+                "--cleanWorkspaceExclude expects workspace-relative file paths without '.' or '..': {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn git(state: &State, args: &[String]) -> Result<()> {
@@ -2651,6 +2686,9 @@ mod tests {
             },
             repositories: Vec::new(),
             git_path: PathBuf::from("git"),
+            clean_workspace: false,
+            clean_workspace_exclude: BTreeSet::new(),
+            seed_filepaths_file: None,
             port: 0,
             request_timeout: Duration::ZERO,
             cache_dir: PathBuf::from("."),
@@ -4476,6 +4514,46 @@ esac
         bad_config.git_path = PathBuf::from("/definitely/missing/git");
         let bad = State::new(bad_config, None);
         assert!(git_output(&bad, &[]).is_err());
+    }
+
+    #[test]
+    fn server_checkout_cleans_same_revision_and_preserves_seed_list_and_inputs() {
+        let (repo, _, second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let mut state = state_for_repo(repo.path(), cache.path(), false);
+        let seed_list = repo.path().join("seed-list.txt");
+        let seed = repo.path().join("seed.txt");
+        fs::write(&seed_list, "seed.txt").unwrap();
+        fs::write(&seed, "seed").unwrap();
+        fs::write(repo.path().join("stale.txt"), "remove").unwrap();
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.seed_filepaths_file = Some(seed_list.clone());
+        config.clean_workspace = true;
+        config.hash_options.seed_filepaths.insert(seed.clone());
+        let lockfile = repo.path().join("MODULE.bazel.lock");
+        fs::write(&lockfile, "{}").unwrap();
+        config
+            .clean_workspace_exclude
+            .insert(PathBuf::from("MODULE.bazel.lock"));
+        config
+            .clean_workspace_exclude
+            .insert(PathBuf::from("not-created-yet/file.txt"));
+        checkout(&state, &second).unwrap();
+        assert!(seed_list.exists());
+        assert!(seed.exists());
+        assert!(lockfile.exists());
+        assert!(!repo.path().join("stale.txt").exists());
+    }
+
+    #[test]
+    fn server_checkout_without_cleanup_keeps_untracked_files() {
+        let (repo, _, second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        let file = repo.path().join("stale.txt");
+        fs::write(&file, "keep").unwrap();
+        checkout(&state, &second).unwrap();
+        assert!(file.exists());
     }
 
     #[test]

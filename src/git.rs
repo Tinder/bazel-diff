@@ -238,6 +238,58 @@ impl Git {
         self.tree_index(&tree)
     }
 
+    /// Cleans a server workspace before checkout, including when HEAD already equals `sha`.
+    pub fn checkout_clean(&self, sha: &str, preserved: &BTreeSet<PathBuf>) -> Result<()> {
+        let workspace = fs::canonicalize(&self.workspace)
+            .context("failed to resolve workspace for git clean")?;
+        let mut args = vec![OsString::from("clean"), OsString::from("-fdx")];
+        for path in preserved {
+            let path = if path.is_absolute() {
+                path.clone()
+            } else {
+                workspace.join(path)
+            };
+            let relative = workspace_relative_file(&workspace, &path).or_else(|| {
+                let relative = path.strip_prefix(&workspace).ok()?;
+                if !relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+                {
+                    return None;
+                }
+                Some(relative.to_str()?.to_owned())
+            });
+            let Some(relative) = relative else {
+                if path.starts_with(&workspace) {
+                    bail!(
+                        "failed to resolve preserved path for git clean: {}",
+                        path.display()
+                    );
+                }
+                continue;
+            };
+            if path.is_dir() || relative.contains(['\n', '\r']) {
+                bail!("git clean exclusions must name files: {}", path.display());
+            }
+            let mut pattern = String::from("/");
+            for character in relative.chars() {
+                if matches!(character, '\\' | '*' | '?' | '[' | ']' | ' ') {
+                    pattern.push('\\');
+                }
+                pattern.push(character);
+            }
+            args.extend([OsString::from("-e"), OsString::from(pattern)]);
+        }
+        let output = self.stdout(args)?;
+        if !output.is_empty() {
+            eprintln!(
+                "[Info] git clean: {}",
+                String::from_utf8_lossy(&output).trim()
+            );
+        }
+        self.checkout(sha)
+    }
+
     /// Checks `sha` out, clearing a stale `index.lock` a killed git left behind once.
     pub fn checkout(&self, sha: &str) -> Result<()> {
         if let Ok(output) = self.output(["rev-parse", "HEAD"]) {
@@ -412,6 +464,47 @@ mod tests {
 
         let missing_binary = Git::new("/definitely/missing/git", repo.path());
         assert!(missing_binary.output::<[&str; 0], &str>([]).is_err());
+    }
+
+    #[test]
+    fn checkout_clean_removes_untracked_and_ignored_files_at_same_revision() {
+        let (repo, git) = repository();
+        let head = git.resolve_sha("HEAD").unwrap();
+        fs::create_dir_all(repo.path().join("ignored/package")).unwrap();
+        fs::write(repo.path().join("ignored/package/BUILD"), "").unwrap();
+        fs::write(repo.path().join("untracked.txt"), "").unwrap();
+        git.checkout_clean(&head, &BTreeSet::new()).unwrap();
+        assert!(!repo.path().join("ignored").exists());
+        assert!(!repo.path().join("untracked.txt").exists());
+        assert_eq!(
+            fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+            "one"
+        );
+        assert_eq!(git.resolve_sha("HEAD").unwrap(), head);
+    }
+
+    #[test]
+    fn checkout_clean_preserves_only_exact_seed_paths_and_propagates_cancellation() {
+        let (repo, git) = repository();
+        fs::create_dir_all(repo.path().join("ignored")).unwrap();
+        let seed = repo.path().join("ignored/seed[1]*.txt");
+        fs::write(&seed, "seed").unwrap();
+        fs::write(repo.path().join("ignored/seed1other.txt"), "remove").unwrap();
+        fs::write(repo.path().join("seed-list.txt"), "ignored/seed[1]*.txt").unwrap();
+        let preserved = BTreeSet::from([seed.clone(), PathBuf::from("seed-list.txt")]);
+        let head = git.resolve_sha("HEAD").unwrap();
+        git.checkout_clean(&head, &preserved).unwrap();
+        assert!(seed.exists());
+        assert!(repo.path().join("seed-list.txt").exists());
+        assert!(!repo.path().join("ignored/seed1other.txt").exists());
+        let token = Arc::new(Cancellation::new());
+        token.cancel();
+        fs::write(repo.path().join("not-cleaned.txt"), "").unwrap();
+        assert!(git
+            .with_cancellation(Some(token))
+            .checkout_clean(&head, &preserved)
+            .is_err());
+        assert!(repo.path().join("not-cleaned.txt").exists());
     }
 
     #[test]

@@ -451,6 +451,18 @@ struct ServeArgs {
     #[arg(long = "gitPath", default_value = "git")]
     git_path: PathBuf,
 
+    /// Remove untracked and ignored files before checkout; configured seeds are preserved
+    #[arg(long = "cleanWorkspace")]
+    clean_workspace: bool,
+
+    /// Exact workspace-relative files to preserve during cleanup, separated by commas
+    #[arg(
+        long = "cleanWorkspaceExclude",
+        value_delimiter = ',',
+        requires = "clean_workspace"
+    )]
+    clean_workspace_exclude: Vec<PathBuf>,
+
     #[arg(long, default_value_t = 8080)]
     port: u16,
 
@@ -1366,6 +1378,15 @@ impl ServeArgs {
             hash_options,
             repositories,
             git_path: self.git_path.clone(),
+            clean_workspace: self.clean_workspace,
+            clean_workspace_exclude: self.clean_workspace_exclude.iter().cloned().collect(),
+            seed_filepaths_file: self
+                .hashing
+                .seed_filepaths
+                .as_ref()
+                .map(fs::canonicalize)
+                .transpose()
+                .context("failed to resolve seed file list")?,
             port: self.port,
             request_timeout: Duration::from_secs(self.request_timeout),
             cache_dir: self.cache_dir.clone(),
@@ -1413,6 +1434,7 @@ impl ServeArgs {
             compute_slot_demand_average_window,
         };
         bazel_diff::server::validate_partial_graph(&config)?;
+        bazel_diff::server::validate_workspace_clean(&config)?;
         bazel_diff::server::repositories(&config)?;
         Ok(config)
     }
@@ -1861,6 +1883,74 @@ mod tests {
             &BTreeMap::from([("a", 1)])
         )
         .is_err());
+    }
+
+    #[test]
+    fn serve_config_parses_opt_in_cleanup_and_comma_separated_exclusions() {
+        for multi in [false, true] {
+            let mut arguments = if multi {
+                vec!["bazel-diff", "serve-multi", "--repo", "test=/tmp/ws"]
+            } else {
+                vec!["bazel-diff", "serve", "--workspacePath", "/tmp/ws"]
+            };
+            arguments.extend(["--cacheDir", "/tmp/cache"]);
+            let config = match parse(&arguments).command {
+                Commands::Serve(args) => args.to_config(false).unwrap(),
+                Commands::ServeMulti(args) => args
+                    .serve
+                    .to_config_with_repositories(false, args.repositories)
+                    .unwrap(),
+                _ => panic!("expected serve"),
+            };
+            assert!(!config.clean_workspace);
+            assert!(config.clean_workspace_exclude.is_empty());
+            arguments.extend([
+                "--cleanWorkspace",
+                "--cleanWorkspaceExclude",
+                "MODULE.bazel.lock,local.bazelrc",
+            ]);
+            let config = match parse(&arguments).command {
+                Commands::Serve(args) => args.to_config(false).unwrap(),
+                Commands::ServeMulti(args) => args
+                    .serve
+                    .to_config_with_repositories(false, args.repositories)
+                    .unwrap(),
+                _ => panic!("expected serve"),
+            };
+            assert!(config.clean_workspace);
+            assert_eq!(
+                config.clean_workspace_exclude,
+                BTreeSet::from([
+                    PathBuf::from("MODULE.bazel.lock"),
+                    PathBuf::from("local.bazelrc"),
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn serve_config_rejects_invalid_cleanup_exclusions() {
+        let base = [
+            "bazel-diff",
+            "serve",
+            "--workspacePath",
+            "/tmp/ws",
+            "--cacheDir",
+            "/tmp/cache",
+        ];
+        let mut without_cleanup = base.to_vec();
+        without_cleanup.extend(["--cleanWorkspaceExclude", "MODULE.bazel.lock"]);
+        assert!(Cli::try_parse_from(without_cleanup).is_err());
+        for value in ["/tmp/file", "../file", "dir/../file", ".", "dir/", "a,,b"] {
+            let mut arguments = base.to_vec();
+            arguments.extend(["--cleanWorkspace", "--cleanWorkspaceExclude", value]);
+            if let Ok(cli) = Cli::try_parse_from(arguments) {
+                let Commands::Serve(args) = cli.command else {
+                    panic!("expected serve");
+                };
+                assert!(args.to_config(false).is_err(), "{value}");
+            }
+        }
     }
 
     #[test]
